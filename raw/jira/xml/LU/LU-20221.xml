@@ -1,0 +1,124 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20221] LNet: lnet_net_show_dump NULL pointer dereference during multi-skb netlink dumps</title>
+                <link>https://jira.whamcloud.com/browse/LU-20221</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;b&gt;Environment&lt;/b&gt;: &lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;&lt;b&gt;Lustre version:&lt;/b&gt;  v2_17_52&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Kernel&lt;/b&gt;: Rocky 9.7: 5.14.0-611.27.1.el9_7.x86_64&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;During testing of adding large numbers of NIDs to a server, I encountered a crash caused by lnetctl net show when I reached a certain threshold of NIDs.&lt;/p&gt;
+
+&lt;p&gt;On analyzing this crash, I was able to consistently reproduce this behaviour using the attached script which simply creates a number of LNET NIDs on a server and calls 'lnetctl net show -v 4'.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[servers] [root@server1 ~]# ./reproducer.sh --nids 150 --verbosity 4
+=================================================
+ Reproducer                                      
+ Max NIDs:  150                                
+ Verbosity: 4                           
+=================================================
+[Pre-flight] Checking modules and limits...
+[Test] Beginning incremental &lt;span class="code-keyword"&gt;interface&lt;/span&gt; addition...
+  - 1 NIDs : PASS (Binary: 9176 bytes | YAML: 14681 bytes)
+  - 2 NIDs : PASS (Binary: 9648 bytes | YAML: 16173 bytes)
+  - 3 NIDs : PASS (Binary: 10120 bytes | YAML: 17665 bytes)
+...
+  - 127 NIDs : PASS (Binary: 65524 bytes | YAML: 191374 bytes)   
+--&amp;gt; *CRASH*&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;I have attached the script and crashdump to the ticket.&lt;/p&gt;
+
+&lt;p&gt;I also include the following analysis from Claude on what it determines the root cause to be, which appears to be triggered when the netlink payload triggered by 'lnetctl net show' exceeds the 64KiB buffer for a single buffer.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+There is a flaw in lnet_net_show_dump() (lnet/lnet/api-ni.c) that reliably panics the kernel or triggers an infinite loop when the number of configured NIs causes the netlink dump payload to exceed the 64 KiB skb buffer limit. The reproducer confirms that when the binary netlink payload crosses 65,535 bytes (e.g., ~128 dummy NIDs at verbosity -v 4), the kernel attempts to fall back to the multi-skb chunking logic but fails due to missing &lt;span class="code-keyword"&gt;return&lt;/span&gt; checks and broken state-resumption logic.
+
+The primary issue causing the kernel panic is that the function makes approximately 18 sequential calls to nla_nest_start() without checking &lt;span class="code-keyword"&gt;for&lt;/span&gt; a NULL &lt;span class="code-keyword"&gt;return&lt;/span&gt;. When the skb buffer fills up, nla_nest_start() returns NULL. Because &lt;span class="code-keyword"&gt;this&lt;/span&gt; is ignored, the subsequent nla_nest_end(msg, NULL) attempts to write the 16-bit nla_len field to address 0, instantly seizing the node with a NULL pointer dereference.Furthermore, even &lt;span class="code-keyword"&gt;if&lt;/span&gt; the buffer overflow perfectly aligns with a network boundary (avoiding the mid-NI panic), the multi-skb resumption path is functionally broken. When genlmsg_put fails due to lack of space, the code executes GOTO(net_unlock, rc = -EMSGSIZE), completely bypassing the nlist-&amp;gt;lngl_idx = idx state-saving assignment. Compounding &lt;span class="code-keyword"&gt;this&lt;/span&gt;, the function initializes idx = nlist-&amp;gt;lngl_idx instead of 0, meaning the &lt;span class="code-keyword"&gt;if&lt;/span&gt; (idx++ &amp;lt; nlist-&amp;gt;lngl_idx) &lt;span class="code-keyword"&gt;continue&lt;/span&gt;; check never actually skips previously processed NIs. This &lt;span class="code-keyword"&gt;throws&lt;/span&gt; the kernel into an infinite loop, returning the exact same chunk of networks repeatedly until lnetctl crashes in userspace with a realloc(): invalid next size heap corruption.&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</description>
+                <environment />
+        <key id="97391">LU-20221</key>
+            <summary>LNet: lnet_net_show_dump NULL pointer dereference during multi-skb netlink dumps</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="3" iconUrl="https://jira.whamcloud.com/images/icons/statuses/inprogress.png" description="This issue is being actively worked on at the moment by the assignee.">In Progress</status>
+                    <statusCategory id="4" key="indeterminate" colorName="inprogress" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="masingh">Malkeet Singh</assignee>
+                                    <reporter username="mrasobarnett">Matt Rásó-Barnett</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 5 May 2026 11:02:15 +0000</created>
+                <updated>Fri, 22 May 2026 15:40:08 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>5</watches>
+                                                                            <comments>
+                            <comment id="494898" author="gerrit" created="Fri, 22 May 2026 12:51:26 +0000">&lt;p&gt;"Malkeet Singh &amp;lt;masingh@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66083" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66083&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20221" title="LNet: lnet_net_show_dump NULL pointer dereference during multi-skb netlink dumps" class="issue-link" data-issue-key="LU-20221"&gt;LU-20221&lt;/a&gt; lnet: fix panic in lnet_net_show_dump with &amp;gt;128 NIDs&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: b4953df34d7795f318284034f734e98fcb9d3362&lt;/p&gt;</comment>
+                            <comment id="494583" author="JIRAUSER19446" created="Fri, 15 May 2026 14:23:23 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=simmonsja" class="user-hover" rel="simmonsja"&gt;simmonsja&lt;/a&gt;  Binary profiling via strace confirms that with verbosity 4 the 'lo' interface alone, when combined with the LNet key table headers, consumes ~2.6 KB of the buffer, (split across two Netlink messages of 2220 and 416 bytes). Each added dummy NI scales the binary payload by exactly +476 to +480 bytes with padding difference.&lt;br/&gt;
+I am relatively new to this specific subsystem, Do you want me to proceed with creating the patch for this which I would love to do so or would you be fixing this.&lt;/p&gt;</comment>
+                            <comment id="494523" author="simmonsja" created="Thu, 14 May 2026 13:07:55 +0000">&lt;p&gt;Oh so we finally hit this issue. I know what the fix is. We need to calculate the actually needed cb-&amp;gt;min_dump_alloc. You can see an example with routes ROUTER_MSG_* in api.c. I need to do some profiling to figure out the sizes we need. Be aware some nl_attrs are padded so its not a simple calculation. I actually examine the returned netlink packets in user land to figure out the sizes I need for each field.&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="28221">LU-6130</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="62606">LU-14391</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="80153">LU-17451</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="85596">LU-18417</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                            <attachment id="64507" name="reproducer.sh" size="3030" author="mrasobarnett" created="Tue, 5 May 2026 10:49:14 +0000" />
+                            <attachment id="64508" name="vmcore" size="92666898" author="mrasobarnett" created="Tue, 5 May 2026 10:59:28 +0000" />
+                            <attachment id="64509" name="vmcore-dmesg.txt" size="116027" author="mrasobarnett" created="Tue, 5 May 2026 10:47:40 +0000" />
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06tjj:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

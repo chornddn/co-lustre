@@ -1,0 +1,309 @@
+Change:     65798
+Subject:    LU-20238 ec: GFNI-accelerated EC primitives
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65798
+Change-Id:  Ia40a743c8e47c018250728668090215c7bd8365b
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-05-11 00:30:11.000000000
+Updated:    2026-05-20 11:03:53.000000000
+Patch Set:  8
+Insertions: +2238
+Deletions:  -41
+Comments:   312 (0 unresolved)
+Hashtags:   pt_ecro
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Andreas Dilger, Patrick Farrell, Ronnie Sahlberg
+
+--- Commit Message ---
+LU-20238 ec: GFNI-accelerated EC primitives
+
+Portable C-intrinsics build of ISA-L that drops the patented
+PSHUFB nibble-table technique used by the AVX2/SSE kernels.
+A follow-on patch in this series adds a non-GFNI byte-indexed
+table-lookup (GF_REGION_MUL) for the scalar fallback path.
+
+Add a runtime-dispatched GFNI fast path to the existing libec.a
+(LU-19465).
+
+On x86_64 CPUs with GFNI:
+
+  - AVX-512 + GFNI: ec_encode_data / ec_encode_data_update /
+    ec_init_tables route to AVX-512 GFNI kernels.  Encode peels
+    parity rows off in groups of up to 6 per FPU pass (kernels
+    for 1/2/3/4/5/6 outputs are shipped); arbitrary m is
+    supported via repeated passes.
+  - AVX2 + GFNI:    same dispatcher with AVX2 GFNI kernels.
+    Encode peels in groups of up to 3 per pass (kernels for
+    1/2/3 outputs); arbitrary m via repeated passes.
+  - Everywhere else (or when GFNI isn't compiled in): the
+    existing ec_*_base() path is used, unchanged.
+
+The GFNI kernels are written in C using compiler intrinsics
+(_mm{256,512}_gf2p8affine_epi64_epi8) gated per-function with
+__attribute__((target("avx2,gfni"))) or
+target("avx512f,avx512bw,gfni"), so the build needs only
+GCC >= 8 / clang >= 8 and does NOT depend on NASM.  The encode
+path uses only the GF(2^8) affine intrinsic (vgf2p8affineqb)
+and standard XOR / load / store; no PSHUFB-style nibble-table
+lookup is used anywhere.
+
+Performance on rd07 (Intel Raptor Lake-P, AVX2 + GFNI, single
+thread, median of 3) vs ISA-L's NASM kernels on the same host:
+
+  Benchmark                            | NASM      | C intrinsics
+  -------------------------------------+-----------+--------------
+  gf_vect_mul_perf                     | 42.5 GB/s | 56.8 (+34%)
+  gf_vect_dot_prod_perf                | 50.1 GB/s |  46.9 (-6%)
+  erasure_code_perf encode             | 18.2 GB/s | 20.0 (+10%)
+  erasure_code_perf decode             | 20.8 GB/s |  22.5 (+8%)
+  erasure_code_update_perf encode      | 16.4 GB/s |  16.8 (+2%)
+  erasure_code_update_perf single_src  | 54.7 GB/s |  56.8 (+4%)
+
+Intrinsics match or beat NASM on 5 of 6 benchmarks; the one
+slower case is by 6%.  The AVX-512 GFNI path builds but is not
+yet runtime-verified (no Sapphire Rapids / Sierra Forest host).
+
+A configure-time probe (EC_GFNI_SUPPORT in
+config/lustre-erasurecode.m4) compile-tests the affine intrinsic
+and, on success, defines LUSTRE_EC_GFNI for the libec.a build
+and enables the new sources via the EC_GFNI automake conditional.
+When the probe fails (non-x86_64, older toolchain), no GFNI
+objects are built and ec_base_aliases.c collapses to the base
+path unchanged.
+
+For this patch, the dispatcher is gated to userspace only via
+C sources are already __KERNEL__-aware and build into ec.ko;
+a follow-on patch in this series will add the lustre/ec/Makefile
+(Kbuild) plumbing and define LUSTRE_EC_GFNI for the kernel build
+so ec.ko also dispatches to GFNI.
+
+A standalone smoke test (gfni_ec_test, noinst_PROGRAMS) is built
+inside the tree and verifies that the GFNI dispatcher and base
+path produce byte-identical output on randomised input.  It
+accepts k/m/len command-line arguments (default k=4 m=2
+len=4096, constraint 1<=k, 1<=m, k+m<=256).  lustre/tests/
+sanity-ec.sh test_0 sweeps a representative set of geometries
+through it.
+
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Change-Id: Ia40a743c8e47c018250728668090215c7bd8365b
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-05-11 00:30:11.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Hiroshi Nishida, 2026-05-11 00:31:46.000000000) ---
+Uploaded patch set 2: Commit message was updated.
+
+--- Message (jenkins, 2026-05-11 00:31:49.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-05-11 00:35:37.000000000) ---
+Patch Set 2:
+
+(89 comments)
+
+113 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-05-11 00:36:02.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/63499/results.html
+
+--- Message (Hiroshi Nishida, 2026-05-11 00:58:52.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2026-05-11 00:58:58.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/124822/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-05-11 01:07:44.000000000) ---
+Patch Set 3:
+
+(89 comments)
+
+113 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-11 06:39:25.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124831/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-05-12 21:54:40.000000000) ---
+Patch Set 4: Commit message was updated.
+
+Copied Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Hiroshi Nishida, 2026-05-12 21:59:00.000000000) ---
+Patch Set 5: Commit message was updated.
+
+Copied Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (wc-checkpatch, 2026-05-12 22:10:15.000000000) ---
+Patch Set 5:
+
+(89 comments)
+
+113 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-05-12 22:46:20.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124948/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-05-13 00:23:13.000000000) ---
+Patch Set 5:
+
+(10 comments)
+
+--- Message (Hiroshi Nishida, 2026-05-13 01:34:43.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-05-13 05:50:39.000000000) ---
+Patch Set 5:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-05-13 06:11:31.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-13 06:21:00.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-05-13 06:40:06.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124969/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-05-13 07:59:37.000000000) ---
+Patch Set 6:
+
+(8 comments)
+
+--- Message (Hiroshi Nishida, 2026-05-13 22:58:22.000000000) ---
+Patch Set 6:
+
+(7 comments)
+
+--- Message (Hiroshi Nishida, 2026-05-13 23:21:13.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-05-13 23:30:47.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-05-13 23:50:58.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125026/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-05-14 00:26:47.000000000) ---
+Patch Set 7: Code-Review+1
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-05-14 00:37:03.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Autotest, 2026-05-14 11:03:07.000000000) ---
+Patch Set 7:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 125026 patch 7. Requested by Andreas Dilger because of LU-20217.
+
+--- Message (Hiroshi Nishida, 2026-05-17 09:49:14.000000000) ---
+Patch Set 8: Patch Set 7 was rebased on behalf of <GERRIT_ACCOUNT_1279>
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-05-17 09:49:33.000000000) ---
+Patch Set 8: Code-Review+1
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-05-17 09:57:06.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-05-17 10:18:06.000000000) ---
+Patch Set 8: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/125189/ : FAILURE
+
+--- Message (Marc Vef, 2026-05-18 09:45:46.000000000) ---
+Hashtag added: pt_ecro
+
+--- Message (Lustre RISC-V Builder, 2026-05-18 21:06:15.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-05-19 19:54:49.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (jenkins, 2026-05-19 20:25:54.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/125332/ : SUCCESS
+
+--- Message (Autotest, 2026-05-20 05:10:43.000000000) ---
+Patch Set 8:
+
+Trevis Autotest 2 retesting enforced review-dne-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 125332 patch 8. Requested by Andreas Dilger because of LU-17891.

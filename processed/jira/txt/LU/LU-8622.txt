@@ -3,13 +3,12 @@ Summary:    recovery-small test_24b: no discarded dirty page found!
 Link:       https://jira.whamcloud.com/browse/LU-8622
 Type:       Bug
 Priority:   Minor
-Status:     Resolved
-Resolution: Fixed
+Status:     Reopened
+Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Maloo
 Created:    Fri, 16 Sep 2016 21:40:57 +0000
-Updated:    Thu, 21 Nov 2024 01:21:38 +0000
-Resolved:   Wed, 6 Nov 2024 14:22:01 +0000
+Updated:    Fri, 15 May 2026 12:04:38 +0000
 Links:      Related: is related to  LU-12511
 
 --- Environment ---
@@ -58,6 +57,95 @@ onyx-38vm8: error: set_param: setting debug: no value
 Resetting fail_loc on all nodes...CMD: onyx-38vm1.onyx.hpdd.intel.com,onyx-38vm2,onyx-38vm7,onyx-38vm8 lctl set_param -n fail_loc=0 	    fail_val=0 2>/dev/null
 done.
  recovery-small test_24b: @@@@@@ FAIL: no discarded dirty page found!
+
+--- Comment (adilger, Mon, 16 Mar 2026 06:19:21 +0000) ---
+The rate limiting message is only printed after the rate limiting has finished and the next time the message is printed again.
+
+That said, I looked through the debug log for the failed subtest and didn't see any dirty page discard message either.  Is it possible that the page is already written by the time the client is evicted?
+
+--- Comment (tappro, Sun, 15 Mar 2026 08:40:32 +0000) ---
+doesn't look so, here is an example of console log from repeated run of 24b:
+
+https://testing.whamcloud.com/test_logs/d1675a74-95b2-4656-b5d0-a710ab7bddf9/show_text
+
+test page: https://testing.whamcloud.com/test_sets/bce221d2-6abc-4ba3-acce-829f1cbb8d15
+
+It has no rate limiting messages when single page discard occurred
+
+--- Comment (adilger, Sun, 15 Mar 2026 08:17:37 +0000) ---
+Could the lack of ll_dirty_page_discard_warn() messages be caused by rate limiting of console error messages?  We've had similar kinds of failures in other tests, especially if they are run in a loop.  Rather than checking the console logs, it would be more robust to dump the debug logs and check for the message there, IFF the debug logs are large enough (i.e. the test itself is not so complex that the message has aged out of the debug log).
+
+--- Comment (tappro, Sat, 14 Mar 2026 16:33:56 +0000) ---
+I am not pretty sure if this is test issue or not, error_ignore call means test results to be ignored, but then second check for 'discard' message makes test FAIL. It looks like we don't need to check for 'discard' after error_ignore() call or why to have that error_ignore() at all?
+
+On other side, I am not sure what test expect to check, there are two processes, one sleeps on 'fsync', another on 'close'.  Both should fail after eviction, so there should be two messages about "dirty page discard:", but test doesn't check that, it passes if single one exists.
+
+I've checked several runs and find that:
+
+fsync: Input/output error
+close: Input/output error
+[  284.628628] Lustre: 4187:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x200000404:0x3:0x0]// may get corrupted (rc -5)
+[  284.631796] Lustre: 4188:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x200000404:0x4:0x0]// may get corrupted (rc -108)
+
+fsync: Input/output error
+close: Input/output error
+[  287.266468] Lustre: 4185:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x240000404:0x2:0x0]// may get corrupted (rc -5)
+[  287.269590] Lustre: 4186:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x240000404:0x3:0x0]// may get corrupted (rc -108)
+
+fsync: Input/output error
+close: Input/output error
+[  289.757591] Lustre: 4186:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x280000404:0x3:0x0]// may get corrupted (rc -108)
+
+fsync: Input/output error
+close: Input/output error
+[  291.910481] Lustre: 4187:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x2c0000404:0x3:0x0]// may get corrupted (rc -108)
+
+fsync: Input/output error
+close: Input/output error
+[  293.962887] Lustre: 4188:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x200000404:0xf:0x0]// may get corrupted (rc -108)
+
+fsync: Input/output error
+close: Input/output error
+[  296.048522] Lustre: 4187:0:(llite_lib.c:4151:ll_dirty_page_discard_warn()) lustre: dirty page discard: 10.240.28.251@tcp:/lustre/fid: [0x240000404:0x6:0x0]// may get corrupted (rc -108)
+
+...
+fsync: Input/output error
+recovery-small test_24b: @@@@@@ IGNORE (bz5494): multiop didn't fail fsync: 5 or close: 0 
+
+note, in some cases there are two 'discard' messages for 'fsync' and 'close' (-5 and -108) but also there a lot more cases when only one 'discard' message occurred with -108 error (for close only?). It looks like in half cases fsync failure doesn't produce 'discard' message and that is just not noticed because test doesn't check that, so in all cases only 'discard' message from close let test pass and test fails if 'close' is not failed after eviction for some reason.
+
+So we need more expertise here to answer these questions:
+
+	should fsync failure produce 'discard' message or not? If not necessary, then why 'fsync' test is there?
+
+	should test check always for two 'discard'  messages if both writes failed?
+
+	should test result be ignored if one of writes doesn't fail and skip check for 'discard'? Or it need to be more robust and check for as many 'discard' and failed writes
+
+--- Comment (tappro, Sat, 14 Mar 2026 16:12:57 +0000) ---
+issue exists in master and happened at 2-3% rate. The symptoms are the same:
+
+== recovery-small test 24b: test dirty page discard due to client eviction (repeat 49/ iter, 1/30 min) ========================================================== 13:38:31 (1773495511)
+multiop /mnt/lustre/d24b.recovery-small/f24b.recovery-small-1 vOw8192_yc
+TMPPIPE=/tmp/multiop_open_wait_pipe.17139
+multiop /mnt/lustre/d24b.recovery-small/f24b.recovery-small-2 vOw8192_c
+TMPPIPE=/tmp/multiop_open_wait_pipe.17139
+CMD: onyx-141vm7 /usr/sbin/lctl set_param -n obdfilter.lustre-OST0000.evict_client 2e67c03c-4bff-4354-8f95-e6ede817184c
+fsync: Input/output error
+fail_loc=0x0
+CMD: onyx-141vm5.onyx.whamcloud.com,onyx-141vm6 /usr/bin/lfs df /mnt/lustre; uname -n >> /mnt/lustre/recon
+Connected clients: onyx-141vm5.onyx.whamcloud.com
+onyx-141vm5.onyx.whamcloud.com
+onyx-141vm6.onyx.whamcloud.com
+ recovery-small test_24b: @@@@@@ IGNORE (bz5494): multiop didn't fail fsync: 5 or close: 0 
+  Trace dump:
+  = /usr/lib64/lustre/tests/test-framework.sh:7402:error_ignore()
+  = /usr/lib64/lustre/tests/recovery-small.sh:1063:test_24b()
+  = /usr/lib64/lustre/tests/test-framework.sh:7762:run_one()
+  = /usr/lib64/lustre/tests/test-framework.sh:7825:run_one_logged()
+  = /usr/lib64/lustre/tests/test-framework.sh:7625:run_test()
+  = /usr/lib64/lustre/tests/recovery-small.sh:1069:main()
+ recovery-small test_24b: @@@@@@ FAIL: no discarded dirty page found!
 
 --- Comment (simmonsja, Wed, 6 Nov 2024 14:22:01 +0000) ---
 Patch 53333 fixed this issue

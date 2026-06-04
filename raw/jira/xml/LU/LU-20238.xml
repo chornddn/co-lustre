@@ -1,0 +1,162 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20238] ec: x86 GFNI/AVX-{2,512} accelerated EC primitives</title>
+                <link>https://jira.whamcloud.com/browse/LU-20238</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Background"&gt;&lt;/a&gt;Background&lt;/h2&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19465" title="FLR-EC: Move the erasue-coding code from the module and into a separate library" class="issue-link" data-issue-key="LU-19465"&gt;&lt;del&gt;LU-19465&lt;/del&gt;&lt;/a&gt; landed a plain-C ISA-L erasure-code library (libec.a, kernel module ec.ko) as the foundation for the EC feature work in flight.&lt;br/&gt;
+&lt;a href="https://jira.whamcloud.com/browse/LU-19929" title="RISC-V Architecture Support" class="issue-link" data-issue-key="LU-19929"&gt;&lt;del&gt;LU-19929&lt;/del&gt;&lt;/a&gt; added a RISC-V optimised path on top of that base.  No acceleration is currently shipped for x86_64.&lt;/p&gt;
+
+&lt;p&gt;This ticket tracks adding an x86_64 fast path using the GFNI / AVX2 / AVX-512 instruction set extensions, byte-compatible with the existing &lt;tt&gt;ec_*_base()&lt;/tt&gt; implementation, runtime-dispatched, and patent-clean.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Changes"&gt;&lt;/a&gt;Changes&lt;/h2&gt;
+
+&lt;p&gt; Add a runtime-dispatched GFNI fast path inside libec.a:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;AVX-512 + GFNI: &lt;tt&gt;ec_encode_data()&lt;/tt&gt; / &lt;tt&gt;ec_encode_data_update()&lt;/tt&gt; &lt;tt&gt;ec_init_tables()&lt;/tt&gt; route to AVX-512 GFNI kernels.  Encode peels parity rows off in groups of up to 6 per FPU pass; any m is supported via repeated passes.&lt;/li&gt;
+	&lt;li&gt;AVX2 + GFNI: same dispatcher, AVX2 GFNI kernels. Encode peels in groups of up to 3 per pass.&lt;/li&gt;
+	&lt;li&gt;Everywhere else (and when GFNI is not compiled in): the existing &lt;tt&gt;ec_*_base()&lt;/tt&gt; path is used, unchanged.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The kernels are written in C using compiler intrinsics (&lt;tt&gt;&amp;#95;mm{256,512}&amp;#95;gf2p8affine&amp;#95;epi64&amp;#95;epi8&lt;/tt&gt;) gated per-function with &lt;tt&gt;_&lt;em&gt;attribute&lt;/em&gt;_((target("avx2,gfni")))&lt;/tt&gt; or &lt;tt&gt;target("avx512f,avx512bw, gfni")&lt;/tt&gt;). The build requires GCC &amp;gt;= 8 / clang &amp;gt;= 8 and does NOT depend on NASM.&lt;/p&gt;
+
+&lt;p&gt;A new autoconf macro &lt;tt&gt;EC_GFNI_SUPPORT&lt;/tt&gt; in &lt;tt&gt;config/lustre-erasurecode.m4&lt;/tt&gt; compile-tests the affine intrinsic. On success, it defines &lt;tt&gt;LUSTRE_EC_GFNI&lt;/tt&gt; for libec.a and sets the EC_GFNI automake conditional that pulls in the new sources. On failure (non-x86_64, older toolchain) no GFNI objects are built and ec_base_aliases.c collapses to the existing base path.&lt;/p&gt;
+
+&lt;p&gt;A small standalone smoke test (&lt;tt&gt;gfni_ec_test&lt;/tt&gt;, &lt;tt&gt;noinst_PROGRAMS&lt;/tt&gt;) is built inside the tree and verifies that the dispatcher and base path produce byte-identical output on randomised input.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Scope"&gt;&lt;/a&gt;Scope&lt;/h2&gt;
+
+&lt;p&gt;This change is strictly userspace-scoped:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;libec.a (userspace static archive) gains the GFNI fast path.&lt;/li&gt;
+	&lt;li&gt;ec.ko (kernel module) is unchanged at runtime — its Makefile does not define &lt;tt&gt;LUSTRE_EC_GFNI&lt;/tt&gt;, so the dispatcher in ec_base_aliases.c collapses to the base path for the kernel build. A future ticket can wire kernel-mode GFNI (with &lt;tt&gt;kernel_fpu_begin/end()&lt;/tt&gt; bracketing, which is already prepared in gfni_glue.c) if/when that is wanted.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Patentconsiderations"&gt;&lt;/a&gt;Patent considerations&lt;/h2&gt;
+
+&lt;p&gt;The encode path uses only the GF(2^8) affine intrinsic (vgf2p8affineqb) plus standard XOR / load / store.  No PSHUFB-style nibble-table lookup is used in any of the GFNI kernels. The fallback in ec_base.c is the plain byte-indexed table lookup (gf_mul_table_base&lt;span class="error"&gt;&amp;#91;256*256&amp;#93;&lt;/span&gt;) already present in master, which is itself patent-clean.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Validation"&gt;&lt;/a&gt;Validation&lt;/h2&gt;
+
+&lt;p&gt;Built and runtime-tested at HEAD against current Lustre master:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;Non-GFNI x86_64 client (RHEL 10.1, kernel 6.12, GCC 14.3.1, KVM): builds cleanly, configure reports checking whether to build GFNI EC primitives... yes (compile-test based on toolchain), gfni_ec_test correctly detects no runtime GFNI and routes through the base path; parity output matches.&lt;/li&gt;
+	&lt;li&gt;AVX2-GFNI x86_64 client (Raptor Lake i5-1340P, RHEL 10.1, kernel 6.12, GCC 14.3.1): builds cleanly, gfni_ec_test detects AVX2-GFNI and routes through ec_encode_data_avx2_gfni; parity output is byte-identical to ec_encode_data_base for k=4 m=2 on randomised input.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;AVX-512-GFNI kernels are compile-tested but not runtime-tested (no AVX-512 hardware available locally). They follow the same intrinsic pattern as the AVX2-GFNI kernels and the same code path in the dispatcher, so this is a hardware coverage gap rather than a correctness gap.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Filesadded"&gt;&lt;/a&gt;Files added&lt;/h2&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+    lustre/utils/erasurecode/gf_vect_dot_prod_avx2_gfni.c
+    lustre/utils/erasurecode/gf_2vect_dot_prod_avx2_gfni.c
+    lustre/utils/erasurecode/gf_3vect_dot_prod_avx2_gfni.c
+    lustre/utils/erasurecode/gf_vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_2vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_3vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_4vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_5vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_6vect_dot_prod_avx512_gfni.c
+    lustre/utils/erasurecode/gf_vect_mad_avx2_gfni.c
+    lustre/utils/erasurecode/gf_2vect_mad_avx2_gfni.c
+    lustre/utils/erasurecode/gf_2vect_mad_avx512_gfni.c
+    lustre/utils/erasurecode/gfni_glue.c
+    lustre/utils/erasurecode/gfni_dispatch.h
+    lustre/utils/erasurecode/gfni_ec_test.c
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;h2&gt;&lt;a name="Filesmodified"&gt;&lt;/a&gt;Files modified&lt;/h2&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+    lustre/ec/ec_base_aliases.c          (+#ifdef LUSTRE_EC_GFNI dispatch)
+    lustre/utils/erasurecode/autoMakefile.am   (+&lt;span class="code-keyword"&gt;if&lt;/span&gt; EC_GFNI block)
+    config/lustre-erasurecode.m4         (+EC_GFNI_SUPPORT macro)
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Diffstat: 18 files, +1863 / -2.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Related"&gt;&lt;/a&gt;Related&lt;/h2&gt;
+
+&lt;p&gt;    &lt;a href="https://jira.whamcloud.com/browse/LU-19465" title="FLR-EC: Move the erasue-coding code from the module and into a separate library" class="issue-link" data-issue-key="LU-19465"&gt;&lt;del&gt;LU-19465&lt;/del&gt;&lt;/a&gt; — adds the base libec.a / ec.ko this patch extends.&lt;br/&gt;
+    &lt;a href="https://jira.whamcloud.com/browse/LU-19929" title="RISC-V Architecture Support" class="issue-link" data-issue-key="LU-19929"&gt;&lt;del&gt;LU-19929&lt;/del&gt;&lt;/a&gt; — adds the RISC-V optimised path (parallel architecture).&lt;/p&gt;</description>
+                <environment>RHEL9.7/10.1</environment>
+        <key id="97483">LU-20238</key>
+            <summary>ec: x86 GFNI/AVX-{2,512} accelerated EC primitives</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hnishida">Hiroshi Nishida</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 11 May 2026 00:23:46 +0000</created>
+                <updated>Thu, 14 May 2026 00:13:39 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="494465" author="gerrit" created="Wed, 13 May 2026 06:11:36 +0000">&lt;p&gt;"Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/65848" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/65848&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20238" title="ec: x86 GFNI/AVX-{2,512} accelerated EC primitives" class="issue-link" data-issue-key="LU-20238"&gt;LU-20238&lt;/a&gt; ec: byte-indexed region multiply in scalar base path&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: efdd46d0ccaa34c591b631213dcb1d8e687eedd0&lt;/p&gt;</comment>
+                            <comment id="494453" author="adilger" created="Tue, 12 May 2026 23:59:50 +0000">&lt;p&gt;Note that the RISC-V "acceleration" is just the same C code lookup table that x86_64 is using.&lt;/p&gt;</comment>
+                            <comment id="494347" author="gerrit" created="Mon, 11 May 2026 00:30:15 +0000">&lt;p&gt;"Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/65798" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/65798&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20238" title="ec: x86 GFNI/AVX-{2,512} accelerated EC primitives" class="issue-link" data-issue-key="LU-20238"&gt;LU-20238&lt;/a&gt; ec: x86 GFNI/AVX-&lt;/p&gt;
+{2,512}
+&lt;p&gt; accelerated EC primitives&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: fac927de70c893c3fe7b4067adb4c2c0d3f1afdd&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="96514">LU-20016</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                                <inwardlinks description="is related to">
+                                        <issuelink>
+            <issuekey id="97515">LU-20258</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06tsn:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

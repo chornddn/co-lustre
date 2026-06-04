@@ -7,18 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-04-17 08:30:40.000000000
-Updated:    2026-04-23 19:02:03.000000000
-Patch Set:  1
-Insertions: +425
+Updated:    2026-06-03 16:01:21.000000000
+Patch Set:  3
+Insertions: +428
 Deletions:  -123
-Comments:   7 (2 unresolved)
+Comments:   48 (13 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Chris Horn: -1
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  REVIEWER: Andreas Dilger, James Simmons, Etienne AUJAMES
+  CC: Lustre RISC-V Builder
+  REVIEWER: Andreas Dilger, James Simmons, Chris Horn, Etienne AUJAMES
 
 --- Commit Message ---
 LU-20090 nrs: add static and dynamic classify conf for TBF policy
@@ -33,21 +34,23 @@ The global rule is NID which is configured via:
 ost.OSS.ost_io.nrs_policies="tbf nid"
 A newly adding rule:
 nrs_tbf_rule="start r1 nid={10.0.0.1@tcp}&uid={50} rate=100"
-will be with class type of "nid+opcode" instead of the global
+will be with class type of "nid+uid" instead of the global
 class type "nid".
 
 The classify strategy can be configured by sysfs entry "classify"
 and "nrs_policies":
 i.e.
 - ost.OSS.ost_io.nrs_policies="tbf nid+opcode classify=dynamic
-- ost.OSS.ost_io.classify="static"
-- ost.OSS.ost_io.classify="dynamic"
-- ost.OSS.ost_io.classify="reg_classify:dynamic"
-- ost.OSS.ost_io.classify="hp_classify:static"
+- ost.OSS.ost_io.nrs_tbf_classify="static"
+- ost.OSS.ost_io.nrs_tbf_classify="dynamic"
+- ost.OSS.ost_io.nrs_tbf_classify="reg_classify:dynamic"
+- ost.OSS.ost_io.nrs_tbf_classify="hp_classify:static"
 
-Add sanityn/test_77tab to test  the setting of the classify
+Add sanityn/test_77tab to test the setting of the classify
 strategies.
 
+Test-Parameters: trivial
+Test-Parameters: testlist=sanityn env=ONLY=77
 Change-Id: Ia6d4ebc8705e67421b60eabc5cea54f1de23952a
 Signed-off-by: Yingjin Qian <qian@ddn.com>
 
@@ -80,3 +83,85 @@ Patch Set 1:
 Patch Set 1:
 
 (1 comment)
+
+--- Message (Qian Yingjin, 2026-05-13 08:16:42.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Qian Yingjin, 2026-05-13 08:21:48.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2026-05-13 08:21:50.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-05-13 08:29:33.000000000) ---
+Patch Set 3:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Qian Yingjin, 2026-05-13 08:33:21.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (jenkins, 2026-05-13 10:17:01.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124999/ : SUCCESS
+
+--- Message (Qian Yingjin, 2026-05-15 08:59:39.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-15 18:56:16.000000000) ---
+Patch Set 3: Code-Review-1
+
+(12 comments)
+
+LU-20090 nrs (PS3): the config plumbing for static/dynamic classify is in good shape overall, but I have a few correctness and polish concerns before this lands.
+
+Main things:
+
+1. nrs_tbf_parse_value_pair() silently accepts unknown keys in the SCHED_START path. Only 'classify=' is checked; any typo (e.g. 'classfy=dynamic', 'classify=foo' would error but 'foobar=static' returns 0). This is more permissive than the existing rule path which returns -EINVAL on unknown keys.
+
+2. NRS_TBF_FLAG_DYNAMIC is OR'd into head->th_type_flag and therefore flows into nrs_tbf_cli_gen_key()'s 'valid' and into key->tk_flags. When the admin toggles classify at runtime, every cached client in the rhashtable has the old tk_flags and will never match again; the old entries become dead weight (no flush). This may be deliberate and addressed by later patches in the series, but worth confirming.
+
+3. nrs_tbf_flags_valid() now accepts (NRS_TBF_FLAG_DYNAMIC only), since the only check is 'has any ALL bit, no extra bits'. A flags value with no field type but DYNAMIC set would pass the predicate. In practice nrs_tbf_type_parse guarantees at least one field, but the predicate name implies it validates that fact.
+
+4. classify writer in ptlrpc_lprocfs_nrs_tbf_classify_seq_write(): when neither 'reg_classify:' nor 'hp_classify:' is present, val_reg/val_hp both equal kernbuf and queue is forced to REG (+HP). That ends up applying *the same* value to both heads, which is the intended behavior for the bare 'static'/'dynamic' form -- OK, but please add a comment to make that explicit, because the variable names (val_reg vs val_hp) suggest two distinct values.
+
+5. Commit/comment polish: subject line is 65 chars, exceeds the 62-char cap from the Lustre wiki commit-message rules. Several spelling errors in new comments: 'possiibly', 'optioinal', 'TVF classify' (s/b TBF), 'automically' (s/b automatically), 'vaid' (s/b valid), 'hybird' (older). Test commit message says test_77tab, source says test_77ta -- pick one.
+
+6. sanityn test_77ta: several error strings are wrong-side-of-the-coin (lines 5599, 5605, 5614, 5626 -- they say 'expected reg_classify:static' when the assertion is actually checking for hp_classify, or vice versa). When the test fires, the error string will mislead the next person debugging.
+
+Nothing here is a -1 blocker on its own, but the silent-unknown-key behavior and the comment/string fixes should land before this does.
+
+--- Message (Chris Horn, 2026-05-15 19:01:01.000000000) ---
+Patch Set 3: -Code-Review
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-05-15 20:13:36.000000000) ---
+Patch Set 3: Code-Review-1
+
+(13 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-05-29 00:08:34.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-06-03 16:01:21.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful

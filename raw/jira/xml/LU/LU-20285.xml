@@ -1,0 +1,207 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20285] replaces an indirect heuristic (vui_ra_valid flag) with a direct check of the I/O type (CIT_FAULT)</title>
+                <link>https://jira.whamcloud.com/browse/LU-20285</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;The patch replaces an indirect heuristic (vui_ra_valid flag)&lt;br/&gt;
+with a direct check of the I/O type (CIT_FAULT),&lt;br/&gt;
+which represents a page fault handling operation&lt;br/&gt;
+(typically triggered by mmap'd page access).&lt;/p&gt;
+
+&lt;p&gt;CIT_FAULT explicitly indicates the I/O is happening&lt;br/&gt;
+due to a page fault from a memory-mapped region,&lt;br/&gt;
+rather than inferring from readahead validity.&lt;/p&gt;</description>
+                <environment />
+        <key id="97605">LU-20285</key>
+            <summary>replaces an indirect heuristic (vui_ra_valid flag) with a direct check of the I/O type (CIT_FAULT)</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="xiwang">Xiyang Wang</reporter>
+                        <labels>
+                            <label>patch</label>
+                    </labels>
+                <created>Wed, 20 May 2026 12:05:21 +0000</created>
+                <updated>Sat, 23 May 2026 09:13:59 +0000</updated>
+                                                                                <due>Wed, 20 May 2026 00:00:00 +0000</due>
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="494923" author="JIRAUSER22000" created="Sat, 23 May 2026 09:13:59 +0000">&lt;p&gt;Since somebody have some questions on this change, i studied the code a little.&lt;/p&gt;
+
+&lt;p&gt;The old sign was initialized in cl_io_init as false &lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+  cl_io_init(env, io, io_type, obj)
+      └─ coo_io_init()  &lt;span class="code-comment"&gt;// cl_object_operations
+&lt;/span&gt;          └─ vvp_io_init(env, obj, io)  &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;and set true only in read process, the code like this.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-object"&gt;int&lt;/span&gt; vvp_io_read_start(&lt;span class="code-keyword"&gt;const&lt;/span&gt; struct lu_env *env,
+                               &lt;span class="code-keyword"&gt;const&lt;/span&gt; struct cl_io_slice *ios){
+      struct vvp_io *vio = cl2vvp_io(env, ios);
+      struct cl_io *io = ios-&amp;gt;cis_io;
+      struct cl_object *obj = io-&amp;gt;ci_obj;
+      struct inode *inode = vvp_object_inode(obj);
+      struct ll_inode_info *lli = ll_i2info(inode);
+      struct file *file = vio-&amp;gt;vui_fd-&amp;gt;fd_file;
+      loff_t pos = io-&amp;gt;u.ci_rd.rd.crw_pos;
+      size_t crw_bytes = io-&amp;gt;u.ci_rd.rd.crw_bytes;
+      size_t tot_bytes = vio-&amp;gt;vui_tot_bytes;
+      &lt;span class="code-object"&gt;int&lt;/span&gt; result;
+      ENTRY;
+      trunc_sem_down_read(&amp;amp;lli-&amp;gt;lli_trunc_sem);
+      &lt;span class="code-comment"&gt;// ━━━ &lt;span class="code-keyword"&gt;return&lt;/span&gt; 1: async read ━━━
+&lt;/span&gt;      &lt;span class="code-keyword"&gt;if&lt;/span&gt; (io-&amp;gt;ci_async_readahead) {
+          file_accessed(file);
+          RETURN(0);  &lt;span class="code-comment"&gt;// ← vui_ra_valid remains &lt;span class="code-keyword"&gt;false&lt;/span&gt;
+&lt;/span&gt;      }
+      &lt;span class="code-comment"&gt;// ━━━ &lt;span class="code-keyword"&gt;return&lt;/span&gt; 2: Layout change  ━━━
+&lt;/span&gt;      &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!can_populate_pages(env, io, inode))
+          RETURN(0);  &lt;span class="code-comment"&gt;// ← vui_ra_valid remains &lt;span class="code-keyword"&gt;false&lt;/span&gt;
+&lt;/span&gt;      &lt;span class="code-comment"&gt;// ━━━ &lt;span class="code-keyword"&gt;return&lt;/span&gt; 3: LRU preserve failed  ━━━
+&lt;/span&gt;      flags = iocb_ki_flags_get(file, vio-&amp;gt;vui_iocb);
+      &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!iocb_ki_flags_check(flags, DIRECT)) {
+          result = cl_io_lru_reserve(env, io, pos, crw_bytes);
+          &lt;span class="code-keyword"&gt;if&lt;/span&gt; (result)
+              RETURN(result);  &lt;span class="code-comment"&gt;// ← vui_ra_valid remains &lt;span class="code-keyword"&gt;false&lt;/span&gt;
+&lt;/span&gt;      }
+      &lt;span class="code-comment"&gt;// ━━━ erturn 4: filesize check  ━━━
+&lt;/span&gt;      result = vvp_prep_size(env, obj, io, pos, crw_bytes, &amp;amp;exceed);
+      &lt;span class="code-keyword"&gt;if&lt;/span&gt; (result != 0)
+          RETURN(result);  &lt;span class="code-comment"&gt;// ← vui_ra_valid remains &lt;span class="code-keyword"&gt;false&lt;/span&gt;
+&lt;/span&gt;      &lt;span class="code-keyword"&gt;else&lt;/span&gt; &lt;span class="code-keyword"&gt;if&lt;/span&gt; (exceed != 0)
+          GOTO(out, result);  &lt;span class="code-comment"&gt;// ← vui_ra_valid remains &lt;span class="code-keyword"&gt;false&lt;/span&gt;
+&lt;/span&gt;      &lt;span class="code-comment"&gt;// ━━━ set &lt;span class="code-keyword"&gt;true&lt;/span&gt;  ━━━
+&lt;/span&gt;      &lt;span class="code-comment"&gt;/* initialize read-ahead window once per syscall */&lt;/span&gt;
+      &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!vio-&amp;gt;vui_ra_valid) {
+          vio-&amp;gt;vui_ra_valid = &lt;span class="code-keyword"&gt;true&lt;/span&gt;;  &lt;span class="code-comment"&gt;// vui_ra_valid set &lt;span class="code-keyword"&gt;true&lt;/span&gt;
+&lt;/span&gt;          vio-&amp;gt;vui_ra_start_idx = pos &amp;gt;&amp;gt; PAGE_SHIFT;
+          vio-&amp;gt;vui_ra_pages = 0;
+          page_offset = pos &amp;amp; ~PAGE_MASK;
+          &lt;span class="code-keyword"&gt;if&lt;/span&gt; (page_offset) {
+              vio-&amp;gt;vui_ra_pages++;
+              &lt;span class="code-keyword"&gt;if&lt;/span&gt; (tot_bytes &amp;gt; PAGE_SIZE - page_offset)
+                  tot_bytes -= (PAGE_SIZE - page_offset);
+              &lt;span class="code-keyword"&gt;else&lt;/span&gt;
+                  tot_bytes = 0;
+          }
+          vio-&amp;gt;vui_ra_pages += (tot_bytes + PAGE_SIZE - 1) &amp;gt;&amp;gt; PAGE_SHIFT;
+          CDEBUG(D_READA, &lt;span class="code-quote"&gt;"tot %zu, ra_start %lu, ra_count %lu\n"&lt;/span&gt;,
+                 vio-&amp;gt;vui_tot_bytes, vio-&amp;gt;vui_ra_start_idx,
+                 vio-&amp;gt;vui_ra_pages);
+      }
+      &lt;span class="code-comment"&gt;// ━━━ actually  I/O (第 892 行) ━━━
+&lt;/span&gt;      result = generic_file_read_iter(vio-&amp;gt;vui_iocb, &amp;amp;iter);
+      &lt;span class="code-comment"&gt;// &lt;span class="code-keyword"&gt;this&lt;/span&gt; will cause page_fault → ll_readpage() → ll_io_read_page()
+&lt;/span&gt;      ......
+}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;as we can see, if vio-&amp;gt;vui_ra_valid remains false, it won't trigger ll_io_read_page(). &lt;/p&gt;
+
+&lt;p&gt;This means when in ll_io_read_page(), if the sign is true, it will no doubtly comes from a REAL read.&lt;/p&gt;
+
+&lt;p&gt;But if the sign is false, it will comes from Not only mmap, but also a normal write with page fault.&lt;/p&gt;
+
+&lt;p&gt;Regarding a write as a mmap won't affect this function's correctness, because ll_io_read_page() still will grab the page, &lt;/p&gt;
+
+&lt;p&gt;but it may cause more RPCs as a mmap, miscalculate the statistic info and affect the RAS policy. &lt;/p&gt;
+
+&lt;p&gt;So the change is more precise.&lt;/p&gt;</comment>
+                            <comment id="494803" author="JIRAUSER22000" created="Wed, 20 May 2026 13:44:04 +0000">&lt;p&gt;Change-Id:  I9cfd098c6d3e84a438eb8f30d74a66c47ee46208&lt;/p&gt;
+
+&lt;p&gt;b_es6_0 --&amp;gt; &lt;a href="https://review.whamcloud.com/c/ex/lustre-release/+/66016" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/ex/lustre-release/+/66016&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;b_es7_0 --&amp;gt; &lt;a href="https://review.whamcloud.com/c/ex/lustre-release/+/66028" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/ex/lustre-release/+/66028&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;master   --&amp;gt; &lt;a href="https://review.whamcloud.com/c/ex/lustre-release/+/66029" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/ex/lustre-release/+/66029&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;</comment>
+                            <comment id="494802" author="gerrit" created="Wed, 20 May 2026 13:39:57 +0000">&lt;p&gt;"Xiyang Wang &amp;lt;xiwang@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66029" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66029&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20285" title="replaces an indirect heuristic (vui_ra_valid flag) with a direct check of the I/O type (CIT_FAULT)" class="issue-link" data-issue-key="LU-20285"&gt;LU-20285&lt;/a&gt; llite: GCP-250: a fix of mmap read ahead logic&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 633c846134683413038aa8a6d33c9ba3baf60e16&lt;/p&gt;</comment>
+                            <comment id="494797" author="JIRAUSER22000" created="Wed, 20 May 2026 12:06:48 +0000">&lt;p&gt;Comes from &lt;a href="https://jira.whamcloud.com/browse/GCP-250" class="external-link" rel="nofollow"&gt;https://jira.whamcloud.com/browse/GCP-250&lt;/a&gt;.&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+Author: Jinshan Xiong &lt;span class="code-quote-red"&gt;&amp;lt;jinshanx@google.com&amp;gt;&lt;/span&gt;
+Date:   Thu May 14 20:04:12 2026 +0000
+
+    Identify the mmap use &lt;span class="code-keyword"&gt;case&lt;/span&gt; properly
+
+    Change-Id: Iffd069b67a4b28e630b834886ff1679c501c2b74
+
+diff --git a/lustre/llite/rw.c b/lustre/llite/rw.c
+index f6836627fe..753c9613e9 100644
+--- a/lustre/llite/rw.c
++++ b/lustre/llite/rw.c
+@@ -1742,8 +1742,7 @@ &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;int&lt;/span&gt;&lt;/span&gt; ll_io_read_page(&lt;span class="code-keyword"&gt;const&lt;/span&gt; &lt;span class="code-keyword"&gt;struct&lt;/span&gt; lu_env *env, &lt;span class="code-keyword"&gt;struct&lt;/span&gt; cl_io *io,
+        &lt;span class="code-keyword"&gt;struct&lt;/span&gt; cl_sync_io         *anchor = &lt;span class="code-keyword"&gt;NULL&lt;/span&gt;;
+        &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;int&lt;/span&gt;&lt;/span&gt;                        rc = 0, rc2 = 0;
+        &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;bool&lt;/span&gt;&lt;/span&gt;                       uptodate;
+-       &lt;span class="code-keyword"&gt;struct&lt;/span&gt; vvp_io *vio = vvp_env_io(env);
+-       &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;bool&lt;/span&gt;&lt;/span&gt; mmap = !vio-&amp;gt;vui_ra_valid;
++       &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;bool&lt;/span&gt;&lt;/span&gt; mmap = !!(io-&amp;gt;ci_type == CIT_FAULT);
+        pgoff_t ra_start_index = 0;
+        pgoff_t io_start_index;
+        pgoff_t io_end_index;
+
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                    <customfield id="customfield_10030" key="com.atlassian.jira.plugin.system.customfieldtypes:labels">
+                        <customfieldname>Epic/Theme</customfieldname>
+                        <customfieldvalues>
+                                        <label>patch</label>
+    
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06u9r:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

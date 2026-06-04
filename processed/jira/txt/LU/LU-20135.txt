@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Duncan Vogel
 Reporter:   Duncan Vogel
 Created:    Tue, 14 Apr 2026 16:29:54 +0000
-Updated:    Wed, 22 Apr 2026 16:30:15 +0000
+Updated:    Thu, 30 Apr 2026 13:08:22 +0000
 Links:      Related: is related to  LU-19199; Related: is related to  LU-18681
 
 --- Description ---
@@ -41,6 +41,20 @@ We have observed all of these behaviors, and by removing the extend_recovery_tim
 I think it would be worth re-evaluating all of this timer extension logic, as it feels potentially overengineered and error-prone. Other network filesytems use fixed timeouts for replay, which is much easier to reason about.
 
 The main concern here would be failover - if the client MUST wait for service_timeout before failing over, then we do need to give them at least that long. We should find a way to resolve this in a way that handles both cases. On servers without failover, this extension is a large liability.
+
+--- Comment (JIRAUSER19589, Thu, 30 Apr 2026 13:03:32 +0000) ---
+Yeah, I had thought about this - this is why I mentioned the failover case is harder. I think in practice there are things which will time out on the client before then, even if at is high, and we have not seen a meaningful increase in evictions from removing the extension. Before making this change we gathered some statistics on our fleet and found that the extra time from the extension in recoveries that lasted some minimum extra time (7 minutes I think?) never resulted in extra clients being recovered than if we just timed out after 5/2.5. This might be fine in the failover case as well.
+
+I definitely like the idea of proactive reachout to the clients - call it "best effort" IR, it's something I was planning on looking into. Personally I feel like rather than using some percentage based threshold we should just have some fixed delay after which we attempt proactive reconnection. Then you're not relying on the topology of your active/dead clients to validate your assumptions about recovery time (what if you only had two jobs and the bigger job was terminated during the downtime?). Pretty much all healthy clients are able to reconnect within [time that first client rejoins recovery] + [fixed delay (30s?)]. We can also adjust this threshold down further with the diagnostic information from LU-18681
+
+I also feel that enabling post-recovery replay and inter-client dependency awareness will help with this issue - we can be way more aggressive in cutting down recovery timeouts knowing that clients will still usually be able to rejoin without errors
+
+--- Comment (adilger, Thu, 30 Apr 2026 05:26:58 +0000) ---
+fvogdunc, I wanted to comment after your LUG presentation today. He reason that the servers wait on recovery based on the service time is not because the server request processing is taking so long after recovery, but rather that the clients were last told by the server that request processing was taking that long and they should not time out their RPCs sooner than this. The service time + 25% + 125s is likely the time that the client estimates is the longest to wait before resending an RPC,  That is probably excessive, but can be constrained by at_max. 
+
+I think the right thing to do in this case is to have the server actively reconnect to the client in this case, one enough "passive" client reconnections have completed (eg. 50% of clients reconnected + 10% of the elapsed recovery time), rather than the server waiting longer for the client to reconnect. That will shortcut the long timeouts without the server getting bogged down connecting to clients that are also connecting to it already. 
+
+We may need to change the last_rcvd or replay_data files to store more information about the clients, so that the server can reconnect to it, instead of waiting for the incoming client connection, but we probably need to change the format of this file already to track the "cohort" information about clients to determine if they are doing related work or not.
 
 --- Comment (adilger, Wed, 22 Apr 2026 16:30:15 +0000) ---
 fvogdunc, if you have an opportunity, implementing LU-18681 to provide information about client reconnection times, and ideally also some histograms for each phase of recovery to see where it is spending its time. 

@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Rajeev Mishra
 Reporter:   Rajeev Mishra
 Created:    Fri, 20 Feb 2026 22:40:42 +0000
-Updated:    Wed, 4 Mar 2026 01:43:46 +0000
+Updated:    Wed, 6 May 2026 20:05:16 +0000
 
 --- Description ---
 Attached script can be used to re-create the issue. Even after the soft limit is reached and the client knows that the soft limit has expired, the client can still perform small writes and continue writing until the hard limit is reached. This appears to be a flaw in the code (please let me know if this understanding is correct).
@@ -68,6 +68,532 @@ vvp_io_commit_sync rc=-122
 vvp_io_write_commit rc=-122
 
 vvp_io_write_start rc=-122
+
+--- Comment (gerrit, Wed, 6 May 2026 20:05:16 +0000) ---
+"Rajeev Mishra " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/65716
+
+Subject: LU-19906 quota: enforce QUOT consistently across OST
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5691abbc9ab6befca36093e42f7f526d79e51c85
+
+--- Comment (JIRAUSER18604, Thu, 16 Apr 2026 15:34:33 +0000) ---
+Hi Sergey,
+
+ Thank you for your continued support on this issue. I will think it through and work on a better approach—perhaps a new RPC.
+
+ Best regards,
+
+ Rajeev
+
+--- Comment (sergey, Mon, 13 Apr 2026 08:41:34 +0000) ---
+Hi rajeevm ,
+
+In ll_write_begin(), I added an early call to llite_check_write_quota() before normal write path allocation/caching.
+
+In llite_check_write_quota(), I scan the file’s LOV sub-objects and check each OSC quota state.
+
+If any OSC reports -EDQUOT, I:
+
+fail the current write immediately with -EDQUOT, and
+
+set a per-user sticky global flag (UID keyed).
+
+According to the current design you can't just return -EDQUOT without reaching out the server side to check for quotas. What if a user on another client has already removed files and freed some quotas space? According to your proposals the 1st client would fail to write despite quotas are not exceeded anymore. Now to get the recent quotas status we are switching to synchronous mode. Sync mode is required to achieve 2 goals:
+
+	Deny new data to be written without checking edquot flag on the server side. 
+
+	Notify the client with the recent quotas status. That is the way for server to notify the client with the current edquot status.
+
+IMO, the problem you are trying to solve can't be easily without significant design changes.
+
+--- Comment (JIRAUSER18604, Mon, 13 Apr 2026 00:56:58 +0000) ---
+Hi Sergey Cheremencev,
+
+Thanks for your feedback and guidance.
+
+I implemented and validated a client-side early quota enforcement fix to reduce the over quota write after quota exhaustion. (This is not a final fix just to test the idea I did this )
+
+What is changed
+
+In ll_write_begin(), I added an early call to llite_check_write_quota() before normal write path allocation/caching.
+
+In llite_check_write_quota(), I scan the file’s LOV sub-objects and check each OSC quota state.
+
+If any OSC reports -EDQUOT, I:
+
+fail the current write immediately with -EDQUOT, and
+
+set a per-user sticky global flag (UID keyed).
+
+On subsequent writes for that user, the sticky flag is checked first and writes are rejected early, even before full per-OSC traversal.
+
+Why this helps:---
+
+It prevents continued buffered/cached writes once quota has already been exceeded on one OST.
+
+It reduces the timing gap caused by asynchronous per-OST quota flag propagation.
+
+It makes behavior more deterministic: first confirmed -EDQUOT quickly transitions to broad client-side blocking for that user.
+
+Current concern / tradeoff :
+
+Because sticky is global per user, it can be conservative and may reject writes slightly earlier than the exact “all OSTs fully converged” boundary.
+
+Planned refinement
+
+I plan to clear/reset the sticky bit when quota pressure is relieved, for example:
+
+when user space is freed by delete/truncate activity, or
+
+when corresponding user quota-exceeded flags are cleared (usr_bits=0) consistently.
+
+I still need to measure the performance and correctness impact of sticky clear policy (frequency of checks, lock/XArray overhead, and false-block duration).
+
+Please let me know if this design direction aligns with your expectations. Alternatively, another possible approach would be to implement a new global quota mechanism, though I haven't fully thought through that option yet. I'm also not sure about the performance aspect.
+
+Program output of the test with the fix
+
+for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k1'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k1
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k1 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k1': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00154646 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k2'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k2
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k2 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k2': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.000687846 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k3'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k3
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k3 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k3': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00386963 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k4'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k4
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k4 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k4': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.001491 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k5'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k5
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k5 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k5': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00298304 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k6'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k6
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k6 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k6': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00470694 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k7'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k7
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k7 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k7': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00311724 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k8'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k8
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k8 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k8': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.000608031 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k9'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k9
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k9 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k9': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.000706415 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k10'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k10
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k10 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k10': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00160226 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k11'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k11
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k11 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k11': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.0029714 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k12'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k12
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k12 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k12': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00328182 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k13'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k13
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k13 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k13': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00528727 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k14'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k14
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k14 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k14': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00154196 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k15'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k15
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k15 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k15': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00191359 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k16'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k16
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k16 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k16': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.000694165 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k17'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k17
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k17 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k17': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00512594 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k18'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k18
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k18 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k18': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.000849432 s, 0.0 kB/s
+
++ for subiter in 
+
+{1..20}
+
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k19'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k19
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k19 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k19': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00124795 s, 0.0 kB/s
+
++ for subiter in {1..20}
++ echo 'small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k20'
+
+small 1k write to /mnt/lustre/quota_test/tstusr1/testfile_2k20
+
++ sudo -u tstusr1 dd if=/dev/zero of=/mnt/lustre/quota_test/tstusr1/testfile_2k20 bs=1k count=1
+
+dd: error writing '/mnt/lustre/quota_test/tstusr1/testfile_2k20': Disk quota exceeded
+
+1+0 records in
+
+0+0 records out
+
+0 bytes copied, 0.00406014 s, 0.0 kB/s
+
++ set +x
+
+_____
+
+debug output 
+
+which shows osc_bits is not set some time 
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833367:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k3 uid=1001 stripe=0 osc=lustre-OST0000-osc-ffff8da92ba07800 usr_bits=0x0
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833367:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k3 uid=1001 any_osc_has_usr_bit=0 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833367:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k3 uid=1001 stripe=0 osc=lustre-OST0000-osc-ffff8da92ba07800 usr_bits=0x0
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833367:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k3 uid=1001 any_osc_has_usr_bit=0 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833370:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k4 uid=1001 stripe=0 osc=lustre-OST0001-osc-ffff8da92ba07800 usr_bits=0x1
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833370:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k4 uid=1001 any_osc_has_usr_bit=1 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833370:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k4 uid=1001 stripe=0 osc=lustre-OST0001-osc-ffff8da92ba07800 usr_bits=0x1
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833370:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k4 uid=1001 any_osc_has_usr_bit=1 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833373:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k5 uid=1001 stripe=0 osc=lustre-OST0000-osc-ffff8da92ba07800 usr_bits=0x0
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833373:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k5 uid=1001 any_osc_has_usr_bit=0 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833373:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k5 uid=1001 stripe=0 osc=lustre-OST0000-osc-ffff8da92ba07800 usr_bits=0x0
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833373:0:(llite_quota_helper.c:149:llite_check_write_quota()) [llite_check_write_quota] sticky proof file=testfile_2k5 uid=1001 any_osc_has_usr_bit=0 (0=STICKY_ONLY_BLOCK 1=osc_also_has)
+
+[Mon Apr 13 00:37:38 2026] LustreError: 833376:0:(llite_quota_helper.c:139:llite_check_write_quota()) [llite_check_write_quota] sticky evidence file=testfile_2k6 uid=1001 stripe=0 osc=lustre-OST0001-osc-ffff8da92ba07800 usr_bits=0x1
+
+__________
+
+--- Comment (sergey, Wed, 1 Apr 2026 23:36:50 +0000) ---
+Hey rajeevm ,
+
+Regarding your 04_march_comment. I don't see any problem in the output. In the beginning your are trying to get overquota writing 2G to testfile1. Note that your file has striping "-c -1", i.e. it has 2 stripes in your system. I haven't checked, but I guess your client gets -EDQUOT and sets quota overrun flag only for one OST(better to say OSC). It gets -EDQUOT when writes the last 1MB, for example, for OST0000-osc. It means that quota overrun is not set for OST0001-osc at the client. That's why when you are starting to make 1K writes into new different files you always have failed write after succeeded: testfile_2k1 is created at the OST0001 that is not aware about the quota overrun yet, testfile_2k2 is created at the OST0000 with quota overrun flag and it's write fails, testfile_2k3 is again created at the OST0001 ...
+
+--- Comment (JIRAUSER18604, Wed, 1 Apr 2026 22:31:11 +0000) ---
+I am putting the stack trace of interest. Trying to disable cache allocation if quota is over. 
+
+cl_page_alloc returned: 1417833640\n
+
+        cl_page_find+306
+
+        ll_write_begin+1013
+
+        generic_perform_write+185
+
+        __generic_file_write_iter+229
+
+        vvp_io_write_start+1390
+
+        cl_io_start+94
+
+        cl_io_loop+153
+
+        ll_file_io_generic+1427
+
+        do_file_write_iter+1371
+
+        new_sync_write+252
+
+        vfs_write+495
+
+        ksys_write+95
+
+        do_syscall_64+89
+
+        entry_SYSCALL_64_after_hwframe+114
+
+osc_quota_chkdq returned: -122\nosc_page_cache_add returned: -122\n
+
+        osc_io_commit_async+724
+
+        cl_io_commit_async+126
+
+        lov_io_commit_async+329
+
+        cl_io_commit_async+126
+
+        vvp_io_write_commit+232
+
+        vvp_io_write_start+1984
+
+        cl_io_start+94
+
+        cl_io_loop+153
+
+        ll_file_io_generic+1427
+
+        do_file_write_iter+1371
+
+        new_sync_write+252
+
+        vfs_write+495
+
+        ksys_write+95
+
+        do_syscall_64+89
+
+        entry_SYSCALL_64_after_hwframe+114
 
 --- Comment (JIRAUSER18604, Wed, 4 Mar 2026 01:43:46 +0000) ---
 with no pools the issue remains the same

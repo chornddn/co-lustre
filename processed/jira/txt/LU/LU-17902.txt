@@ -8,12 +8,88 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Andreas Dilger
 Created:    Tue, 4 Jun 2024 04:23:51 +0000
-Updated:    Fri, 13 Feb 2026 01:21:49 +0000
+Updated:    Thu, 21 May 2026 07:53:05 +0000
 Labels:     TBF, medium, nodemap
-Links:      Duplicate: is duplicated by LU-18089; Related: is related to  LU-18179; Related: is related to  LU-14501; Related: is related to  LU-17166; Related: is related to LU-19077
+Links:      Duplicate: is duplicated by LU-18089; Related: is related to  LU-18179; Related: is related to  LU-14501; Related: is related to  LU-17166; Related: is related to LU-18269; Related: is related to LU-19077; Related: is related to LU-20090
+Attachments: Screenshot 2026-03-27 145739-1.png, Screenshot 2026-03-27 145739.png, Screenshot 2026-03-27 151853.png, Screenshot 2026-03-27 153630.png, Screenshot 2026-03-27 153647.png
 
 --- Description ---
 For isolation of workloads across multiple sub-tenants of a filesystem, it would be useful to allow registering an NRS TBF rule for a nodemap.  This can be proxied to some extent by setting a TBF rule for a project ID, but this doesn't work if there are multiple project IDs used by a single nodemap.
+
+--- Comment (mrasobarnett, Thu, 2 Apr 2026 11:09:29 +0000) ---
+@Yingjin - I was only using nodemap policy at the moment, so not combined with anything. The server configuration is very basic, this is just a small VM environment for learning (two servers, three clients). Each server has a single CPT. The files I was using were not striped, so each client was writing to a single OST - the confusion I had was that I was unexpectedly writing to two OSTs, one on each server, so I was seeing the aggregate rate-limit of both servers.
+
+@Andreas - yes, per-CPT and per-Server (rather than per-target) is my understanding. As you say, if we could move towards a model where there is a single TBF rate set by the administrator centrally on the object (nodemap, user, projID etc...), that is then distributed by some mechanism across the servers, but with the ability to automatically shift unused tokens from idle servers towards busier servers so that a client could theoretically saturate their TBF limit through a single server, this would both make the TBF mechanism easier to administer, and also more flexible. I believe GPFS has this sort of dynamic redistribution in it's implementation: https://www.ibm.com/docs/en/storage-scale/6.0.0?topic=reference-mmqos-command#mmqos__dqr_description__title__1
+
+Also - removing the per-CPT limitation within a single server would also be a good initial improvement, so that you set a rate limit for a server, which could be automatically distributed amongst CPTs, however again, with some mechanism whereby unused tokens in an inactive CPT could be reallocated towards another CPT that is reaching it's limit - this way a single client again could theoretically saturate it's per-server TBF limit through a single CPT.
+
+--- Comment (adilger, Sat, 28 Mar 2026 07:39:51 +0000) ---
+mrasobarnett, good to hear it worked out in the end. But it exposes the other significant issue with TBF that the TBF limits are per-CPT and per-target, so it is difficult for an administrator to set them, and difficult for users to achieve their maximum limit without a perfectly balanced workload across targets. 
+
+It would be useful to have a PtlRPC-level mechanism to share credits between all of the buckets in a filesystem. That wouldn't have to be "real time", but a few times per second shouldn't be too much overhead. That can be some kind of decaying average exchanged with a central coordinator, so that there aren't huge swings in global rate limit split across peers.
+
+--- Comment (qian_wc, Fri, 27 Mar 2026 15:53:51 +0000) ---
+What's the nrs TBF policy you are using? just nodemap or combined with other kinds such as NID, gid, uid, jobid?
+
+Or what's the server configuration? do you make the file stripping over more than 1 OSTs on two OSSes? What's the CPT (it seems 1 in your case)?
+
+In theory, all clients belonged to a nodemap should classify into a same NRS TBF class and all I/O requests will be enqueued and serviced in FIFO order with the shared rate limiting.
+
+--- Comment (mrasobarnett, Fri, 27 Mar 2026 15:38:36 +0000) ---
+Sorry - ignore the above comment, this was a testing problem. In my test Client1 and Client3 were writing to files on different OSS servers, and thus were both getting 10 RPC/s from each server.
+
+Re-configuring the test so that client1 & client3 (both members of nodemap tenant1) both write to files striped onto OST0000 on a single server, gives the expected aggregate limit of 10 RPC/s for both clients in the nodemap.
+
+ 
+
+So this patch works as I originally expected it to. Thanks!
+
+--- Comment (mrasobarnett, Fri, 27 Mar 2026 14:57:23 +0000) ---
+All, I wanted to check my understanding of the patch in this ticket, https://review.whamcloud.com/c/fs/lustre-release/+/57254
+
+I tested this patch today and in my limited testing, the way this feature works is similar to other rules such as a NID range, in that every client that is a member of the nodemap, will get the specified rate, rather than all clients, collectively, sharing the rate set.
+
+For example, in my test environment I have 3 clients, and 2 servers. I have configured the following TBF rules:
+
+[root@server1 ~]# lctl get_param ost.OSS.ost_io.nrs_tbf_rule
+ost.OSS.ost_io.nrs_tbf_rule=
+regular_requests:
+CPT 0:
+T1_rule nodemap={tenant1} 10, ref 1
+T2_rule nodemap={tenant2} 20, ref 1
+T3_rule nodemap={tenant3} 30, ref 0
+default * 10000, ref 0
+high_priority_requests:
+CPT 0:
+T1_rule nodemap={tenant1} 10, ref 0
+T2_rule nodemap={tenant2} 20, ref 0
+T3_rule nodemap={tenant3} 30, ref 0
+default * 10000, ref 0
+
+My nodemap configuration is setup such that 2 of the clients are in tenant1, and 1 client is in tenant2:
+
+[root@server1 ~]# lctl get_param nodemap.tenant*.ranges
+nodemap.tenant1.ranges=
+[
+ { id: 27, start_nid: 10.100.103.123@tcp103, end_nid: 10.100.103.123@tcp103 },
+ { id: 26, start_nid: 10.100.103.23@tcp103, end_nid: 10.100.103.23@tcp103 },
+ { id: 18, start_nid: 10.100.101.121@tcp101, end_nid: 10.100.101.121@tcp101 },
+ { id: 17, start_nid: 10.100.101.21@tcp101, end_nid: 10.100.101.21@tcp101 }
+]
+nodemap.tenant2.ranges=
+[
+ { id: 20, start_nid: 10.100.102.122@tcp102, end_nid: 10.100.102.122@tcp102 },
+ { id: 19, start_nid: 10.100.102.22@tcp102, end_nid: 10.100.102.22@tcp102 }
+]
+nodemap.tenant3.ranges=[]
+
+(Note: each client has two NIDs, client1 has IPs on 10.10.101..., client2 on 10.100.102...., client3 on 10.100.103....)
+
+If I run a simple single-thread fio job, with 1M RPC size on all three clients, I see client1 gets 10 IOPS, client3 gets 10 IOPS and client2 gets 20 IOPS:
+
+Is this the expected behaviour?
+
+I was hoping to use this policy as an aggregate limit on all members of the nodemap. Is the intention that to achieve an aggregate limit on this policy, or any policy, to use the 'shared' property in https://jira.whamcloud.com/browse/LU-18183?
 
 --- Comment (gerrit, Fri, 13 Feb 2026 01:21:49 +0000) ---
 "Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/63491/

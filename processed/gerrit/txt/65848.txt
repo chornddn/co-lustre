@@ -1,0 +1,108 @@
+Change:     65848
+Subject:    LU-20238 ec: byte-indexed region multiply in scalar base path
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65848
+Change-Id:  I905e365d145d0018cbcd2bbc919eb4e516fafe8e
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-05-13 06:11:31.000000000
+Updated:    2026-05-18 20:04:14.000000000
+Patch Set:  1
+Insertions: +120
+Deletions:  -27
+Comments:   80 (0 unresolved)
+Hashtags:   pt_ecro
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Andreas Dilger, Patrick Farrell
+
+--- Commit Message ---
+LU-20238 ec: byte-indexed region multiply in scalar base path
+
+Replace the per-byte gf_mul() log+antilog form in the *_base hot
+paths with a byte-indexed per-coefficient lookup:
+
+  tbl[b] = c * b in GF(2^8), built once per coefficient
+  GF_REGION_MUL(tbl, x) = tbl[x]   (single load in the inner loop)
+
+Two motivations:
+
+ 1. Performance. The default gf_mul() in ec_base.c does 3 table
+    lookups + 2 conditional branches per byte. A precomputed
+    256-byte region table reduces this to a single load, which
+    measures ~5x faster than the gf_mul() path on rd07
+    (Raptor Lake, single-thread) across k=4..16 / m=2..4 and
+    stripe sizes 4 KiB .. 1 MiB.
+
+ 2. Patent-clean. The technique is byte-indexed table lookup
+    (gf-nishida-16 / "FullByte"-style scalar GF multiply). It is
+    structurally distinct from the PSHUFB + 4-bit nibble-table
+    pattern in ISA-L's SIMD kernels that maps onto US 8,683,296
+    claim 21. No PSHUFB, no nibble split, no 16-byte gftbl.
+
+Functions modified in ec_base.c (both userspace and kernel via
+the lustre/utils/erasurecode/ec_base.c -> lustre/ec/ec_base.c
+symlink):
+
+  gf_vect_dot_prod_base       heap-allocated per-source tables
+  gf_vect_mad_base            stack table (256 bytes)
+  ec_encode_data_base         heap-allocated per-(src,dest) tables
+  ec_encode_data_update_base  stack table per output row
+  gf_vect_mul_base            stack table (256 bytes)
+
+Allocator wrappers ec_alloc()/ec_free() select kmalloc(GFP_ATOMIC)
+in the kernel build and malloc() in userspace. The two functions
+that allocate (gf_vect_dot_prod_base, ec_encode_data_base) fall
+through to the original scalar gf_mul() path on allocation
+failure, preserving behavior under memory pressure.
+
+Adds GF_REGION_MUL macro to lustre/include/ec_base.h. Adds the
+build_mul_tbl() static-inline helper to ec_base.c. No public-API
+change; only internal scalar-arithmetic substitution.
+
+Verified on rd07 (RHEL 10.1, AVX2+GFNI, no AVX-512): builds with
+-Wall -Werror; gfni_ec_test passes with byte-identical parity on
+both columns (the test uses the base path as the reference for
+the GFNI intrinsic path).
+
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Change-Id: I905e365d145d0018cbcd2bbc919eb4e516fafe8e
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-05-13 06:11:31.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-05-13 06:21:13.000000000) ---
+Patch Set 1:
+
+(79 comments)
+
+79 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-05-13 06:31:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (jenkins, 2026-05-13 06:58:35.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/124970/ : SUCCESS
+
+--- Message (Marc Vef, 2026-05-18 09:47:12.000000000) ---
+Hashtag added: pt_ecro
+
+--- Message (Lustre RISC-V Builder, 2026-05-18 20:04:14.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful

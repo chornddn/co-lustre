@@ -3,13 +3,15 @@ Summary:    client write hang in osc_extent_wait()
 Link:       https://jira.whamcloud.com/browse/LU-19932
 Type:       Bug
 Priority:   Medium
-Status:     Open
-Resolution: Unresolved
-Assignee:   WC Triage
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   Patrick Farrell
 Reporter:   Andreas Dilger
 Created:    Thu, 26 Feb 2026 20:40:59 +0000
-Updated:    Mon, 2 Mar 2026 22:25:53 +0000
-Links:      Related: is related to  LU-5469; Related: is related to LU-19536
+Updated:    Wed, 20 May 2026 06:23:46 +0000
+Resolved:   Fri, 6 Mar 2026 01:47:13 +0000
+Links:      Duplicate: duplicates LU-19536; Related: is related to  LU-5469; Related: is related to LU-19536
+Attachments: patched_2-15-90client_debug.log, patched_2-17client_debug.log
 
 --- Description ---
 I was testing out a workload that was reported in GitHub:
@@ -83,6 +85,115 @@ LustreError: 627533:0:(osc_cache.c:990:osc_extent_wait()) ### extent: 000000000f
     remote: 0x198a66a0ec5e0d26 expref: -99 pid: 627533 timeout: 0 lvb_type: 1 lru_score: 4 lru_type: 1
 
 It isn't clear why the process is waiting, since the client and server are both responsive to all other commands (ls -l on the file, etc).
+
+--- Comment (JIRAUSER19463, Wed, 6 May 2026 18:26:43 +0000) ---
+Hi Andreas - I saw your comment until now, I will take a look. This account is bound to my personal email and I don't have access to it on my working laptop.
+
+--- Comment (JIRAUSER19463, Wed, 6 May 2026 18:25:14 +0000) ---
+nevermind
+
+--- Comment (JIRAUSER19573, Tue, 10 Mar 2026 05:38:17 +0000) ---
+Thanks for your patience Patrick. Attaching debug logs.
+
+patched_2-17client_debug.log
+
+root@ubuntu24-arm64-64k ps aux | grep python
+root        2145  0.7  7.8 993216 970752 pts/2   I+   05:23   0:01 python3 python-test.py
+root        2201  0.0  0.0   8192  2048 pts/3    S+   05:25   0:00 grep --color=auto python
+
+root@ubuntu24-arm64-64k# cat /proc/2145/stack
+[] osc_extent_wait+0x5c8/0x670 [osc]
+[] osc_cache_wait_range+0x174/0xa58 [osc]
+[] osc_io_fsync_end+0xf4/0x150 [osc]
+[] cl_io_end+0x90/0x1d0 [obdclass]
+[] lov_io_end_wrapper+0x124/0x130 [lov]
+[] lov_io_fsync_end+0x90/0x218 [lov]
+[] cl_io_end+0x90/0x1d0 [obdclass]
+[] cl_io_loop+0x19c/0x250 [obdclass]
+[] cl_sync_file_range+0x284/0x358 [lustre]
+[] ll_writepages+0x1d8/0x2d0 [lustre]
+[] do_writepages+0x98/0x250
+[] filemap_fdatawrite_wbc+0xbc/0x148
+[] __filemap_fdatawrite_range+0x70/0xc8
+[] filemap_write_and_wait_range+0x7c/0x118
+[] direct_write_fallback+0x54/0x128
+[] __generic_file_write_iter+0xd8/0x128
+[] vvp_io_write_start+0x2b0/0xe90 [lustre]
+[] cl_io_start+0x98/0x1c8 [obdclass]
+[] cl_io_loop+0x18c/0x250 [obdclass]
+[] ll_file_io_generic+0x4b4/0xf60 [lustre]
+[] do_file_write_iter+0x86c/0xc78 [lustre]
+[] ll_file_write_iter+0x5c/0x158 [lustre]
+[] vfs_write+0x274/0x3d8
+[] ksys_write+0x80/0x140
+[] __arm64_sys_write+0x28/0x50
+[] invoke_syscall+0x7c/0x130
+[] el0_svc_common.constprop.0+0x4c/0x140
+[] do_el0_svc+0x28/0x58
+[] el0_svc+0x40/0x158
+[] el0t_64_sync_handler+0x148/0x158
+[] el0t_64_sync+0x1b0/0x1b8 
+
+Reproducer was exact same as Andreas shared earlier (just making sure hybrid_io is enabled)- 
+
+root@ubuntu24-arm64-64k# lctl get_param llite.*.hybrid_io
+llite.lustrefs-ffff0000cc53a000.hybrid_io=1
+
+root@ubuntu24-arm64-64k# cat python-test.py
+import numpy as np
+data = np.random.random((6000, 500, 40))
+np.save("/mnt/lustrefs/patched-debug-enabled.npy", data)
+
+--- Comment (paf0186, Sun, 8 Mar 2026 00:01:57 +0000) ---
+Interesting, thanks.  -1 debug and your reproducer steps would be very helpful.
+
+--- Comment (JIRAUSER19573, Sat, 7 Mar 2026 05:48:04 +0000) ---
+Hi Patrick
+
+Update - I applied both the patches and still see the issue repro'd.
+
+Will share debug logs soon
+
+--- Comment (paf0186, Fri, 6 Mar 2026 04:58:58 +0000) ---
+interesting - it resolved it partially in my testing.
+
+ 
+
+try this in addition:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/64331/5
+
+if those two together don’t work, can you look at getting debug logs and posting them here?
+
+--- Comment (JIRAUSER19573, Fri, 6 Mar 2026 03:04:15 +0000) ---
+@Patrick Farrell
+
+I did try out the 62095 patch but it didn't seem to help in this case. I was able to reproduce the hang with that small script Andreas has given in the description.
+
+https://review.whamcloud.com/c/fs/lustre-release/+/62095
+
+--- Comment (paf0186, Fri, 6 Mar 2026 01:47:13 +0000) ---
+See LU-19536.
+
+--- Comment (paf0186, Fri, 6 Mar 2026 01:46:26 +0000) ---
+This issue does appear to be a duplicate of LU-19536; Andreas I don't want to lose the restore interruptible wait patch, but I feel this should be closed as a dupe in service of clarity...?
+
+I'm going to do that and we'll figure out that patch.
+
+--- Comment (JIRAUSER19573, Thu, 5 Mar 2026 23:59:43 +0000) ---
+Yeah agreed, The customer chose that version on their own.
+
+We are now suggesting them to use 2.17 with the workaround of just disabling hybrid I/O for now.
+
+--- Comment (paf0186, Thu, 5 Mar 2026 15:02:38 +0000) ---
+Very odd to be running 2.16.59 - that's a development version, not a release version!
+
+--- Comment (JIRAUSER19573, Thu, 5 Mar 2026 05:15:21 +0000) ---
+OCI has a Customer hitting this issue with Lustre 2.16.59 clients as well. 
+
+One more observation we had for 2.17 clients, disabling hybrid I/O avoids the issue. Running the repro given in the ticket after disabling hybrid I/O didn't encounter the issue.
+
+lctl set_param llite.*.hybrid_io=0
 
 --- Comment (adilger, Mon, 2 Mar 2026 22:25:53 +0000) ---
 jinshanx  I was looking at your old patch https://review.whamcloud.com/8656 ("LU-4198 clio: generalize cl_sync_io") while trying to restore the ability to interrupt a stuck IO.
