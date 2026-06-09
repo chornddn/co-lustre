@@ -1,0 +1,142 @@
+Key:        LU-20344
+Summary:    Reachability-scoped peer discovery
+Link:       https://jira.whamcloud.com/browse/LU-20344
+Type:       New Feature
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Tue, 9 Jun 2026 05:11:35 +0000
+Updated:    Tue, 9 Jun 2026 05:14:48 +0000
+
+--- Description ---
+Note: the following should be considered a draft design. I want to extend this to both add/del cases in the discovery merge, and I think we should deprecate lnet_peer_discovery_disabled and use the lnet_peer_discovery_mode to cover disabled (equivalent to lnet_peer_discovery_disabled=1), enabled (lnet_peer_discovery_disabled=0) as well as the new mode.
+
+Background
+
+When LNet discovers a peer, the merge step adds every NID from the
+
+peer's ping reply into the local peer tables. This includes NIDs on
+
+networks this node has no interface on and no route to. On large,
+
+heterogeneous, or multi-tenant fabrics this means a node accumulates
+
+peer NIDs it can never use. The unreachable NIDs:
+
+	pollute the local peer tables,
+
+	are considered by multi-rail path selection, wasting cycles on paths
+
+that can never succeed, and
+
+	generate health/recovery churn as LNet repeatedly probes NIDs that
+
+are unreachable from this node.
+
+The motivating deployment is cloud / multi-tenancy. There, a server on
+
+the storage fabric should retain full visibility of every NID in the
+
+network, while a client should only learn the NIDs it has locally
+
+configured or can reach via a configured route. It has no business
+
+building peer state for NIDs that belong to other tenants' networks
+
+and that it cannot reach.
+
+Enhancement
+
+Add a global, opt-in LNet tunable, lnet_discovery_mode, that scopes
+
+the discovery merge to reachable NIDs:
+
+value
+mode
+a discovered NID on network N is merged when...
+
+0
+full (default)
+always – current behavior, unchanged
+
+1
+reachable
+N is a local network or this node has a configured route to N
+
+Because the policy keys on reachability, the desired server/client
+
+asymmetry falls out automatically: a server sitting on the fabric
+
+reaches every NID and keeps full visibility, while a client on a
+
+narrower network (e.g. tcp-only) only adopts the NIDs it can actually
+
+reach. A tcp client that routes to o2ib via tcpo2ib routers will
+
+still build multi-rail peers from the peer's o2ib NIDs (a route
+
+exists) while ignoring every other off-net NID.
+
+The default (full) is byte-for-byte the current behavior, so the
+
+change is opt-in and carries no regression risk for existing setups.
+
+Semantics
+
+	Receive-side policy only. The mode changes what a node merges from a
+
+ping reply; it does not change what a node advertises or negotiate
+
+anything on the wire. Only the node applying the policy needs the
+
+feature – peers can run stock LNet.
+
+	Block-new-only. Enabling reachable stops adding unreachable
+
+NIDs; it does not retroactively prune NIDs learned earlier under
+
+full.
+
+	Advertised primary handling. If the peer's advertised primary NID is
+
+itself unreachable, the node keeps its existing reachable primary and
+
+still merges the reachable NIDs, rather than adopting an off-net
+
+primary.
+
+	Manually configured peers are exempt. DLC-configured peer NIDs do
+
+not carry the discovery flag and are never filtered.
+
+Configuration
+
+The tunable is wired through the usual interfaces:
+
+	Unknown macro: {{lnetctl set discovery_mode {0|1}} 
+
+}
+
+	lnetctl global show reports discovery_mode
+
+	DLC YAML import (lnetctl import)
+
+	sysfs: /sys/module/lnet/parameters/lnet_discovery_mode
+
+Scope
+
+Plan to land to master and backport to supported branches.
+
+Test
+
+New sanity-lnet.sh subtest (requires >= 1 remote node):
+
+the remote configures NIDs on two networks; the local node configures
+
+only the first. Under discovery_mode=1 the unreachable NID is
+
+filtered from the peer after lnetctl discover; under discovery_mode=0
+
+it is merged, confirming the default path is unchanged. Additional test (requires >= 2 remote nodes) exercises the feature in a routed configuration.
