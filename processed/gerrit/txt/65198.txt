@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Robert Read
 Created:    2026-04-09 15:56:46.000000000
-Updated:    2026-06-09 15:38:27.000000000
-Patch Set:  10
-Insertions: +503
-Deletions:  -38
-Comments:   119 (0 unresolved)
+Updated:    2026-06-10 13:28:00.000000000
+Patch Set:  11
+Insertions: +472
+Deletions:  -42
+Comments:   134 (0 unresolved)
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Jinshan Xiong: -1; Chris Horn: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
@@ -24,62 +24,41 @@ Comments:   119 (0 unresolved)
 --- Commit Message ---
 LU-20104 lnet: fix selftest session teardown and BRW bugs
 
-Fix multiple issues in lnet-selftest that caused kernel
-deadlocks, crashes, and stale sessions.
+Fix lnet-selftest crashes and stale sessions, on top of the
+module-unload deadlock fixes in LU-20342 (current_work()
+guard in swi_cancel_workitem() and srpc_service_fini()
+syncing running workitems before freeing them).
 
-Split the server-side srpc_ev field on srpc_server_rpc into
-separate srpc_bulkev and srpc_replyev, mirroring the client
-side (crpc_bulkev/crpc_reqstev/crpc_replyev).  The single
-shared event struct was reused for the bulk MD post and then
-for the reply MD post, so a stale bulk UNLINK arriving after
-the state machine had moved to REPLY_SUBMITTED was dispatched
-against the now-rewritten ev_type=SRPC_REPLY_SENT and flagged
-the reply as fired.  The wi then completed the RPC while the
-reply MD was still in flight, and the eventual reply event
-double-completed against a recycled RPC slot, leading to
-INIT_WORK on a queued swi_work and a list_add corruption in
-srpc_lnet_ev_handler (reported by James Simmons).  Also gate
-SRPC_BULK_PUT_SENT and SRPC_REPLY_SENT on ev->unlinked so
-that intermediate SEND/ACK events stop scheduling redundant
-wi runs.
+Split the server srpc_ev into srpc_bulkev and srpc_replyev,
+mirroring the client side.  The shared event was reused for
+the bulk MD and then the reply MD, so a late bulk UNLINK was
+dispatched against the rewritten reply event and completed
+the RPC while the reply MD was still in flight; the reply
+event then double-completed a recycled RPC, causing the
+list_add corruption in srpc_lnet_ev_handler reported by
+James Simmons.  Also gate SRPC_BULK_PUT_SENT/SRPC_REPLY_SENT
+on ev->unlinked so intermediate events stop rescheduling the
+wi.
 
-INIT_WORK the server RPC swi_work once at allocation in
-srpc_service_init(); srpc_init_server_rpc() now resets state
-via swi_reset_workitem() instead of re-running INIT_WORK,
-which would reset the list_head of a work_struct a late
-UNLINK event had already queue_work()'d.  Add an
-srpc_completed flag so a stale queue_work after completion is
-discarded rather than double-completing the RPC.
+INIT_WORK the server swi_work once at allocation and only
+reset its state on reuse (swi_reset_workitem), since
+re-INIT_WORK on a still-queued work corrupts the workqueue
+list.  Add an srpc_completed flag so a stale queue_work after
+completion is discarded, and complete RPCs that re-enter
+srpc_handle_rpc in SWI_STATE_DONE once both events have
+fired, preventing orphans on scd_rpc_active.
 
-In srpc_handle_rpc(), call srpc_server_rpc_done() when a
-server RPC workitem re-enters in SWI_STATE_DONE after an
-async LNetMDUnlink event, preventing orphaned RPCs on
-scd_rpc_active.  Completion now waits for both bulkev and
-replyev to fire (ev_fired is initialised to 1 in
-srpc_init_server_rpc, so unposted MDs do not block).
+Order session teardown: sfw_remove_session() drains
+client-side batches before deactivating the session and then
+drains server-side RPCs; lstcon_session_end() stops active
+batches before end_session.  Add lst_wait_until_timeout() to
+bound the console RPC waits that could spin under ses_mutex.
 
-In sfw_remove_session(), stop and drain client-side batches
-before deactivating the session, then drain server-side
-RPCs with re-abort on each iteration.
+Fix BRW offset handling: mask offset with ~PAGE_MASK,
+allocate bulk with off+len, and reject off+len > LNET_MTU.
 
-In lstcon_session_end(), stop all active batches before
-sending end_session RPCs.
-
-Add lst_wait_until_timeout() and use it in
-lstcon_rpc_cleanup_wait() to bound waits for console RPCs,
-preventing infinite spins while holding ses_mutex.
-
-Defer zombie session destruction from lst_test_wq to
-lst_serial_wq via sfw_destroy_session_deferred(), avoiding
-cancel_work_sync() deadlock on the same workqueue.
-
-Fix BRW offset handling: mask offset with ~PAGE_MASK in
-brw_client_prep_rpc(), allocate bulk with off+len in
-brw_client_init(), and validate off+len <= LNET_MTU.
-
-Add lnet-selftest.sh tests for session teardown stress,
-BRW offset edge cases, and a workqueue list-corruption
-race (teardown_race).
+Add lnet-selftest.sh tests for teardown stress, BRW offset
+edge cases, and the workqueue list-corruption race.
 
 Test-Parameters: trivial testlist=lnet-selftest
 Signed-off-by: Robert Read <rread@thelustrecollective.com>
@@ -410,3 +389,40 @@ Patch Set 10: Code-Review+1
 Patch Set 10: Code-Review-1
 
 (1 comment)
+
+--- Message (Robert Read, 2026-06-09 16:43:29.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Jinshan Xiong, 2026-06-09 17:22:15.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-06-10 12:34:49.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-10 12:37:42.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-06-10 12:37:47.000000000) ---
+Patch Set 11:
+
+(12 comments)
+
+17 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-10 13:11:20.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126274/ : SUCCESS
