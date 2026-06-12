@@ -1,0 +1,223 @@
+Change:     66588
+Subject:    LU-20350 o2iblnd: Bounce cross-NUMA bulk via NIC-local pool
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66588
+Change-Id:  Icf39b39a7a3f3f3fdfdaa886edf9695af28eb48f
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Chris Horn
+Created:    2026-06-10 20:10:02.000000000
+Updated:    2026-06-11 10:43:57.000000000
+Patch Set:  3
+Insertions: +1284
+Deletions:  -44
+Comments:   308 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Janitor Bot
+
+--- Commit Message ---
+LU-20350 o2iblnd: Bounce cross-NUMA bulk via NIC-local pool
+
+On a dual-socket client the HCA hangs off one socket's PCIe root
+complex, so any RDMA against memory on the other socket crosses the
+inter-socket link. Without PCIe Relaxed Ordering that path serializes
+toward single-outstanding-write and burns link bandwidth shared with
+the CPUs. Lustre lands the bulk in the application buffer, placed
+wherever the job ran, so a cross-socket job pays this on every bulk.
+
+The client bulk is passive and connection-bound: the server drives the
+RDMA over the connection the request arrived on, so the only per-I/O
+client lever is which NI the request egressed on, since the server
+bulk-backs to that NID. Stock LNet already steers that egress by the
+bulk buffer's NUMA node. The request MD carries LNET_MD_BULK_HANDLE
+(niobuf.c) and lnet_cpt_of_md() ranks the egress NI by the bulk
+buffer's own first page via lnet_get_first_page() (lib-md.c). So on a
+multi-rail client with a healthy buffer-local rail the bulk already
+lands NIC-local and this patch changes nothing there.
+
+The case it can't reach is a single-HCA client, where there is no
+buffer-local NI to select and the bulk crosses sockets to whatever
+rail the server picks. numactl can avoid that by binding the job's
+memory to the HCA's socket, but only by surrendering the application's
+own NUMA locality, and for O_DIRECT the job has to place the buffer
+itself. The bounce gives HCA-local DMA without constraining where the
+job allocates.
+
+Stage the bulk through a per-HCA arena allocated on the HCA's own NUMA
+node and pay a CPU copy for the last hop. A cross-socket CPU copy is
+cheaper than a cross-socket NIC DMA and is immune to the ordering
+penalty. The bounce lives entirely in ko2iblnd, so it is transparent
+to ptlrpc/osc/llite and to the server, with no wire change. For a read
+we advertise the slot's REMOTE_WRITE rkey as the PUT sink and run the
+slot->app copy-out off the CQ poller on an HCA-CPT-bound workqueue,
+with lnet_finalize() deferred behind the copy. For a write we copy
+app->slot inline and the device DMAs from the slot. GPUDirect pages
+bypass the bounce.
+
+bounce_enable is tristate (0 off, 1 force, 2 auto) and defaults off.
+auto allocates the arena only on a multi-node NUMA box and engages the
+inbound path only when the buffer is NUMA-remote (node_distance >
+LOCAL_DISTANCE), so local I/O stays zero-copy. Outbound stays opt-in
+under force because I measured the bounce helping reads but hurting
+writes. With the buffer bound to the far socket, inbound read goes
+from 2036 to 7422 MiB/s (3.65x, about 80% of the 9291 MiB/s NIC-local
+ceiling), since cross-socket HCA writes are heavily RO-penalized. HCA
+reads are barely penalized, so for a write the added copy-in costs
+more than it saves and outbound drops from 20.0 to 16.7 GiB/s, a 16%
+loss. Thus auto cannot regress writes. Slot exhaustion or any rd-build
+failure falls back to the direct app buffer, so a bounce never fails
+an I/O.
+
+Because a slot is recycled, a non-conformant peer that RDMA-writes
+fewer bytes than advertised yet reports success could leak the slot's
+prior-transfer bytes in the untransferred tail. Zero each slot on
+release to close this. The inbound copy-out fuses the zero into the
+read-out while the line is cache-hot, so the common path adds no
+separate pass.
+
+The new module parameters are bounce_enable, bounce_pool_mb (64) and
+bounce_min_nob (65536). Slot size is fixed at LNET_MTU. Read
+/sys/kernel/debug/lnet/bounce_stats for the engaged, exhausted,
+inflight, fallback and byte counters. fail_loc 0xe010 forces
+engagement and 0xe011 forces the fallback, for selftests.
+
+At bounce_enable=0 the datapath is byte-for-byte identical to stock:
+the two rd-build sites add a predicate test and nothing reroutes. I
+validated the functional paths over SoftRoCE (byte-exact read and
+write, exhaustion fallback, clean teardown) and measured the numbers
+above on mlx5.
+
+Test-Parameters: trivial
+Signed-off-by: Chris Horn <chorn@ddn.com>
+Change-Id: Icf39b39a7a3f3f3fdfdaa886edf9695af28eb48f
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-06-10 20:10:02.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Janitor Bot, 2026-06-10 20:17:37.000000000) ---
+Patch Set 2: Published edit on patch set 1.
+
+--- Message (Janitor Bot, 2026-06-10 20:17:38.000000000) ---
+Patch Set 1:
+
+I attempted to fix the build errors present in this patch and succeeded. Yay! Now, keep in mind I barely have any idea what I am doing, so please doublecheck the changes I made to make sure they make sense.
+
+This service is only provided in hopes to be useful and reduce latency from push to getting actual results in the face of trivial code errors
+
+Here's summary of my changes:
+Perfect! Now let me provide a summary of the fix:
+
+## Summary
+
+### The Compile Errors
+
+The patch introduced two compilation errors related to **const-correctness**:
+
+1. **Error in `kiblnd_setup_rd_kiov`**: Passing `const struct bio_vec **` to `kiblnd_kiov_skip()` which expected non-const `struct bio_vec **`
+2. **Warning in `kiblnd_recv`**: Passing `const struct bio_vec *` (from `to->bvec`) to `kiblnd_recv_build_sink()` which expected non-const `struct bio_vec *`
+
+### Root Cause
+
+The existing function signatures in the codebase use `const struct bio_vec *kiov` parameters (e.g., in `kiblnd_setup_rd_kiov`), but the new bounce pool code introduced helper functions that didn't respect this const-ness. This violated C's type safety rules when these helpers were called from const-aware contexts.
+
+### The Fix
+
+I added `const` qualifiers throughout the bounce code chain:
+
+1. **`kiblnd_kiov_skip()`** helper: Changed parameter from `struct bio_vec **kiov` to `const struct bio_vec **kiov`
+   
+2. **`kiblnd_bounce_copy_in()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+3. **`kiblnd_bounce_copy_out()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+4. **`kiblnd_bounce_first_page()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+5. **`kiblnd_reply_build_src()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+6. **`kiblnd_recv_build_sink()`**: Changed from `struct bio_vec *kiov` to `const struct bio_vec *kiov`
+
+### Rationale
+
+This fix is **correct and safe** because:
+
+- These functions only **read** from the `bio_vec` arrays (they iterate and copy data, but never modify the bio_vec structures themselves)
+- The const qualifier accurately documents this read-only contract
+- It allows the functions to be called from both const and non-const contexts
+- No functionality is changed—only type safety is improved
+
+
+Request ID: de7886e6-7a6c-4928-b134-490adce33f85
+
+--- Message (jenkins, 2026-06-10 20:17:43.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126294/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-06-10 20:19:01.000000000) ---
+Patch Set 1:
+
+(140 comments)
+
+153 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (wc-checkpatch, 2026-06-10 20:34:22.000000000) ---
+Patch Set 2:
+
+(142 comments)
+
+155 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-10 20:42:53.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-06-10 22:04:09.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126308/ : SUCCESS
+
+--- Message (Chris Horn, 2026-06-11 04:26:34.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-11 04:27:46.000000000) ---
+Patch Set 3:
+
+(22 comments)
+
+28 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-11 04:29:44.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-06-11 04:54:12.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126329/ : SUCCESS
