@@ -1,0 +1,101 @@
+Change:     66690
+Subject:    LU-20400 o2iblnd: fix descriptor leak on FastReg map error
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66690
+Change-Id:  I9580a6ebc9fd7056c0450cca912f613491ee908d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Chris Horn
+Created:    2026-06-17 01:46:46.000000000
+Updated:    2026-06-17 08:01:57.000000000
+Patch Set:  2
+Insertions: +30
+Deletions:  -3
+Comments:   3 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Commit Message ---
+LU-20400 o2iblnd: fix descriptor leak on FastReg map error
+
+kiblnd_fmr_pool_map() removes a fast registration descriptor from
+fpo->fast_reg.fpo_pool_list and bumps fpo->fpo_map_count before
+calling ib_map_mr_sg(). When ib_map_mr_sg() short-maps the
+scatterlist (n != rd->rd_nfrags), the function returns the error
+without returning the descriptor to the pool and without dropping
+the map count. It also leaves fmr->fmr_frd and fmr->fmr_pool NULL,
+so the caller's kiblnd_fmr_pool_unmap() is a no-op and cannot
+recover them.
+
+Each short-map therefore leaks one descriptor and one pool
+reference. Because fpo_map_count never returns to zero,
+kiblnd_fmr_pool_is_idle() never reports the pool idle, so it is
+never reaped. Under a workload that produces gapped transfers
+(which fail ib_map_mr_sg() repeatedly) the FMR pool grows without
+bound.
+
+On the error path, reacquire fps_lock, return the descriptor to
+fpo_pool_list, mark it not posted, and decrement fpo_map_count, the
+same cleanup kiblnd_fmr_pool_unmap() performs. fmr_frd and fmr_pool
+are intentionally left NULL.
+
+Add a fault-injection point, CFS_FAIL_O2IBLND_FMR_MAP_SHORT
+(0xf101), that forces a short-map result so the cleanup path can be
+exercised deterministically without a real gapped layout. With the
+leak present, fpo_map_count never returns to zero and
+kiblnd_destroy_fmr_pool()'s LASSERT(fpo_map_count == 0) fires on
+module unload; with the fix, unload is clean.
+
+Test-Parameters: trivial
+Signed-off-by: Chris Horn <chorn@ddn.com>
+Change-Id: I9580a6ebc9fd7056c0450cca912f613491ee908d
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-06-17 01:46:46.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-17 01:50:33.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-06-17 01:59:31.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-06-17 02:03:15.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2026-06-17 02:03:20.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/126658/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-17 02:07:04.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-06-17 02:15:12.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-06-17 02:31:41.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126660/ : SUCCESS

@@ -1,0 +1,105 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20400] frd + fpo_map_count leak on the ib_map_mr_sg error path</title>
+                <link>https://jira.whamcloud.com/browse/LU-20400</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;In kiblnd_fmr_pool_map():&lt;/p&gt;
+
+&lt;p&gt;The FastReg descriptor is removed from the free list:&lt;br/&gt;
+ &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+list_del(&amp;amp;frd-&amp;gt;frd_list);&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;br/&gt;
+On a short map, the function returns directly:&lt;br/&gt;
+ &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;if&lt;/span&gt; (unlikely(n != rd-&amp;gt;rd_nfrags)) { CERROR(&lt;span class="code-quote"&gt;"Failed to map mr %d/%d elements\n"&lt;/span&gt;, n, rd-&amp;gt;rd_nfrags); &lt;span class="code-keyword"&gt;return&lt;/span&gt; n &amp;lt; 0 ? n : -EINVAL; }&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;br/&gt;
+This return is reached before fmr-&amp;gt;fmr_frd = frd and before fpo-&amp;gt;fpo_map_count-&lt;del&gt;. kiblnd_unmap_tx()(o2iblnd_cb.c:676-681) releases the frd only when tx&lt;/del&gt;&amp;gt;tx_fmr.fmr_frd is set (it is not).&lt;/p&gt;
+
+&lt;p&gt;Thus, every failed map leaks one frd (never returned to fpo_pool_list) and one fpo_map_count refcount. This has two downstream consequences:&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;the pool can never be reaped in kiblnd_fmr_pool_is_idle()&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt; &lt;br/&gt;
+&lt;tt&gt;     &lt;/tt&gt;&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;if&lt;/span&gt; (fpo-&amp;gt;fpo_map_count != 0) &lt;span class="code-comment"&gt;/* still in use */&lt;/span&gt; &lt;span class="code-keyword"&gt;return&lt;/span&gt; 0;&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;  # frd exhaustion drives unbounded pool growth&lt;/p&gt;
+
+&lt;p&gt;Each failure drains one frd. Once fpo-&amp;gt;fast_reg.fpo_pool_list is empty, the FastReg branch guard fails:&lt;br/&gt;
+ &lt;br/&gt;
+ &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+ &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!list_empty(&amp;amp;fpo-&amp;gt;fast_reg.fpo_pool_list)) { &lt;span class="code-comment"&gt;/* now &lt;span class="code-keyword"&gt;false&lt;/span&gt; */&lt;/span&gt;   &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;br/&gt;
+&lt;del&gt;&amp;gt; falls through to rc = -EAGAIN , fpo_map_count&lt;/del&gt;- , retry. With every existing pool's frd list drained, every pool yields -EAGAIN → the grow path runs (fps_increasing) → a new pool is allocated and appended. Its frds get drained the same way by ongoing gapped txs → another new pool, and so on.&lt;/p&gt;
+
+&lt;p&gt;As a result, pool count climbs monotonically, and every drained old pool carries a non-zero leaked fpo_map_count so none are ever reclaimed. Memory and pool-list length grow without bound over a long run.&lt;/p&gt;</description>
+                <environment />
+        <key id="98119">LU-20400</key>
+            <summary>frd + fpo_map_count leak on the ib_map_mr_sg error path</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 17 Jun 2026 00:14:47 +0000</created>
+                <updated>Wed, 17 Jun 2026 01:46:49 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="496284" author="gerrit" created="Wed, 17 Jun 2026 01:46:49 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66690" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66690&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20400" title="frd + fpo_map_count leak on the ib_map_mr_sg error path" class="issue-link" data-issue-key="LU-20400"&gt;LU-20400&lt;/a&gt; o2iblnd: fix descriptor leak on FastReg map error&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: f1a939ff7b70dac2638426919eb886bf63b39992&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06vnz:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

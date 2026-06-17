@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-05-11 00:30:11.000000000
-Updated:    2026-06-09 12:30:20.000000000
-Patch Set:  9
-Insertions: +2238
+Updated:    2026-06-17 15:34:59.000000000
+Patch Set:  10
+Insertions: +2864
 Deletions:  -41
-Comments:   313 (1 unresolved)
+Comments:   314 (0 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
@@ -36,10 +36,11 @@ Add a runtime-dispatched GFNI fast path to the existing libec.a
 On x86_64 CPUs with GFNI:
 
   - AVX-512 + GFNI: ec_encode_data / ec_encode_data_update /
-    ec_init_tables route to AVX-512 GFNI kernels.  Encode peels
-    parity rows off in groups of up to 6 per FPU pass (kernels
-    for 1/2/3/4/5/6 outputs are shipped); arbitrary m is
-    supported via repeated passes.
+    ec_init_tables route to AVX-512 GFNI kernels.  Both encode
+    (dot_prod) and update (mad) peel parity rows off in groups
+    of up to 6 per FPU pass (full 1/2/3/4/5/6-output kernel
+    ladder is shipped for each); arbitrary m is supported via
+    repeated passes.
   - AVX2 + GFNI:    same dispatcher with AVX2 GFNI kernels.
     Encode peels in groups of up to 3 per pass (kernels for
     1/2/3 outputs); arbitrary m via repeated passes.
@@ -55,6 +56,17 @@ path uses only the GF(2^8) affine intrinsic (vgf2p8affineqb)
 and standard XOR / load / store; no PSHUFB-style nibble-table
 lookup is used anywhere.
 
+The multi-output AVX-512 kernels read the GF coefficient as an
+EVEX {1to8} embedded-broadcast operand of vgf2p8affineqb, so
+the 8-byte broadcast folds into the affine's own load micro-op.
+This keeps the broadcast off the vector-ALU port: gcc/clang
+lower _mm512_set1_epi64()+affine to a GPR-source vpbroadcastq
+on Port5, which made the first-gen multi-vect encode ~25%
+slower than NASM on Sapphire Rapids.  The compilers will not
+emit {1to8} from intrinsics, so a short inline-asm macro is
+used.  The single-output kernels keep the plain set1 form (no
+competing affines, so no Port5 contention to avoid).
+
 Performance on rd07 (Intel Raptor Lake-P, AVX2 + GFNI, single
 thread, median of 3) vs ISA-L's NASM kernels on the same host:
 
@@ -67,9 +79,25 @@ thread, median of 3) vs ISA-L's NASM kernels on the same host:
   erasure_code_update_perf encode      | 16.4 GB/s |  16.8 (+2%)
   erasure_code_update_perf single_src  | 54.7 GB/s |  56.8 (+4%)
 
-Intrinsics match or beat NASM on 5 of 6 benchmarks; the one
-slower case is by 6%.  The AVX-512 GFNI path builds but is not
-yet runtime-verified (no Sapphire Rapids / Sierra Forest host).
+Intrinsics match or beat NASM on 5 of 6 AVX2 benchmarks; the
+one slower case is by 6%.
+
+AVX-512 + GFNI on a Xeon Platinum 8481C (Sapphire Rapids, GCP
+c3, single thread, median of 3), same benchmarks, dispatch-
+confirmed (gdb) to the *_avx512_gfni kernels on both builds:
+
+  Benchmark                            |    NASM    | C intrinsics
+  -------------------------------------+------------+-------------
+  gf_vect_mul_perf                     |  31.1 GB/s |  31.4 (+1%)
+  gf_vect_dot_prod_perf                |  79.0 GB/s |  79.7 (+1%)
+  erasure_code_perf encode             |  44.0 GB/s |  43.0 (-2%)
+  erasure_code_perf decode             |  54.3 GB/s |  51.4 (-5%)
+  erasure_code_update_perf encode      |  35.8 GB/s |  35.9 (+0%)
+  erasure_code_update_perf single_src  | 115.8 GB/s | 115.2 (-1%)
+
+The {1to8} embedded broadcast brings the AVX-512 multi-vect
+dot_prod kernels to parity with NASM (+1% to -5%), closing the
+~25% gap the first-gen set1-broadcast intrinsics showed.
 
 A configure-time probe (EC_GFNI_SUPPORT in
 config/lustre-erasurecode.m4) compile-tests the affine intrinsic
@@ -79,8 +107,9 @@ When the probe fails (non-x86_64, older toolchain), no GFNI
 objects are built and ec_base_aliases.c collapses to the base
 path unchanged.
 
-For this patch, the dispatcher is gated to userspace only via
-C sources are already __KERNEL__-aware and build into ec.ko;
+For this patch, the dispatcher is gated to userspace only by the
+guard #if defined(LUSTRE_EC_GFNI) && !defined(__KERNEL__).  The C
+sources are already __KERNEL__-aware and build into ec.ko;
 a follow-on patch in this series will add the lustre/ec/Makefile
 (Kbuild) plumbing and define LUSTRE_EC_GFNI for the kernel build
 so ec.ko also dispatches to GFNI.
@@ -93,6 +122,11 @@ len=4096, constraint 1<=k, 1<=m, k+m<=256).  lustre/tests/
 sanity-ec.sh test_0 sweeps a representative set of geometries
 through it.
 
+The vendored gf_*_gfni.c kernels are reflowed for lustre
+checkpatch and intentionally diverge from canonical isa-l;
+see lustre/utils/erasurecode/GFNI_VENDORED.md.
+
+Test-Parameters: testlist=sanity-ec
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Change-Id: Ia40a743c8e47c018250728668090215c7bd8365b
 
@@ -354,3 +388,31 @@ Onyx Autotest retesting enforced review-dne-part-5 session on el9.7-x86_64/ldisk
 Patch Set 9:
 
 Trevis Autotest retesting enforced review-dne-zfs-part-4 session on el8.10-x86_64/zfs servers and clients for build 126144 patch 9. Requested by Andreas Dilger because of LU-20249.
+
+--- Message (Hiroshi Nishida, 2026-06-17 15:02:50.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-06-17 15:06:38.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-17 15:06:43.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-06-17 15:11:55.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-06-17 15:27:15.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126677/ : SUCCESS
