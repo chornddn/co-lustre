@@ -1,5 +1,5 @@
 Change:     65848
-Subject:    LU-20238 ec: byte-indexed region multiply in scalar base path
+Subject:    LU-20238 ec: branch-free byte-indexed scalar base path
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65848
 Change-Id:  I905e365d145d0018cbcd2bbc919eb4e516fafe8e
 Project:    fs/lustre-release
@@ -7,70 +7,93 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-05-13 06:11:31.000000000
-Updated:    2026-06-09 06:23:27.000000000
-Patch Set:  2
-Insertions: +121
-Deletions:  -28
-Comments:   159 (0 unresolved)
+Updated:    2026-06-18 06:02:27.000000000
+Patch Set:  3
+Insertions: +446
+Deletions:  -248
+Comments:   226 (0 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
   REVIEWER: Andreas Dilger, Patrick Farrell
 
 --- Commit Message ---
-LU-20238 ec: byte-indexed region multiply in scalar base path
+LU-20238 ec: branch-free byte-indexed scalar base path
 
-Replace the per-byte gf_mul() log+antilog form in the *_base hot
-paths with a byte-indexed per-coefficient lookup:
+Replace the log+antilog gf_mul() form in the scalar *_base hot
+paths with the canonical isa-l alloc-free, branch-free base
+path: a byte-indexed per-coefficient region-multiply table.
 
   tbl[b] = c * b in GF(2^8), built once per coefficient
-  GF_REGION_MUL(tbl, x) = tbl[x]   (single load in the inner loop)
+  GF_REGION_MUL(tbl, x) = tbl[x]   (single load, inner loop)
 
-Two motivations:
+Three motivations:
 
- 1. Performance. The default gf_mul() in ec_base.c does 3 table
-    lookups + 2 conditional branches per byte. A precomputed
-    256-byte region table reduces this to a single load, which
-    measures ~5x faster than the gf_mul() path on rd07
-    (Raptor Lake, single-thread) across k=4..16 / m=2..4 and
-    stripe sizes 4 KiB .. 1 MiB.
+ 1. Performance. The old gf_mul() does 3 table lookups + 2
+    conditional branches per byte. This change wins twice: the
+    branch-free single-table gf_mul() (gff[log[a]+log[b]], 511
+    sentinel + zeroed antilog tail, ~1.5 KB L1-resident) is ~2x
+    stock and also speeds matrix build (gf_gen_rs / gf_invert);
+    and in the region hot loop a precomputed 256-byte
+    per-coefficient table (GF_REGION_MUL, one load per byte)
+    replaces the per-byte multiply, ~5x faster than the gf_mul()
+    path on rd07 across k=4..16 / m=2..4 and 4 KiB .. 1 MiB
+    stripes.
 
- 2. Patent-clean. The technique is byte-indexed table lookup
-    (gf-nishida-16 / "FullByte"-style scalar GF multiply). It is
-    structurally distinct from the PSHUFB + 4-bit nibble-table
-    pattern in ISA-L's SIMD kernels that maps onto US 8,683,296
-    claim 21. No PSHUFB, no nibble split, no 16-byte gftbl.
+    gf_mul() microbench (ns/mul, min of 6, -O2 -march=native):
 
-Functions modified in ec_base.c (both userspace and kernel via
-the lustre/utils/erasurecode/ec_base.c -> lustre/ec/ec_base.c
-symlink):
+      CPU                    | stock     | branch-free
+      -----------------------+-----------+-------------
+      Ryzen 7 5800X (Zen 3)  | 0.72      | 0.36  (~2.0x)
+      i5-1340P (Raptor Lake) | 1.04-1.30 | 0.54  (~2.4x)
 
-  gf_vect_dot_prod_base       heap-allocated per-source tables
-  gf_vect_mad_base            stack table (256 bytes)
-  ec_encode_data_base         heap-allocated per-(src,dest) tables
-  ec_encode_data_update_base  stack table per output row
-  gf_vect_mul_base            stack table (256 bytes)
+ 2. Patent-clean. Byte-indexed table lookup (gf-nishida-16 /
+    "FullByte"-style scalar GF multiply), structurally
+    distinct from the PSHUFB + 4-bit nibble-table pattern in
+    ISA-L's SIMD kernels that maps onto US 8,683,296 claim
+    21. No PSHUFB, no nibble split, no 16-byte gftbl.
 
-Allocator wrappers ec_alloc()/ec_free() select kmalloc(GFP_ATOMIC)
-in the kernel build and malloc() in userspace. The two functions
-that allocate (gf_vect_dot_prod_base, ec_encode_data_base) fall
-through to the original scalar gf_mul() path on allocation
-failure, preserving behavior under memory pressure.
+ 3. Correctness. The shared uapi ec_base.h carried the old
+    single-period gflog_base/gff_base tables, so the
+    userspace build (already alloc-free, built without
+    GF_LARGE_TABLES) evaluated gf_mul() against tables
+    lacking the 511 sentinel and the doubled antilog period
+    -- mathematically wrong, masked only by the kernel
+    forcing GF_LARGE_TABLES.
 
-Adds GF_REGION_MUL macro to lustre/include/ec_base.h. Adds the
-build_mul_tbl() static-inline helper to ec_base.c. No public-API
-change; only internal scalar-arithmetic substitution.
+Changes:
+  - ec_base.c: canonical alloc-free stack byte-table region
+    multiply + branch-free gf_mul() in gf_vect_dot_prod_base,
+    gf_vect_mad_base, ec_encode_data_base,
+    ec_encode_data_update_base, gf_vect_mul_base; rename
+    gf_vect_mul_init -> gf_vect_mul_init_base.
+  - ec_base.h: replace the small-table block with canonical
+    uint16_t gflog_base (511 sentinel) + doubled gff_base;
+    add the GF_REGION_MUL macro.
+  - ec_base_aliases.c: add the gf_vect_mul_init() wrapper.
+  - gf_vect_mul.h: declare gf_vect_mul_init_base().
+  - ec/Makefile: drop -DGF_LARGE_TABLES (branch-free path).
 
-Verified on rd07 (RHEL 10.1, AVX2+GFNI, no AVX-512): builds with
--Wall -Werror; gfni_ec_test passes with byte-identical parity on
-both columns (the test uses the base path as the reference for
-the GFNI intrinsic path).
+Shared by userspace libec.a and kernel ec.ko via the
+utils/erasurecode/ec_base.c -> lustre/ec/ec_base.c symlink.
+No public-API change; ec.ko exports via ec_kmod.c, so the
+canonical EXPORT_SYMBOL_GPL(*_base) block is omitted.
+ec_base.c uses tab indentation (checkpatch-clean); the
+vendored GF hex data tables in ec_base.h stay space-
+indented as before.
 
+Validated on rd07 (RHEL 10.1, AVX2+GFNI): exhaustive gf_mul
+(65536 pairs) + gf_inv + k=6/p=2 erasure round-trip KAT,
+clean -Werror, and gfni_ec_test byte-identical parity on
+both columns (the base path is the reference for the GFNI
+intrinsic path).
+
+Test-Parameters: testlist=sanity-ec
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Change-Id: I905e365d145d0018cbcd2bbc919eb4e516fafe8e
 
@@ -132,3 +155,36 @@ Patch Set 2: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/126145/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-06-17 18:58:08.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-17 19:00:13.000000000) ---
+Patch Set 3:
+
+(67 comments)
+
+133 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-06-17 19:01:09.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: Cannot build patch due to 10, messages:
+
+ b'git checkout error!\n'
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-17 19:01:13.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-06-17 19:24:15.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126685/ : SUCCESS

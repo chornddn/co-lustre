@@ -5,10 +5,10 @@ Type:       Improvement
 Priority:   Medium
 Status:     Open
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Keguang Xu
 Reporter:   Andreas Dilger
 Created:    Thu, 11 Jun 2026 01:29:01 +0000
-Updated:    Wed, 17 Jun 2026 13:06:17 +0000
+Updated:    Thu, 18 Jun 2026 19:12:01 +0000
 Labels:     FLR-EC-RO, LMR
 Links:      Related: is related to  LU-17820; Related: is related to  LU-18823; Related: is related to  LU-20212; Related: is related to  LU-15419
 
@@ -63,3 +63,73 @@ I am not a fan of maintaining a persistent usage cache directly on the QMT by pi
 Aside from the fact that this usage data is not up-to-date, this approach introduces additional architectural complexity: modifying lquota_slv_rec alters the on-disk layout, which demands rigorous  backward compatibility handling.
 
 Given that our primary goal under FLR-ECRO is simply to provide a "good enough" estimate to prevent lfs quota from blocking or returning incomplete data, adding Step 4 offers a much simpler, low-risk, and cost-effective alternative.
+
+--- Comment (adilger, Thu, 18 Jun 2026 07:41:43 +0000) ---
+Hi Keguang, I think in the case of not-yet-inactive OSTs that have just failed, we want to make sure that the GETQUOTA RPCs do not hang for a long time. As such, these RPCs should be allowed to time out but not retry these RPCs. 
+
+I'm not exactly sure of the quota implementation details, but my thought would be to have the fallback to the quota grant usage to happen immediately after the OST RPC fails/times out. That localizes the error handling, and does not require storing some extra state about which OSTs to retry. However, that is just a high-level opinion and maybe does not match the way the code is implemented. 
+
+On the one hand, it may not be ideal to store a persistent record of the quota usage on QMT0000 since it could become stale, however it might also have some advantages. This cache on QMT0000 would allow the client to avoid potentially hundreds of extra RPCs for statfs() calls when project quota is enabled on a directory tree (which is basically always for multi-tenant systems that are increasingly common today. In some cases, applications are calling statfs() frequently, and while we have a client-side per-ID cache, it still means GETQUOTA calls to all MDTs and OSTs every few seconds from every client calling statfs(). If the quota master cached the aggregated quota usage per ID then the clients only need to do a single GETQUOTA call to get the full limits, reducing the RPC count by a factor of hundreds.
+
+--- Comment (sergey, Thu, 18 Jun 2026 11:20:49 +0000) ---
+I am not a fan of maintaining a persistent usage cache directly on the QMT by piggybacking qb_usage on all quota requests (QUOTA_DQACQ_FL_REPORT, ACQ, and RELEASE) and serializing it into struct lquota_slv_rec.
+
+As said before there is already a field qb_usage. It is always used for QUOTA_DQACQ_FL_REPORT. In case of other requests(ACQ, RELEASE), it is set with zeroes. It's pretty easy to always set it before sending ACQ and RELEASE as well.
+
+Aside from the fact that this usage data is not up-to-date, this approach introduces additional architectural complexity: modifying lquota_slv_rec alters the on-disk layout, which demands rigorous  backward compatibility handling.
+
+I suggested to modify lquota_slv_rec for better optimisation: qmt_dqacq0 would modify one file instead of two. It could be stored in a separate index file if there is a problem with the backward compatibility. This could be even stored in a memory.
+
+Note, since we start storing the actual usage at the QMT the usage will be always more accurate than the granted space: It's impossible to change granted space without a request from the quota slave.
+
+If it is required for FLR, we could use the granted as I suggested but as "phase 1". Keeping in mind, that there is a better solution.
+
+adilger , I would agree that having the usage on the QMT gives us a serious advantage especially for the case of statfs. Part of this task is already implemented in https://review.whamcloud.com/c/fs/lustre-release/+/65511. Now it returns granted space only for the LQA, but it could return usage for regular quota IDs if it will be implemented.
+
+--- Comment (JIRAUSER19404, Thu, 18 Jun 2026 12:15:35 +0000) ---
+Hi scherementsev , I generally would avoid serializing(store) somewhat stale data (usage) into disk, especially when we could inference it through its neighbours. However, if we just store them in memory, that sounds more reasonable.
+
+Another concern here is, how fresh could we provide from the Cache, given that qb_usage is piggybacked through QUOTA_DQACQ_FL_REPORT/ACQ/RELEASE, there might be a balance between correctness and performance ?
+
+--- Comment (sergey, Thu, 18 Jun 2026 15:58:49 +0000) ---
+Hi squalfof , 
+
+I think this needs some kind of small HLD or good explanation how it is going to be implemented.
+
+I generally would avoid serializing(store) somewhat stale data (usage) into disk, especially when we could inference it through its neighbours. However, if we just store them in memory, that sounds more reasonable.
+
+Having that only in memory causes another problem. When QMT starts, it wouldn't know the usage.
+
+Another concern here is, how fresh could we provide from the Cache, given that qb_usage is piggybacked through QUOTA_DQACQ_FL_REPORT/ACQ/RELEASE, there might be a balance between correctness and performance ?
+
+The usage freshness would depend on the latest ACQ/REL/REPORT request.
+
+ 
+
+The both approaches with usage and granted space have own benefits and drawbacks. Note, that granted space is 0 if limits are set to 0, i.e. the usage could be > 0, while granted space is 0.
+
+I think a lot of things need to be discussed before starting implementation.
+
+--- Comment (adilger, Thu, 18 Jun 2026 16:33:06 +0000) ---
+For FLR-EC/mirror, the cached quota data will always be more accurate than not having any information at all if the OST is unavailable. I suspect it will still be fairly accurate, within one qunit per inaccessible OST because that is the granularity of OSTs requesting more qunits from QMT. Also, the quota usage cannot become too outdated if the OST is offline, so I'm not very worried about the accuracy of the cache. 
+
+This is especially true since the quota usage reported to users is not "binding" in any sense. It is just a snapshot of the real usage and will be immediately outdated if the user is actively writing or deleting files. If the user is not active, then the cached usage should be fairly accurate.
+
+--- Comment (sergey, Thu, 18 Jun 2026 17:19:53 +0000) ---
+Following our previous discussion about the difference between granted and usage. In some cases the difference could be pretty high. This happens when the real usage is significantly below the limit:
+
+[root@vm3 tests]# lfs quota -u quota_usr -vh /mnt/lustre
+Disk quotas for usr quota_usr (uid 1000):
+      Filesystem    used   bquota  blimit  bgrace   files   iquota  ilimit  igrace
+     /mnt/lustre   30.3M       0k    100G       -       2        0       0       -
+  lustre-MDT0000      0k        -      0k       -       2        -       0       -
+  lustre-OST0000      0k        -      0k       -       -        -       -       -
+  lustre-OST0001   30.3M        -     16G       -       -        -       -       -
+Total allocated inode limit: 0, total allocated block limit:    16G
+
+16G here is OST0001 granted space vs 30.3M actual usage.
+
+ That's why I suggested to consider using qb_usage instead of granted space.
+
+--- Comment (adilger, Thu, 18 Jun 2026 19:12:01 +0000) ---
+I'm definitely more in favor of using and caching the actual usage instead of the grant. I suspect that given the large difference between usage and granted, the cached usage is always going to be more accurate than the grant or an estimate based on the grant. Again, since this is just a reported value and not anything to do with quota enforcement, I don't think it is critical that this be totally accurate if an OST is inaccessible.
