@@ -1,0 +1,156 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20423] TBF: fix the wrong TBF class bucket when check its state bit in LRU</title>
+                <link>https://jira.whamcloud.com/browse/LU-20423</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;In nrs_tbf_cli_findadd(), when found a class bucket form rhashtable but with refcount of 0, it should continue to check whether it is in LRU. But the implementation uses the wrong class bucket for the check.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; struct nrs_tbf_client *                                                  
+nrs_tbf_cli_findadd(struct nrs_tbf_head *head,                                  
+                    struct nrs_tbf_client *cli)                                 
+{                                                                               
+        struct nrs_tbf_client *cli2 = NULL;                                     
+                                                                                
+try_again:                                                                      
+        rcu_read_lock();                                                        
+        cli2 = rhashtable_lookup_get_insert_fast(&amp;amp;head-&amp;gt;th_cli_rhash,           
+                                                 &amp;amp;cli-&amp;gt;tc_rhash,                
+                                                 head-&amp;gt;th_rhash_params);        
+        &lt;span class="code-keyword"&gt;if&lt;/span&gt; (IS_ERR(cli2))                                                       
+                &lt;span class="code-keyword"&gt;goto&lt;/span&gt; out;                                                       
+                                                                                
+        &lt;span class="code-keyword"&gt;if&lt;/span&gt; (cli2 &amp;amp;&amp;amp; !refcount_inc_not_zero(&amp;amp;cli2-&amp;gt;tc_ref)) {                    
+                cli2 = nrs_tbf_lru_tryhit(head, cli); ==&amp;gt; &lt;span class="code-quote"&gt;"cli"&lt;/span&gt; -&amp;gt; &lt;span class="code-quote"&gt;"cli2"&lt;/span&gt;                          
+                &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!cli2) {                                                    
+                        &lt;span class="code-comment"&gt;/* lost race -&amp;gt; retry */&lt;/span&gt;                                
+                        rcu_read_unlock();                                      
+                        schedule();                                             
+                        &lt;span class="code-keyword"&gt;goto&lt;/span&gt; try_again;                                         
+                }                                                               
+        }                              
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</description>
+                <environment />
+        <key id="98195">LU-20423</key>
+            <summary>TBF: fix the wrong TBF class bucket when check its state bit in LRU</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="qian_wc">Qian Yingjin</assignee>
+                                    <reporter username="qian_wc">Qian Yingjin</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 24 Jun 2026 01:33:35 +0000</created>
+                <updated>Wed, 24 Jun 2026 09:15:12 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>4</watches>
+                                                                            <comments>
+                            <comment id="496685" author="qian_wc" created="Wed, 24 Jun 2026 01:36:27 +0000">&lt;p&gt;Moreover, I doubt there should be some racing bug in nrs_tbf_lru_shrink():&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+rcu_read_lock();                                                        
+        list_for_each_entry_rcu(cli, &amp;amp;head-&amp;gt;th_lru_list, tc_lru) {              
+                &lt;span class="code-keyword"&gt;if&lt;/span&gt; (atomic_read(&amp;amp;head-&amp;gt;th_lru_cnt) &amp;lt;= low)                      
+                        &lt;span class="code-keyword"&gt;break&lt;/span&gt;;                                                  
+                                                                                
+                &lt;span class="code-comment"&gt;/* race with nrs_tbf_lru_tryhit()/nrs_tbf_lru_add ? */&lt;/span&gt;          
+                &lt;span class="code-keyword"&gt;if&lt;/span&gt; (!test_and_clear_bit(NRS_TBF_CLI_LRU_BIT, &amp;amp;cli-&amp;gt;tc_state))   
+                        &lt;span class="code-keyword"&gt;continue&lt;/span&gt;;                                               
+                                                                                
+                LASSERTF(!refcount_read(&amp;amp;cli-&amp;gt;tc_ref), &lt;span class="code-quote"&gt;"class@%p ref != 0: %d"&lt;/span&gt;, 
+                         cli, refcount_read(&amp;amp;cli-&amp;gt;tc_ref));                     
+                                                                                
+                rhashtable_remove_fast(&amp;amp;head-&amp;gt;th_cli_rhash, &amp;amp;cli-&amp;gt;tc_rhash,     
+                                       head-&amp;gt;th_rhash_params);                  
+                                                                                
+                spin_lock(&amp;amp;head-&amp;gt;th_lru_lock);                                  
+                atomic_dec(&amp;amp;head-&amp;gt;th_lru_cnt);                                  
+                list_del_rcu(&amp;amp;cli-&amp;gt;tc_lru);                                     
+                spin_unlock(&amp;amp;head-&amp;gt;th_lru_lock);                                
+                                                                                
+                nrs_tbf_cli_fini(cli);                                          
+                freed++;                                                        
+        }                                                                       
+        rcu_read_unlock();
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;we remove the class bucket in the read RCU lock, it may race with nrs_tbf_lru_add()?&lt;/p&gt;</comment>
+                            <comment id="496686" author="gerrit" created="Wed, 24 Jun 2026 01:47:31 +0000">&lt;p&gt;"Qian Yingjin &amp;lt;qian@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66827" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66827&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20423" title="TBF: fix the wrong TBF class bucket when check its state bit in LRU" class="issue-link" data-issue-key="LU-20423"&gt;LU-20423&lt;/a&gt; nrs: check LRU hit using the wrong TBF class bucket&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 8c7e257cb2e31d0977a03f8b4befcedb9939f39e&lt;/p&gt;</comment>
+                            <comment id="496725" author="eaujames" created="Wed, 24 Jun 2026 09:14:40 +0000">&lt;blockquote&gt;
+&lt;p&gt;we remove the class bucket in the read RCU lock, it may race with nrs_tbf_lru_add()?&lt;/p&gt;&lt;/blockquote&gt;
+
+&lt;p&gt;Could you elaborate on your thoughts? What race are you referring to?&lt;br/&gt;
+This comment explains how handle the race to add/delete/shrink the TBF LRU:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+/* The following nrs_tbf_lru_* function manipulate &lt;span class="code-keyword"&gt;class &lt;/span&gt;object with a 0
+ * refcount. These need to be accessed with a rcu lock to prevent deletions.
+ * A TBF &lt;span class="code-keyword"&gt;class &lt;/span&gt;with a 0 refcount means the following things:
+ *  - &lt;span class="code-keyword"&gt;class &lt;/span&gt;is in LRU list (NRS_TBF_CLI_LRU_BIT is set)
+ *  - &lt;span class="code-keyword"&gt;class &lt;/span&gt;is being added in LRU (refs 1-&amp;gt;0 then NRS_TBF_CLI_LRU_BIT 0-&amp;gt;1)
+ *  - &lt;span class="code-keyword"&gt;class &lt;/span&gt;is being deleted (NRS_TBF_CLI_LRU_BIT 1-&amp;gt;0)
+ *  - &lt;span class="code-keyword"&gt;class &lt;/span&gt;is being removed from LRU (NRS_TBF_CLI_LRU_BIT 1-&amp;gt;0 then refs 0-&amp;gt;1)
+ */
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;So to add a class in LRU the ref was &amp;gt; 0 and the flag NRS_TBF_CLI_LRU_BIT not set, this should not race with the shrink process ref = 0 and NRS_TBF_CLI_LRU_BIT set. The race window between test_and_clear_bit(NRS_TBF_CLI_LRU_BIT,..) and rhashtable_remove_fast() should not exist.&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;void&lt;/span&gt;&lt;/span&gt;
+nrs_tbf_cli_put(&lt;span class="code-keyword"&gt;struct&lt;/span&gt; nrs_tbf_head *head, &lt;span class="code-keyword"&gt;struct&lt;/span&gt; nrs_tbf_client *cli)
+{
+
+	if (!refcount_dec_and_test(&amp;amp;cli-&amp;gt;tc_ref))
+		&lt;span class="code-keyword"&gt;return&lt;/span&gt;;
+
+	nrs_tbf_lru_add(head, cli);
+	nrs_tbf_lru_shrink(head);
+}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06vxb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
