@@ -7,18 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-06-10 20:10:02.000000000
-Updated:    2026-06-11 10:43:57.000000000
-Patch Set:  3
-Insertions: +1284
-Deletions:  -44
-Comments:   308 (0 unresolved)
+Updated:    2026-06-26 04:03:19.000000000
+Patch Set:  4
+Insertions: +1030
+Deletions:  -29
+Comments:   327 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Janitor Bot
+  CC: Janitor Bot, Lustre RISC-V Builder
+  REVIEWER: Li Xi, Qian Yingjin, Cyril Bordage, Xinxia Qu
 
 --- Commit Message ---
 LU-20350 o2iblnd: Bounce cross-NUMA bulk via NIC-local pool
@@ -40,57 +41,71 @@ buffer's own first page via lnet_get_first_page() (lib-md.c). So on a
 multi-rail client with a healthy buffer-local rail the bulk already
 lands NIC-local and this patch changes nothing there.
 
-The case it can't reach is a single-HCA client, where there is no
-buffer-local NI to select and the bulk crosses sockets to whatever
-rail the server picks. numactl can avoid that by binding the job's
-memory to the HCA's socket, but only by surrendering the application's
-own NUMA locality, and for O_DIRECT the job has to place the buffer
-itself. The bounce gives HCA-local DMA without constraining where the
-job allocates.
+The gap is any client whose HCAs do not cover every NUMA node a job
+can land a buffer on, that is fewer rails than NUMA nodes. A
+single-HCA dual-socket client is the extreme case, but a multi-rail
+client is stranded the same way whenever a buffer lands on a node with
+no local rail: there is no buffer-local NI to select and the bulk
+crosses to whatever rail the server picks. numactl can avoid that by
+binding the job's memory to an HCA-local node, but only by
+surrendering the application's own NUMA locality, and for O_DIRECT the
+job has to place the buffer itself. The bounce gives HCA-local DMA
+without constraining where the job allocates.
 
 Stage the bulk through a per-HCA arena allocated on the HCA's own NUMA
 node and pay a CPU copy for the last hop. A cross-socket CPU copy is
 cheaper than a cross-socket NIC DMA and is immune to the ordering
 penalty. The bounce lives entirely in ko2iblnd, so it is transparent
-to ptlrpc/osc/llite and to the server, with no wire change. For a read
-we advertise the slot's REMOTE_WRITE rkey as the PUT sink and run the
-slot->app copy-out off the CQ poller on an HCA-CPT-bound workqueue,
-with lnet_finalize() deferred behind the copy. For a write we copy
-app->slot inline and the device DMAs from the slot. GPUDirect pages
-bypass the bounce.
+to ptlrpc/osc/llite and to the server, with no wire change. We bounce
+the read path: advertise the slot's REMOTE_WRITE rkey as the PUT sink
+and run the slot->app copy-out off the CQ poller on an HCA-CPT-bound
+workqueue, with lnet_finalize() deferred behind the copy. GPUDirect
+pages bypass the bounce.
 
-bounce_enable is tristate (0 off, 1 force, 2 auto) and defaults off.
-auto allocates the arena only on a multi-node NUMA box and engages the
-inbound path only when the buffer is NUMA-remote (node_distance >
-LOCAL_DISTANCE), so local I/O stays zero-copy. Outbound stays opt-in
-under force because I measured the bounce helping reads but hurting
-writes. With the buffer bound to the far socket, inbound read goes
-from 2036 to 7422 MiB/s (3.65x, about 80% of the 9291 MiB/s NIC-local
-ceiling), since cross-socket HCA writes are heavily RO-penalized. HCA
-reads are barely penalized, so for a write the added copy-in costs
-more than it saves and outbound drops from 20.0 to 16.7 GiB/s, a 16%
-loss. Thus auto cannot regress writes. Slot exhaustion or any rd-build
-failure falls back to the direct app buffer, so a bounce never fails
-an I/O.
+bounce_enable is tristate (0 off, 1 auto, 2 force) and defaults off.
+auto allocates the arena only on a multi-node NUMA box and engages
+only when the buffer is NUMA-remote (node_distance > LOCAL_DISTANCE),
+so local I/O stays zero-copy. force engages unconditionally and
+allocates even on a single-socket box, for selftests.
+
+HCA reads are barely penalized, so for a Lustre write the added
+copy-in costs more than it saves. I measured a 16% throughput loss for
+writes, so the write path stays direct.
+
+|  read buffer  |  mode  |  throughput  |  % of LOCAL       |
+|  placement    |        |              |  ceiling          |
+|---------------|--------|--------------|-------------------|
+|  LOCAL        |  off   |  8707 MiB/s  |  100% (baseline)  |
+|  FAR          |  off   |  1847 MiB/s  |  ~21%             |
+|  FAR          |  on    |  7422 MiB/s  |  ~85%             |
+|  FAR          |  *on   |  8382 MiB/s  |  ~96%             |
+* With bounce_scrub=0 (disabled)
+
+The above numbers were generated with fio running on a single-HCA,
+dual-socket client against two single-HCA OSSes, each hosting two
+OSTs (all HCAs 200 Gbps, IB).
 
 Because a slot is recycled, a non-conformant peer that RDMA-writes
 fewer bytes than advertised yet reports success could leak the slot's
 prior-transfer bytes in the untransferred tail. Zero each slot on
-release to close this. The inbound copy-out fuses the zero into the
-read-out while the line is cache-hot, so the common path adds no
-separate pass.
+release to close this; the copy-out fuses the zero into the read-out
+while the line is cache-hot, so the common path adds no separate pass.
+bounce_scrub (default on) gates the zeroing so a trusted fabric can
+drop it.
 
-The new module parameters are bounce_enable, bounce_pool_mb (64) and
-bounce_min_nob (65536). Slot size is fixed at LNET_MTU. Read
+The new module parameters are bounce_enable, bounce_pool_mb (64),
+bounce_min_nob (65536), bounce_scrub (on) and
+bounce_copyout_max_active (2), which sets the per-HCA-CPT copy-out
+workqueue concurrency. Slot size is fixed at LNET_MTU. Read
 /sys/kernel/debug/lnet/bounce_stats for the engaged, exhausted,
 inflight, fallback and byte counters. fail_loc 0xe010 forces
 engagement and 0xe011 forces the fallback, for selftests.
 
 At bounce_enable=0 the datapath is byte-for-byte identical to stock:
-the two rd-build sites add a predicate test and nothing reroutes. I
-validated the functional paths over SoftRoCE (byte-exact read and
-write, exhaustion fallback, clean teardown) and measured the numbers
-above on mlx5.
+the sink rd-build adds one predicate test and nothing reroutes. I
+validated the functional paths over SoftRoCE (byte-exact read,
+exhaustion fallback, clean teardown) and measured the numbers above on
+mlx5.
 
 Test-Parameters: trivial
 Signed-off-by: Chris Horn <chorn@ddn.com>
@@ -221,3 +236,42 @@ Patch Set 3: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/126329/ : SUCCESS
+
+--- Message (Chris Horn, 2026-06-25 20:40:12.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-06-25 20:41:39.000000000) ---
+Patch Set 4:
+
+(15 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-06-25 20:42:45.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Chris Horn, 2026-06-25 20:56:06.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-06-25 21:04:28.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-06-25 21:23:31.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/126964/ : SUCCESS
