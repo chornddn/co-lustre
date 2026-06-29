@@ -47,10 +47,10 @@ Modules: ksocklnd ptlrpc obdclass lnet libcfs ... [last unloaded: libcfs]
                         <labels>
                     </labels>
                 <created>Tue, 14 Apr 2026 07:42:40 +0000</created>
-                <updated>Thu, 25 Jun 2026 03:58:04 +0000</updated>
+                <updated>Sat, 27 Jun 2026 15:26:30 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>2</watches>
+                                    <watches>3</watches>
                                                                             <comments>
                             <comment id="496696" author="gerrit" created="Wed, 24 Jun 2026 03:56:56 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66829" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66829&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20132" title="sanity-lnet test cleanup: NULL deref in __wake_up_common via tcp_child_process on lnet reload" class="issue-link" data-issue-key="LU-20132"&gt;LU-20132&lt;/a&gt; lnet: statically initialize acceptor wait queue&lt;br/&gt;
@@ -58,8 +58,62 @@ Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
 Commit: fb7ac81d665fe105aa2b46be8f1475f44dceb19e&lt;/p&gt;</comment>
+                            <comment id="496919" author="hornc" created="Sat, 27 Jun 2026 15:26:30 +0000">&lt;p&gt;Forgot to post the RCA here.&lt;/p&gt;
+
+&lt;p&gt;This is a latent bug in one of the &lt;a href="https://jira.whamcloud.com/browse/LU-18812" title="lnet: restrict IP addresses that socklnd listens on" class="issue-link" data-issue-key="LU-18812"&gt;&lt;del&gt;LU-18812&lt;/del&gt;&lt;/a&gt; patches.&lt;/p&gt;
+
+&lt;p&gt;When each socklnd NI comes up, lnet_acceptor_add_socket() opens a listening socket and replaces its sk-&amp;gt;sk_data_ready with lnet_acceptor_ready.&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        /* Setup socket callback properly */
+        lnet_acceptor_state.pta_odata = lsock-&amp;gt;liss_sock-&amp;gt;sk-&amp;gt;sk_data_ready;
+        lsock-&amp;gt;liss_sock-&amp;gt;sk-&amp;gt;sk_data_ready = lnet_acceptor_ready;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;lnet_acceptor_ready() does an unconditional wake_up_interruptible()&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        wake_up_interruptible(&amp;amp;lnet_acceptor_state.pta_waitq);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;pta_waitq is a field of the file-static lnet_acceptor_state struct, which is zero. The static initializer only sets .pta_shutdown = 1, not pta_waitq. It is only made valid by init_waitqueue_head() inside the acceptor kthread&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;static struct {
+        int                     pta_shutdown;
+        struct socket           *pta_sock;
+        struct completion       pta_signal;
+        struct net              *pta_ns;
+        wait_queue_head_t       pta_waitq;
+        atomic_t                pta_ready;
+#ifdef HAVE_SK_DATA_READY_ONE_ARG
+        void                    (*pta_odata)(struct sock *);
+#else
+        void                    (*pta_odata)(struct sock *, int);
+#endif
+} lnet_acceptor_state = {
+        .pta_shutdown = 1
+};
+
+...
+
+static int
+lnet_acceptor(void *arg)
+{
+...
+        init_waitqueue_head(&amp;amp;lnet_acceptor_state.pta_waitq);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;When LNet is started, all listeners are hooked in lnet_startup_lndnets() before lnet_acceptor_start() spawns the kthread. So there is a window where the listening sockets are live and hooked but pta_waitq.head.next == NULL.&lt;/p&gt;
+
+&lt;p&gt;An inbound TCP connection completing its 3-way handshake in that window goes tcp_v4_rcv &amp;#45;&amp;gt; tcp_child_process &amp;#45;&amp;gt; parent-&amp;gt;sk_data_ready (=lnet_acceptor_ready) -&amp;gt; wake_up_interruptible(&amp;amp;pta_waitq) and dereferences the NULL list head -&amp;gt; __wake_up_common+0x4c NULL deref in softirq -&amp;gt; panic.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
+                            <issuelinktype id="10010">
+                    <name>Duplicate</name>
+                                                                <inwardlinks description="is duplicated by">
+                                        <issuelink>
+            <issuekey id="92969">LU-19489</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
                             <issuelinktype id="10011">
                     <name>Related</name>
                                                                 <inwardlinks description="is related to">

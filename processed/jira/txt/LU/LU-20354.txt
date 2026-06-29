@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Keguang Xu
 Reporter:   Andreas Dilger
 Created:    Thu, 11 Jun 2026 01:29:01 +0000
-Updated:    Thu, 25 Jun 2026 12:19:45 +0000
+Updated:    Sat, 27 Jun 2026 06:15:24 +0000
 Labels:     FLR-EC-RO, LMR
 Links:      Related: is related to  LU-17820; Related: is related to  LU-18823; Related: is related to  LU-20212; Related: is related to  LU-15419
 
@@ -135,25 +135,23 @@ Total allocated inode limit: 0, total allocated block limit:    16G
 I'm definitely more in favor of using and caching the actual usage instead of the grant. I suspect that given the large difference between usage and granted, the cached usage is always going to be more accurate than the grant or an estimate based on the grant. Again, since this is just a reported value and not anything to do with quota enforcement, I don't think it is critical that this be totally accurate if an OST is inaccessible.
 
 --- Comment (JIRAUSER19404, Wed, 24 Jun 2026 05:39:16 +0000) ---
-Hi adilger  scherementsev  hongchao.zhang, a simple HLD about the Cache,
+Hi adilger  scherementsev  hongchao.zhang, a simple HLD about the cache,
 
-TL;DR: Add quota-usage cache (not serialize to disk) in QMT where clients consult first for quota usage, cache itself needs warmup and may face cache-miss, in which case clients just fallback to current approach – query all/some OSTs/MDTs.
+TL;DR: Add quota-usage cache (not serialize to disk) in QMT where clients consult for quota usage, cache itself needs warmup and may face cache-miss; in that case, QMT proxies RPCs to OSTs to fetch usage and populate the cache on behalf of clients.
 
 PRE: we already have a workable mechnism to fulfill the lfs quota command as mentioned above.
 
-Startup: At startup, QMT will read all index files into Cache, {qid, osts[grants, usage(missing at startup)], mdts[...]}. During this phase, query from clients are rejected and redirect to the legacy mech.
+Startup: At startup, QMT will read all index files into Cache, {qid, osts[grants, usage(missing at startup)], mdts[...]}. During this phase, query from clients are rejected and redirect to the legacy mech (to keep the design simple and consistent, we do not perform proxy RPCs at this stage). (should we continue serving ACQ/REL at this stage?).
 
-Warmup: QSD would piggyback 'usage' field in their ACQ/REL/REPORT, which could help to warmup the Cache.
+Warmup: QSD piggybacks the usage field in their ACQ/REL/REPORT, which helps to warmup the cache.
 
-Serve clients: On each query with UID/GID, QMT return the corresponding OSTs/MDTs like { osts:[grants, usage?], mdts:[...] }. With this response, clients could recognize the missing ones (less likely given a warmed cache), send request to them (significantly reduced RPC overhead compared to the legacy mechanism). If 'invalid' OST encountered, use the 'grant' field instead for this OST.
+Serve clients: On each query with UID/GID, QMT return the corresponding OSTs/MDTs like { osts:[grants, usage], mdts:[...] }. If usage is missing at this stage, QMT proxies RPCs to OSTs to retrieve quota usage on behalf of the clients, the populated cache avoids repeat RPCs for subsequent callers. Based on prior experience with stats(), the extra RPC load on MDS0 is acceptable here.
 
-(optional) Speedup warm: OSTs receiving quota query could directly send their usage to QMTs.
-
-With this Cache, we could significantly reduce quota queries to OSTs/MDSs, optimising clients' query performance as suggested in the description of this ticket.
+With this cache, we could significantly reduce quota queries to OSTs/MDTs and improve client query performance as suggested in the description of this ticket.
 
  
 
-Open: about Cache, there's already a global Cache in QMT. It's indexed through ID. We may reuse it with a new field like 'ost_maps'  under each lqe? Concerns: we need to cache grant/usage during the lifetime of QMT(without eviction); Startup needs more time, could we serve ACQ/REL meanwhile or not?
+Open: about Cache, there's already a global Cache in QMT. It's indexed through ID. We may reuse it with a new field like 'ost_maps'  under each lqe.
 
 --- Comment (adilger, Wed, 24 Jun 2026 05:59:20 +0000) ---
 Rather than ignore requests before the cache is populated, it would be possible for QMT to do proxy RPCs to the other targets to populate its cache and return that to the client. That is the same RPC count, but will populate the cache for the next caller.
