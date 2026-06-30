@@ -108,12 +108,72 @@ state_history:
                         <labels>
                     </labels>
                 <created>Mon, 29 Jun 2026 21:37:56 +0000</created>
-                <updated>Mon, 29 Jun 2026 22:01:33 +0000</updated>
+                <updated>Mon, 29 Jun 2026 22:53:18 +0000</updated>
                                             <version>Lustre 2.16.1</version>
                                                         <due />
                             <votes>0</votes>
-                                    <watches>1</watches>
-                                                                                    <attachments>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="497056" author="hornc" created="Mon, 29 Jun 2026 22:25:17 +0000">&lt;p&gt;I think this is a regression in ae6d373bc6 "&lt;a href="https://jira.whamcloud.com/browse/LU-17379" title="try MGS NIDs more quickly at initial mount" class="issue-link" data-issue-key="LU-17379"&gt;&lt;del&gt;LU-17379&lt;/del&gt;&lt;/a&gt; lnet: parallelize peer discovery via LNetAddPeer".&lt;/p&gt;
+
+&lt;p&gt;That change has LNetAddPeer() add each non-primary NID as its own peer and lets background discovery consolidate the records afterward, rather than attaching the non-primary NID to the primary peer directly. The consolidation is only armed when lnet_add_peer_ni() returns 0 for the non-primary NID:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;    rc = lnet_add_peer_ni(&amp;amp;nids[i], &amp;amp;LNET_ANY_NID, true, 0);
+    if (!rc) {
+            if (lock_prim_nid) {
+                    lp = lnet_find_peer(&amp;amp;nids[i]);
+                    if (lp) {
+                            lp-&amp;gt;lp_merge_primary_nid = pnid;
+                            lnet_peer_decref_locked(lp);
+                    }
+            }
+            lnet_discover_peer_nid(&amp;amp;nids[i]);
+    }
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;If a peer record for that non-primary NID already exists, lnet_add_peer_ni() returns -EEXIST, the if (!rc) block is skipped, lp_merge_primary_nid is never set, discovery is never kicked, and the two peers never merge.&lt;/p&gt;
+
+&lt;p&gt;On this system that precondition is met on every mount. The monitoring service loads LNet and pings the server NIDs before Lustre starts, so by the time the config llog runs LNetAddPeer() for kjlmo7fs-MDT0001-osp-MDT0000 a peer for 19@kfi already exists and is up to date.&lt;/p&gt;
+
+&lt;p&gt;Here are the relevant lines from the dk log captured after the monitoring service start, then mount (prefixes trimmed):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;    lnet_peer_alloc() nid 82@kfi
+    lnet_peer_attach_peer_ni() peer 82@kfi NID 82@kfi flags 0x100001
+    lnet_peer_send_ping() peer 82@kfi
+    lnet_peer_add() peer 19@kfi NID flags 0x1: -17
+    LNetPrimaryNID() NID 82@kfi primary NID 82@kfi rc 0
+    ...
+    lnet_peer_push_event() Received Push 19@kfi 2
+    lnet_peer_discovery_complete() Discovery complete. Dequeue peer 19@kfi
+    LNetPrimaryNID() NID 19@kfi primary NID 19@kfi rc 0
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;We can see 82@kfi created as a locked primary with a ping sent to it, 19@kfi coming back -17 (-EEXIST) so no merge is armed, and no later set_primary_nid() that joins them. 19@kfi finishes discovery on its own ~17s later as a separate MR peer, and LNetPrimaryNID(82@kfi) keeps returning 82@kfi. The configured&lt;/p&gt;
+
+{82@kfi, 19@kfi}
+
+&lt;p&gt;peer never forms.&lt;/p&gt;
+
+&lt;p&gt;Two things make that fatal here:&lt;br/&gt;
+1. lock_prim_nid is on (default) and the osp device was set up on 82@kfi, so the import targets 82@kfi and, being the locked primary, it can't be re-homed or deleted.&lt;br/&gt;
+2. 82@kfi never came up. Its link was down when LNet started so the NI was never instantiated:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;    LNet: Added LNI 19@kfi [16/1024/-1/180]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;(no 82@kfi LNI.) So 82@kfi is never discovered, sits alone in its own peer with no reachable NID to fall back to, and MDT0000 never connects to MDT0001.&lt;/p&gt;
+
+&lt;p&gt;2.15 doesn't hit this because its LNetAddPeer() attaches the non-primary NID synchronously with lnet_add_peer_ni(pnid, nids&lt;span class="error"&gt;&amp;#91;i&amp;#93;&lt;/span&gt;, mr, flags), so {82@kfi, 19@kfi} forms regardless of the pre-existing 19@kfi peer and MR send routes around the dead 82@kfi.&lt;/p&gt;
+
+&lt;p&gt;To fix this, in the non-primary branch of LNetAddPeer() I think we can treat -EEXIST and -EALREADY the same as a freshly created peer. Stamp lp_merge_primary_nid and force a fresh discovery (clear LNET_PEER_NIDS_UPTODATE, set LNET_PEER_FORCE_PING) so the merge runs even when the peer is already up to date.&lt;/p&gt;</comment>
+                            <comment id="497060" author="gerrit" created="Mon, 29 Jun 2026 22:53:18 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/66980" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/66980&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20439" title="Lustre server mount problem on MR kfilnd system when primary lnet nid interface is down" class="issue-link" data-issue-key="LU-20439"&gt;LU-20439&lt;/a&gt; lnet: consolidate existing peer in LNetAddPeer&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 52542cf75936f265f4ae94d569cb7c81018dcb21&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
                             <attachment id="65413" name="dklog.post_lcn_mount.gz" size="954808" author="peggy" created="Mon, 29 Jun 2026 21:41:26 +0000" />
                     </attachments>
                 <subtasks>
