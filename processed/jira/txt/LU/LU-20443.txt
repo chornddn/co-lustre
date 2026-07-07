@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Qian Yingjin
 Created:    Wed, 1 Jul 2026 07:01:17 +0000
-Updated:    Thu, 2 Jul 2026 07:52:50 +0000
+Updated:    Tue, 7 Jul 2026 04:10:15 +0000
 
 --- Description ---
 Stuck umount stack looks like :
@@ -140,3 +140,39 @@ So, all of these points tend to indicate that file has been close()ed/release (a
 
 --- Comment (apercher, Thu, 2 Jul 2026 07:52:50 +0000) ---
 I have a similar problem with version 2.15.8+.
+
+--- Comment (qian_wc, Tue, 7 Jul 2026 04:10:15 +0000) ---
+[root@qian lustre-release.git]# git diff
+diff --git a/lustre/llite/statahead.c b/lustre/llite/statahead.c
+index a565d3295e..698b32d0f7 100644
+--- a/lustre/llite/statahead.c
++++ b/lustre/llite/statahead.c
+@@ -1723,7 +1723,26 @@ static int start_statahead_thread(struct inode *dir, struct dentry *dentry,
+                ll_start_agl(parent, sai);
+ 
+        atomic_inc(&sbi->ll_sa_total);
+-       sai->sai_task = task;
++
++       /*
++        * When a user thread calls open/readdir/closedir() in one thread
++        * context and perform stat() on subsequent dentry in another thread
++        * context (This is a common stat workload in mpiFileUtils/dwalk and the
++        * statahead thread is started in the stat thread context), it may
++        * result in that the user has already called closedir() on the parent
++        * directory to deauthorize the statahead but the statahead thread does
++        * not start yet and set @sai_task with the statahead task pointer.
++        * This may cause the finished statahead thread waiting endless for the
++        * user to call closedir() to deauthorize the statahead and wakeup the
++        * statahead thread.
++        * To avoid this case, we check lli_sa_enabled before setting sai_task.
++        * By this way, the statahead thread can check @sai_task and know that
++        * it is deauthorized and should quit immediately in the above case.
++        */
++       spin_lock(&lli->lli_sa_lock);
++       if (lli->lli_sa_enabled)
++               sai->sai_task = task;
++       spin_unlock(&lli->lli_sa_lock);
+ 
+        wake_up_process(task);
+
+This is a simple path for 2.14

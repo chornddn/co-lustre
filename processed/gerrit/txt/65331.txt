@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-14 22:35:51.000000000
-Updated:    2026-07-03 11:11:53.000000000
-Patch Set:  8
-Insertions: +302
+Updated:    2026-07-07 13:35:46.000000000
+Patch Set:  9
+Insertions: +326
 Deletions:  -0
-Comments:   41 (0 unresolved)
+Comments:   42 (0 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Sebastien Buisson: +1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -24,25 +24,44 @@ Comments:   41 (0 unresolved)
 --- Commit Message ---
 LU-20119 selinux: add lustre_helpers SELinux policy module
 
-RHEL/Rocky 10+ dropped kernel_generic_helper_t from the base
-selinux-policy (selinux-policy-42.1.7), causing SELinux to deny
-every call_usermodehelper() spawn under enforcing mode. This
-breaks l_getsepol (mount aborts after 30s), lctl (root_squash
-not applied), l_getidentity, and l_getauth.
+Helpers launched by the kernel via call_usermodehelper()
+(l_getsepol, lctl, l_getidentity, l_getauth) are execed from
+kernel_t and, when labeled bin_t, transition into the base
+policy's kernel_generic_helper_t domain.  On RHEL/Rocky 9 that
+domain is broadly privileged and the helpers work unmodified.
+On RHEL/Rocky 10 it is much more restricted -- in particular it
+cannot read selinuxfs or the on-disk SELinux policy -- so under
+enforcing mode the helpers fail: l_getsepol returns -EACCES
+(mount aborts after 30s), lctl cannot apply root_squash, and
+l_getidentity/l_getauth are denied.
 
 Introduce a dedicated lustre_helper_t domain with a
 lustre_helper_exec_t file type for the Lustre helper binaries.
-A type_transition rule transitions kernel_t to lustre_helper_t
-on exec of those binaries, confining all permissions to Lustre
+A type_transition rule moves kernel_t to lustre_helper_t on exec
+of those binaries, confining all needed permissions to Lustre
 helpers only -- no other call_usermodehelper() callers are
-affected.
+affected, and the shared kernel_generic_helper_t domain is left
+untouched.
 
-On RHEL/Rocky 9 the base policy's kernel_t ->
-kernel_generic_helper_t transition covers all UMH helpers and
-Lustre works without this module. On RHEL/Rocky 10 that
-transition was removed together with kernel_generic_helper_t
-itself, so kernel_t execs the helper binary directly; the
-kernel_t -> lustre_helper_t transition handles that case.
+For that transition to fire the helper binaries must actually
+carry the lustre_helper_exec_t label, which requires two things:
+
+  - lustre_helpers.fc lists both /usr/bin and /usr/sbin paths for
+    each helper.  The binaries install under /usr/sbin, but on
+    RHEL/Rocky 10.2+ SELinux applies a "/usr/sbin = /usr/bin"
+    file-context equivalency (file_contexts.subs_dist), so
+    restorecon of /usr/sbin/l_getsepol is resolved against
+    /usr/bin and only a /usr/bin rule matches; on el8/el9 and
+    el10.0/10.1 there is no such equivalency and the /usr/sbin
+    rule matches the real path.  Listing both covers every case;
+    the unused entry is harmless.
+
+  - The label is applied by restorecon.  semodule -i does not
+    relabel already-installed files, and the binaries were
+    labeled bin_t at install time (before the module was loaded),
+    so lustre.spec.in %post now runs restorecon after semodule -i.
+    make install already did this for direct source installs, but
+    it is skipped for staged/RPM builds where DESTDIR is set.
 
 Additionally cover lgss_keyring, the GSS/SSK credential helper.
 Unlike the helpers above it is not run via call_usermodehelper()
@@ -63,6 +82,7 @@ Files added/modified:
   lustre/utils/selinux/lustre_helpers.te  - policy source
   lustre/utils/selinux/lustre_helpers.fc  - file context labels
   lustre/utils/selinux/Makefile.am        - build and install rules
+  lustre.spec.in                          - %post restorecon
 
 Build-time detection in config/lustre-core.m4 via the new
 LC_CONFIG_SELINUX_POLICY macro auto-enables the module when
@@ -72,36 +92,20 @@ PLATFORM_ID is platform:el10 or later; can be overridden with
 
 For direct source installs (DESTDIR unset), make install runs
 semodule -i and restorecon immediately. For RPM installs,
-lustre.spec.in runs semodule -i in %post and semodule -r in
-%preun.
+lustre.spec.in runs semodule -i and restorecon in %post and
+semodule -r in %preun.
 
 The RPM bcond (lustre_selinux_policy) is enabled by default on
 RHEL 10+ (%rhel >= 10) and disabled on all other distros.
 
-RHEL 9.7 (selinux-policy-38.1.65) is unaffected as
-kernel_generic_helper_t is fully defined there. The
+RHEL 9.7 (selinux-policy-38.1.65) is unaffected because its
+kernel_generic_helper_t domain is broadly privileged. The
 call_usermodehelper helpers were tested on Rocky 10.1
-(selinux-policy-42.1.7) with SELinux enforcing. The lgss_keyring
-rules were verified on RHEL 10.2 (selinux-policy-42.1.18) with
-SELinux enforcing: with them loaded, lgss_keyring passes all
-SELinux checks (zero keyutils_request_t denials) and SSK context
-negotiation proceeds.
-
-lustre_helpers.fc uses /usr/bin/ paths even though the binaries
-are physically installed under /usr/sbin/.  On RHEL/Rocky 10
-the SELinux policy database contains an equivalency rule
-"/usr/sbin = /usr/bin", which causes restorecon and matchpathcon
-to resolve any /usr/sbin/ path to its /usr/bin/ equivalent
-before looking up file context rules.  A rule written as
-/usr/sbin/l_getsepol is therefore silently bypassed: restorecon
-resolves the file to /usr/bin/l_getsepol, finds no matching
-rule, and falls back to the default bin_t label, leaving the
-binary unlabeled as lustre_helper_exec_t and the type transition
-ineffective.  Writing the rules as /usr/bin/l_getsepol matches
-the resolved path and restorecon correctly applies
-lustre_helper_exec_t to the file at its /usr/sbin/ location.
-This is safe because the module is only installed on el10+
-where the equivalency rule is present.
+(selinux-policy-42.1.7) and RHEL 10.0 with SELinux enforcing. The
+lgss_keyring rules were verified on RHEL 10.2 (selinux-policy-
+42.1.18) with SELinux enforcing: with them loaded, lgss_keyring
+passes all SELinux checks (zero keyutils_request_t denials) and
+SSK context negotiation proceeds.
 
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.0
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.1
@@ -381,3 +385,56 @@ https://build.whamcloud.com/job/lustre-reviews/127149/ : SUCCESS
 Patch Set 8:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-05 04:21:22.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-07-06 15:47:19.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-06 15:48:33.000000000) ---
+Patch Set 9:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-06 15:50:27.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-06 15:51:22.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-06 16:04:19.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-06 16:12:47.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127248/ : SUCCESS
+
+--- Message (Autotest, 2026-07-07 12:44:40.000000000) ---
+Patch Set 9:
+
+Trevis Autotest retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 127248 patch 9. Requested by S Buisson because of LU-19569.
+
+--- Message (Autotest, 2026-07-07 12:58:49.000000000) ---
+Patch Set 9:
+
+Onyx Autotest retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 127248 patch 9. Requested by Hiroshi Nishida because of LU-19569.
+
+--- Message (Sebastien Buisson, 2026-07-07 13:35:46.000000000) ---
+Patch Set 9: Code-Review+1
+
+(1 comment)

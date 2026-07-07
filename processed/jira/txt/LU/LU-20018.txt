@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Alex Zhuravlev
 Reporter:   Hongchao Zhang
 Created:    Wed, 18 Mar 2026 09:53:18 +0000
-Updated:    Wed, 27 May 2026 13:16:20 +0000
+Updated:    Tue, 7 Jul 2026 01:03:40 +0000
 
 --- Description ---
 [2781170.052516] LustreError: 191:0:(osd_handler.c:2364:osd_drop_preallocated_space()) ASSERTION( list_empty(&LDISKFS_I(inode)->i_orphan) ) failed: 
@@ -101,59 +101,21 @@ Updated:    Wed, 27 May 2026 13:16:20 +0000
 
 [2781170.115373]  ret_from_fork+0x1f/0x40
 
---- Comment (shadow, Wed, 27 May 2026 13:14:55 +0000) ---
-I don't think it problem now. inode should have an nlink zero, just after destroy. Okey - from our theory it might called for different object, but  Lustre have duplicate an oo_destroy flag in the inode state field.
+--- Comment (bzzz, Wed, 18 Mar 2026 10:09:10 +0000) ---
+for a reason I can't comment in DDN-6641, so here.. I think lu_site_purge() should ignore objects being used (another thread was in ofd_destroy()) ?
 
->>
+--- Comment (hongchao.zhang, Thu, 19 Mar 2026 11:01:34 +0000) ---
+the patch is tracked at https://review.whamcloud.com/c/fs/lustre-release/+/64691
 
-osd_destroy ->         ldiskfs_set_inode_state(inode, LDISKFS_STATE_LUSTRE_DESTROY);
+--- Comment (shadow, Thu, 21 May 2026 09:57:36 +0000) ---
+It looks like - we don't have a second thread for a free - but it's log (my coredump).
 
->>
+--- Comment (shadow, Thu, 21 May 2026 11:28:37 +0000) ---
+hongchao
 
-but all crash dumps I have, don't have this state set - it have 0x7 as state.
+can you explain bit more how it can be created a new lu object before old flushed and it object had moved into LRU list to be free?
 
-so no destroy called.
-
-as it's LLOG it can't be have a parallel access a specially ofd_destroy. (btw)
-
---- Comment (hongchao.zhang, Wed, 27 May 2026 09:10:10 +0000) ---
-Hi,
-
-In "htable_lookup" (lu_object.c), if there is an existing object and the object is not in use, it will drop the object from the hash immediately and retry the insertion of the new object, and it will wait the shadow object to be "inited" or "dying" if the shadow
-
-object is still in use.
-
-        if (atomic_inc_not_zero(&h->loh_ref)) {
-                rcu_read_unlock();
-                return lu_object_top(h);
-        }
-
-        spin_lock(&bkt->lsb_waitq.lock);
-        if (lu_object_is_dying(h) ||
-            test_bit(LU_OBJECT_UNHASHED, &h->loh_flags)) {
-                spin_unlock(&bkt->lsb_waitq.lock);
-                rcu_read_unlock();
-                if (new) {
-                        /*
-                         * Old object might have already been removed, or will
-                         * be soon.  We need to insert our new object, so
-                         * remove the old one just in case it is still there.
-                         */
-                        rhashtable_remove_fast(&s->ls_obj_hash, &h->loh_hash,
-                                               obj_hash_params);
-                        goto try_again;
-                }
-                lprocfs_counter_incr(s->ls_stats, LU_SS_CACHE_MISS);
-                return ERR_PTR(-ENOENT);
-        }
-
-If the existing lu_object is dropped from the hash by lu_site_purge before it calls the "lu_object_free" to free the lu_object, and the "lu_object_find_at" won't know there is another lu_object to be deleted by lu_site_purge, then it will destroy the OSD object after creating the new lu_object, which could race with it and lead to this issue.
-
-Yes, the "nlink == 0" causes the inode to be put on the orphan list by "ldiskfs_truncate", which trigger the LASSERTION.
-
-There is LLOG object to be used during mount, and it could be same issue, but will look it more detailedly for other casuses.
-
-Thanks
+my point view - it's so hard to have it fast.
 
 --- Comment (shadow, Thu, 21 May 2026 12:31:41 +0000) ---
 in my case, it's llog so no parallel ofd_destroy possible.
@@ -304,18 +266,56 @@ struct osd_object {
   oo_header = 0x0
 }
 
---- Comment (shadow, Thu, 21 May 2026 11:28:37 +0000) ---
-hongchao
+--- Comment (hongchao.zhang, Wed, 27 May 2026 09:10:10 +0000) ---
+Hi,
 
-can you explain bit more how it can be created a new lu object before old flushed and it object had moved into LRU list to be free?
+In "htable_lookup" (lu_object.c), if there is an existing object and the object is not in use, it will drop the object from the hash immediately and retry the insertion of the new object, and it will wait the shadow object to be "inited" or "dying" if the shadow
 
-my point view - it's so hard to have it fast.
+object is still in use.
 
---- Comment (shadow, Thu, 21 May 2026 09:57:36 +0000) ---
-It looks like - we don't have a second thread for a free - but it's log (my coredump).
+        if (atomic_inc_not_zero(&h->loh_ref)) {
+                rcu_read_unlock();
+                return lu_object_top(h);
+        }
 
---- Comment (hongchao.zhang, Thu, 19 Mar 2026 11:01:34 +0000) ---
-the patch is tracked at https://review.whamcloud.com/c/fs/lustre-release/+/64691
+        spin_lock(&bkt->lsb_waitq.lock);
+        if (lu_object_is_dying(h) ||
+            test_bit(LU_OBJECT_UNHASHED, &h->loh_flags)) {
+                spin_unlock(&bkt->lsb_waitq.lock);
+                rcu_read_unlock();
+                if (new) {
+                        /*
+                         * Old object might have already been removed, or will
+                         * be soon.  We need to insert our new object, so
+                         * remove the old one just in case it is still there.
+                         */
+                        rhashtable_remove_fast(&s->ls_obj_hash, &h->loh_hash,
+                                               obj_hash_params);
+                        goto try_again;
+                }
+                lprocfs_counter_incr(s->ls_stats, LU_SS_CACHE_MISS);
+                return ERR_PTR(-ENOENT);
+        }
 
---- Comment (bzzz, Wed, 18 Mar 2026 10:09:10 +0000) ---
-for a reason I can't comment in DDN-6641, so here.. I think lu_site_purge() should ignore objects being used (another thread was in ofd_destroy()) ?
+If the existing lu_object is dropped from the hash by lu_site_purge before it calls the "lu_object_free" to free the lu_object, and the "lu_object_find_at" won't know there is another lu_object to be deleted by lu_site_purge, then it will destroy the OSD object after creating the new lu_object, which could race with it and lead to this issue.
+
+Yes, the "nlink == 0" causes the inode to be put on the orphan list by "ldiskfs_truncate", which trigger the LASSERTION.
+
+There is LLOG object to be used during mount, and it could be same issue, but will look it more detailedly for other casuses.
+
+Thanks
+
+--- Comment (shadow, Wed, 27 May 2026 13:14:55 +0000) ---
+I don't think it problem now. inode should have an nlink zero, just after destroy. Okey - from our theory it might called for different object, but  Lustre have duplicate an oo_destroy flag in the inode state field.
+
+>>
+
+osd_destroy ->         ldiskfs_set_inode_state(inode, LDISKFS_STATE_LUSTRE_DESTROY);
+
+>>
+
+but all crash dumps I have, don't have this state set - it have 0x7 as state.
+
+so no destroy called.
+
+as it's LLOG it can't be have a parallel access a specially ofd_destroy. (btw)
