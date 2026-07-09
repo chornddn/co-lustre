@@ -95,7 +95,7 @@ LustreError: 627533:0:(osc_cache.c:990:osc_extent_wait()) ### extent: 000000000f
                         <labels>
                     </labels>
                 <created>Thu, 26 Feb 2026 20:40:59 +0000</created>
-                <updated>Wed, 20 May 2026 06:23:46 +0000</updated>
+                <updated>Thu, 9 Jul 2026 04:09:17 +0000</updated>
                             <resolved>Fri, 6 Mar 2026 01:47:13 +0000</resolved>
                                     <version>Lustre 2.17.0</version>
                     <version>Lustre 2.18.0</version>
@@ -103,8 +103,74 @@ LustreError: 627533:0:(osc_cache.c:990:osc_extent_wait()) ### extent: 000000000f
                             <votes>0</votes>
                                     <watches>9</watches>
                                                                             <comments>
-                            <comment id="494116" author="JIRAUSER19463" created="Wed, 6 May 2026 18:26:43 +0000">&lt;p&gt;Hi Andreas - I saw your comment until now, I will take a look. This account is bound to my personal email and I don't have access to it on my working laptop. &lt;/p&gt;</comment>
-                            <comment id="494115" author="JIRAUSER19463" created="Wed, 6 May 2026 18:25:14 +0000">&lt;p&gt;nevermind&lt;/p&gt;</comment>
+                            <comment id="489247" author="adilger" created="Thu, 26 Feb 2026 20:41:49 +0000">&lt;p&gt;This code was changed from using &lt;tt&gt;l_wait_event()&lt;/tt&gt; with &lt;tt&gt;LWI_INTR()&lt;/tt&gt; (interruptible sleep) to &lt;tt&gt;wait_event_idle()&lt;/tt&gt; in patch &lt;a href="https://review.whamcloud.com/35971" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/35971&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-10467" title="use standard linux wait_event macros" class="issue-link" data-issue-key="LU-10467"&gt;&lt;del&gt;LU-10467&lt;/del&gt;&lt;/a&gt; lustre: use wait_event_idle() where appropriate").  It is worthwhile to change this back to an interruptible sleep, but that doesn't address the core issue of why the IO never completes.&lt;/p&gt;</comment>
+                            <comment id="489251" author="gerrit" created="Thu, 26 Feb 2026 21:36:51 +0000">&lt;p&gt;"Andreas Dilger &amp;lt;adilger@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/64250" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/64250&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19932" title="client write hang in osc_extent_wait()" class="issue-link" data-issue-key="LU-19932"&gt;&lt;del&gt;LU-19932&lt;/del&gt;&lt;/a&gt; osc: restore interruptible waits on client&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 7a635020fb4adfeabe71cd8d3ab52acb143b68dc&lt;/p&gt;</comment>
+                            <comment id="489256" author="adilger" created="Thu, 26 Feb 2026 22:23:35 +0000">&lt;p&gt;It looks from the console messages and if I read &lt;tt&gt;OSC_EXTENT_DUMP()&lt;/tt&gt; correctly, that &lt;tt&gt;oe_state=1&lt;/tt&gt; ("active") and it is waiting for &lt;tt&gt;state=0&lt;/tt&gt;.  The system is still running if there is interest to debug something live, but I'm not sure what to check next.&lt;/p&gt;</comment>
+                            <comment id="489591" author="adilger" created="Mon, 2 Mar 2026 22:25:53 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=jinshanx" class="user-hover" rel="jinshanx"&gt;jinshanx&lt;/a&gt;  I was looking at your old patch &lt;a href="https://review.whamcloud.com/8656" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/8656&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-4198" title="Improve IO performance when using DIRECT IO using libaio" class="issue-link" data-issue-key="LU-4198"&gt;&lt;del&gt;LU-4198&lt;/del&gt;&lt;/a&gt; clio: generalize cl_sync_io") while trying to restore the ability to interrupt a stuck IO.&lt;/p&gt;
+
+&lt;p&gt;Your old patch is removing the call to `cl_io_cancel()` (which was the only caller of this function, and was eventually removed in later patches), and it appears that the code now just waits forever until the IO is finished (which may never happen) and can never be interrupted, rather than trying to abort the in-flight IO and then exit quickly with an error.  There were some later changes to the waiting functions, but I think 8565 is the patch that fundamentally broke being able to interrupt an IO in &lt;tt&gt;cl_sync_io_wait()&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;Changing the (existing) `wait_event_idle()` to `l_wait_event_abortable()` allows the wait to be interrupted, but it immediately crashes in several sanityn test cases like:&lt;br/&gt;
+&lt;a href="https://testing.whamcloud.com/test_sets/f50e770b-a2d5-4bc6-8dd7-40240778c241" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/f50e770b-a2d5-4bc6-8dd7-40240778c241&lt;/a&gt;&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LustreError: 265444:0:(cl_io.c:1239:cl_sync_io_wait()) ASSERTION( atomic_read(&amp;amp;anchor-&amp;gt;csi_sync_nr) == 0 ) failed: 
+CPU: 0 PID: 265444 Comm: rw_seq_cst_vs_d Kdump: loaded Tainted: G           OE     -------- -  - 4.18.0-553.89.1.el8_10.x86_64 #1
+Call Trace:
+dump_stack+0x41/0x60
+lbug_with_loc.cold.7+0x5/0x43 [libcfs]
+cl_sync_io_wait+0x384/0x3c0 [obdclass]
+ll_io_read_page+0x6d3/0xa60 [lustre]
+ll_readpage+0xbd7/0x1140 [lustre]
+generic_file_buffered_read+0x5eb/0xbb0
+vvp_io_read_start+0x6a2/0x880 [lustre]
+cl_io_start+0x61/0x130 [obdclass]
+cl_io_loop+0x9e/0x220 [obdclass]
+ll_file_io_generic+0xb7d/0x11f0 [lustre]
+do_file_read_iter+0x951/0xfe0 [lustre]
+new_sync_read+0x10f/0x160
+vfs_read+0x91/0x150
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;I looked at restoring the &lt;tt&gt;cl_io_cancel()&lt;/tt&gt; call to &lt;tt&gt;cl_sync_io_wait()&lt;/tt&gt; but its function arguments no longer exist after your patch 8656.  I'm wondering if there is some other function that could be called to actively cancel the in-flight pages?  Something like the following to clean up all the pages?  or will that have other fallout?&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+        anchor-&amp;gt;csi_sync_rc = rc;
+        anchor-&amp;gt;csi_end_io(env, anchor);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Alternately, find the right arguments to call &lt;tt&gt;cl_io_cancel()&lt;/tt&gt; again...&lt;/p&gt;</comment>
+                            <comment id="489932" author="JIRAUSER19573" created="Thu, 5 Mar 2026 05:15:21 +0000">&lt;p&gt;OCI has a Customer hitting this issue with Lustre 2.16.59 clients as well. &lt;br/&gt;
+One more observation we had for 2.17 clients, disabling hybrid I/O avoids the issue. Running the repro given in the ticket after disabling hybrid I/O didn't encounter the issue.&lt;br/&gt;
+&lt;tt&gt;lctl set_param llite.*.hybrid_io=0&lt;/tt&gt;&lt;/p&gt;</comment>
+                            <comment id="490022" author="paf0186" created="Thu, 5 Mar 2026 15:02:38 +0000">&lt;p&gt;Very odd to be running 2.16.59 - that's a development version, not a release version!&lt;/p&gt;</comment>
+                            <comment id="490124" author="JIRAUSER19573" created="Thu, 5 Mar 2026 23:59:43 +0000">&lt;p&gt;Yeah agreed, The customer chose that version on their own.&lt;br/&gt;
+We are now suggesting them to use 2.17 with the workaround of just disabling hybrid I/O for now. &lt;/p&gt;</comment>
+                            <comment id="490130" author="paf0186" created="Fri, 6 Mar 2026 01:46:26 +0000">&lt;p&gt;This issue does appear to be a duplicate of &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt;; Andreas I don't want to lose the restore interruptible wait patch, but I feel this should be closed as a dupe in service of clarity...?&lt;/p&gt;
+
+&lt;p&gt;I'm going to do that and we'll figure out that patch.&lt;/p&gt;</comment>
+                            <comment id="490131" author="paf0186" created="Fri, 6 Mar 2026 01:47:13 +0000">&lt;p&gt;See &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt;.&lt;/p&gt;</comment>
+                            <comment id="490142" author="JIRAUSER19573" created="Fri, 6 Mar 2026 03:04:15 +0000">&lt;p&gt;@Patrick Farrell&lt;br/&gt;
+I did try out the 62095 patch but it didn't seem to help in this case. I was able to reproduce the hang with that small script Andreas has given in the description.&lt;br/&gt;
+&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/62095" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/62095&lt;/a&gt;&lt;/p&gt;</comment>
+                            <comment id="490157" author="paf0186" created="Fri, 6 Mar 2026 04:58:58 +0000">&lt;p&gt;interesting - it resolved it partially in my testing.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;try this in addition:&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/64331/5" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/64331/5&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;if those two together don’t work, can you look at getting debug logs and posting them here?&lt;/p&gt;</comment>
+                            <comment id="490310" author="JIRAUSER19573" created="Sat, 7 Mar 2026 05:48:04 +0000">&lt;p&gt;Hi Patrick&lt;br/&gt;
+Update - I applied both the patches and still see the issue repro'd.&lt;br/&gt;
+Will share debug logs soon&lt;/p&gt;</comment>
+                            <comment id="490317" author="paf0186" created="Sun, 8 Mar 2026 00:01:57 +0000">&lt;p&gt;Interesting, thanks.  -1 debug and your reproducer steps would be very helpful.&lt;/p&gt;</comment>
                             <comment id="490603" author="JIRAUSER19573" created="Tue, 10 Mar 2026 05:38:17 +0000">&lt;p&gt;Thanks for your patience Patrick. Attaching debug logs.&lt;/p&gt;
 
 &lt;p&gt;&lt;span class="nobr"&gt;&lt;a href="https://jira.whamcloud.com/secure/attachment/63526/63526_patched_2-17client_debug.log" title="patched_2-17client_debug.log attached to LU-19932"&gt;patched_2-17client_debug.log&lt;sup&gt;&lt;img class="rendericon" src="https://jira.whamcloud.com/images/icons/link_attachment_7.gif" height="7" width="7" align="absmiddle" alt="" border="0"/&gt;&lt;/sup&gt;&lt;/a&gt;&lt;/span&gt;&lt;/p&gt;
@@ -169,74 +235,8 @@ np.save(&lt;span class="code-quote"&gt;"/mnt/lustrefs/patched-debug-enabled.npy"
 &lt;p&gt; &lt;/p&gt;
 
 &lt;p&gt; &lt;/p&gt;</comment>
-                            <comment id="490317" author="paf0186" created="Sun, 8 Mar 2026 00:01:57 +0000">&lt;p&gt;Interesting, thanks.  -1 debug and your reproducer steps would be very helpful.&lt;/p&gt;</comment>
-                            <comment id="490310" author="JIRAUSER19573" created="Sat, 7 Mar 2026 05:48:04 +0000">&lt;p&gt;Hi Patrick&lt;br/&gt;
-Update - I applied both the patches and still see the issue repro'd.&lt;br/&gt;
-Will share debug logs soon&lt;/p&gt;</comment>
-                            <comment id="490157" author="paf0186" created="Fri, 6 Mar 2026 04:58:58 +0000">&lt;p&gt;interesting - it resolved it partially in my testing.&lt;/p&gt;
-
-&lt;p&gt; &lt;/p&gt;
-
-&lt;p&gt;try this in addition:&lt;/p&gt;
-
-&lt;p&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/64331/5" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/64331/5&lt;/a&gt;&lt;/p&gt;
-
-&lt;p&gt;if those two together don’t work, can you look at getting debug logs and posting them here?&lt;/p&gt;</comment>
-                            <comment id="490142" author="JIRAUSER19573" created="Fri, 6 Mar 2026 03:04:15 +0000">&lt;p&gt;@Patrick Farrell&lt;br/&gt;
-I did try out the 62095 patch but it didn't seem to help in this case. I was able to reproduce the hang with that small script Andreas has given in the description.&lt;br/&gt;
-&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/62095" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/62095&lt;/a&gt;&lt;/p&gt;</comment>
-                            <comment id="490131" author="paf0186" created="Fri, 6 Mar 2026 01:47:13 +0000">&lt;p&gt;See &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt;.&lt;/p&gt;</comment>
-                            <comment id="490130" author="paf0186" created="Fri, 6 Mar 2026 01:46:26 +0000">&lt;p&gt;This issue does appear to be a duplicate of &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt;; Andreas I don't want to lose the restore interruptible wait patch, but I feel this should be closed as a dupe in service of clarity...?&lt;/p&gt;
-
-&lt;p&gt;I'm going to do that and we'll figure out that patch.&lt;/p&gt;</comment>
-                            <comment id="490124" author="JIRAUSER19573" created="Thu, 5 Mar 2026 23:59:43 +0000">&lt;p&gt;Yeah agreed, The customer chose that version on their own.&lt;br/&gt;
-We are now suggesting them to use 2.17 with the workaround of just disabling hybrid I/O for now. &lt;/p&gt;</comment>
-                            <comment id="490022" author="paf0186" created="Thu, 5 Mar 2026 15:02:38 +0000">&lt;p&gt;Very odd to be running 2.16.59 - that's a development version, not a release version!&lt;/p&gt;</comment>
-                            <comment id="489932" author="JIRAUSER19573" created="Thu, 5 Mar 2026 05:15:21 +0000">&lt;p&gt;OCI has a Customer hitting this issue with Lustre 2.16.59 clients as well. &lt;br/&gt;
-One more observation we had for 2.17 clients, disabling hybrid I/O avoids the issue. Running the repro given in the ticket after disabling hybrid I/O didn't encounter the issue.&lt;br/&gt;
-&lt;tt&gt;lctl set_param llite.*.hybrid_io=0&lt;/tt&gt;&lt;/p&gt;</comment>
-                            <comment id="489591" author="adilger" created="Mon, 2 Mar 2026 22:25:53 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=jinshanx" class="user-hover" rel="jinshanx"&gt;jinshanx&lt;/a&gt;  I was looking at your old patch &lt;a href="https://review.whamcloud.com/8656" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/8656&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-4198" title="Improve IO performance when using DIRECT IO using libaio" class="issue-link" data-issue-key="LU-4198"&gt;&lt;del&gt;LU-4198&lt;/del&gt;&lt;/a&gt; clio: generalize cl_sync_io") while trying to restore the ability to interrupt a stuck IO.&lt;/p&gt;
-
-&lt;p&gt;Your old patch is removing the call to `cl_io_cancel()` (which was the only caller of this function, and was eventually removed in later patches), and it appears that the code now just waits forever until the IO is finished (which may never happen) and can never be interrupted, rather than trying to abort the in-flight IO and then exit quickly with an error.  There were some later changes to the waiting functions, but I think 8565 is the patch that fundamentally broke being able to interrupt an IO in &lt;tt&gt;cl_sync_io_wait()&lt;/tt&gt;.&lt;/p&gt;
-
-&lt;p&gt;Changing the (existing) `wait_event_idle()` to `l_wait_event_abortable()` allows the wait to be interrupted, but it immediately crashes in several sanityn test cases like:&lt;br/&gt;
-&lt;a href="https://testing.whamcloud.com/test_sets/f50e770b-a2d5-4bc6-8dd7-40240778c241" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/f50e770b-a2d5-4bc6-8dd7-40240778c241&lt;/a&gt;&lt;/p&gt;
-&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
-&lt;pre&gt;LustreError: 265444:0:(cl_io.c:1239:cl_sync_io_wait()) ASSERTION( atomic_read(&amp;amp;anchor-&amp;gt;csi_sync_nr) == 0 ) failed: 
-CPU: 0 PID: 265444 Comm: rw_seq_cst_vs_d Kdump: loaded Tainted: G           OE     -------- -  - 4.18.0-553.89.1.el8_10.x86_64 #1
-Call Trace:
-dump_stack+0x41/0x60
-lbug_with_loc.cold.7+0x5/0x43 [libcfs]
-cl_sync_io_wait+0x384/0x3c0 [obdclass]
-ll_io_read_page+0x6d3/0xa60 [lustre]
-ll_readpage+0xbd7/0x1140 [lustre]
-generic_file_buffered_read+0x5eb/0xbb0
-vvp_io_read_start+0x6a2/0x880 [lustre]
-cl_io_start+0x61/0x130 [obdclass]
-cl_io_loop+0x9e/0x220 [obdclass]
-ll_file_io_generic+0xb7d/0x11f0 [lustre]
-do_file_read_iter+0x951/0xfe0 [lustre]
-new_sync_read+0x10f/0x160
-vfs_read+0x91/0x150
-&lt;/pre&gt;
-&lt;/div&gt;&lt;/div&gt;
-
-&lt;p&gt;I looked at restoring the &lt;tt&gt;cl_io_cancel()&lt;/tt&gt; call to &lt;tt&gt;cl_sync_io_wait()&lt;/tt&gt; but its function arguments no longer exist after your patch 8656.  I'm wondering if there is some other function that could be called to actively cancel the in-flight pages?  Something like the following to clean up all the pages?  or will that have other fallout?&lt;/p&gt;
-&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
-&lt;pre class="code-java"&gt;
-        anchor-&amp;gt;csi_sync_rc = rc;
-        anchor-&amp;gt;csi_end_io(env, anchor);
-&lt;/pre&gt;
-&lt;/div&gt;&lt;/div&gt;
-&lt;p&gt;Alternately, find the right arguments to call &lt;tt&gt;cl_io_cancel()&lt;/tt&gt; again...&lt;/p&gt;</comment>
-                            <comment id="489256" author="adilger" created="Thu, 26 Feb 2026 22:23:35 +0000">&lt;p&gt;It looks from the console messages and if I read &lt;tt&gt;OSC_EXTENT_DUMP()&lt;/tt&gt; correctly, that &lt;tt&gt;oe_state=1&lt;/tt&gt; ("active") and it is waiting for &lt;tt&gt;state=0&lt;/tt&gt;.  The system is still running if there is interest to debug something live, but I'm not sure what to check next.&lt;/p&gt;</comment>
-                            <comment id="489251" author="gerrit" created="Thu, 26 Feb 2026 21:36:51 +0000">&lt;p&gt;"Andreas Dilger &amp;lt;adilger@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/64250" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/64250&lt;/a&gt;&lt;br/&gt;
-Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19932" title="client write hang in osc_extent_wait()" class="issue-link" data-issue-key="LU-19932"&gt;&lt;del&gt;LU-19932&lt;/del&gt;&lt;/a&gt; osc: restore interruptible waits on client&lt;br/&gt;
-Project: fs/lustre-release&lt;br/&gt;
-Branch: master&lt;br/&gt;
-Current Patch Set: 1&lt;br/&gt;
-Commit: 7a635020fb4adfeabe71cd8d3ab52acb143b68dc&lt;/p&gt;</comment>
-                            <comment id="489247" author="adilger" created="Thu, 26 Feb 2026 20:41:49 +0000">&lt;p&gt;This code was changed from using &lt;tt&gt;l_wait_event()&lt;/tt&gt; with &lt;tt&gt;LWI_INTR()&lt;/tt&gt; (interruptible sleep) to &lt;tt&gt;wait_event_idle()&lt;/tt&gt; in patch &lt;a href="https://review.whamcloud.com/35971" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/35971&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-10467" title="use standard linux wait_event macros" class="issue-link" data-issue-key="LU-10467"&gt;&lt;del&gt;LU-10467&lt;/del&gt;&lt;/a&gt; lustre: use wait_event_idle() where appropriate").  It is worthwhile to change this back to an interruptible sleep, but that doesn't address the core issue of why the IO never completes.&lt;/p&gt;</comment>
+                            <comment id="494115" author="JIRAUSER19463" created="Wed, 6 May 2026 18:25:14 +0000">&lt;p&gt;nevermind&lt;/p&gt;</comment>
+                            <comment id="494116" author="JIRAUSER19463" created="Wed, 6 May 2026 18:26:43 +0000">&lt;p&gt;Hi Andreas - I saw your comment until now, I will take a look. This account is bound to my personal email and I don't have access to it on my working laptop. &lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10010">
