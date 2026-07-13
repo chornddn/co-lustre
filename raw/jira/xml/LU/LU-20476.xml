@@ -1,0 +1,176 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20476] o2iblnd: double destroy of cm_id on netevent UNREACHABLE</title>
+                <link>https://jira.whamcloud.com/browse/LU-20476</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;A server that loses all of its o2ib interfaces at once (switch failure, or&lt;br/&gt;
+every port unplugged) panics in kiblnd_connd() about 5 minutes later:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;general protection fault, probably for non-canonical address 0xdead000000000200
+RIP: 0010:_destroy_id+0x18c/0x300 [rdma_cm]
+RAX: dead000000000100  RDX: dead000000000200
+Call Trace:
+ kiblnd_destroy_conn+0x29f/0x670 [ko2iblnd]
+ kiblnd_connd+0xfa/0x980 [ko2iblnd]
+ kthread+0x134/0x150
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;RAX and RDX are LIST_POISON1 and LIST_POISON2, so the hlist node in the&lt;br/&gt;
+cm_id has already been unlinked once. The cm_id was destroyed before&lt;br/&gt;
+kiblnd_destroy_conn() called rdma_destroy_id() on it, i.e. this is a&lt;br/&gt;
+double destroy.&lt;/p&gt;
+
+&lt;p&gt;The first destroy comes from the CMA netevent notifier added in&lt;br/&gt;
+925d046e7e52 "RDMA/core: Add a netevent notifier to cma" (v6.0).&lt;br/&gt;
+cma_netevent_work_handler() delivers RDMA_CM_EVENT_UNREACHABLE to the ULP&lt;br/&gt;
+and, if the ULP handler returns non-zero, destroys the cm_id itself:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;	if (cma_cm_event_handler(id_priv, &amp;amp;event)) {
+		__acquire(&amp;amp;id_priv-&amp;gt;handler_mutex);
+		id_priv-&amp;gt;cm_id.ib = NULL;
+		cma_id_put(id_priv);
+		destroy_id_handler_unlock(id_priv);
+		return;
+	}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;o2iblnd returns non-zero from UNREACHABLE when the cm_id context is NULL:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;	case RDMA_CM_EVENT_UNREACHABLE:
+		conn = cmid-&amp;gt;context;
+
+		/* In case we have a flapping network, we can get this event
+		 * before conn is created */
+		if (conn == NULL)
+			return -ENETDOWN;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;That comment, and the commit that added the check (47b4886e12dc "&lt;a href="https://jira.whamcloud.com/browse/LU-18897" title="NULL pointer dereference when handling RDMA_CM_EVENT_UNREACHABLE with no context" class="issue-link" data-issue-key="LU-18897"&gt;&lt;del&gt;LU-18897&lt;/del&gt;&lt;/a&gt;&lt;br/&gt;
+o2iblnd: NULL pointer dereference"), assume a NULL context means no conn&lt;br/&gt;
+has been created yet. It doesn't. The only assignment of NULL to a cm_id&lt;br/&gt;
+context anywhere in o2iblnd is in the DISCONNECTED handler:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;	case RDMA_CM_EVENT_DISCONNECTED:
+		...
+		kiblnd_conn_decref(conn);
+		cmid-&amp;gt;context = NULL;
+		return 0;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Before a conn exists the context is not NULL, it is the kib_peer_ni that&lt;br/&gt;
+kiblnd_connect_peer() passed to rdma_create_id() (or, on the passive side,&lt;br/&gt;
+the kib_dev inherited from the listener). So a NULL context at UNREACHABLE&lt;br/&gt;
+can only mean that DISCONNECTED has already run and the conn is a zombie&lt;br/&gt;
+waiting for connd, which is exactly the case where o2iblnd still owns the&lt;br/&gt;
+cm_id. The -ENETDOWN hands that cm_id to rdma_cm to destroy, and&lt;br/&gt;
+kiblnd_destroy_conn() then calls rdma_destroy_id() on it a second time.&lt;/p&gt;
+
+&lt;p&gt;Returning 0 instead is correct and does not leak: the conn still holds&lt;br/&gt;
+ibc_cmid, and connd destroys the cm_id in kiblnd_destroy_conn() before&lt;br/&gt;
+freeing the conn, so the cm_id never outlives the conn.&lt;/p&gt;
+
+&lt;p&gt;Note that we return before the CNETERR, so there is nothing in the logs to&lt;br/&gt;
+show that the UNREACHABLE arrived.&lt;/p&gt;
+
+&lt;p&gt;There is a second problem in the same handler. An id becomes eligible for&lt;br/&gt;
+netevent UNREACHABLE once cma_add_id_to_tree() puts it in the id table,&lt;br/&gt;
+which happens in rdma_resolve_route() on the RoCE path only. o2iblnd calls&lt;br/&gt;
+rdma_resolve_route() from the ADDR_RESOLVED handler, but does not create&lt;br/&gt;
+the conn until ROUTE_RESOLVED. For the duration of the route resolve the id&lt;br/&gt;
+is in the table with its context still pointing at a kib_peer_ni, and an&lt;br/&gt;
+UNREACHABLE delivered in that window is read as a kib_conn:&lt;br/&gt;
+conn-&amp;gt;ibc_peer-&amp;gt;ibp_nid in the CNETERR dereferences a kib_peer_ni as a&lt;br/&gt;
+kib_conn. Narrow, but a link loss is precisely when neighbour&lt;br/&gt;
+invalidations are flying.&lt;/p&gt;
+
+&lt;p&gt;Both problems are only reachable via the netevent notifier, so they need an&lt;br/&gt;
+IP based fabric (RoCE) and an OFED new enough to carry 925d046e7e52. Prior&lt;br/&gt;
+to that, UNREACHABLE could only arrive from cma_ib_handler() while a&lt;br/&gt;
+connect was in flight, where the context is always a live conn. Dropping&lt;br/&gt;
+every port on a server at once and waiting ~5 minutes reproduced the panic&lt;br/&gt;
+on 3 of 4 servers, so it is straightforward to verify a fix against.&lt;/p&gt;
+
+&lt;p&gt;Proposed fix:&lt;/p&gt;
+
+&lt;p&gt;1. UNREACHABLE must never return non-zero for a cm_id that o2iblnd owns.&lt;br/&gt;
+   Return 0 on the NULL context.&lt;br/&gt;
+2. Distinguish the pre-conn (kib_peer_ni) context from a conn context so&lt;br/&gt;
+   UNREACHABLE cannot type-confuse the two.&lt;br/&gt;
+3. Reorder kiblnd_destroy_conn() to call rdma_destroy_id() before&lt;br/&gt;
+   kiblnd_peer_decref(). Today the peer reference is dropped while the&lt;br/&gt;
+   cm_id is still live and a netevent handler may still be running on it.&lt;br/&gt;
+   rdma_destroy_id() blocks until in-flight handlers complete, so doing it&lt;br/&gt;
+   first closes that window.&lt;/p&gt;
+
+&lt;p&gt;1) is the panic and is a one line change. 2) and 3) are latent.&lt;/p&gt;
+
+&lt;p&gt;I'm opening this as critical because it panics the node and reproduces&lt;br/&gt;
+reliably on a total link loss.&lt;/p&gt;</description>
+                <environment />
+        <key id="98488">LU-20476</key>
+            <summary>o2iblnd: double destroy of cm_id on netevent UNREACHABLE</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="2" iconUrl="https://jira.whamcloud.com/images/icons/priorities/critical.svg">Critical</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                            <label>o2iblnd</label>
+                    </labels>
+                <created>Mon, 13 Jul 2026 14:56:56 +0000</created>
+                <updated>Mon, 13 Jul 2026 15:18:01 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="88947">LU-18897</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06wov:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
