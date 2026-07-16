@@ -1,0 +1,386 @@
+Change:     67282
+Subject:    LU-20483 lov: fix lo_loi NULL deref in DOM layout init
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67282
+Change-Id:  I280e07709d349313166f7b525ca91e6cb7150bbb
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sunghwan Kim
+Created:    2026-07-16 05:54:38.000000000
+Updated:    2026-07-16 13:09:55.000000000
+Patch Set:  1
+Insertions: +32
+Deletions:  -4
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20483 lov: fix lo_loi NULL deref in DOM layout init
+
+A race in lov_init_dom() allows lov_attr_get_dom() to dereference
+a NULL lo_loi pointer at offset 0x48 (loi_lvb.lvb_blocks).
+
+  BUG: NULL pointer dereference at 0000000000000048
+  RIP: lov_attr_get_dom+0x24/0x90
+
+Two race windows:
+
+Window A: Between LOOP1 (sets lle_valid=1) and LOOP2 (lov_init_dom),
+lo_loi is NULL. Concurrent lov_attr_get_composite() can reach
+lov_attr_get_dom() with lo_attr_valid=0 and crash on loi->loi_lvb.
+
+Window B: Inside lov_init_dom(), lo_dom_r0 fields are written before
+lo_loi with no ordering barrier, so concurrent readers may observe
+a partially initialized state.
+
+Fix:
+1. Defer lo_loi load in lov_attr_get_dom() past the lo_attr_valid
+   fast-path; guard with smp_load_acquire() + NULL check (return 0).
+2. Publish lo_loi last in lov_init_dom() via smp_store_release(),
+   pairing with the acquire in lov_attr_get_dom().
+3. Guard lov_oinfo_is_dummy() in fiemap path against NULL lo_loi.
+4. Initialize lo_preferred_mirror=0 early for non-FLR files to
+   prevent concurrent lov_io_mirror_init() from hitting LASSERT.
+5. Guard i_size_write() in ll_merge_attr_nolock(): skip when
+   cat_size=0 but inode has non-zero i_size, preventing O_APPEND
+   position corruption during the initialization race window.
+
+Reproducer: concurrent O_APPEND writes crossing the 1 MB DOM
+threshold trigger a layout change while other threads read file
+attributes via ll_merge_attr().
+
+Known limitation: FLR+DOM files have a pre-existing race where
+lo_preferred_mirror==-1 can reach lov_io_mirror_init() and index
+lo_mirrors[-1]. Fix 1 removes the NULL deref crash that prevented
+reaching this path; this pre-existing issue is not addressed in
+this patch.
+
+Assisted-by: Claude:claude-sonnet-4-6 [Claude Code]
+Signed-off-by: Sunghwan Kim <shkim3220@gluesys.com>
+Change-Id: I280e07709d349313166f7b525ca91e6cb7150bbb
+
+--- Review History ---
+
+--- Message (Sunghwan Kim, 2026-07-16 05:54:38.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-16 05:57:50.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-16 05:59:54.000000000) ---
+Patch Set 1:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66243/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-07-16 06:04:07.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-16 06:43:01.000000000) ---
+Patch Set 1:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66243/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-07-16 06:43:17.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127659/ : SUCCESS
+
+--- Message (Maloo, 2026-07-16 06:44:19.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 127659 (patch #1):
+
+#### Enforced:
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=127659&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=127659#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-07-16 07:50:05.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-07-16 10:12:31.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm161: https://testing.whamcloud.com/test_sessions/418b0ef7-d34f-4a19-954c-0ae4e9303cad ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-07-16 10:55:42.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm197: https://testing.whamcloud.com/test_sessions/ede11be8-7fc7-4c72-a28e-b72239262566 ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-16 11:12:40.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm202: https://testing.whamcloud.com/test_sessions/be4c9782-88b6-4d9e-a421-32f2ea538579 ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-16 11:15:13.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm194: https://testing.whamcloud.com/test_sessions/cfb7c8fd-80ab-411d-b911-15d50ec6b097 ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-16 11:23:23.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm212: https://testing.whamcloud.com/test_sessions/8c3600c8-0430-44ea-ad11-35d38c045536 ran 5 tests.  2 tests failed: recovery-small, lustre-rsync-test.
+
+--- Message (Maloo, 2026-07-16 11:26:26.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm162: https://testing.whamcloud.com/test_sessions/1cea676c-5d54-4d54-9fa8-366da7d22917 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-07-16 11:34:29.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-5 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm161: https://testing.whamcloud.com/test_sessions/7bae40c9-7d6b-4c02-a930-dc92d631e1fa ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-07-16 11:38:21.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-4 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm131: https://testing.whamcloud.com/test_sessions/5c423140-b6e0-432d-bb29-57729c402a95 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 11:50:45.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm147: https://testing.whamcloud.com/test_sessions/1e244e95-ec6a-4433-9c68-1c691fc7f6ba ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 12:15:30.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-4 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm156: https://testing.whamcloud.com/test_sessions/19c443d5-83d8-431c-967d-b58429b45976 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 12:16:39.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm152: https://testing.whamcloud.com/test_sessions/119d67a3-a78a-449d-8c20-c038dcd0b394 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 12:17:04.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-zfs-part-4 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm159: https://testing.whamcloud.com/test_sessions/c34e1f8d-8374-4fda-94fe-ee4256088400 ran 9 tests.  2 tests failed: sanity-quota, sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 12:23:08.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm146: https://testing.whamcloud.com/test_sessions/0df8dd23-2b22-488f-8ae4-4aa3a55c99e7 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 12:30:03.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm166: https://testing.whamcloud.com/test_sessions/b746de2f-ae61-4af1-8afd-fe3b0a327a94 ran 9 tests.  2 tests failed: racer, parallel-scale.
+
+--- Message (Maloo, 2026-07-16 12:34:53.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm200: https://testing.whamcloud.com/test_sessions/7c9841d4-bb1a-4b2c-9fc2-1f2d0273bfed ran 11 tests.  3 tests failed: racer, parallel-scale, sanity-benchmark.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-07-16 12:35:46.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-2 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm154: https://testing.whamcloud.com/test_sessions/c99677f0-ab5b-4b21-9ca7-4fcd9edf5291 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-07-16 12:44:38.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm177: https://testing.whamcloud.com/test_sessions/a99bc57e-56b5-49c6-87c3-654ea96d7a78 ran 11 tests.  2 tests failed: racer, sanity-benchmark.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-07-16 12:58:55.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm171: https://testing.whamcloud.com/test_sessions/3270da3d-f0a0-4d98-b376-db4fb6c74488 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 13:07:04.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-4 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm166: https://testing.whamcloud.com/test_sessions/e10c5530-8af6-4f77-b044-679d4ff2aaaf ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-07-16 13:09:55.000000000) ---
+Patch Set 1:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm205: https://testing.whamcloud.com/test_sessions/1ad8b68f-2b8f-408a-853c-c1df47dadffc ran 6 tests.  3 tests failed: sanity-sec, sanity-lnet, sanity.
+%% THIS TEST SESSION CRASHED %%

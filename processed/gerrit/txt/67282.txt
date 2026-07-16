@@ -1,0 +1,93 @@
+Change:     67282
+Subject:    LU-20483 lov: fix lo_loi NULL deref in DOM layout init
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67282
+Change-Id:  I280e07709d349313166f7b525ca91e6cb7150bbb
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sunghwan Kim
+Created:    2026-07-16 05:54:38.000000000
+Updated:    2026-07-16 13:09:55.000000000
+Patch Set:  1
+Insertions: +32
+Deletions:  -4
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20483 lov: fix lo_loi NULL deref in DOM layout init
+
+A race in lov_init_dom() allows lov_attr_get_dom() to dereference
+a NULL lo_loi pointer at offset 0x48 (loi_lvb.lvb_blocks).
+
+  BUG: NULL pointer dereference at 0000000000000048
+  RIP: lov_attr_get_dom+0x24/0x90
+
+Two race windows:
+
+Window A: Between LOOP1 (sets lle_valid=1) and LOOP2 (lov_init_dom),
+lo_loi is NULL. Concurrent lov_attr_get_composite() can reach
+lov_attr_get_dom() with lo_attr_valid=0 and crash on loi->loi_lvb.
+
+Window B: Inside lov_init_dom(), lo_dom_r0 fields are written before
+lo_loi with no ordering barrier, so concurrent readers may observe
+a partially initialized state.
+
+Fix:
+1. Defer lo_loi load in lov_attr_get_dom() past the lo_attr_valid
+   fast-path; guard with smp_load_acquire() + NULL check (return 0).
+2. Publish lo_loi last in lov_init_dom() via smp_store_release(),
+   pairing with the acquire in lov_attr_get_dom().
+3. Guard lov_oinfo_is_dummy() in fiemap path against NULL lo_loi.
+4. Initialize lo_preferred_mirror=0 early for non-FLR files to
+   prevent concurrent lov_io_mirror_init() from hitting LASSERT.
+5. Guard i_size_write() in ll_merge_attr_nolock(): skip when
+   cat_size=0 but inode has non-zero i_size, preventing O_APPEND
+   position corruption during the initialization race window.
+
+Reproducer: concurrent O_APPEND writes crossing the 1 MB DOM
+threshold trigger a layout change while other threads read file
+attributes via ll_merge_attr().
+
+Known limitation: FLR+DOM files have a pre-existing race where
+lo_preferred_mirror==-1 can reach lov_io_mirror_init() and index
+lo_mirrors[-1]. Fix 1 removes the NULL deref crash that prevented
+reaching this path; this pre-existing issue is not addressed in
+this patch.
+
+Assisted-by: Claude:claude-sonnet-4-6 [Claude Code]
+Signed-off-by: Sunghwan Kim <shkim3220@gluesys.com>
+Change-Id: I280e07709d349313166f7b525ca91e6cb7150bbb
+
+--- Review History ---
+
+--- Message (Sunghwan Kim, 2026-07-16 05:54:38.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-16 05:57:50.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-16 06:04:07.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-16 06:43:17.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127659/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-16 07:50:05.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
