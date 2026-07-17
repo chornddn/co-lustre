@@ -7,62 +7,42 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-14 22:35:51.000000000
-Updated:    2026-07-13 08:15:26.000000000
-Patch Set:  9
-Insertions: +326
+Updated:    2026-07-17 13:52:21.000000000
+Patch Set:  11
+Insertions: +304
 Deletions:  -0
-Comments:   44 (2 unresolved)
-Hashtags:   master-next
+Comments:   56 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1; Sebastien Buisson: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Sebastien Buisson, Matt Raso-Barnett
 
 --- Commit Message ---
 LU-20119 selinux: add lustre_helpers SELinux policy module
 
-Helpers launched by the kernel via call_usermodehelper()
-(l_getsepol, lctl, l_getidentity, l_getauth) are execed from
-kernel_t and, when labeled bin_t, transition into the base
-policy's kernel_generic_helper_t domain.  On RHEL/Rocky 9 that
-domain is broadly privileged and the helpers work unmodified.
-On RHEL/Rocky 10 it is much more restricted -- in particular it
-cannot read selinuxfs or the on-disk SELinux policy -- so under
-enforcing mode the helpers fail: l_getsepol returns -EACCES
-(mount aborts after 30s), lctl cannot apply root_squash, and
-l_getidentity/l_getauth are denied.
+RHEL/Rocky 10+ dropped kernel_generic_helper_t from the base
+selinux-policy (selinux-policy-42.1.7), causing SELinux to deny
+every call_usermodehelper() spawn under enforcing mode. This
+breaks l_getsepol (mount aborts after 30s), lctl (root_squash
+not applied), l_getidentity, and l_getauth.
 
 Introduce a dedicated lustre_helper_t domain with a
 lustre_helper_exec_t file type for the Lustre helper binaries.
-A type_transition rule moves kernel_t to lustre_helper_t on exec
-of those binaries, confining all needed permissions to Lustre
+A type_transition rule transitions kernel_t to lustre_helper_t
+on exec of those binaries, confining all permissions to Lustre
 helpers only -- no other call_usermodehelper() callers are
-affected, and the shared kernel_generic_helper_t domain is left
-untouched.
+affected.
 
-For that transition to fire the helper binaries must actually
-carry the lustre_helper_exec_t label, which requires two things:
-
-  - lustre_helpers.fc lists both /usr/bin and /usr/sbin paths for
-    each helper.  The binaries install under /usr/sbin, but on
-    RHEL/Rocky 10.2+ SELinux applies a "/usr/sbin = /usr/bin"
-    file-context equivalency (file_contexts.subs_dist), so
-    restorecon of /usr/sbin/l_getsepol is resolved against
-    /usr/bin and only a /usr/bin rule matches; on el8/el9 and
-    el10.0/10.1 there is no such equivalency and the /usr/sbin
-    rule matches the real path.  Listing both covers every case;
-    the unused entry is harmless.
-
-  - The label is applied by restorecon.  semodule -i does not
-    relabel already-installed files, and the binaries were
-    labeled bin_t at install time (before the module was loaded),
-    so lustre.spec.in %post now runs restorecon after semodule -i.
-    make install already did this for direct source installs, but
-    it is skipped for staged/RPM builds where DESTDIR is set.
+On RHEL/Rocky 9 the base policy's kernel_t ->
+kernel_generic_helper_t transition covers all UMH helpers and
+Lustre works without this module. On RHEL/Rocky 10 that
+transition was removed together with kernel_generic_helper_t
+itself, so kernel_t execs the helper binary directly; the
+kernel_t -> lustre_helper_t transition handles that case.
 
 Additionally cover lgss_keyring, the GSS/SSK credential helper.
 Unlike the helpers above it is not run via call_usermodehelper()
@@ -83,7 +63,6 @@ Files added/modified:
   lustre/utils/selinux/lustre_helpers.te  - policy source
   lustre/utils/selinux/lustre_helpers.fc  - file context labels
   lustre/utils/selinux/Makefile.am        - build and install rules
-  lustre.spec.in                          - %post restorecon
 
 Build-time detection in config/lustre-core.m4 via the new
 LC_CONFIG_SELINUX_POLICY macro auto-enables the module when
@@ -93,21 +72,40 @@ PLATFORM_ID is platform:el10 or later; can be overridden with
 
 For direct source installs (DESTDIR unset), make install runs
 semodule -i and restorecon immediately. For RPM installs,
-lustre.spec.in runs semodule -i and restorecon in %post and
-semodule -r in %preun.
+lustre.spec.in runs semodule -i in %post and semodule -r in
+%preun.
 
 The RPM bcond (lustre_selinux_policy) is enabled by default on
 RHEL 10+ (%rhel >= 10) and disabled on all other distros.
 
-RHEL 9.7 (selinux-policy-38.1.65) is unaffected because its
-kernel_generic_helper_t domain is broadly privileged. The
+RHEL 9.7 (selinux-policy-38.1.65) is unaffected as
+kernel_generic_helper_t is fully defined there. The
 call_usermodehelper helpers were tested on Rocky 10.1
-(selinux-policy-42.1.7) and RHEL 10.0 with SELinux enforcing. The
-lgss_keyring rules were verified on RHEL 10.2 (selinux-policy-
-42.1.18) with SELinux enforcing: with them loaded, lgss_keyring
-passes all SELinux checks (zero keyutils_request_t denials) and
-SSK context negotiation proceeds.
+(selinux-policy-42.1.7) with SELinux enforcing. The lgss_keyring
+rules were verified on RHEL 10.2 (selinux-policy-42.1.18) with
+SELinux enforcing: with them loaded, lgss_keyring passes all
+SELinux checks (zero keyutils_request_t denials) and SSK context
+negotiation proceeds.
 
+lustre_helpers.fc uses /usr/bin/ paths even though the binaries
+are physically installed under /usr/sbin/.  On RHEL/Rocky 10
+the SELinux policy database contains an equivalency rule
+"/usr/sbin = /usr/bin", which causes restorecon and matchpathcon
+to resolve any /usr/sbin/ path to its /usr/bin/ equivalent
+before looking up file context rules.  A rule written as
+/usr/sbin/l_getsepol is therefore silently bypassed: restorecon
+resolves the file to /usr/bin/l_getsepol, finds no matching
+rule, and falls back to the default bin_t label, leaving the
+binary unlabeled as lustre_helper_exec_t and the type transition
+ineffective.  Writing the rules as /usr/bin/l_getsepol matches
+the resolved path and restorecon correctly applies
+lustre_helper_exec_t to the file at its /usr/sbin/ location.
+This is safe because the module is only installed on el10+
+where the equivalency rule is present.
+
+Test-Parameters: trivial
+Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.0
+Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.1
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.0
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.1
 Change-Id: I1ad770867d2e48be9b72c128d50d2f246f79bdfe
@@ -462,3 +460,133 @@ Patch Set 9:
 
 --- Message (Marc Vef, 2026-07-13 08:15:26.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-07-16 18:39:34.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-16 19:41:13.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-16 19:54:54.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-16 19:56:32.000000000) ---
+Patch Set 10:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-16 19:59:14.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-16 20:02:36.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127685/ : FAILURE
+
+--- Message (wc-checkpatch, 2026-07-16 20:06:53.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-16 20:20:51.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-07-17 08:46:43.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-07-17 08:46:43.000000000) ---
+Patch Set 10:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-07-17 08:46:44.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Sebastien Buisson, 2026-07-17 09:04:33.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (jenkins, 2026-07-17 09:09:57.000000000) ---
+Patch Set 10:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127722/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-07-17 09:52:13.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (jenkins, 2026-07-17 09:58:43.000000000) ---
+Patch Set 10:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127725/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-07-17 10:08:22.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Sebastien Buisson, 2026-07-17 10:57:42.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-07-17 13:00:39.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Sebastien Buisson, 2026-07-17 13:12:42.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-07-17 13:33:13.000000000) ---
+Uploaded patch set 11: Commit message was updated.
+
+Copied Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Hiroshi Nishida, 2026-07-17 13:33:32.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-07-17 13:34:45.000000000) ---
+Patch Set 11:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-17 13:36:02.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-17 13:45:46.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-17 13:52:21.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
