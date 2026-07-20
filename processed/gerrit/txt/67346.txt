@@ -1,0 +1,165 @@
+Change:     67346
+Subject:    LU-12571 llite: drain pinned dcache before cl_sb_fini at umount
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67346
+Change-Id:  Ib2360e9a9427af31115902d57bd4b6fb91916eb9
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-18 15:25:24.000000000
+Updated:    2026-07-20 03:01:12.000000000
+Patch Set:  3
+Insertions: +176
+Deletions:  -0
+Comments:   28 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Qian Yingjin, Lustre RISC-V Builder
+  REVIEWER: Alex Zhuravlev, Sebastien Buisson
+
+--- Commit Message ---
+LU-12571 llite: drain pinned dcache before cl_sb_fini at umount
+
+On a subdir (fileset) mount, a lookup of /.fscrypt is redirected to the
+.fscrypt directory at the real filesystem root (LU-15176).  This
+instantiates a cross-tree dcache subtree under the mount root whose
+regular-file inodes (the fscrypt protector/policy metadata) carry
+cl_objects.  At umount such a subtree can still be pinned by a transient
+asynchronous reference at the moment the VFS runs
+shrink_dcache_for_umount()/evict_inodes() (before ->put_super), so it is
+not reclaimed.  Its inodes then survive into client_common_put_super()
+and their live cl_objects trip:
+
+  lu_device_fini() ASSERTION( atomic_read(&d->ld_ref) == 0 ) Refcount
+    lovsub_device_free() -> cl_sb_fini() -> ll_put_super()
+
+The straggling reference is released asynchronously moments later, but by
+then the teardown has already reached cl_sb_fini().  The window is narrow,
+so the failure is intermittent; it is seen most often as sanity-sec
+test_54 crashing the fscrypt client on umount.
+
+Before tearing down the cl object stack in client_common_put_super(),
+give any straggling references a bounded window to drain, reclaiming the
+now-unused dentries with shrink_dcache_sb() -- which evicts their inodes,
+SB_ACTIVE being clear -- so the cl_objects are destroyed first.  The loop
+is a no-op on a clean umount, where s_inodes is already empty.
+
+Add sanity-sec test_54a as a deterministic regression test.  A new
+fail_loc, OBD_FAIL_LLITE_FSCRYPT_UMOUNT_PIN, pins the cross-tree .fscrypt
+metadata-file dentries at lookup and releases them via a short delayed
+work at umount, modelling the transient reference.  With the fail_loc
+armed the orphaned subtree and LBUG reproduce on every umount without the
+drain, and never with it; the test crashes the client without this fix
+and passes with it.
+
+Test-Parameters: trivial clientdistro=ubuntu2604 serverdistro=el8.10 fstype=ldiskfs testlist=sanity-sec
+Test-Parameters: clientdistro=ubuntu2604 serverdistro=el8.10 fstype=ldiskfs testlist=sanity-sec
+Test-Parameters: clientdistro=ubuntu2604 serverdistro=el8.10 fstype=ldiskfs testlist=sanity-sec
+Test-Parameters: clientdistro=ubuntu2604 serverdistro=el8.10 fstype=ldiskfs testlist=sanity-sec
+Test-Parameters: clientdistro=ubuntu2604 serverdistro=el8.10 fstype=ldiskfs testlist=sanity-sec
+Test-Parameters: testlist=sanity-sec
+Fixes: c12378fba7f0 ("LU-15176 sec: present .fscrypt in subdir mount")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Change-Id: Ib2360e9a9427af31115902d57bd4b6fb91916eb9
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-18 15:25:24.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 15:28:02.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 15:36:57.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wc-checkpatch, 2026-07-18 15:37:45.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+16 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-18 15:51:31.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127760/ : FAILURE
+
+--- Message (Oleg Drokin, 2026-07-18 16:12:34.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 16:15:15.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-18 16:23:45.000000000) ---
+Patch Set 2:
+
+(6 comments)
+
+14 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 16:34:46.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-18 16:41:38.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127763/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-07-18 20:47:07.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-18 20:50:30.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-18 20:58:10.000000000) ---
+Patch Set 3:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-18 21:00:17.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-18 21:13:25.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127772/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-07-19 02:57:14.000000000) ---
+Patch Set 3:
+
+(1 comment)

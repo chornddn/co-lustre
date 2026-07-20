@@ -1,5 +1,5 @@
 Change:     67017
-Subject:    LU-20403 ptlrpc: refresh import conn on primary migration
+Subject:    LU-20403 ptlrpc: refresh conn on peer primary migration
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67017
 Change-Id:  Iafad7c6674e9aa93b64016d46434d9273026ad9a
 Project:    fs/lustre-release
@@ -7,50 +7,69 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-01 22:02:45.000000000
-Updated:    2026-07-17 08:46:21.000000000
-Patch Set:  4
-Insertions: +160
-Deletions:  -1
-Comments:   11 (1 unresolved)
+Updated:    2026-07-20 08:22:55.000000000
+Patch Set:  7
+Insertions: +334
+Deletions:  -15
+Comments:   25 (0 unresolved)
 Hashtags:   master-next
 
 --- Labels ---
-  Code-Review: Manish Regmi: +1; Xinxia Qu: +1; Serguei Smirnov: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
-  REVIEWER: Serguei Smirnov, Cyril Bordage, Manish Regmi, Xinxia Qu
+  REVIEWER: Oleg Drokin, Mikhail Pershin, Serguei Smirnov, Cyril Bordage, Manish Regmi, Xinxia Qu
 
 --- Commit Message ---
-LU-20403 ptlrpc: refresh import conn on primary migration
+LU-20403 ptlrpc: refresh conn on peer primary migration
 
-ptlrpc_connection_get() resolves the peer primary once and freezes it
-in the cached connection; reconnect reuses the connection and never
-re-resolves. ptl_send_rpc() keys the reply ME on that frozen NID. When
-LNet's primary for the peer later migrates, which can happen for any
-unlocked peer, the reply ME no longer matches the source NID LNet
-stamps on the reply. Each reply then either takes the costly
-lnet_try_match_md() same-peer fallback, or it can be dropped, which
-leaves the import stuck in CONNECTING.
+ptlrpc caches a connection keyed on the peer's primary NID and then
+freezes it: ptlrpc_connection_get() resolves the primary once,
+reconnect reuses the connection, and it is never re-resolved. Both
+the client import reply ME (ptl_send_rpc) and the server export reply
+target (exp_connection) are keyed on that frozen NID. When LNet's
+primary for the peer later migrates, which can happen for any unlocked
+peer, the reply is stamped with the new primary and no longer matches.
+It then takes the costly lnet_try_match_md() same-peer fallback or is
+dropped, which leaves the import stuck in CONNECTING.
 
 Add LNetPeerPrimaryNID(), a non-blocking primary lookup that neither
-discovers nor allocates, and call it from ptl_send_rpc() before the
-reply ME is posted. On a change, swap in a connection keyed on the
-current primary. This covers client RPCs and server reverse-channel
-ASTs alike, since both reach ptl_send_rpc() through their import.
+discovers nor allocates, and detect a migration on every send.
+
+Client side: ptl_send_rpc() calls ptlrpc_refresh_import_primary()
+before posting the reply ME. On a change it installs a connection
+keyed on the current primary through import_switch_connection(), the
+single place that swaps imp_connection so the DLM export connection
+always moves with it, and re-keys the current imp_conn_list entry so
+a later reconnect cannot restore the stale connection. The replacement
+is resolved with ptlrpc_connection_get_primary(), a variant that skips
+the internal blocking primary lookup, so the send never blocks on
+discovery.
+
+Server side: replies use exp_connection directly and bypass
+ptl_send_rpc(), so ptlrpc_server_handle_request() calls
+ptlrpc_refresh_export_primary() when rq_peer, the primary NID LNet
+already resolved for the request at parse time, differs from the NID
+the export is keyed on. Because rq_peer is stable across a multi-rail
+client's NICs, the gate stays quiet until a real migration and needs
+no lookup of its own. On a change it re-keys exp_connection on that
+primary, mirroring the connect-time swap (obd_nid_del/obd_nid_add) so
+the target NID hash stays consistent.
 
 The lookup takes a per-CPT lnet_net_lock and does one peer-table
-lookup. This is the same work lnet_select_pathway() already performs
-for the send that immediately follows, so it is resolved on every
-send. ptlrpc_connection_put() does not free a connection at
-runtime (connections are cached in the hash until module unload), so
-the connection swap is safe.
+lookup, the same work lnet_select_pathway() already performs for the
+send that immediately follows. ptlrpc_connection_put() does not free
+a connection at runtime (connections are cached in the hash until
+module unload), so the connection swaps are safe.
+
+Add conf-sanity test_73g, which migrates a server's NID under a live
+client import and checks that the import recovers.
 
 Assisted-by: Claude:claude-opus-4.8
 
-Test-Parameters: trivial
-Test-Parameters: testlist=conf-sanity env=ONLY=73g
+Test-Parameters: testlist=conf-sanity env=ONLY=73g,ONLY_REPEAT=50
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: Iafad7c6674e9aa93b64016d46434d9273026ad9a
 
@@ -219,3 +238,114 @@ Patch Set 4:
 
 --- Message (Marc Vef, 2026-07-17 08:46:21.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-07-19 02:34:50.000000000) ---
+Patch Set 4: Verified-1
+
+(2 comments)
+
+--- Message (Mikhail Pershin, 2026-07-19 10:58:39.000000000) ---
+Patch Set 4: Code-Review-1
+
+(3 comments)
+
+--- Message (Chris Horn, 2026-07-19 14:48:40.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+--- Message (Chris Horn, 2026-07-19 18:25:32.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-07-19 18:27:04.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-07-19 18:28:33.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-19 18:29:11.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Chris Horn, 2026-07-19 18:34:19.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-07-19 18:46:48.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: Cannot build patch due to 13, messages:
+
+ b'build error!\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_pool.o\n   LD [M]  /home/ahalim/lustre-release/lustre/obdclass/obdclass.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/vvp_object.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_reclaim.o\n   CC [M]  /home/ahalim/lustre-release/lustre/ptlrpc/../ldlm/ldlm_cache_policy.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/pcc.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/crypto.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/llite_foreign.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/llite_foreign_symlink.o\n   CC [M]  /home/ahalim/lustre-release/lustre/llite/acl.o\n   LD [M]  /home/ahalim/lustre-release/lustre/ptlrpc/ptlrpc.o\n   LD [M]  /home/ahalim/lustre-release/lustre/llite/lustre.o\n   MODPOST /home/ahalim/lustre-release/Module.symvers\n ERROR: modpost: "ptlrpc_refresh_export_primary" [/home/ahalim/lustre-release/lustre/ptlrpc/ptlrpc.ko] undefined!\n make[3]: *** [scripts/Makefile.modpost:145: /home/ahalim/lustre-release/Module.symvers] Error 1\n make[2]: *** [/usr/src/linux-headers-6.6.63/Makefile:1873: modpost] Error 2\n make[1]: *** [Makefile:234: __sub-make] Error 2\n make[1]: Leaving directory \'/usr/src/linux-headers-6.6.63\'\n make: *** [Makefile:144: __modules] Error 2\n === make completed in 9m 13s ===\n'
+
+--- Message (jenkins, 2026-07-19 18:56:45.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127787/ : FAILURE
+
+--- Message (Chris Horn, 2026-07-19 19:21:33.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-19 19:25:07.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Chris Horn, 2026-07-19 19:29:03.000000000) ---
+Uploaded patch set 7.
+
+--- Message (jenkins, 2026-07-19 19:29:19.000000000) ---
+Patch Set 6: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127793/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-07-19 19:30:25.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-19 19:33:19.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-19 20:06:23.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/127797/ : FAILURE
+
+--- Message (Chris Horn, 2026-07-19 20:07:40.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-07-19 20:09:50.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-19 20:34:12.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127798/ : SUCCESS

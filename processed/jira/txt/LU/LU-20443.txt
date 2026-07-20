@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Qian Yingjin
 Created:    Wed, 1 Jul 2026 07:01:17 +0000
-Updated:    Wed, 15 Jul 2026 09:24:33 +0000
+Updated:    Mon, 20 Jul 2026 13:22:39 +0000
 Labels:     aurp
 
 --- Description ---
@@ -182,3 +182,196 @@ This is a simple path for 2.14
 qian_wc won't you push a master patch ?
 
 Or do you consider that due to non-trivial changes in lustre/ptlrpc/statahead.c this no longer applies ?
+
+--- Comment (eaujames, Mon, 20 Jul 2026 13:13:32 +0000) ---
+Reproducer for 2.15.8:
+
+diff --git a/lustre/include/obd_support.h b/lustre/include/obd_support.h                         
+index 51ddef312c..4eed0fed1e 100644                                                              
+--- a/lustre/include/obd_support.h                                                               
++++ b/lustre/include/obd_support.h                                                               
+@@ -611,6 +611,7 @@ extern char obd_jobid_var[];                                                 
+ #define OBD_FAIL_LLITE_XATTR_PAUSE                 0x1420                                       
+ #define OBD_FAIL_LLITE_PANIC_ON_ESTALE             0x1423                                       
+ #define OBD_FAIL_LLITE_READPAGE_PAUSE2             0x1424                                       
++#define OBD_FAIL_LLITE_STATAHEAD_RACE               0x143a                                      
+                                                                                                 
+ #define OBD_FAIL_FID_INDIR     0x1501                                                           
+ #define OBD_FAIL_FID_INLMA     0x1502                                                           
+diff --git a/lustre/llite/statahead.c b/lustre/llite/statahead.c                                 
+index e45982680c..aeb4233d1a 100644                                                              
+--- a/lustre/llite/statahead.c                                                                   
++++ b/lustre/llite/statahead.c                                                                   
+@@ -1314,6 +1314,7 @@ void ll_deauthorize_statahead(struct inode *dir, void *key)                
+                wake_up_process(task);                                                           
+        }                                                                                        
+        spin_unlock(&lli->lli_sa_lock);                                                          
++       CFS_RACE(OBD_FAIL_LLITE_STATAHEAD_RACE);                                                 
+ }                                                                                               
+                                                                                                 
+ enum {                                                                                          
+@@ -1686,6 +1687,7 @@ static int start_statahead_thread(struct inode *dir, struct dentry *dentry,
+        CDEBUG(D_READA, "start statahead thread: [pid %d] [parent %pd]\n",                       
+               current->pid, parent);                                                            
+                                                                                                 
++       CFS_RACE(OBD_FAIL_LLITE_STATAHEAD_RACE);                                                 
+        task = kthread_create_on_node(ll_statahead_thread, parent, node,                         
+                                      "ll_sa_%u", lli->lli_opendir_pid);                         
+        if (IS_ERR(task)) {                                                                      
+
+reproducer.c:
+
+void *thr_close(void *msg)
+{
+        char *message = (char *)msg;
+
+        do {
+                usleep(50000);
+        } while (!fd);
+
+        printf("close %d\n", fd);
+        close(fd);
+        return NULL;
+}
+
+void *thr_stat(void *path)
+{
+        struct stat st;
+        char *pth = path;
+        DIR *dir;
+        struct dirent *entry;
+
+        printf("open %s\n", pth);
+        dir = opendir(pth);
+        if (!dir) {
+                fprintf(stderr, "Error opening %s\n", pth);
+                return NULL;
+        }
+
+        fd = dirfd(dir);
+
+        while ((entry = readdir(dir)) != NULL) {
+                printf("stat %s/%s\n", pth, entry->d_name);
+                fstatat(fd, entry->d_name, &st, 0);
+        }
+        return NULL;
+}
+
+int main(int argc, char **argv)
+{
+        pthread_t thread1, thread2;
+        int ret1, ret2;
+
+        if (argc "You should specified a dir\n");
+                return 1;
+        }
+
+        ret1 = pthread_create(&thread1, NULL, thr_stat, (void *)argv[1]);
+        if (ret1 != 0) {
+                fprintf(stderr, "Error creating thread 1: %d\n", ret1);
+                return 1;
+        }
+
+        ret2 = pthread_create(&thread2, NULL, thr_close, NULL);
+        if (ret2 != 0) {
+                fprintf(stderr, "Error creating thread 2: %d\n", ret2);
+                return 1;
+        }
+
+        pthread_join(thread1, NULL);
+        pthread_join(thread2, NULL);
+
+        printf("Both threads have finished.\n");
+        return 0;
+}
+
+[root@client-el8 lustre]# echo 3 > /proc/sys/vm/drop_caches
+[root@client-el8 ~]# lctl set_param fail_loc=0x143a
+[root@client-el8 lustre]# strace -f /tmp/test_threads testdir
+[root@client-el8 ~]# /home/lustre-release/lustre/tests/llmountcleanup.sh 
+Stopping clients: client-el8 /mnt/lustre (opts:-f)                       
+Stopping client client-el8 /mnt/lustre opts:-f                           
+[root@client-el8 ~]# pgrep -a ll_sa
+317418 ll_sa_0
+
+bt:
+
+crash>  foreach 'umount' bt                                               
+PID: 317684   TASK: ffff8aa5e643a800  CPU: 1    COMMAND: "umount"         
+ #0 [ffffa1364177fd90] __schedule at ffffffff91a206a1                     
+ #1 [ffffa1364177fde8] schedule at ffffffff91a20c95                       
+ #2 [ffffa1364177fe00] schedule_timeout at ffffffff91a255df               
+ #3 [ffffa1364177fe98] ll_kill_super at ffffffffc1a007e3 [lustre]         
+ #4 [ffffa1364177feb0] lustre_kill_super at ffffffffc1a2d428 [lustre]     
+ #5 [ffffa1364177fec0] deactivate_locked_super at ffffffff91370b24        
+ #6 [ffffa1364177fed8] cleanup_mnt at ffffffff9139278b                    
+ #7 [ffffa1364177fee8] task_work_run at ffffffff9111d6da                  
+ #8 [ffffa1364177ff20] exit_to_usermode_loop at ffffffff91003644          
+ #9 [ffffa1364177ff38] do_syscall_64 at ffffffff91003e8b                  
+#10 [ffffa1364177ff50] entry_SYSCALL_64_after_hwframe at ffffffff91c0012e 
+crash> foreach 'll_sa' bt                                                         
+PID: 317418   TASK: ffff8aa65991a800  CPU: 5    COMMAND: "ll_sa_0"
+ #0 [ffffa13640f7bdc8] __schedule at ffffffff91a206a1
+ #1 [ffffa13640f7be20] schedule at ffffffff91a20c95
+ #2 [ffffa13640f7be38] ll_statahead_thread.cold.32 at ffffffffc1a4e473 [lustre]
+ #3 [ffffa13640f7bf10] kthread at ffffffff91120254
+ #4 [ffffa13640f7bf50] ret_from_fork at ffffffff91c002e5
+
+debug:
+
+crash> ll_inode_info ffff8aa6505ae600
+...
+      lli_opendir_key = 0x0,
+      lli_sai = 0xffff8aa56e7fcc00,
+      lli_opendir_pid = 0
+
+crash> ll_statahead_info 0xffff8aa56e7fcc00
+  sai_task = 0xffff8aa65991a800,
+  sai_agl_task = 0xffff8aa572730000,
+...
+
+void ll_deauthorize_statahead(struct inode *dir, void *key)                   
+{                                                                             
+        struct ll_inode_info *lli = ll_i2info(dir);                           
+        struct ll_statahead_info *sai;                                        
+                                                                              
+        LASSERT(lli->lli_opendir_key == key);                                 
+        LASSERT(lli->lli_opendir_pid != 0);                                   
+                                                                              
+        printk("ll_deauthorize_statahead: %p\n", dir);                        
+        CDEBUG(D_READA, "deauthorize statahead for "DFID"\n",                 
+               PFID(&lli->lli_fid));                                          
+                                                                              
+        spin_lock(&lli->lli_sa_lock);                                         
+        lli->lli_opendir_key = NULL;                                          
+        lli->lli_opendir_pid = 0;                                             
+        lli->lli_sa_enabled = 0;                                              
+        sai = lli->lli_sai;                                                   
+        if (sai && sai->sai_task) {                                           
+                /*                                                            
+                 * statahead thread may not have quit yet because it needs to 
+                 * cache entries, now it's time to tell it to quit.           
+                 *                                                            
+                 * wake_up_process() provides the necessary barriers          
+                 * to pair with set_current_state().                          
+                 */                                                           
+                struct task_struct *task = sai->sai_task;                     
+                                                                              
+                /* matches smp_load_acquire() in ll_statahead_thread() */     
+                smp_store_release(&sai->sai_task, NULL);                      
+                wake_up_process(task);                                        
+        }                                                                     
+        spin_unlock(&lli->lli_sa_lock);                                       
+        CFS_RACE(OBD_FAIL_LLITE_STATAHEAD_RACE);                              
+}                                                                             
+
+This seems to be a race between start_statahead_thread() and ll_deauthorize_statahead().
+
+	One thread try to start statahead thread: sai_task is not yet set.
+
+	The other close the FD: ll_deauthorize_statahead(). It resets lli_opendir_key/lli_opendir_pid but could not wake_up the statahead thread (not yet started).
+
+	Once statahead starts and sai_task is set, the thread remains blocked and never wakes up.
+
+--- Comment (eaujames, Mon, 20 Jul 2026 13:22:39 +0000) ---
+On master, the code uses schedule_timeout(), so the race is less visible.
