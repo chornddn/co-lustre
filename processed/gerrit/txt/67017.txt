@@ -7,16 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-01 22:02:45.000000000
-Updated:    2026-07-20 08:22:55.000000000
-Patch Set:  7
-Insertions: +334
-Deletions:  -15
-Comments:   25 (0 unresolved)
-Hashtags:   master-next
+Updated:    2026-07-21 12:05:58.000000000
+Patch Set:  8
+Insertions: +426
+Deletions:  -20
+Comments:   27 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
@@ -41,12 +40,12 @@ discovers nor allocates, and detect a migration on every send.
 Client side: ptl_send_rpc() calls ptlrpc_refresh_import_primary()
 before posting the reply ME. On a change it installs a connection
 keyed on the current primary through import_switch_connection(), the
-single place that swaps imp_connection so the DLM export connection
-always moves with it, and re-keys the current imp_conn_list entry so
-a later reconnect cannot restore the stale connection. The replacement
-is resolved with ptlrpc_connection_get_primary(), a variant that skips
-the internal blocking primary lookup, so the send never blocks on
-discovery.
+single place that swaps imp_connection so a forward import's DLM
+export connection always moves with it, and re-keys the current
+imp_conn_list entry so a later reconnect cannot restore the stale
+connection. The replacement is resolved with
+ptlrpc_connection_get_primary(), a variant that skips the internal
+blocking primary lookup, so the send never blocks on discovery.
 
 Server side: replies use exp_connection directly and bypass
 ptl_send_rpc(), so ptlrpc_server_handle_request() calls
@@ -58,18 +57,40 @@ no lookup of its own. On a change it re-keys exp_connection on that
 primary, mirroring the connect-time swap (obd_nid_del/obd_nid_add) so
 the target NID hash stays consistent.
 
+A server's reverse import cannot recover from a client primary
+migration on its own. ptlrpc_refresh_import_primary() keys its
+lookup on the NID its connection already holds, but discovery
+deletes a NID the peer no longer advertises, and
+LNetPeerPrimaryNID() reports a NID it cannot find unchanged. Once
+the client drops the NID its reverse import was keyed on, the
+send path can no longer detect the migration, so lock callbacks
+target a dead NID until the AST times out and the client is
+evicted. The export refresh has the current primary so we move the
+reverse import along with the exp_connection. exp_imp_reverse is
+stable under exp_lock, and the import paths that hold imp_lock do
+not take exp_lock, so the nesting order is exp_lock -> imp_lock.
+
+A reverse import owns no DLM export of its own: the server's DLM
+export for that client is the obd_export the reverse import hangs
+off, and it is refreshed directly. import_switch_connection()
+therefore skips the DLM export step for IMPF_DLM_FAKE imports
+rather than reporting -EINVAL, and is no longer static so the
+export refresh can reach it.
+
 The lookup takes a per-CPT lnet_net_lock and does one peer-table
 lookup, the same work lnet_select_pathway() already performs for the
 send that immediately follows. ptlrpc_connection_put() does not free
 a connection at runtime (connections are cached in the hash until
 module unload), so the connection swaps are safe.
 
-Add conf-sanity test_73g, which migrates a server's NID under a live
-client import and checks that the import recovers.
+Add conf-sanity test_73g. It first migrates the servers' primary
+NIDs under a live client and checks the client imports recover,
+exercising the client-side refresh. It then migrates the client's
+own primary NID, so the servers detect the change on the next
+request and refresh both the export and its reverse import,
+exercising the server-side refresh.
 
 Assisted-by: Claude:claude-opus-4.8
-
-Test-Parameters: testlist=conf-sanity env=ONLY=73g,ONLY_REPEAT=50
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: Iafad7c6674e9aa93b64016d46434d9273026ad9a
 
@@ -349,3 +370,64 @@ Patch Set 7: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/127798/ : SUCCESS
+
+--- Message (Autotest, 2026-07-20 14:18:13.000000000) ---
+Patch Set 7:
+
+Onyx Autotest 2 retesting enforced review-dne-part-8 session on el10.1-x86_64/ldiskfs servers and clients for build 127798 patch 7. Requested by Chris Horn because of ATM-3997.
+
+--- Message (Autotest, 2026-07-20 14:18:25.000000000) ---
+Patch Set 7:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 127798 patch 7. Requested by Chris Horn because of LU-20276.
+
+--- Message (Autotest, 2026-07-20 14:18:33.000000000) ---
+Patch Set 7:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 127798 patch 7. Requested by Chris Horn because of LU-17891.
+
+--- Message (Autotest, 2026-07-20 14:21:52.000000000) ---
+Patch Set 7:
+
+Trevis Autotest 2 retesting enforced review-dne-subtest-change session on el9.7-x86_64/ldiskfs servers and clients for build 127798 patch 7. Requested by Chris Horn because of LU-19714.
+
+--- Message (Chris Horn, 2026-07-21 00:46:41.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-21 00:51:08.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-21 01:01:40.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-21 01:22:10.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127854/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-21 01:35:15.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-07-21 02:02:24.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-07-21 02:08:07.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-07-21 03:34:03.000000000) ---
+Hashtag removed: master-next
