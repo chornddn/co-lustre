@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Maloo
 Created:    Fri, 8 May 2026 05:17:01 +0000
-Updated:    Fri, 17 Jul 2026 18:19:27 +0000
+Updated:    Tue, 21 Jul 2026 20:53:03 +0000
 Links:      Duplicate: is duplicated by LU-20124
 
 --- Description ---
@@ -79,3 +79,40 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 1f82f5832ad6e88d766c373f567aebb2b297c7bf
+
+--- Comment (sergey, Tue, 21 Jul 2026 19:19:12 +0000) ---
+I reproduced it with 20 seconds delay in https://testing.whamcloud.com/test_sets/3c7fe3f9-5a2b-4c04-a073-a2998cb3ecbd.
+
+It's clear why it fails. After qmt_delete_qid had finished, OST0002 got blocking_ast that caused qsd_adjust->qsd_calc_adjust. As OST0002 granted space was not zero, it sent release request to the QMT.
+
+ 00040000:00000001:1.0:1784570170.469048:0:13363:0:(qsd_lock.c:335:qsd_id_blocking_ast()) Process entered
+00040000:00010000:1.0:1784570170.469049:0:13363:0:(qsd_lock.c:349:qsd_id_blocking_ast()) ### canceling ID quota lock ns: lustre-MDT0000-lwp-OST0002 lock: ff4708015fcdca00/0x6cea0dcdf6a355d9 lrc: 2/0,0 mode: CR/CR res: [0x200000006:0x2020000:0x2710].0x0 rrc: 2 type: PLN flags: 0x9400000000 nid: local remote: 0x59e780a606177f52 expref: -99 pid: 42021 timeout: 0 lvb_type: 2 lru_score: 1 lru_type: 0
+00040000:00000001:1.0:1784570170.469055:0:13363:0:(qsd_lock.c:82:qsd_id_ast_data_get()) Process entered
+00040000:00000001:1.0:1784570170.469056:0:13363:0:(qsd_lock.c:96:qsd_id_ast_data_get()) Process leaving (rc=18394680005240136544 : -52064068469415072 : ff4708016d51a360)
+00040000:04000000:1.0:1784570170.469059:0:13363:0:(qsd_lock.c:354:qsd_id_blocking_ast()) $$$ losing ID lock  qsd:lustre-OST0002 qtype:prj lqe: ff4708016d51a360 id:10000 enforced:1 granted: 16384 pending:0 waiting:0 req:0 usage: 0 qunit:16384 qtune:4096 edquot:0 default:no revoke:0
+00040000:04000000:1.0:1784570170.469063:0:13363:0:(qsd_internal.h:297:qsd_set_qunit()) $$$ changing qunit & qtune  qsd:lustre-OST0002 qtype:prj lqe: ff4708016d51a360 id:10000 enforced:1 granted: 16384 pending:0 waiting:0 req:0 usage: 0 qunit:0 qtune:0 edquot:0 default:no revoke:0
+00040000:00000001:1.0:1784570170.469066:0:13363:0:(qsd_handler.c:934:qsd_adjust()) Process entered
+00040000:00000001:1.0:1784570170.469067:0:13363:0:(qsd_handler.c:38:qsd_ready()) Process entered
+00040000:00000001:1.0:1784570170.469076:0:13363:0:(qsd_handler.c:88:qsd_ready()) Process leaving (rc=0 : 0 : 0)
+00040000:00000001:1.0:1784570170.469077:0:13363:0:(qsd_handler.c:109:qsd_calc_adjust()) Process entered
+00040000:04000000:1.0:1784570170.469078:0:13363:0:(qsd_handler.c:143:qsd_calc_adjust()) $$$ no usage, releasing all space  qsd:lustre-OST0002 qtype:prj lqe: ff4708016d51a360 id:10000 enforced:1 granted: 16384 pending:0 waiting:0 req:0 usage: 0 qunit:0 qtune:0 edquot:0 default:no revoke:0
+00040000:00000001:1.0:1784570170.469080:0:13363:0:(qsd_handler.c:148:qsd_calc_adjust()) Process leaving (rc=1 : 1 : 1)
+00040000:00000001:1.0:1784570170.469081:0:13363:0:(qsd_request.c:84:qsd_send_dqacq()) Process entered
+00040000:00000001:1.0:1784570170.469113:0:13363:0:(qsd_request.c:122:qsd_send_dqacq()) Process leaving (rc=0 : 0 : 0)
+00040000:00000001:1.0:1784570170.469114:0:13363:0:(qsd_handler.c:1025:qsd_adjust()) Process leaving (rc=0 : 0 : 0)
+00040000:00000001:1.0:1784570170.469115:0:13363:0:(qsd_lock.c:393:qsd_id_blocking_ast()) Process leaving (rc=0 : 0 : 0)
+
+QMT had already removed record for project:10000 when got release request from the OST0002. However, it created a new one during release request.
+
+According to the test session output, the previous sanity-quota_48 did IO to the file(project:10000) at the OST0002.
+
+I'm not sure why it gets blocking_ast, but my guess is that it is because of buffered IO from the previous test case.
+
+--- Comment (sergey, Tue, 21 Jul 2026 20:53:03 +0000) ---
+I'm thinking about a fix. I suppose we could start reintegration in the beginning of the sanity-quota_48.
+
+However, there could a problem in the qsd code. From the logs it is seen that lqe at the OST0002 is enforced even after deleting:
+
+00040000:04000000:0.0:1784570170.215644:0:19818:0:(qsd_lock.c:281:qsd_glb_glimpse_ast()) lustre-OST0002: glimpse on glb quota locks, id:10000 ver:1189 hard:0 soft:0 # This AST adds a UPD that should remove qsd record and lqe_enforced to 0.
+...
+00040000:04000000:1.0:1784570170.469059:0:13363:0:(qsd_lock.c:354:qsd_id_blocking_ast()) $$$ losing ID lock  qsd:lustre-OST0002 qtype:prj lqe: ff4708016d51a360 id:10000 enforced:1 granted: 16384 pending:0 waiting:0 req:0 usage: 0 qunit:16384 qtune:4096 edquot:0 default:no revoke:0

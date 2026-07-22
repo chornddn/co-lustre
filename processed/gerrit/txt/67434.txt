@@ -1,0 +1,87 @@
+Change:     67434
+Subject:    LU-18838 statahead: fix ll_sa_refcnt leak from ctx re-read at teardown
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67434
+Change-Id:  Ie3af5e2ee9a78102ad7bce154de5013cbc5c3e40
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-21 22:19:48.000000000
+Updated:    2026-07-22 13:20:51.000000000
+Patch Set:  1
+Insertions: +28
+Deletions:  -5
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-18838 statahead: fix ll_sa_refcnt leak from ctx re-read at teardown
+
+ll_statahead_thread() dropped its statahead-context reference by
+re-reading the global lli->lli_sax at teardown:
+
+	ctx = lli->lli_sax;
+	ll_sai_put(sai);
+	if (ctx)
+		ll_sax_put(ctx);
+
+but lli->lli_sax is not stable for the lifetime of the thread.
+A concurrent pattern transition (the 'LIST => FNAME' path) or a
+deauthorize+reauthorize of the directory can replace lli->lli_sax
+with a different context between the time the thread started and
+the time it tears down.  The thread then puts the current
+lli->lli_sax while the context it actually holds a reference on
+is never released.  Its sax_refcount never reaches 0, so
+ll_sax_free() is never called, ll_sa_refcnt stays > 0, and
+ll_kill_super() spins forever in its
+'while (ll_sa_running > 0 || ll_sa_refcnt > 0)' drain loop -- umount
+hangs (D-state, needs reboot).  Reproduced under racer/DNE; a timeout
+vmcore showed one directory with lli_sax set, sax_refcount == 1, an
+empty sax_sai_list and lli_sa_pattern == LSA_PATTERN_NONE.
+
+Record the context each sai is attached to in sai->sai_sax at thread
+creation, and have the thread drop that exact reference at teardown
+instead of re-reading lli->lli_sax.  The reference charged to the sai
+keeps the context alive until the thread puts it, and the sai still
+pins it on sax_sai_list until ll_sai_put(), so reading sai->sai_sax
+before ll_sai_put() frees the sai is safe.
+
+Test-Parameters: optional testlist=racer
+Fixes: 085c0dc58865 ("LU-18838 llite: Fix sax use race condition in ll_statahead_thread")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Change-Id: Ie3af5e2ee9a78102ad7bce154de5013cbc5c3e40
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-21 22:19:48.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-07-21 22:23:20.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-21 22:32:26.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-21 22:32:52.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-21 23:50:36.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127885/ : SUCCESS

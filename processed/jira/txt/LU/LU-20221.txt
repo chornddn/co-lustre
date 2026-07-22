@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Malkeet Singh
 Reporter:   Matt Rásó-Barnett
 Created:    Tue, 5 May 2026 11:02:15 +0000
-Updated:    Fri, 22 May 2026 15:40:08 +0000
+Updated:    Tue, 21 Jul 2026 15:37:03 +0000
 Links:      Related: is related to  LU-6130; Related: is related to  LU-14391; Related: is related to  LU-17451; Related: is related to  LU-18417
 Attachments: reproducer.sh, vmcore, vmcore-dmesg.txt
 
@@ -46,6 +46,14 @@ There is a flaw in lnet_net_show_dump() (lnet/lnet/api-ni.c) that reliably panic
 
 The primary issue causing the kernel panic is that the function makes approximately 18 sequential calls to nla_nest_start() without checking for a NULL return. When the skb buffer fills up, nla_nest_start() returns NULL. Because this is ignored, the subsequent nla_nest_end(msg, NULL) attempts to write the 16-bit nla_len field to address 0, instantly seizing the node with a NULL pointer dereference.Furthermore, even if the buffer overflow perfectly aligns with a network boundary (avoiding the mid-NI panic), the multi-skb resumption path is functionally broken. When genlmsg_put fails due to lack of space, the code executes GOTO(net_unlock, rc = -EMSGSIZE), completely bypassing the nlist->lngl_idx = idx state-saving assignment. Compounding this, the function initializes idx = nlist->lngl_idx instead of 0, meaning the if (idx++ lngl_idx) continue; check never actually skips previously processed NIs. This throws the kernel into an infinite loop, returning the exact same chunk of networks repeatedly until lnetctl crashes in userspace with a realloc(): invalid next size heap corruption.
 
+--- Comment (simmonsja, Thu, 14 May 2026 13:07:55 +0000) ---
+Oh so we finally hit this issue. I know what the fix is. We need to calculate the actually needed cb->min_dump_alloc. You can see an example with routes ROUTER_MSG_* in api.c. I need to do some profiling to figure out the sizes we need. Be aware some nl_attrs are padded so its not a simple calculation. I actually examine the returned netlink packets in user land to figure out the sizes I need for each field.
+
+--- Comment (JIRAUSER19446, Fri, 15 May 2026 14:23:23 +0000) ---
+simmonsja  Binary profiling via strace confirms that with verbosity 4 the 'lo' interface alone, when combined with the LNet key table headers, consumes ~2.6 KB of the buffer, (split across two Netlink messages of 2220 and 416 bytes). Each added dummy NI scales the binary payload by exactly +476 to +480 bytes with padding difference.
+
+I am relatively new to this specific subsystem, Do you want me to proceed with creating the patch for this which I would love to do so or would you be fixing this.
+
 --- Comment (gerrit, Fri, 22 May 2026 12:51:26 +0000) ---
 "Malkeet Singh " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66083
 
@@ -59,10 +67,15 @@ Current Patch Set: 1
 
 Commit: b4953df34d7795f318284034f734e98fcb9d3362
 
---- Comment (JIRAUSER19446, Fri, 15 May 2026 14:23:23 +0000) ---
-simmonsja  Binary profiling via strace confirms that with verbosity 4 the 'lo' interface alone, when combined with the LNet key table headers, consumes ~2.6 KB of the buffer, (split across two Netlink messages of 2220 and 416 bytes). Each added dummy NI scales the binary payload by exactly +476 to +480 bytes with padding difference.
+--- Comment (gerrit, Tue, 21 Jul 2026 15:37:03 +0000) ---
+"James Simmons " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/67421
 
-I am relatively new to this specific subsystem, Do you want me to proceed with creating the patch for this which I would love to do so or would you be fixing this.
+Subject: LU-20221 lnet: allocate proper size sk buffer for NIs
 
---- Comment (simmonsja, Thu, 14 May 2026 13:07:55 +0000) ---
-Oh so we finally hit this issue. I know what the fix is. We need to calculate the actually needed cb->min_dump_alloc. You can see an example with routes ROUTER_MSG_* in api.c. I need to do some profiling to figure out the sizes we need. Be aware some nl_attrs are padded so its not a simple calculation. I actually examine the returned netlink packets in user land to figure out the sizes I need for each field.
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 58b013ce42f4264e16a782e878dce8483c239aba
