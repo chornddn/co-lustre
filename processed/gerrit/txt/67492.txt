@@ -1,0 +1,91 @@
+Change:     67492
+Subject:    LU-20516 ldlm: fix flock deadlock-detection state races
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67492
+Change-Id:  If5ad3aba7b2276394b3b06bde62a80c46fa3f431
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sohei Koyama
+Created:    2026-07-23 11:13:09.000000000
+Updated:    2026-07-23 13:52:04.000000000
+Patch Set:  1
+Insertions: +102
+Deletions:  -54
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20516 ldlm: fix flock deadlock-detection state races
+
+The deadlock-detection walk finds the blocked lock of the next
+owner in the chain with cfs_hash_lookup(), which drops the
+flock-hash bucket lock before returning, and only then reads
+blocking_owner and blocking_export of the found lock.  Those
+fields are rewritten by ldlm_flock_blocking_link()/unlink() under
+the resource lock of the request lock, which the walk does not
+hold.  A racing relink corrupts the walk in two ways: it
+overwrites blocking_export between the walk's hs_get and hs_put,
+which both read the live field, so one export leaks a reference
+and another is put while still in use; and its
+atomic_set(blocking_refs, 0) discards the reference the walk
+still holds, so the walk's put later reaches zero and clears the
+blocking state of the meanwhile re-hashed lock.
+
+Instead of taking the found lock out of the hash, read it in
+place: replace cfs_hash_lookup() with cfs_hash_for_each_key(),
+whose callback runs under the bucket lock, and there snapshot
+blocking_owner and take a reference on blocking_export.  Nothing
+of the found lock is used once the bucket lock is dropped.  Since
+cfs_hash_add()/del() take the same bucket lock, the blocking
+state is now written only while the lock is unhashed: link sets
+it (taking the blocking_export reference) before cfs_hash_add()
+and unlink clears it (dropping the reference) after
+cfs_hash_del().  blocking_refs and the export refcounting in the
+hs_get/hs_put callbacks become unnecessary and are removed.
+
+Add OBD_FAIL_LDLM_FLOCK_DEADLOCK_PAUSE and sanityn test_74b
+racing deadlock detection against blocking-state relinks; it
+crashes unfixed servers within seconds (test_74 is renamed to
+test_74a).
+
+Test-Parameters: testlist=sanityn env=ONLY=74b,ONLY_REPEAT=5
+Fixes: 2c7a41a5c595 ("LU-1157 ldlm: replace waiting flock lists by hashes")
+Assisted-by: ClaudeCode:Fable-5
+Signed-off-by: Sohei Koyama <skoyama@ddn.com>
+Change-Id: If5ad3aba7b2276394b3b06bde62a80c46fa3f431
+
+--- Review History ---
+
+--- Message (Sohei Koyama, 2026-07-23 11:13:09.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 11:16:13.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-23 11:26:17.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-23 12:09:10.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127983/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 12:20:22.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful

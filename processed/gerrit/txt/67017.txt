@@ -1,5 +1,5 @@
 Change:     67017
-Subject:    LU-20403 ptlrpc: refresh conn on peer primary migration
+Subject:    LU-20403 ptlrpc: refresh import conn on primary migration
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67017
 Change-Id:  Iafad7c6674e9aa93b64016d46434d9273026ad9a
 Project:    fs/lustre-release
@@ -7,88 +7,54 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-01 22:02:45.000000000
-Updated:    2026-07-22 05:38:00.000000000
-Patch Set:  8
-Insertions: +426
-Deletions:  -20
-Comments:   34 (5 unresolved)
+Updated:    2026-07-23 10:12:32.000000000
+Patch Set:  9
+Insertions: +284
+Deletions:  -30
+Comments:   40 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Mikhail Pershin: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
   REVIEWER: Oleg Drokin, Mikhail Pershin, Serguei Smirnov, Cyril Bordage, Manish Regmi, Xinxia Qu
 
 --- Commit Message ---
-LU-20403 ptlrpc: refresh conn on peer primary migration
+LU-20403 ptlrpc: refresh import conn on primary migration
 
 ptlrpc caches a connection keyed on the peer's primary NID and then
 freezes it: ptlrpc_connection_get() resolves the primary once,
-reconnect reuses the connection, and it is never re-resolved. Both
-the client import reply ME (ptl_send_rpc) and the server export reply
-target (exp_connection) are keyed on that frozen NID. When LNet's
-primary for the peer later migrates, which can happen for any unlocked
-peer, the reply is stamped with the new primary and no longer matches.
-It then takes the costly lnet_try_match_md() same-peer fallback or is
-dropped, which leaves the import stuck in CONNECTING.
+reconnect reuses the connection, and it is never re-resolved. The
+client import reply ME (ptl_send_rpc) is keyed on that frozen NID.
+When LNet's primary for the peer later migrates, which can happen for
+any unlocked peer, the reply is stamped with the new primary and no
+longer matches. It then takes the costly lnet_try_match_md() same-peer
+fallback or is dropped, which leaves the import stuck in CONNECTING.
 
 Add LNetPeerPrimaryNID(), a non-blocking primary lookup that neither
 discovers nor allocates, and detect a migration on every send.
 
-Client side: ptl_send_rpc() calls ptlrpc_refresh_import_primary()
-before posting the reply ME. On a change it installs a connection
-keyed on the current primary through import_switch_connection(), the
-single place that swaps imp_connection so a forward import's DLM
-export connection always moves with it, and re-keys the current
-imp_conn_list entry so a later reconnect cannot restore the stale
-connection. The replacement is resolved with
-ptlrpc_connection_get_primary(), a variant that skips the internal
-blocking primary lookup, so the send never blocks on discovery.
-
-Server side: replies use exp_connection directly and bypass
-ptl_send_rpc(), so ptlrpc_server_handle_request() calls
-ptlrpc_refresh_export_primary() when rq_peer, the primary NID LNet
-already resolved for the request at parse time, differs from the NID
-the export is keyed on. Because rq_peer is stable across a multi-rail
-client's NICs, the gate stays quiet until a real migration and needs
-no lookup of its own. On a change it re-keys exp_connection on that
-primary, mirroring the connect-time swap (obd_nid_del/obd_nid_add) so
-the target NID hash stays consistent.
-
-A server's reverse import cannot recover from a client primary
-migration on its own. ptlrpc_refresh_import_primary() keys its
-lookup on the NID its connection already holds, but discovery
-deletes a NID the peer no longer advertises, and
-LNetPeerPrimaryNID() reports a NID it cannot find unchanged. Once
-the client drops the NID its reverse import was keyed on, the
-send path can no longer detect the migration, so lock callbacks
-target a dead NID until the AST times out and the client is
-evicted. The export refresh has the current primary so we move the
-reverse import along with the exp_connection. exp_imp_reverse is
-stable under exp_lock, and the import paths that hold imp_lock do
-not take exp_lock, so the nesting order is exp_lock -> imp_lock.
-
-A reverse import owns no DLM export of its own: the server's DLM
-export for that client is the obd_export the reverse import hangs
-off, and it is refreshed directly. import_switch_connection()
-therefore skips the DLM export step for IMPF_DLM_FAKE imports
-rather than reporting -EINVAL, and is no longer static so the
-export refresh can reach it.
+ptl_send_rpc() calls ptlrpc_refresh_import_primary() before posting
+the reply ME. On a change it installs a connection keyed on the
+current primary through import_switch_connection(), the single place
+that swaps imp_connection so a forward import's DLM export connection
+always moves with it, and re-keys the current imp_conn_list entry so a
+later reconnect cannot restore the stale connection. The replacement
+is resolved with ptlrpc_connection_get_primary(), a variant that skips
+the internal blocking primary lookup, so the send never blocks on
+discovery.
 
 The lookup takes a per-CPT lnet_net_lock and does one peer-table
 lookup, the same work lnet_select_pathway() already performs for the
-send that immediately follows. ptlrpc_connection_put() does not free
-a connection at runtime (connections are cached in the hash until
-module unload), so the connection swaps are safe.
+send that immediately follows. ptlrpc_connection_put() does not free a
+connection at runtime (connections are cached in the hash until module
+unload), so the connection swaps are safe.
 
-Add conf-sanity test_73g. It first migrates the servers' primary
-NIDs under a live client and checks the client imports recover,
-exercising the client-side refresh. It then migrates the client's
-own primary NID, so the servers detect the change on the next
-request and refresh both the export and its reverse import,
-exercising the server-side refresh.
+Add conf-sanity test_73g. It migrates the servers' primary NIDs under
+a live client and checks the client imports recover, exercising the
+client-side refresh.
 
 Assisted-by: Claude:claude-opus-4.8
 Signed-off-by: Chris Horn <chorn@ddn.com>
@@ -441,3 +407,40 @@ Patch Set 8:
 Patch Set 8: Code-Review-1
 
 (6 comments)
+
+--- Message (Chris Horn, 2026-07-22 16:30:13.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-07-22 16:30:26.000000000) ---
+Patch Set 9:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-22 16:33:44.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-22 16:35:38.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-07-22 16:54:17.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-22 17:46:58.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127937/ : SUCCESS
