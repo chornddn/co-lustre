@@ -1,0 +1,158 @@
+Change:     67497
+Subject:    LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67497
+Change-Id:  Iea44872f5507d829c1baa791ed179ee0f13f09c1
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-23 19:10:14.000000000
+Updated:    2026-07-24 12:04:31.000000000
+Patch Set:  3
+Insertions: +28
+Deletions:  -4
+Comments:   4 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+
+The first LU-6301 patch added ll_open_cleanup() to send a close RPC
+when the client hits an error after the MDT has granted an open,
+so the MDT-side open handle is not leaked. That fix only covers
+the server side: the original open request is replayable,
+so after_reply() left it on the import replay list with rq_replay
+set, and because a failed open has no close/commit callback
+(mdc_commit_open) nothing ever clears rq_replay.
+The request then stays on the committed-replay list until reconnect,
+pinning its reply buffer (sized to max_mds_easize, which can be hundreds
+of KB with wide/PFL/DoM layouts). Under an open-heavy workload that
+takes the open-error cleanup path frequently this accumulates without
+bound and can OOM the client.
+
+This becomes easy to hit once ll_splice_alias() uses d_splice_alias()
+for directories (which, unlike the old d_add(), can return -ELOOP or
+-ESTALE): a racing rename/create workload then drives ll_lookup_it_finish()
+into this error path thousands of times per run.
+
+Clear rq_replay in ll_open_cleanup() after the MDT open handle has been
+released, so ptlrpc_free_committed() can drop the request once its
+transaction commits. The server-side handle is already closed at this
+point, so dropping replay for this request is safe.
+
+Make ll_open_cleanup() idempotent and self-guarding while here. It now
+takes the lookup_intent: it does nothing unless DISP_OPEN_OPEN is set
+(there is no granted open handle to release otherwise, which also stops
+it from md_close()ing a bogus handle), and it clears DISP_OPEN_OPEN once
+the handle is released. The same intent is shared across ll_prep_inode(),
+ll_lookup_it_finish() and ll_atomic_open()'s out_release, so a second
+cleanup of the same abandoned open now short-circuits at the guard rather
+than double-closing. Only DISP_OPEN_OPEN is cleared; DISP_ENQ_OPEN_REF
+must survive so ll_intent_release() still drops the request reference that
+mdc_finish_intent_lock() took for the open. The callers reduce to
+"DISP_OPEN_OPEN && it_request" and no longer reach into rq_replay /
+rq_commit_cb.
+
+Fixes: d2b203692e ("LU-6301 llite: cleanup open handle for client open failure")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+Change-Id: Iea44872f5507d829c1baa791ed179ee0f13f09c1
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-23 19:10:14.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-07-23 19:18:33.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 19:24:24.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-23 20:48:45.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/127999/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 20:49:14.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Oleg Drokin, 2026-07-23 21:58:56.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-07-23 22:00:46.000000000) ---
+Uploaded patch set 3.
+
+--- Message (jenkins, 2026-07-23 22:00:48.000000000) ---
+Patch Set 2:
+
+No Builds Executed
+
+--- Message (Lustre Gerrit Janitor, 2026-07-23 22:05:09.000000000) ---
+Patch Set 2:
+
+Newer revision detected, aborting all work on revision 2
+
+--- Message (wc-checkpatch, 2026-07-23 22:06:59.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 22:07:50.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 22:18:09.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 22:24:23.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-23 22:35:11.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128003/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 23:58:50.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-07-24 08:33:18.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+Experimental feature testing in progress, please pay attention to the comments
+
+Looks good. The rq_replay clear plus the it/DISP_OPEN_OPEN gating and the rq_commit_cb/rc_req guard are consistent: on a replayable MDC import the abandoned-open request stays pinned on the replay list (so rc_req is valid), and rq_early_free_repbuf is only ever set together with rq_commit_cb, so the guard also avoids the freed-reply-buffer LBUG. One trivial style nit inline. A deterministic regression test for the unbounded reply-buffer accumulation is hard to write, but the racer/d_splice_alias workload named in the message does exercise this path if a Test-Parameters line pointing at it is worth adding.

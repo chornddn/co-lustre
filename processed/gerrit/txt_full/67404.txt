@@ -1,5 +1,5 @@
 Change:     67404
-Subject:    LU-20501 llite: skip dot/dotdot in NFS get_name
+Subject:    LU-20501 llite: skip dot/dotdot in NFS get_name for striped dir
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67404
 Change-Id:  I0b9854525a165780e505db977a89f91c6d11b705
 Project:    fs/lustre-release
@@ -7,63 +7,55 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-21 06:40:57.000000000
-Updated:    2026-07-23 08:41:30.000000000
-Patch Set:  3
-Insertions: +14
+Updated:    2026-07-24 10:40:49.000000000
+Patch Set:  4
+Insertions: +15
 Deletions:  -0
-Comments:   18 (4 unresolved)
+Comments:   21 (4 unresolved)
 Hashtags:   testfix
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Lai Siyao: +1; Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Timothy Day, Lustre RISC-V Builder
   REVIEWER: Lai Siyao, Andreas Dilger, James Simmons
 
 --- Commit Message ---
-LU-20501 llite: skip dot/dotdot in NFS get_name
+LU-20501 llite: skip dot/dotdot in NFS get_name for striped dir
 
-sanityn test_102 intermittently fails on ZFS DNE with a spurious ESTALE
-from open_by_handle_at() of a striped subdirectory:
+sanityn test_102 intermittently fails on ZFS DNE with a spurious
+ESTALE from open_by_handle_at() of a striped subdirectory whose
+parent is also striped:
 
   open_by_handle_at(subdir) error: Stale file handle
 
-The handle decodes fine.  The ESTALE comes out of the NFS reconnect:
-reconnect_one() finds the disconnected dentry's parent, calls
-exportfs_get_name() (ll_get_name()) to get the child's name in that
-parent, then lookup_one() on it.  ll_get_name() returned "..", so
-lookup_one("..") failed -EACCES, and exportfs_decode_fh() converts any
-decode error into -ESTALE.
+The handle decodes fine; the ESTALE is produced by the kernel NFS
+reconnect path.  reconnect_one() gets the disconnected dentry's
+parent, then calls exportfs_get_name() (ll_get_name()) to find the
+child's name in that parent, and finally lookup_one() on that name.
 
-ll_get_name() walks the parent's dirents with do_nfs_get_name_filldir(),
-matching each lde_fid against the child FID.  It matches "." and ".."
-like any other name, and it does not check LUDA_FID, which is what tells
-it whether lde_fid is meaningful at all.
+ll_get_name() walks the parent's dirents and matches each entry's FID
+against the child FID with do_nfs_get_name_filldir().  It does not
+skip the "." and ".." entries.  For a DNE striped directory the merged
+readdir rewrites the "." and ".." entries to the master / parent FID in
+lmv_striped_read_page(), using op_data->op_fid3 for "..".  ll_readdir()
+sets op_fid3, but ll_get_name() does not, so on this path ".." carries
+a stale FID that can equal the child FID being searched.  When it does,
+ll_get_name() returns "..", reconnect_one() then does lookup_one(".."),
+which fails with -EACCES, and exportfs_decode_fh() turns any decode
+error into -ESTALE -- hence the intermittent failure.
 
-On ZFS the ".." entry of the filesystem root has no valid FID: osd-zfs
-osd_zfs_it_rec() computes it with osd_find_parent_fid(), which returns
--ENOENT at the root, and that path deliberately leaves LUDA_FID unset.
-lde_fid is then simply whatever the recycled dirent page held.
-Instrumenting the root's ".." FID showed it varying per run between the
-correct root FID, zero, wild values such as
-[0xfcaae7467e00fcaa:0xc834a400:0x450008], and real FIDs of unrelated
-objects -- and when it happened to equal the child FID being searched,
-ll_get_name() returned "..".
+A child is never reached through "." or "..", so do_nfs_get_name_filldir()
+must never match them (the generic get_name() is immune because it
+matches by inode number rather than FID).  Skip both entries.
 
-Skip "." and ".." outright.  A child is never reached through those
-names, so they are never a valid answer here regardless of what lde_fid
-holds.  The generic get_name() is immune already because it matches by
-inode number rather than by FID.
+Reproduced and fixed on a ZFS DNE cluster: sanityn test_102 failed
+~15% of runs without the fix and 0/120 runs with it.
 
-Server side will be addressed in a separate patch.
-
-Reproduced and fixed on a ZFS DNE cluster: sanityn test_102 failed ~15%
-of runs without this patch and 0/120 runs with it.
-
+Fixes: 0d8c5ccc4e ("LU-4603 lmv: a few fixes about readdir of striped dir.")
 Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102,ONLY_REPEAT=200
-Fixes: 96a5daa0c0 ("LU-163 MDS returns 32/64-bit dir name hash according to client type")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
 Change-Id: I0b9854525a165780e505db977a89f91c6d11b705
@@ -820,3 +812,86 @@ Passed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 /
 
 --- Message (Lai Siyao, 2026-07-23 08:41:30.000000000) ---
 Patch Set 3: Code-Review+1
+
+--- Message (Timothy Day, 2026-07-24 03:31:02.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-07-24 04:07:20.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-07-24 04:07:48.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-07-24 04:09:58.000000000) ---
+Patch Set 4:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66615/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-24 04:10:16.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-24 04:14:14.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-24 04:31:09.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128018/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-07-24 05:34:50.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-07-24 06:07:33.000000000) ---
+Patch Set 4:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66615/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-07-24 10:40:49.000000000) ---
+Patch Set 4:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity1@zfs:test_56ab(Seen in reviews: 67459 67116 66588 66553 66267 65914 65838 65771 65770 65552 65512 65414 65140 65094 65083 64429 64408 64321 64314 63981 58508 58493 58456 58275 55770 49732 37246)
+
+
+> recovery-small@zfs Failure(7315s)
+- 155(ls1 != ls2) 
+> replay-single2@ldiskfs+DNE Failure(2816s)
+- 135(Unexpected sync success) 
+> replay-single2@zfs Failure(777s)
+- 135(Unexpected sync success) 
+> sanity1@zfs Failure(6796s)
+- 56ab(>1M blocks files 3 isn't 1 as expected) 
+> sanity-ec@zfs Failure(376s)
+- 5b(mirror resync failed) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single1@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66615/results.html

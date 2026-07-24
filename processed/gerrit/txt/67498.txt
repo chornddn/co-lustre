@@ -1,0 +1,116 @@
+Change:     67498
+Subject:    LU-19805 llite: unregister client BDI on pre-5.11 kernels
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67498
+Change-Id:  I7cfbc98da727bc8ddb53c9282f62c666f5d5d929
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-23 19:15:40.000000000
+Updated:    2026-07-24 10:54:32.000000000
+Patch Set:  1
+Insertions: +43
+Deletions:  -1
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: James Simmons, Shaun Tancheff
+
+--- Commit Message ---
+LU-19805 llite: unregister client BDI on pre-5.11 kernels
+
+Repeated client mount/umount eventually fails with:
+
+  sysfs: cannot create duplicate filename '/devices/virtual/bdi/fs-ffffa08a8a808000'
+  kobject_add_internal failed for fs-ffffa08a8a808000 with -EEXIST
+  llite: Unable to mount <unknown>: rc = -17
+
+ll_fill_super() names the per-superblock BDI after the superblock
+address (ll_get_cfg_instance()), so that name is only unique for as
+long as the BDI does not outlive the superblock.
+
+LU-16954 set SB_I_CGROUPWB on the Lustre superblock.  Every cgroup
+bdi_writeback created for the mount takes a reference on the BDI in
+wb_init(), and those references are only dropped by bdi_unregister()
+via cgwb_bdi_unregister().  Kernels older than v5.11 have no
+SB_I_PERSB_BDI, so generic_shutdown_super() only calls bdi_put():
+release_bdi() cannot run while a cgwb holds a reference, and the cgwbs
+are not killed because that only happens from bdi_unregister().  The
+BDI and its sysfs node therefore stay behind after umount, and the next
+mount that gets a struct super_block back at the same address fails
+with -EEXIST.
+
+LU-16954 compensated for this by unregistering the BDI device from
+ll_put_super().  LU-17745 disabled that for kernels which still have
+backing_dev_info.debug_stats (below v5.10), because RHEL 8.2 crashed in
+wb_workfn(), which called dev_name(wb->bdi->dev) with no NULL check.
+That was fixed upstream by v5.7 commit 68f23b89067f ("memcg: fix a
+crash in wb_workfn when a device disappears"), which added
+bdi_dev_name(), and which RHEL picked up in 8.6.  The condition that
+matters is therefore not the absence of debug_stats but the presence of
+bdi_dev_name(): on RHEL 8.6 and later the explicit unregister is safe,
+and without it every mount/umount cycle strands a BDI.
+
+Key the unregister off a new HAVE_BDI_DEV_NAME test and restore the
+debug_stats removal that pre-v5.10 kernels need.  Only ask for cgroup
+writeback where the BDI can be unregistered again, so kernels that have
+neither SB_I_PERSB_BDI nor bdi_dev_name() do not strand BDIs either.
+
+This removes the sysfs name collision.  On pre-v5.11 kernels the BDI
+itself is still only freed once the memory cgroups referencing it go
+away; a module has no exported way to break that cycle.
+
+Reproduced on a RHEL 8.10 client booted with cgroup v2 (memory and io
+controllers) by mounting, writing a file from a non-root cgroup, and
+unmounting in a loop: without the patch the mount fails after ~10
+iterations and one /sys/class/bdi/<fsname>-<address> entry is stranded
+per cycle; with it, 100 iterations pass leaving none.  No regression
+test is added, because triggering the failure requires cgroup v2 with
+both the memory and io controllers on a client kernel older than v5.11,
+which no autotest client configuration provides, and a test that cannot
+fail without the fix is worse than none.
+
+Test-Parameters: clientdistro=el8.10 testlist=sanity
+Test-Parameters: clientdistro=ubuntu2404 testlist=sanity
+Fixes: facff17860 ("LU-17745 llite: fix the umount panic due to BDI unregister")
+Fixes: dcc1dd39a6 ("LU-16954 llite: add SB_I_CGROUPWB on super block for cgroup")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Change-Id: I7cfbc98da727bc8ddb53c9282f62c666f5d5d929
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-23 19:15:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-07-23 19:18:01.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-23 19:28:57.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Oleg Drokin, 2026-07-23 19:36:43.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-07-23 19:45:33.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-23 20:54:34.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128000/ : SUCCESS
