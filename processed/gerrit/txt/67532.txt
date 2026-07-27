@@ -1,0 +1,118 @@
+Change:     67532
+Subject:    LU-20522 obdclass: bound llog header length before using the tail
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67532
+Change-Id:  I484be880d2ede4e9ab9fdfedfe22969355bd7601
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-07-25 18:39:08.000000000
+Updated:    2026-07-26 06:54:24.000000000
+Patch Set:  1
+Insertions: +65
+Deletions:  -3
+Comments:   1 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20522 obdclass: bound llog header length before using the tail
+
+LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes
+from the start of the header buffer.  lustre_swab_llog_hdr() uses it
+twice without ever checking lrh_len, which at that point is raw data
+from disk or the wire:
+
+  print_llog_hdr()	CDEBUG(D_OTHER) of LLOG_HDR_TAIL(h)->lrt_index
+			and ->lrt_len -- an out-of-bounds read
+  lustre_swab_llog_rec()	__swab32s() of the same two fields via
+			tail = LLOG_HDR_TAIL(llh) -- an out-of-bounds
+			*write*
+
+The first print_llog_hdr() call happens before the header is swabbed,
+so lrh_len is still in the peer's byte order.  Even a perfectly valid
+foreign-endian header therefore reads ~2MB past an 8KB buffer:
+__swab32(8192) == 0x00200000.
+
+recovery-small test_154a overwrites an update log catalog with
+/dev/urandom and expects the corrupt log to be rejected.  Roughly 1
+random lrh_type in 4096 satisfies LLOG_REC_HDR_NEEDS_SWABBING(), which
+sends that random header into lustre_swab_llog_hdr() and dereferences
+the tail at a random multi-gigabyte offset:
+
+  BUG: unable to handle kernel paging request at ffff9857f0a959ca
+  RIP: print_llog_hdr+0x568/0x6b0 [obdclass]
+   lustre_swab_llog_hdr+0x37/0x140 [obdclass]
+   llog_osd_read_header+0x4b1/0xb60 [obdclass]
+   llog_read_header+0x6a/0x390 [obdclass]
+   llog_init_handle+0xf2/0xad0 [obdclass]
+   lod_sub_prep_llog+0x581/0xcd9 [lod]
+   lod_sub_recovery_thread+0xd6/0xef0 [lod]
+
+RAX held the on-disk lrh_len 0xdc75d9ce and RBX the header at
+ffff985714338000; the faulting insn is "mov edx,[rbx+rax-4]", i.e.
+LLOG_HDR_TAIL(h)->lrt_index exactly.
+
+Validate lrh_len against the range llog_init_handle() can actually
+allocate before dereferencing the tail, in both places.  Callers detect
+the still-unswabbed header through their existing lrh_type and lrh_len
+checks and return -EINVAL, which is what lod_sub_prep_llog() already
+handles by renewing the log.  This also covers the two other callers
+that swab an unvalidated header: lod_update_log_stale() and the
+RMF_LLOG_LOG_HDR reply swabber, where a foreign-endian peer can reach
+the out-of-bounds write over the network.
+
+Add LLOG_MAX_CHUNK_SIZE for the bound and use it where the update log
+chunk size is set, so the two cannot drift apart.
+
+recovery-small test_154c reproduces this deterministically instead of
+waiting for the 1-in-4096 draw.
+
+The dereference has been unbounded since 2015, but nothing fed it a
+corrupt header until test_154a landed in 54301fe4f5 ("LU-15934 tests: add
+a test case for update llog"), which is why this only shows up in results
+from 2024 on.  It is not test-only, though: lod_update_log_stale() swabs
+an on-disk header during normal stale update log cleanup with no length
+check at all.
+
+Change-Id: I484be880d2ede4e9ab9fdfedfe22969355bd7601
+Fixes: dc689955366c ("LU-6602 obdclass: variable llog chunk size")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-07-25 18:39:08.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Oleg Drokin, 2026-07-25 18:39:45.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-25 18:42:25.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-25 18:52:51.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wc-checkpatch, 2026-07-25 18:53:35.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-25 19:04:07.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128098/ : SUCCESS

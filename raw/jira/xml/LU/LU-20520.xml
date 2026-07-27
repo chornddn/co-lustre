@@ -1,0 +1,88 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20520] Large unaligned bulk write hangs when client and server page sizes differ</title>
+                <link>https://jira.whamcloud.com/browse/LU-20520</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;A bulk write whose object offset is not aligned to the &lt;b&gt;larger&lt;/b&gt; of the two page sizes hangs indefinitely, with the writer thread stuck in D state holding a PW extent lock. The console on the client shows repeated LNet drops of the server's bulk GET:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lnet_try_match_md() ... Matching packet from &amp;lt;server&amp;gt; ... length 1015808 too big: 32768 left
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Root cause: both peers build the bulk memory-descriptor (MD) list with `__ptlrpc_prep_bulk_page()`, but a new MD is started whenever `bd_iov_count` reaches a multiple of `LNET_MAX_IOV`. `bd_iov_count` advances at a different rate on each end — a 64KiB-page sender splits pages to keep each MD within `LNET_MTU` and so accumulates kiov entries faster than a 4KiB-page peer — so the two ends place MD boundaries at different byte offsets. For a full-size (16MiB) transfer that is not page-aligned, the 64KiB client builds 17 MDs where the 4KiB server builds 16. The server issues a bulk GET sized for one of its MDs against the match bits of a smaller client MD; LNet drops it as too large; the write times out and retries forever.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19180" title="interop sanityn test_16a: fsx with O_DIRECT failed." class="issue-link" data-issue-key="LU-19180"&gt;&lt;del&gt;LU-19180&lt;/del&gt;&lt;/a&gt; already made the &lt;b&gt;byte&lt;/b&gt; accounting page-size-independent (`bd_iop_len`, in 4KiB interop units) but left the MD-boundary rule keyed on `bd_iov_count`, which is page-size-dependent — so the disagreement remains for large unaligned transfers.&lt;/p&gt;
+
+&lt;p&gt;*&lt;b&gt;Fix:&lt;/b&gt;*&lt;br/&gt;
+Take the MD boundary from `bd_iop_len` (the 4KiB-virtual on-wire byte count, the only quantity identical on both ends) instead of `bd_iov_count`: open the first MD when none exists, and open each later MD when the current one reaches `LNET_MTU`. Each kiov adds at least `PTLRPC_BULK_INTEROP_PAGE_SIZE` to `bd_iop_len`, so an MD reaches `LNET_MTU` at or before its `LNET_MAX_IOV`'th kiov and the per-MD iov limit is still honoured. This synchronizes segmentation for every transfer whose fragments are 4KiB-aligned (all page-cache IO, any page size). Sub-4KiB unaligned direct IO is out of scope — its fragment lengths themselves differ between page sizes, so agreement there requires exchanging the segmentation on the wire.&lt;/p&gt;
+
+&lt;p&gt;*&lt;b&gt;Reproduction:&lt;/b&gt;*&lt;br/&gt;
+`sanity` test_119s: writes one full-size RPC at an object offset that is not page-aligned and fails if the two ends disagree on the MD count. Reproduces only with a client page larger than the server's (`clientarch=aarch64 serverarch=x86_64`); the existing 56x coverage (1–4MiB, matched page sizes) never exercised it.&lt;/p&gt;
+
+&lt;p&gt;*&lt;b&gt;Workaround:&lt;/b&gt;*&lt;br/&gt;
+On large-page clients, cap the RPC below the divergence point: `lctl set_param osc.*.max_pages_per_rpc=240` (validated via &lt;a href="https://review.whamcloud.com/67524" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/67524&lt;/a&gt;).&lt;/p&gt;</description>
+                <environment />
+        <key id="98643">LU-20520</key>
+            <summary>Large unaligned bulk write hangs when client and server page sizes differ</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="3" iconUrl="https://jira.whamcloud.com/images/icons/statuses/inprogress.png" description="This issue is being actively worked on at the moment by the assignee.">In Progress</status>
+                    <statusCategory id="4" key="indeterminate" colorName="inprogress" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 25 Jul 2026 15:22:07 +0000</created>
+                <updated>Sat, 25 Jul 2026 15:42:58 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="498524" author="gerrit" created="Sat, 25 Jul 2026 15:36:17 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/67530" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/67530&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20520" title="Large unaligned bulk write hangs when client and server page sizes differ" class="issue-link" data-issue-key="LU-20520"&gt;LU-20520&lt;/a&gt; ptlrpc: pack bulk MDs by on-wire byte count&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 19b694b0eecf859da7f318cb80995f04a9f05547&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10120">
+                    <name>Blocker</name>
+                                            <outwardlinks description="is blocking">
+                                                        </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06xbz:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

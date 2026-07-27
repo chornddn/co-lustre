@@ -1,0 +1,136 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20527] conf-sanity test_122a: MDS LBUG osp_statfs() ASSERTION( sfs-&gt;os_fprecreated &lt;= OST_MAX_PRECREATE * 2 )</title>
+                <link>https://jira.whamcloud.com/browse/LU-20527</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;ai generated triage report&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Symptom"&gt;&lt;/a&gt;Symptom&lt;/h3&gt;
+
+&lt;p&gt;The MDS LBUGs during conf-sanity &lt;tt&gt;test_122a&lt;/tt&gt; "Check OST sequence update" on a&lt;br/&gt;
+DNE ldiskfs config:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LustreError: 29639:0:(osp_dev.c:843:osp_statfs()) ASSERTION( sfs-&amp;gt;os_fprecreated &amp;lt;= OST_MAX_PRECREATE * 2 ) failed: last_created [0x280000401:0xff02:0x0], next_fid [0x280000401:0x1:0x0], reserved 0
+LustreError: 29639:0:(osp_dev.c:843:osp_statfs()) LBUG
+Kernel panic - not syncing: LBUG #3 lbug_with_loc                [libcfs]
+ #4 osp_statfs                   [osp]    lustre/osp/osp_dev.c:840
+ #5 lod_statfs_and_check         [lod]
+ #6 lod_qos_statfs_update        [lod]    lustre/lod/lod_qos.c:175
+ #7 lod_qos_prep_create          [lod]    lustre/lod/lod_qos.c:2950
+ #9 lod_declare_striped_create   [lod]
+#13 mdd_declare_create_object_internal [mdd]
+#16 mdd_create                   [mdd]
+#17 mdt_reint_open               [mdt]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Seen on the Lustre Gerrit Janitor across unrelated patches, e.g.&lt;br/&gt;
+&lt;a href="https://testing.whamcloud.com/gerrit-janitor/66699/testresults/conf-sanity4-ldiskfs-DNE-rocky8.10_x86_64-rocky8.10_x86_64" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/gerrit-janitor/66699/testresults/conf-sanity4-ldiskfs-DNE-rocky8.10_x86_64-rocky8.10_x86_64&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;Relatively rare in autotest, but 100% reproducible once the right OSP is used &amp;#8211; see "Why it is intermittent" below.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Rootcause"&gt;&lt;/a&gt;Root cause&lt;/h3&gt;
+
+&lt;p&gt;&lt;tt&gt;ofd_create_hdl()&lt;/tt&gt; answers a &lt;b&gt;normal&lt;/b&gt; (non-DELORPHAN) precreate request whose&lt;br/&gt;
+last OID is below the OST's LAST_ID with the OST's own &lt;tt&gt;last_oid + 1&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;("trust the OST") and precreates nothing (lustre/ofd/ofd_dev.c:1687):&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+             &lt;span class="code-keyword"&gt;if&lt;/span&gt; (diff &amp;lt; 0) {
+                LCONSOLE(D_INFO,
+                     &lt;span class="code-quote"&gt;"%s: MDS LAST_ID "&lt;/span&gt;DFID&lt;span class="code-quote"&gt;" (%llu) is %lld behind OST LAST_ID "&lt;/span&gt;DFID&lt;span class="code-quote"&gt;" (%llu), trust the OST\n"&lt;/span&gt;, ...);
+                &lt;span class="code-comment"&gt;/* Let MDS know that we are so far ahead. */&lt;/span&gt;
+                rc = ostid_set_id(&amp;amp;rep_oa-&amp;gt;o_oi,
+                          ofd_seq_last_oid(oseq) + 1);
+            }
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;&lt;tt&gt;osp_precreate_send()&lt;/tt&gt; stores that reply into &lt;tt&gt;opd_pre_last_created_fid&lt;/tt&gt; but never touches &lt;tt&gt;opd_pre_used_fid&lt;/tt&gt; (lustre/osp/osp_precreate.c:699), so the OSP then advertises every object in between as precreated, although the OST created none of them for this request. From the failing session's debug log:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lustre-OST0000: MDS LAST_ID [0x280000401:0x21:0x0] (33) is 65248 behind OST LAST_ID [0x280000401:0xff01:0x0] (65281), trust the OST
+lustre-OST0000-osc-MDT0001: current precreated pool: [0x280000401:0x1:0x0]-[0x280000401:0xff02:0x0]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;&lt;tt&gt;os_fprecreated&lt;/tt&gt;is then 0xff02 - 0x1 = 65281, above &lt;tt&gt;OST_MAX_PRECREATE * 2 (40000), and the next {{lod_statfs_and_check()&lt;/tt&gt;}} during object creation hits the assertion.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Whenitwasintroduced"&gt;&lt;/a&gt;When it was introduced&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;1711e26ae861 ("&lt;a href="https://jira.whamcloud.com/browse/LU-15009" title="precreate should cleanup orphans upon error" class="issue-link" data-issue-key="LU-15009"&gt;&lt;del&gt;LU-15009&lt;/del&gt;&lt;/a&gt; ofd: continue precreate if LAST_ID is less on MDT", landed 2.14.57/2.15.0) introduced that OST reply, but capped the jump at &lt;tt&gt;OST_MAX_PRECREATE&lt;/tt&gt; &amp;#8211; so the precreate window was already wrong, but &lt;tt&gt;os_fprecreated&lt;/tt&gt; stayed below the assertion.&lt;/li&gt;
+	&lt;li&gt;53940ff3eee8 ("&lt;a href="https://jira.whamcloud.com/browse/LU-17987" title="always trust OST last_id in normal precreate" class="issue-link" data-issue-key="LU-17987"&gt;&lt;del&gt;LU-17987&lt;/del&gt;&lt;/a&gt; ofd: always trust OST last_id", landed 2.15.90/2.16.0) removed that cap, so an arbitrarily large jump now reaches the assertion and the MDS LBUGs.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Whyitisintermittent"&gt;&lt;/a&gt;Why it is intermittent&lt;/h3&gt;
+
+&lt;p&gt;&lt;tt&gt;test_122a&lt;/tt&gt; sets &lt;tt&gt;OBD_FAIL_OFD_SET_OID&lt;/tt&gt; (0x1e0) on ost1, which makes the OST&lt;br/&gt;
+stamp a newly created sequence's LAST_ID at &lt;tt&gt;seq_width - 255&lt;/tt&gt;. Any OSP that rolls over to a &lt;b&gt;fresh&lt;/b&gt; sequence while that fail_loc is still set gets the "trust the OST" reply and a poisoned precreate window.&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;MDT0000's OSP starts on the IDIF sequence and therefore &lt;b&gt;always&lt;/b&gt; rolls over as soon as it connects, i.e. always while the fail_loc is set. But stock &lt;tt&gt;test_122a&lt;/tt&gt; only creates files under a directory on MDT0001, so that poisoned OSP is normally never used and the test passes.&lt;/li&gt;
+	&lt;li&gt;The crash needs MDT0001's OSP to be poisoned as well. That requires an extra race: &lt;tt&gt;mount_facet()&lt;/tt&gt; applies &lt;tt&gt;seq.cli-&amp;lt;OST&amp;gt;-super.width&lt;/tt&gt; &lt;b&gt;after&lt;/b&gt; the OST mount returns, so an OSP that creates its first sequence's LAST_ID object before that gets it stamped with the default&lt;br/&gt;
+&lt;tt&gt;LUSTRE_DATA_SEQ_MAX_WIDTH - 255 (0x1ffff00). The OSP later learns the real width (65536) from a reply, declares the sequence exhausted and rolls over - while the fail_loc is still set.&lt;/tt&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;tt&gt;In the failing session: {{Got last_fid &lt;span class="error"&gt;&amp;#91;0x280000400:0x1ffff00:0x0&amp;#93;&lt;/span&gt;&lt;/tt&gt;}} for MDT0001 versus the healthy &lt;tt&gt;&lt;span class="error"&gt;&amp;#91;...:0xff01&amp;#93;&lt;/span&gt;&lt;/tt&gt;.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;p&gt;Making it deterministic only takes using the OSP that is always poisoned - add to &lt;tt&gt;test_122a&lt;/tt&gt;, after the existing &lt;tt&gt;createmany&lt;/tt&gt; :&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+    $LFS mkdir -i0 -c1 $DIR/${tdir}0 || error &lt;span class="code-quote"&gt;"mkdir on MDT0000 failed"&lt;/span&gt;
+    $LFS setstripe -i0 -c1 $DIR/${tdir}0
+    createmany -o $DIR/${tdir}0/file_ 100 ||
+        error &lt;span class="code-quote"&gt;"Fail to create on MDT0000"&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;With that, MDSCOUNT=2 OSTCOUNT=2 ldiskfs LBUGs the MDS on every run.&lt;/p&gt;</description>
+                <environment />
+        <key id="98683">LU-20527</key>
+            <summary>conf-sanity test_122a: MDS LBUG osp_statfs() ASSERTION( sfs-&gt;os_fprecreated &lt;= OST_MAX_PRECREATE * 2 )</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="green">Oleg Drokin</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 27 Jul 2026 04:35:17 +0000</created>
+                <updated>Mon, 27 Jul 2026 04:35:17 +0000</updated>
+                                            <version>Lustre 2.16.0</version>
+                    <version>Lustre 2.17.0</version>
+                    <version>Lustre 2.18.0</version>
+                                    <fixVersion>Lustre 2.18.0</fixVersion>
+                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06xdr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

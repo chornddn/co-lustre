@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Lai Siyao
 Reporter:   James Nunez
 Created:    Thu, 3 Aug 2017 23:14:35 +0000
-Updated:    Thu, 23 Jul 2026 18:22:01 +0000
+Updated:    Fri, 24 Jul 2026 18:58:23 +0000
 Links:      Duplicate: is duplicated by LU-18044; Duplicate: is duplicated by LU-17590; Related: is related to  LU-10553; Related: is related to  LU-17857; Related: is related to  LU-10690; Related: is related to  LU-10789; Related: is related to  LU-9927; Related: is related to  LU-4684; Related: is related to LU-18598; Related: is related to LU-20303
 
 --- Description ---
@@ -212,3 +212,56 @@ https://testing.whamcloud.com/search?status%5B%5D=TIMEOUT&test_set_script_id=570
 
 --- Comment (adilger, Wed, 8 Jul 2026 05:35:36 +0000) ---
 +1 on master: https://testing.whamcloud.com/test_sets/e9394bbd-c3bf-416d-b5d5-7e26e309ef3b
+
+--- Comment (green, Fri, 24 Jul 2026 18:58:23 +0000) ---
+ok, so a lot of this is ai generated, but claude rootcaused this for me with instrumentation and all:
+
+  Root cause, pinned to the end-state (not theory):
+
+  - The failure is a dangling directory entry: source_file5 is returned by
+
+  readdir but lfs path2fid → ENOENT. rm -rf skips the ENOENT child, rmdir →
+
+  ENOTEMPTY, permanently unremovable.
+
+  - The dirent references child FID [0x200000404:0x3b:0x0] — in migrate_dir's
+
+  own sequence — which mdt_cross_open reports "doesn't exist" for the whole run.
+
+  So migration created a child object, inserted a name pointing at it, then the
+
+  object was destroyed, leaving the name dangling.
+
+  - The underflow that flags it is mdo_ref_del at mdd_dir.c:4837 (confirmed
+
+  earlier by stack trace), with the stock nlink==0 (LU-3915) log as
+
+  corroboration.
+
+ 
+
+  This race is uninstrumentable on the MDS hot path. Any per-operation CERROR —
+
+  even one filtered to just the three race filenames — slowed the MDS enough to
+
+  drop reproduction to 0/9. That's why I could pin the site but not capture the
+
+  full interleaving, and it's a real constraint on how much further in-kernel
+
+  tracing can go. I fell back to stock + post-mortem, which is non-perturbing
+
+  and gave the end-state facts above.
+
+ 
+
+ the ai conclusion:
+
+  The correct fix is a concurrency-atomicity change — making per-entry migration
+
+  atomic with respect to concurrent rename/unlink of that object's names — not
+
+  a lock bit or a point guard. Four targeted point-fixes failing, plus the
+
+  ticket's age, both point the same way. I don't have that design validated, and
+
+  I won't dress up a partial one as the fix.
