@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Sunghwan Kim
 Created:    2026-07-16 05:54:38.000000000
-Updated:    2026-07-21 05:06:22.000000000
-Patch Set:  3
+Updated:    2026-07-28 13:44:11.000000000
+Patch Set:  4
 Insertions: +23
 Deletions:  -3
-Comments:   0 (0 unresolved)
+Comments:   12 (5 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-20483 lov: fix lo_loi NULL deref in DOM layout init
@@ -29,7 +29,7 @@ a NULL lo_loi pointer at offset 0x48 (loi_lvb.lvb_blocks).
   BUG: NULL pointer dereference at 0000000000000048
   RIP: lov_attr_get_dom+0x24/0x90
 
-Two race windows:
+Three race windows:
 
 Window A: Between LOOP1 (sets lle_valid=1) and LOOP2 (lov_init_dom),
 lo_loi is NULL. Concurrent lov_attr_get_composite() can reach
@@ -39,27 +39,34 @@ Window B: Inside lov_init_dom(), lo_dom_r0 fields are written before
 lo_loi with no ordering barrier, so concurrent readers may observe
 a partially initialized state.
 
+Window C: lov_attr_get() dispatches with LOV_2DISPATCH_NOLOCK, so
+lov_attr_get_composite() can be entered while lov_layout_change() is
+between llo_fini and llo_init. At that point lo_entries==NULL, the
+lov_for_layout_entry() loop is skipped, and the function returns rc=0
+with cat_size=0, causing ll_merge_attr_nolock() to call
+i_size_write(inode, 0).
+
 Fix:
 1. Defer lo_loi load in lov_attr_get_dom() past the lo_attr_valid
-   fast-path; guard with smp_load_acquire() + NULL check. Return
-   -ENODATA when lo_loi is NULL so ll_merge_attr_nolock() exits
-   early without touching i_size, preserving correct behavior for
-   both the race window and legitimate truncate-to-zero paths.
+   fast-path; guard with smp_load_acquire() + NULL check.
 2. Publish lo_loi last in lov_init_dom() via smp_store_release(),
    pairing with the acquire in lov_attr_get_dom().
-3. Guard lov_oinfo_is_dummy() in fiemap path against NULL lo_loi.
-4. Initialize lo_preferred_mirror=0 early for non-FLR files to
-   prevent concurrent lov_io_mirror_init() from hitting LASSERT.
+3. Guard fiemap path: load lo_loi first via smp_load_acquire() and
+   use the bound value for both the NULL check and lov_oinfo_is_dummy().
+   lov_object_fiemap() is a NOLOCK path (direct coo_fiemap dispatch),
+   so a single acquire load is required for correctness.
+   Introduced by: 5921e1571f ("LU-5560 lov: implement lov_object_fiemap")
+4. Return -ENODATA from lov_attr_get_dom() when lo_loi is NULL
+   (race window), instead of silently returning 0 with no attr.
+5. Return -ENODATA from lov_attr_get_composite() when lo_entries is
+   NULL (layout change window), for the same reason.
+   ll_merge_attr_nolock() already converts -ENODATA to rc=0 and
+   exits early, preserving the existing i_size for both windows.
 
+Fixes: 8b352709a66f ("LU-3285 lov: add MDT target to the LOV device")
 Reproducer: concurrent O_APPEND writes crossing the 1 MB DOM
 threshold trigger a layout change while other threads read file
 attributes via ll_merge_attr().
-
-Known limitation: FLR+DOM files have a pre-existing race where
-lo_preferred_mirror==-1 can reach lov_io_mirror_init() and index
-lo_mirrors[-1]. Fix 1 removes the NULL deref crash that prevented
-reaching this path; this pre-existing issue is not addressed in
-this patch.
 
 Assisted-by: Claude:claude-sonnet-4-6 [Claude Code]
 Signed-off-by: Sunghwan Kim <shkim3220@gluesys.com>
@@ -147,3 +154,40 @@ Patch Set 3: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/127717/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-07-27 20:23:20.000000000) ---
+Patch Set 3:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Experimental feature testing in progress, please pay attention to the comments
+
+Some concerns, see inline comments. The bigger question is whether the guards belong here at all: lov_attr_get() and lov_object_fiemap() walk lov->u.composite with no lo_type_guard and no lo_active_ios reference, so lov_fini_composite() can free lo_entries and drop lo_lsm underneath them just before lov_init_composite() runs. Adding NULL checks to two of those readers narrows one window; the reader side is still unserialized against lov_layout_change(). Serializing the reader (lov_conf_freeze() in lov_attr_get(), or running the pre-IO ll_merge_attr() in ll_file_io_generic() under an IO/layout reference) would close all of them at once. Also, given there is a described reproducer, a regression test in sanity-dom or sanityn that races O_APPEND writes across the DOM threshold against stat would be worth adding.
+
+--- Message (Sunghwan Kim, 2026-07-28 06:19:16.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+--- Message (Sunghwan Kim, 2026-07-28 06:39:03.000000000) ---
+Uploaded patch set 4: Commit message was updated.
+
+Copied Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (wc-checkpatch, 2026-07-28 06:40:07.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-28 06:42:20.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-28 06:53:34.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful

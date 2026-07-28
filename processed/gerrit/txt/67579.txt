@@ -1,0 +1,103 @@
+Change:     67579
+Subject:    LU-12668 lov: track EC stripe health per-IO
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67579
+Change-Id:  I03e1d68d7d7d06d0fdd90ebbd1268aa7e2e8cab9
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Maximilian Dilger
+Created:    2026-07-27 23:55:24.000000000
+Updated:    2026-07-28 13:31:35.000000000
+Patch Set:  1
+Insertions: +376
+Deletions:  -36
+Comments:   2 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Qian Yingjin
+
+--- Commit Message ---
+LU-12668 lov: track EC stripe health per-IO
+
+EC stripe health lived in the shared lovsub_object (lso_status),
+mutated with bare stores from every io's iter-init, lock-enqueue and
+read-failure paths.  Concurrent degraded reads on the same file
+therefore raced: one reader could flip a stripe's status inside
+another's lov_lock_sub_init() count/init window, diverging the
+initialized sub-lock count from the pre-counted lls_nr and tripping
+the LASSERT at lov_lock.c:207 (LBUG, panics the client under
+panic_on_lbug).  The same interference could also desynchronize an
+io's lock coverage from its own reconstruct decisions.
+
+lso_status carried no cross-IO value: lov_ecio_add_data_sub()
+re-derives every stripe's health on each iteration anyway.  Move the
+state into per-IO bitmaps (lov_io.lis_err_map, one per layout entry,
+allocated per iteration like lis_trunc_stripe_index) and delete the
+shared field.  Each io derives and updates only its own view, so a
+concurrent io can never change the set under us and the
+lov_lock_sub_init() invariant holds by construction.  Healthy-file
+reads never touch the map.
+
+Also fix wrong-data reconstruction on the degraded-read (CIT_EC_RD)
+path.  lov_ec_read_stripe_pages() classified a survivor data page
+EC_DPG_ZERO once its offset reached i_size_read(inode), but i_size is
+transiently short there: the survivor stripes' LVBs are not yet
+refreshed when recovery starts, so the size merge briefly returns a
+stripe0-only value and live survivor pages were zero-filled into the
+GF decode.  The recovery-group bound (eoff) already delimits valid
+data, and a survivor stripe read past its OST object end returns
+natural sparse zeros matching the encoder's zero-pad, so the i_size
+test is both unreliable here and unnecessary; drop it.
+
+Add the two sanity-ec tests that reproduced the crash: 49a runs four
+concurrent readers over a 4+2 file with two data OSTs failed and
+reliably LBUGed the client, and 74a races readers against OST
+deactivation for 20 rounds and crashed likewise; both pass now.  Their
+helpers fail an OST's BRW reads (OBD_FAIL_OST_BRW_READ_BULK) rather
+than deactivating the import, so the client really enters CIT_EC_RD
+reconstruction instead of taking -EIO ahead of it.
+
+Remaining sanity-ec reconstruction failures (holes 59a-c and the 64-74
+recovery group) are a separate defect, not addressed here.
+
+Assisted-by: ClaudeCode:opus llm_code_and_review_tools
+
+Test-Parameters: testlist=sanity-ec
+Test-Parameters: testlist=sanity-ec fstype=zfs
+Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
+Change-Id: I03e1d68d7d7d06d0fdd90ebbd1268aa7e2e8cab9
+
+--- Review History ---
+
+--- Message (Maximilian Dilger, 2026-07-27 23:55:24.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-28 00:03:08.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-28 00:03:57.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-07-28 02:25:19.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128189/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-28 02:41:46.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
