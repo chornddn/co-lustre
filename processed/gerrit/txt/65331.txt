@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-14 22:35:51.000000000
-Updated:    2026-07-28 09:56:43.000000000
-Patch Set:  13
-Insertions: +322
+Updated:    2026-07-29 00:51:31.000000000
+Patch Set:  14
+Insertions: +450
 Deletions:  -0
-Comments:   70 (10 unresolved)
+Comments:   90 (8 unresolved)
 
 --- Labels ---
   Code-Review: Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -96,6 +96,67 @@ of /usr/sbin/l_getsepol is resolved against /usr/bin and only a
 /usr/bin rule matches.  On el8/el9 and el10.0/10.1 there is no
 such equivalency and the /usr/sbin rule matches the real path.
 Listing both covers every case; the unused entry is harmless.
+
+Because every permission not enumerated becomes a new denial
+once the helpers leave kernel_t, the lustre_helper_t rule set is
+derived per helper rather than from the helpers that happened to
+be exercised by hand.
+
+l_getidentity, the MDS identity upcall
+(mdt_identity_do_upcall()), resolves supplementary groups with
+getpwuid()/getgrouplist() and reads PERM_PATHNAME
+(/etc/lustre/perm.conf).  That reaches well beyond the Lustre
+parameter paths: /etc/nsswitch.conf and perm.conf are etc_t,
+/etc/passwd and /etc/group are passwd_file_t, and glibc NSS also
+walks /proc/self, /run, /var/lib and the systemd-userdb and sssd
+client sockets.  Without these the identity upcall fails on
+every MDS running enforcing SELinux, whether or not GSS is used.
+
+l_getauth, the GSS server-side context upcall (rsi_do_upcall()),
+hands the request to lsvcgssd over a unix *stream* socket bound
+at GSS_SOCKET_PATH (/tmp/svcgssd.socket), so the datagram rule
+the other helpers use is not sufficient.  Connecting needs write
+on the socket file plus connectto on the listening daemon.
+lsvcgssd has no SELinux policy of its own: it runs as
+unconfined_service_t under the targeted policy, or init_t where
+the unconfined module is absent.
+
+Build-system and packaging fixes:
+
+  - The .pp is built under lustre/utils/selinux, which is only
+    reached when lustre/utils is built.  Both the %files entry
+    and the configure flag are now conditional on lustre_utils,
+    and LC_CONFIG_SELINUX_POLICY errors out on
+    --with-selinux-policy together with --disable-utils.
+    Previously "rpmbuild --without lustre_utils" on el10 failed
+    on the missing file.
+  - policycoreutils is now Requires(post)/Requires(preun), not
+    only BuildRequires, since %post and %preun run semodule and
+    restorecon on the target machine.
+  - %post no longer runs "semodule -r" before "semodule -i".
+    -i upgrades a module in place, so the removal only opened a
+    window with no policy loaded; its errors are also no longer
+    discarded.
+  - semodule_package reads $(srcdir)/lustre_helpers.fc so that
+    a separate build directory and make distcheck work.
+  - The source-install step is install-data-hook rather than
+    install-data-local, which automake may run concurrently
+    with install-selinuxDATA under make -j install.
+  - restorecon is located by configure and applied to
+    $(sbindir) instead of a hard-coded /usr/sbin.
+
+The lustre_helper_t rules were additionally validated on a live
+cluster.  Loading the module on a RHEL 9.7 MDS moves the helpers
+out of kernel_generic_helper_t into lustre_helper_t exactly as
+on el10, which makes the upcalls testable there: with the module
+loaded and the helpers relabeled, l_getidentity runs with zero
+denials, and removing the grants reproduces the failure (denials
+on /etc/passwd and /etc/nsswitch.conf).  On a RHEL 10.2 client
+l_getsepol likewise runs clean, and removing its policy-read
+grants makes mount.lustre fail outright.  The l_getauth rules
+follow from the code and from the observed lsvcgssd socket label
+and domain; an end-to-end GSS context negotiation was not
+exercised.
 
 Test-Parameters: trivial
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.0
@@ -696,3 +757,64 @@ Patch Set 13:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The structural one worth thinking about: moving the helpers out of kernel_t into a narrow lustre_helper_t domain means every permission not enumerated in lustre_helpers.te becomes a new denial, so the rule set needs to be derived per helper rather than from the ones that were exercised by hand. A couple of gaps and one packaging build break are noted inline.
+
+--- Message (Hiroshi Nishida, 2026-07-28 14:25:24.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-28 14:26:51.000000000) ---
+Patch Set 14:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-28 14:29:21.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-28 14:35:39.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-28 14:39:52.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-07-28 14:41:09.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (jenkins, 2026-07-28 14:50:34.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128231/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-07-28 14:52:08.000000000) ---
+Patch Set 14:
+
+(10 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-28 14:55:27.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-07-28 19:16:34.000000000) ---
+Patch Set 14: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-07-28 20:49:27.000000000) ---
+Patch Set 14:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The policy module itself builds cleanly (checkmodule -M -m + semodule_package both succeed on selinux-policy-44.4), and the four call_usermodehelper() paths in the commit message check out against obd_config.c, mdt_identity.c, sec.c and gss_svc_upcall.c. The comments are mostly about how the two new types are declared.

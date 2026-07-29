@@ -1,5 +1,5 @@
 Change:     64355
-Subject:    LU-19536 osc: enforce dirty limits for DIO writes
+Subject:    LU-19536 osc: enforce dirty limits for regular DIO writes
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64355
 Change-Id:  I115232216ae77740f0a779994e8a020eedeebfef
 Project:    fs/lustre-release
@@ -7,66 +7,49 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-03-04 18:31:47.000000000
-Updated:    2026-05-28 17:47:52.000000000
-Patch Set:  9
-Insertions: +111
-Deletions:  -58
-Comments:   34 (17 unresolved)
+Updated:    2026-07-29 13:59:44.000000000
+Patch Set:  10
+Insertions: +284
+Deletions:  -52
+Comments:   35 (17 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
-  REVIEWER: Andreas Dilger, Qian Yingjin, Patrick Farrell, Marc Vef
+  REVIEWER: Andreas Dilger, Qian Yingjin, Patrick Farrell, Vitaliy Kuznetsov, Marc Vef
 
 --- Commit Message ---
-LU-19536 osc: enforce dirty limits for DIO writes
+LU-19536 osc: enforce dirty limits for regular DIO writes
 
-The DIO path (osc_queue_dio_pages) only checked server
-grant availability before allowing a write, ignoring
-both the per-client dirty page limit (max_dirty_mb) and
-the global dirty page limit (obd_max_dirty_pages).
-This meant DIO could pile up unlimited dirty pages per
-OSC, bypassing memory pressure management.
+osc_queue_dio_pages() checked only server grant before queuing a
+write. For regular non-AIO DIO, parallel submission could therefore
+bypass the per-OSC max_dirty_mb and global obd_max_dirty_pages limits.
 
-Consolidate all three write-permission checks into
-osc_reserve_grant(): server grant, per-OSC dirty limit
-(cl_dirty_max_pages), and global dirty limit
-(obd_max_dirty_pages).  This makes it the single gate
-for "can I dirty these pages?" and ensures every write
-path - buffered, sync, and DIO - enforces all limits.
-All checks are done before any state is mutated, so
-failure is a simple early return with no rollback.
+Add osc_reserve_dio_grant() to validate the local dirty limit,
+atomically reserve global dirty pages, and reserve server grant under
+the client lock. Check dirty pressure first so a simultaneous grant
+shortage cannot hide the dirty limit.
 
-Use osc_reserve_grant() in all three write paths:
+When a regular DIO extent cannot enter dirty accounting, submit it
+synchronously and wait for that extent before forming more unaccounted
+RPCs. Preserve existing no-grant and true AIO paths. Keep buffered
+osc_enter_cache_try() accounting unchanged.
 
- - osc_queue_dio_pages (DIO) - adds both missing dirty
-   page checks
- - osc_queue_sync_pages (sync buffered IO) - uses the
-   shared helper, fixing a pre-existing grant leak: the
-   old code used "osc_reserve_grant() == 0 && dirty <
-   max" so when grant succeeded but dirty failed, the &&
-   short-circuit skipped into the else branch with grant
-   moved to cl_reserved_grant but never consumed or
-   returned to cl_avail_grant
- - osc_enter_cache_try (buffered IO) - simplified to a
-   single osc_reserve_grant() call followed by
-   osc_consume_write_grant(), replacing three exit
-   points with manual rollback
+Remove the obsolete DIO grant branch from osc_queue_sync_pages().
+Since LU-13814, DIO requests use osc_queue_dio_pages(). Rename
+__osc_unreserve_grant() to osc_unreserve_grant_no_wake() to document
+the no-wakeup rollback needed by waitqueue callers.
 
-When the dirty limit is exceeded, DIO falls back to
-synchronous RPC submission (ci_parallel_dio = false),
-same as when grant is exhausted.
-
-Add test_398v to verify DIO respects max_dirty_mb by
-writing 32MB with the limit set to 1MB and checking the
-kernel debug log for the sync fallback message.
-
-Generated with Claude Code + Tools
+Rewrite sanity test_398v to use one exact OSC, warm its grant, and
+pause OST bulk completion. Verify that four DIO RPCs do not all
+overlap at the dirty limit. Check final dirty counters and include
+the test in grant consistency checks.
 
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Signed-off-by: Vitaliy Kuznetsov <vkuznetsov@ddn.com>
 Change-Id: I115232216ae77740f0a779994e8a020eedeebfef
 
 --- Review History ---
@@ -530,3 +513,19 @@ Patch Set 9:
 Patch Set 9:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Vitaliy Kuznetsov, 2026-07-29 13:54:51.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vitaliy Kuznetsov, 2026-07-29 13:55:38.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-29 13:59:44.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.

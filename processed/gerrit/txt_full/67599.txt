@@ -1,0 +1,278 @@
+Change:     67599
+Subject:    LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67599
+Change-Id:  I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Vandana Rungta
+Created:    2026-07-28 17:49:43.000000000
+Updated:    2026-07-29 08:40:17.000000000
+Patch Set:  2
+Insertions: +62
+Deletions:  -3
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Timothy Day, Duncan Vogel, Keguang Xu
+
+--- Commit Message ---
+LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+
+Problem
+=======
+On a DNE (multi-MDT) filesystem, a cascading deadlock can drain an
+MDS's ldlm_bl (LDLM blocking/cancel) thread pool and stall lock
+cancellation fleet-wide, requiring a full MDS reboot to clear.
+
+The trigger is entirely local to one MDS.  An ldlm_bl thread performs
+a routine LRU cancellation of a cross-MDT LDLM lock that holds the
+MDS_INODELOCK_OPEN bit for a cached, deferred open handle on an
+otherwise idle inode.  No process has the file open: ldlm_cancel_lru()
+only walks ns_unused_list, so the lock has zero l_readers/l_writers and
+is LRU-eligible precisely because it is idle.  The OPEN bit covers open
+state that the client is caching to avoid a re-open round-trip, and
+that cached handle does not take an active reference on the lock.
+
+Cancelling the lock is therefore the client voluntarily returning that
+cached open state.  Doing so prunes the last cached dentry and drops
+the final inode reference (ll_md_blocking_ast -> ll_lock_cancel_bits ->
+ll_prune_aliases -> d_prune_aliases -> iput -> evict ->
+ll_md_real_close), and flushing the deferred open handle issues a
+synchronous MDS_CLOSE RPC to the remote MDT that owns the inode.
+
+If the MDC import to that remote MDT is not LUSTRE_IMP_FULL (the peer
+is failing over / in recovery), the close cannot be transmitted.  It
+parks in ptlrpc_import_delay_req() while holding the single "close"
+modify-RPC slot (cl_close_rpcs_in_flight == 1).  Every other ldlm_bl
+thread that subsequently reaches mdc_close() then blocks in
+obd_get_mod_rpc_slot(), because a close is only granted a slot when no
+other close is in flight.  Those waits are TASK_UNINTERRUPTIBLE with
+MAX_SCHEDULE_TIMEOUT and are woken only on RPC completion via
+cl_mod_rpcs_waitq -- there is no wakeup on import state change.
+
+With the whole pool parked, the MDS can no longer answer any lock
+cancellation, including the blocking ASTs its own server needs, so it
+evicts its internal client and customers while peers evict it.  The
+close needs the import FULL; the import needs the bl threads; the bl
+threads are all parked on the close slot.  The cycle cannot self-heal.
+
+This is proven from production logs of a 16-MDT DNE filesystem running
+Lustre 2.15: 10 ldlm_bl threads on the victim MDT blocked >122s in
+obd_get_mod_rpc_slot via mdc_close, the stuck lock holding bits 0x5
+(LOOKUP|OPEN), and the MDC import to the recovering peer never
+reaching FULL (the OSP import restored, the MDC did not).  Replayed
+cross-MDT LDLM_ENQUEUEs to the peer aborted with status 301
+(ELDLM_LOCK_ABORTED), so the peer's recovery never completed and the
+MDC was ultimately evicted and marked IMPF_INVALID.
+
+Fix
+===
+Two complementary changes are required.  The first lets a close that
+*can* complete proceed during the peer's recovery; the second makes a
+close that *cannot* complete fail fast instead of hanging forever.
+
+1) mdc_close(): allow the cross-MDT close during the target's recovery
+   (lustre/mdc/mdc_request.c)
+
+   When the MDS-internal client (OBD_CONNECT_MDS_MDS) closes a file on
+   a remote MDT while the local top device is recovering
+   (OBDF_RECOVERING on ld_site->ls_top_dev), set req->rq_allow_replay.
+   ptlrpc_import_delay_req() then transmits the close during the
+   import's REPLAY/REPLAY_LOCKS/REPLAY_WAIT/RECOVER sub-states instead
+   of parking it.  rq_allow_replay does not set MSG_REPLAY on the wire,
+   so this remains an ordinary MDS_CLOSE; the server already accepts
+   MDS_CLOSE during recovery via tgt_filter_recovery_request() ->
+   target_queue_recovery_request().  This mirrors the existing OSP
+   cross-MDT CANCEL handling (ldlm_cli_cancel_req) and the SEQ/FLD
+   during-recovery idioms.  It is scoped to OBD_CONNECT_MDS_MDS +
+   OBDF_RECOVERING, so a customer-client close is never affected.
+
+   This covers the pre-eviction window only: while the import is still
+   in a recovery sub-state, the close is allowed out and completes,
+   releasing the close slot.
+
+2) Abort the mod-RPC-slot wait on an invalid import
+   (lustre/obdclass/genops.c, lustre/ptlrpc/client.c,
+    lustre/ptlrpc/import.c, lustre/include/lustre_net.h,
+    lustre/mdc/mdc_request.c)
+
+   rq_allow_replay is not sufficient by itself.  Once the peer's
+   recovery aborts and the MDC import is evicted and marked
+   IMPF_INVALID, the close no longer parks in a recovery sub-state --
+   it hits -ESHUTDOWN in ptlrpc_import_delay_req() -- but any threads
+   already sleeping in obd_get_mod_rpc_slot() for the close slot are
+   never woken, because the slot is only released on RPC completion
+   and the RPC will never complete.  The slot wait needs to become
+   import-state aware:
+
+   - genops.c: add a bool "aborted" to struct mod_waiter.  In the
+     custom wake function claim_mod_rpc_function(), before evaluating
+     slot availability, check the import: if cli->cl_import is NULL or
+     IMPF_INVALID is set, mark the waiter aborted, wake it, and return.
+     The abort must live inside claim_mod_rpc_function() rather than at
+     a plain wake_up site: for a close waiter, the custom wake function
+     deliberately refuses to wake the thread while another close is in
+     flight, so an ordinary wakeup would not rouse the stuck thread.
+     obd_get_mod_rpc_slot() detects wait.aborted after
+     __remove_wait_queue(), drops the lock, and returns tag 0 (the
+     existing "no slot acquired" sentinel) without allocating a bitmap
+     tag.  The LU-18826 kthread/PF_MEMALLOC force-grant branch and the
+     LU-15947 wakeup precision are left unchanged.
+
+   - client.c / lustre_net.h: ptlrpc_get_mod_rpc_slot() now returns int
+     instead of void.  A returned tag of 0 is translated to -ENOTCONN;
+     the success path sets the tag, reassigns the xid, and returns 0.
+     The other callers (ldlm_request, mdc_reint, mdc_request open/
+     intent paths, osp_trans, ptlrpc batch) ignore the return value,
+     which is source-compatible.
+
+   - mdc_request.c: mdc_close() checks the return of
+     ptlrpc_get_mod_rpc_slot() and, on error, GOTO(out, rc) before
+     ptlrpc_queue_wait().  Because the abort path never claimed a slot
+     and the close bails before ptlrpc_put_mod_rpc_slot(), the
+     cl_close_rpcs_in_flight accounting stays balanced.
+
+   - import.c: ptlrpc_deactivate_import_nolock() -- the single point
+     that sets IMPF_INVALID -- calls
+     wake_up_all(&imp->imp_obd->u.cli.cl_mod_rpcs_waitq) immediately
+     after ptlrpc_abort_inflight().  This is the event that drives the
+     parked waiters to re-run claim_mod_rpc_function(), observe
+     IMPF_INVALID, and abort.  Both invalidation entry points
+     (ptlrpc_deactivate_import and ptlrpc_invalidate_import) funnel
+     through the nolock form, so both are covered.
+
+Together the parked close is woken, returns -ENOTCONN, releases the
+close slot, and the next waiter is woken to the same fast-fail; the bl
+pool drains and lock cancellation resumes without a reboot.
+
+Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
+Signed-off-by: Vandana Rungta <vrungta@amazon.com>
+
+--- Review History ---
+
+--- Message (Vandana Rungta, 2026-07-28 17:49:43.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-28 17:52:42.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66828/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-28 17:53:03.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-07-28 17:53:44.000000000) ---
+Patch Set 2: Commit message was updated.
+
+--- Message (wc-checkpatch, 2026-07-28 17:54:37.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-28 17:56:33.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-28 17:56:41.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/66829/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-07-28 18:05:19.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-28 18:15:09.000000000) ---
+Patch Set 1: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 2 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128242/ : SUCCESS
+
+--- Message (Maloo, 2026-07-28 18:15:41.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 128242 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128242&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128242#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-07-28 19:16:17.000000000) ---
+Patch Set 2:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66829/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Maloo, 2026-07-28 23:35:09.000000000) ---
+Patch Set 1: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 2 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm29: https://testing.whamcloud.com/test_sessions/21b4b73f-063b-435e-bc64-70da8eec1d73 ran 5 tests.
+
+--- Message (Lustre Gerrit Janitor, 2026-07-29 08:40:17.000000000) ---
+Patch Set 2:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity1@zfs:test_56od(Seen in reviews: 65862)
+
+
+> replay-dual@ldiskfs+DNE Timeout(382s)
+> replay-dual@zfs Timeout(382s)
+> sanity-slow@ldiskfs+DNE Timeout(3585s)
+> sanity1@zfs Failure(12185s)
+- 56od('/home/green/git/lustre-release/lustre/utils/lfs find /mnt/lustre/d56od.sanity -btime -11s -type d' wrong: found 3, expected 4) 
+> sanity-ec@zfs Failure(1218s)
+- 5b(mirror resync failed) 
+> sanity-pcc@ldiskfs+DNE Failure(5152s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Timeout(3570s)
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66829/results.html
