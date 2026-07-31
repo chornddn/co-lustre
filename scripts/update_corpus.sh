@@ -12,7 +12,7 @@
 #   5. convert manual DocBook -> processed/manual   (needs pandoc)
 #   6. convert wiki  XML  -> processed/wiki
 #
-# DoS-safety: a flock(1) single-instance lock means a second invocation (e.g.
+# DoS-safety: an flock(2) single-instance lock means a second invocation (e.g.
 # an overlapping cron fire) exits immediately instead of doubling load on the
 # shared JIRA/Gerrit servers.  The fetchers themselves are sequential and
 # rate-limited.
@@ -51,7 +51,8 @@ set -uo pipefail   # NOT -e: one failing converter must not abort the rest.
 
 log() { printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
-usage() { sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p}' "$0"; }
+# The `;` before `}` is required by BSD sed (macOS); GNU sed accepts both.
+usage() { sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p;}' "$0"; }
 
 FAILURES=0
 
@@ -194,10 +195,27 @@ pick_python() {
 # ── single-instance lock (the #1 DoS guard) ──────────────────────────────
 # Held for the whole run; released automatically when fd 9 closes on exit,
 # so a crash never leaves a stale lock.  Lives outside the repo.
+#
+# macOS has no flock(1), so the lock is taken by a short-lived python3 child
+# on the inherited fd 9 -- exactly what flock(1) does.  The lock belongs to
+# the open file description, not the fd, so it persists after that child
+# exits and dies with the shell that holds fd 9.  Never fail open: if no
+# python3 is available we abort rather than run unlocked, since this lock is
+# what keeps an overlapping cron fire off the shared servers.
 
 LOCKFILE="${TMPDIR:-/tmp}/co-lustre-update_corpus.lock"
 exec 9>"$LOCKFILE"
-if ! flock -n 9; then
+if ! command -v python3 >/dev/null 2>&1; then
+    log "ERROR: python3 not found; refusing to run without the single-instance lock."
+    exit 1
+fi
+if ! python3 -c '
+import fcntl, sys
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)
+' 2>/dev/null; then
     log "Another update_corpus run is in progress (${LOCKFILE}) — exiting."
     exit 0
 fi
@@ -222,7 +240,11 @@ else
     jira_args=()
     $DRY_RUN && jira_args+=(--dry-run)
     [[ -n "$MAX_ISSUES" ]] && jira_args+=(--max-issues "$MAX_ISSUES")
-    run_step "JIRA fetch" "$PYTHON" "${SCRIPT_DIR}/download_jira_incremental.py" "${jira_args[@]}"
+    # "${a[@]+"${a[@]}"}" expands to nothing when the array is empty.  A bare
+    # "${a[@]}" is an unbound-variable error under `set -u` in bash 3.2, which
+    # is what macOS ships; bash 4.4+ allows it.
+    run_step "JIRA fetch" "$PYTHON" "${SCRIPT_DIR}/download_jira_incremental.py" \
+        "${jira_args[@]+"${jira_args[@]}"}"
 fi
 
 # 2. Gerrit fetch (incremental by default via its own .last_update marker).

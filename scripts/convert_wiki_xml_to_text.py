@@ -117,6 +117,81 @@ def strip_wikitext(text: str) -> str:
     return s.strip()
 
 
+def page_wikitext(page_el) -> str:
+    """Return a page's raw wikitext, or "" when it has none."""
+    revision = page_el.find(f"{MW_NS}revision")
+    if revision is None:
+        return ""
+    text_el = revision.find(f"{MW_NS}text")
+    return text_el.text if text_el is not None and text_el.text else ""
+
+
+def page_id_of(page_el) -> int:
+    """Return a page's numeric id, or 0 when it has none."""
+    id_el = page_el.find(f"{MW_NS}id")
+    return int(id_el.text) if id_el is not None and (id_el.text or "").isdigit() else 0
+
+
+def assign_filenames(pages) -> dict:
+    """Map each page to a unique output basename, renaming on collision.
+
+    MediaWiki namespaces here are `first-letter` cased, so "ZFS System Design"
+    and "Zfs system design" are two distinct pages -- but they sanitize to one
+    filename on a case-insensitive filesystem (macOS's default APFS).  Left
+    alone, whichever is written last silently wins: the corpus loses a page
+    and quietly depends on which host generated it.
+
+    Rather than drop a page, keep every one of them.  Within a colliding
+    group the page carrying the most wikitext (in practice the real article)
+    keeps the plain name, so existing paths don't churn; the others get a
+    `__<page id>` suffix, which is unique by construction and traceable back
+    to the export.  Ties break on the lower page id, and suffixed names are
+    re-checked against every other name, so the result is deterministic and
+    byte-identical on macOS and Linux.
+    """
+    by_name: dict = {}
+    for page_el in pages:
+        title_el = page_el.find(f"{MW_NS}title")
+        if title_el is None or not title_el.text:
+            continue
+        key = sanitize_filename(title_el.text).lower()
+        by_name.setdefault(key, []).append(page_el)
+
+    # Rank: most wikitext first, then lowest page id.
+    def rank(page_el):
+        return (-len(page_wikitext(page_el)), page_id_of(page_el))
+
+    names: dict = {}
+    taken = {k for k, group in by_name.items() if len(group) == 1}
+    for key, group in sorted(by_name.items()):
+        if len(group) == 1:
+            page_el = group[0]
+            names[id(page_el)] = sanitize_filename(page_el.find(f"{MW_NS}title").text)
+            continue
+
+        keeper, *renamed = sorted(group, key=rank)
+        base = sanitize_filename(keeper.find(f"{MW_NS}title").text)
+        names[id(keeper)] = base
+        taken.add(base.lower())
+        print(f"NOTE  filename collision on {key!r}: "
+              f"{keeper.find(f'{MW_NS}title').text!r} keeps {base!r}")
+
+        for page_el in renamed:
+            title = page_el.find(f"{MW_NS}title").text
+            stem = sanitize_filename(title)
+            candidate = f"{stem}__{page_id_of(page_el)}"
+            # Paranoia: a suffixed name must not collide with anything either.
+            n = 2
+            while candidate.lower() in taken:
+                candidate = f"{stem}__{page_id_of(page_el)}_{n}"
+                n += 1
+            taken.add(candidate.lower())
+            names[id(page_el)] = candidate
+            print(f"      {title!r} -> {candidate!r} ({len(page_wikitext(page_el))}B)")
+
+    return names
+
+
 def process_full_export(raw_dir: Path, processed_dir: Path):
     """Parse the full export and write individual XML + text files."""
     full_xml = raw_dir / "full_xml_download.xml"
@@ -143,18 +218,29 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
     pages = root.findall(f"{MW_NS}page")
     print(f"Found {len(pages)} pages.\n")
 
+    # Settle case-only filename clashes up front, so a page is never written
+    # and then silently overwritten by its differently-cased twin.
+    names = assign_filenames(pages)
+
     split_count = 0
     convert_count = 0
+    renamed_count = 0
 
     for page_el in pages:
         title_el = page_el.find(f"{MW_NS}title")
         if title_el is None or not title_el.text:
             continue
         title = title_el.text
+        # safe_name derives from the title and keeps pointing at the live wiki
+        # page; out_name is the on-disk basename, which may carry a
+        # disambiguating suffix.  They differ only for colliding pages.
         safe_name = sanitize_filename(title)
+        out_name = names[id(page_el)]
+        if out_name != safe_name:
+            renamed_count += 1
 
         # --- Write individual XML ---
-        xml_path = xml_dir / f"{safe_name}.xml"
+        xml_path = xml_dir / f"{out_name}.xml"
         # Build a standalone mediawiki XML doc for this page
         new_root = ET.Element("mediawiki", mediawiki_attribs)
         if siteinfo is not None:
@@ -167,7 +253,7 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
         split_count += 1
 
         # --- Convert to plaintext ---
-        txt_path = txt_dir / f"{safe_name}.txt"
+        txt_path = txt_dir / f"{out_name}.txt"
 
         ns_el = page_el.find(f"{MW_NS}ns")
         page_id_el = page_el.find(f"{MW_NS}id")
@@ -212,7 +298,7 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
         txt_path.write_text("\n".join(lines), encoding="utf-8")
 
         # --- Write wikitext (original MediaWiki markup) ---
-        wikitext_path = wikitext_dir / f"{safe_name}.txt"
+        wikitext_path = wikitext_dir / f"{out_name}.txt"
         wt_lines = []
         wt_lines.append(f"Title:        {title}")
         wt_lines.append(f"URL:          https://wiki.lustre.org/{safe_name.replace(' ', '_')}")
@@ -232,6 +318,9 @@ def process_full_export(raw_dir: Path, processed_dir: Path):
         print(f"OK  {title}")
 
     print(f"\nDone: {split_count} XML files, {convert_count} text files, {convert_count} wikitext files.")
+    if renamed_count:
+        print(f"Renamed: {renamed_count} page(s) given a suffix to avoid a "
+              f"case-only filename collision.")
     print(f"XML:      {xml_dir}")
     print(f"TXT:      {txt_dir}")
     print(f"Wikitext: {wikitext_dir}")
