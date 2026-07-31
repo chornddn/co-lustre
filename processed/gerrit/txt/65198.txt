@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Robert Read
 Created:    2026-04-09 15:56:46.000000000
-Updated:    2026-07-28 10:42:37.000000000
-Patch Set:  14
-Insertions: +456
-Deletions:  -38
-Comments:   174 (9 unresolved)
+Updated:    2026-07-31 15:04:55.000000000
+Patch Set:  15
+Insertions: +665
+Deletions:  -46
+Comments:   201 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Chris Horn: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -37,17 +37,61 @@ both events fired before completing an RPC re-entering
 srpc_handle_rpc in SWI_STATE_DONE.
 
 Order session teardown so client-side batches drain before the
-session is deactivated and server-side RPCs are drained, and
-add lst_wait_until_timeout() to bound console RPC waits held
-under ses_mutex.
+session is deactivated and server-side RPCs are drained.  On the
+console, set ses_shutdown before the batch-stop loop, since that
+loop contains the first point where lstcon_rpc_trans_postwait()
+drops ses_mutex; without it a concurrent end_session can run
+nested and free the batches the loop is still walking.  The stop
+transactions are created with a NULL translist so they stay off
+bat_trans_list, both so lstcon_rpc_trans_check() does not abandon
+them once ses_shutdown is set and so lstcon_batch_destroy()'s
+assertions still hold.
+
+Bound the console teardown drain in lstcon_rpc_cleanup_wait(),
+which previously waited forever under ses_mutex in an
+uninterruptible sleep - an unkillable hang that also blocked
+module unload.  The bound is derived from rpc_timeout, since an
+outstanding console RPC cannot be recycled before its own timer
+fires, and the sleeps are now killable.  On expiry the session
+objects are left allocated and ses_shutdown stays set: the
+transactions and RPCs that failed to drain still point at the
+batches, groups and nodes the destroy phase would free, so the
+session is left inert rather than half-destroyed.
+
+Bound the node-side drain loops with a fixed timeout instead of
+2 * rpc_timeout.  rpc_timeout is a module parameter documented as
+"0 == never", which would collapse the deadline to "now", and
+these loops run from sfw_remove_session() on the ordered
+lst_serial_wq where they block every other framework RPC on the
+node, so they have to stay well inside the console's SESEND
+transaction timeout.
 
 Fix BRW offset handling: mask offset with ~PAGE_MASK, allocate
-bulk with off+len, and reject off+len > LNET_MTU.
+bulk with off+len, and reject off+len > LNET_MTU.  The unmasked
+offset in brw_client_prep_rpc() dates back to the original offset
+support; the missing off+len bound came in when the server-side
+preallocated bulk replaced srpc_alloc_bulk(cpt, off, npg, len,
+sink) with srpc_alloc_bulk(cpt, len) plus srpc_init_bulk(), and
+swapped the npg > LNET_MAX_IOV check for len > LNET_MTU.  NB the
+len > LNET_MTU check is retained ahead of the off+len check: len
+is a __u32 from the wire, so it also guards the addition against
+wrapping.
 
 Add lnet-selftest.sh tests for teardown stress, BRW offset
 edge cases, and the workqueue list-corruption race.
 
+test_teardown_race checks every setup step.  lst add_group exits 0
+even when some nodes fail to answer, so without an explicit node
+count check the batch runs empty and the test reports success
+having exercised nothing.
+
+test_teardown_deadpeer covers teardown against a peer that stops
+answering, with rpc_timeout=0 so the client-side RPC timers are
+disabled and end_session has only its own abort path to rely on.
+
 Test-Parameters: trivial testlist=lnet-selftest,sanity-lnet
+Fixes: e502638050a6 ("LU-16011 lnet: use preallocate bulk for server")
+Fixes: efcef00cb304 ("LU-5718 lnet: add offset for selftest brw")
 Signed-off-by: Robert Read <rread@thelustrecollective.com>
 Change-Id: I8025abd76528f96e3b1835c6119a7b677b9fb677
 
@@ -546,3 +590,90 @@ Patch Set 14:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The console-side teardown rework (conrpc.c and console.c) looks like the riskiest part of the change and is worth a close second look before this lands; the LNet event split and the BRW offset fixes read fine.
+
+--- Message (Robert Read, 2026-07-30 22:25:36.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:30:12.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:32:25.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:37:25.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:38:57.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:40:24.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:41:44.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:42:05.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:44:09.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:44:20.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-30 22:45:24.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Robert Read, 2026-07-31 14:35:51.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-07-31 14:36:37.000000000) ---
+Patch Set 15:
+
+(15 comments)
+
+22 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-31 14:38:28.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-07-31 14:47:53.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-07-31 15:03:55.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128456/ : SUCCESS

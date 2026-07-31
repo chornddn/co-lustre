@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-14 22:35:51.000000000
-Updated:    2026-07-29 00:51:31.000000000
-Patch Set:  14
-Insertions: +450
+Updated:    2026-07-31 02:47:14.000000000
+Patch Set:  16
+Insertions: +625
 Deletions:  -0
-Comments:   90 (8 unresolved)
+Comments:   116 (2 unresolved)
 
 --- Labels ---
   Code-Review: Andreas Dilger: +1
@@ -24,11 +24,13 @@ Comments:   90 (8 unresolved)
 --- Commit Message ---
 LU-20119 selinux: add lustre_helpers SELinux policy module
 
-RHEL/Rocky 10+ dropped kernel_generic_helper_t from the base
-selinux-policy (selinux-policy-42.1.7), causing SELinux to deny
-every call_usermodehelper() spawn under enforcing mode. This
-breaks l_getsepol (mount aborts after 30s), lctl (root_squash
-not applied), l_getidentity, and l_getauth.
+On RHEL/Rocky 10+ SELinux denies every call_usermodehelper()
+spawn under enforcing mode, breaking l_getsepol (mount aborts
+after 30s), lctl (root_squash not applied), l_getidentity, and
+l_getauth. The cause differs by minor release: 10.1 and later
+(selinux-policy 42.x) dropped kernel_generic_helper_t from the
+base policy, while 10.0 (selinux-policy 40.13.26) still has the
+type but does not grant it what the helpers need.
 
 Introduce a dedicated lustre_helper_t domain with a
 lustre_helper_exec_t file type for the Lustre helper binaries.
@@ -39,10 +41,15 @@ affected.
 
 On RHEL/Rocky 9 the base policy's kernel_t ->
 kernel_generic_helper_t transition covers all UMH helpers and
-Lustre works without this module. On RHEL/Rocky 10 that
+Lustre works without this module. On RHEL/Rocky 10.1+ that
 transition was removed together with kernel_generic_helper_t
-itself, so kernel_t execs the helper binary directly; the
-kernel_t -> lustre_helper_t transition handles that case.
+itself, so kernel_t execs the helper binary directly. On
+RHEL/Rocky 10.0 the transition is still there, but the domain
+it leads to is denied security_t:file read, selinux_config_t:
+file read, debugfs_t:file write and passwd_file_t:file read,
+so the helpers fail there as well. Relabeling the binaries to
+lustre_helper_exec_t takes them out of both paths, and the
+kernel_t -> lustre_helper_t transition handles each case.
 
 Additionally cover lgss_keyring, the GSS/SSK credential helper.
 Unlike the helpers above it is not run via call_usermodehelper()
@@ -60,9 +67,11 @@ not use the lustre_helper_exec_t label or transition.
 
 Files added/modified:
 
-  lustre/utils/selinux/lustre_helpers.te  - policy source
-  lustre/utils/selinux/lustre_helpers.fc  - file context labels
-  lustre/utils/selinux/Makefile.am        - build and install rules
+  lustre/utils/selinux/lustre_helpers.te     - policy source
+  lustre/utils/selinux/lustre_helpers.fc.in  - file context
+                                               template
+  lustre/utils/selinux/Makefile.am           - build and
+                                               install rules
 
 Build-time detection in config/lustre-core.m4 via the new
 LC_CONFIG_SELINUX_POLICY macro auto-enables the module when
@@ -71,10 +80,14 @@ PLATFORM_ID is platform:el10 or later; can be overridden with
 (checkpolicy) and semodule_package/semodule (policycoreutils).
 
 For direct source installs (DESTDIR unset), make install runs
-semodule -i and restorecon immediately. For RPM installs,
-lustre.spec.in runs semodule -i then restorecon in %post, and
-semodule -r in %preun guarded to the final-erase case ([ $1 -eq
-0 ]) so a routine dnf upgrade does not leave the module unloaded.
+semodule -X 200 -i and restorecon immediately. For RPM installs,
+lustre.spec.in runs semodule -X 200 -i then restorecon in %post,
+and semodule -X 200 -r in %preun guarded to the final-erase case
+([ $1 -eq 0 ]) so a routine dnf upgrade does not leave the module
+unloaded. Priority 200 is the range for modules shipped by
+packages; a bare semodule -i installs at 400, which is reserved
+for an administrator's own modules and would leave no priority
+from which to override this one.
 
 The RPM bcond (lustre_selinux_policy) is enabled by default on
 RHEL 10+ (%rhel >= 10) and disabled on all other distros.
@@ -88,14 +101,54 @@ SELinux enforcing: with them loaded, lgss_keyring passes all
 SELinux checks (zero keyutils_request_t denials) and SSK context
 negotiation proceeds.
 
-lustre_helpers.fc lists both /usr/bin and /usr/sbin paths for
-each helper.  The binaries install under /usr/sbin, but on
-RHEL/Rocky 10.2+ SELinux applies a "/usr/sbin = /usr/bin"
-file-context equivalency (file_contexts.subs_dist), so restorecon
-of /usr/sbin/l_getsepol is resolved against /usr/bin and only a
-/usr/bin rule matches.  On el8/el9 and el10.0/10.1 there is no
-such equivalency and the /usr/sbin rule matches the real path.
-Listing both covers every case; the unused entry is harmless.
+lustre_helper_t carries the "domain" attribute so the base
+policy's per-domain baseline applies to it (the standard self:
+process/file/dir/lnk_file set, /dev/null, ld.so.cache, locale
+data, sysctl_*, security_t). Without it every one of those has
+to be hand-derived from whichever code path happened to be
+exercised, and any path that was not becomes a denial in the
+field. The explicit rules are kept alongside it: they record
+what each helper needs and keep the module working where the
+base policy's domain baseline differs.
+
+lustre_helper_exec_t carries the attribute set the base policy
+gives comparable exec types (kmod_exec_t, mount_exec_t,
+keyutils_request_exec_t) plus base_ro_file_type, which bin_t
+has, so attribute-based rules that reached these binaries
+through bin_t still reach them once they are relabeled. That
+cannot be made complete: a rule naming bin_t by type rather
+than by attribute no longer applies to /usr/sbin/lctl. lctl is
+a general-purpose admin command as well as an upcall target --
+the kernel execs it from process_param2_config() -- so the
+relabel is unavoidable, but it does reach past the upcall. The
+one such rule that matters in practice is
+"type_transition init_t bin_t:process unconfined_service_t":
+without it a systemd unit with ExecStart=/usr/sbin/lctl would
+run as init_t rather than unconfined_service_t, so the module
+re-adds the equivalent transition on lustre_helper_exec_t.
+
+Types that are not present in every base policy are required
+inside optional blocks rather than at the top level, because
+semodule -i rejects the entire module when a top-level require
+names a type the running policy does not define -- it does not
+skip the rules. That applies to keyutils_request_t and the
+systemd-userdb types, absent on el8 (selinux-policy-3.14.3),
+and to unconfined_service_t, absent wherever the unconfined
+module is (semodule -d unconfined, minimum/mls policy).
+
+lustre_helpers.fc is generated from lustre_helpers.fc.in with
+%sbindir% substituted at build time, so the labels follow the
+configured install location; with a hard-coded path and a
+non-default --prefix or --sbindir the binaries are never
+labeled and the module loads but is inert -- no transition, no
+denial, no diagnostic. The template also carries the literal
+/usr/sbin and /usr/bin paths, which the kernel upcalls use
+regardless of configure options, and which cover the merged
+/usr case: on RHEL/Rocky 10.2+ SELinux applies a "/usr/sbin =
+/usr/bin" equivalency (file_contexts.subs_dist) so only a
+/usr/bin rule matches, while on el8/el9 and el10.0/10.1 the
+/usr/sbin rule matches the real path. The build rule drops the
+entries that collide once %sbindir% is substituted.
 
 Because every permission not enumerated becomes a new denial
 once the helpers leave kernel_t, the lustre_helper_t rule set is
@@ -109,8 +162,13 @@ getpwuid()/getgrouplist() and reads PERM_PATHNAME
 parameter paths: /etc/nsswitch.conf and perm.conf are etc_t,
 /etc/passwd and /etc/group are passwd_file_t, and glibc NSS also
 walks /proc/self, /run, /var/lib and the systemd-userdb and sssd
-client sockets.  Without these the identity upcall fails on
-every MDS running enforcing SELinux, whether or not GSS is used.
+client sockets.  The sssd path needs more than a directory
+search -- an NSS client opens and writes the client socket under
+/var/lib/sss/pipes and connects to the daemon holding it -- and
+without it the upcall is still denied on an LDAP/AD-joined MDS,
+which is the common deployment for it.  Without these the
+identity upcall fails on every MDS running enforcing SELinux,
+whether or not GSS is used.
 
 l_getauth, the GSS server-side context upcall (rsi_do_upcall()),
 hands the request to lsvcgssd over a unix *stream* socket bound
@@ -121,50 +179,67 @@ lsvcgssd has no SELinux policy of its own: it runs as
 unconfined_service_t under the targeted policy, or init_t where
 the unconfined module is absent.
 
-Build-system and packaging fixes:
+Build and packaging:
 
   - The .pp is built under lustre/utils/selinux, which is only
-    reached when lustre/utils is built.  Both the %files entry
-    and the configure flag are now conditional on lustre_utils,
-    and LC_CONFIG_SELINUX_POLICY errors out on
+    reached when lustre/utils is built, so both the %files
+    entry and the configure flag are conditional on
+    lustre_utils, and LC_CONFIG_SELINUX_POLICY errors out on
     --with-selinux-policy together with --disable-utils.
-    Previously "rpmbuild --without lustre_utils" on el10 failed
-    on the missing file.
-  - policycoreutils is now Requires(post)/Requires(preun), not
-    only BuildRequires, since %post and %preun run semodule and
+  - policycoreutils is Requires(post)/Requires(preun) as well
+    as BuildRequires, since %post and %preun run semodule and
     restorecon on the target machine.
-  - %post no longer runs "semodule -r" before "semodule -i".
-    -i upgrades a module in place, so the removal only opened a
-    window with no policy loaded; its errors are also no longer
+  - %post runs semodule -i without a preceding semodule -r: -i
+    upgrades a module in place, so removing it first would only
+    open a window with no policy loaded.  Its errors are not
     discarded.
-  - semodule_package reads $(srcdir)/lustre_helpers.fc so that
-    a separate build directory and make distcheck work.
-  - The source-install step is install-data-hook rather than
-    install-data-local, which automake may run concurrently
-    with install-selinuxDATA under make -j install.
+  - The source-install step is install-data-hook, which
+    automake guarantees runs after the install rules have
+    completed; install-data-local is only another prerequisite
+    of install-data-am and may run concurrently with
+    install-selinuxDATA under make -j install.
   - restorecon is located by configure and applied to
-    $(sbindir) instead of a hard-coded /usr/sbin.
+    $(sbindir) rather than a hard-coded /usr/sbin.
 
 The lustre_helper_t rules were additionally validated on a live
-cluster.  Loading the module on a RHEL 9.7 MDS moves the helpers
-out of kernel_generic_helper_t into lustre_helper_t exactly as
-on el10, which makes the upcalls testable there: with the module
-loaded and the helpers relabeled, l_getidentity runs with zero
-denials, and removing the grants reproduces the failure (denials
-on /etc/passwd and /etc/nsswitch.conf).  On a RHEL 10.2 client
-l_getsepol likewise runs clean, and removing its policy-read
-grants makes mount.lustre fail outright.  The l_getauth rules
-follow from the code and from the observed lsvcgssd socket label
-and domain; an end-to-end GSS context negotiation was not
-exercised.
+cluster. Loading the module on a RHEL 9.7 MDS moves the helpers out of
+kernel_generic_helper_t into lustre_helper_t exactly as on el10, which
+makes the upcalls testable there. With the module loaded and the
+helpers relabeled, every call_usermodehelper() helper that can be
+triggered on el9 runs as system_u:system_r:lustre_helper_t:s0 with
+zero denials: l_getidentity on the MDS, l_getsepol on the client, and
+the kernel-launched lctl from process_param2_config(). Two of those
+need to be provoked: l_getsepol is not called at all until "lctl
+set_param sptlrpc.send_sepol=-1", because sptlrpc_sepol_get() returns
+early while send_sepol is 0, and process_param2_config() only reaches
+the upcall for a parameter whose subsystem has no kobject, since
+anything else is handled by class_set_global() or a sysfs uevent.
+Removing a single grant reproduces the matching failure: without
+passwd_file_t:file the identity upcall takes exactly one denial, on
+/etc/passwd. On a RHEL 10.2 client l_getsepol likewise runs clean, and
+removing its policy-read grants makes mount.lustre fail outright. The
+l_getauth rules follow from the code and from the observed lsvcgssd
+socket label and domain; an end-to-end GSS context negotiation was not
+exercised. The sssd rules follow the pattern the base policy uses for
+every sssd client; the lab MDS is files-backed, so that path was not
+exercised either.
+
+The module was built and loaded with semodule -i on el8.10
+(selinux-policy-3.14.3), el9.7 (38.1.65), el10.0 (40.13.26),
+el10.1 (42.1.7) and el10.2 (42.1.18); on each of them every
+optional block resolves.  On el10.2, both typeattribute sets take
+effect, lustre_helper_exec_t keeps the execute and process
+transition init_t had on bin_t, and running lctl from a systemd
+unit after restorecon produces no denials.
 
 Test-Parameters: trivial
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.0
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.1
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.0
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 clientdistro=el10.1
-Change-Id: I1ad770867d2e48be9b72c128d50d2f246f79bdfe
+Test-Parameters: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Change-Id: I1ad770867d2e48be9b72c128d50d2f246f79bdfe
 
 --- Review History ---
 
@@ -818,3 +893,118 @@ Patch Set 14:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The policy module itself builds cleanly (checkmodule -M -m + semodule_package both succeed on selinux-policy-44.4), and the four call_usermodehelper() paths in the commit message check out against obd_config.c, mdt_identity.c, sec.c and gss_svc_upcall.c. The comments are mostly about how the two new types are declared.
+
+--- Message (Hiroshi Nishida, 2026-07-29 18:29:22.000000000) ---
+Patch Set 14:
+
+(8 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-29 18:30:17.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-29 18:32:25.000000000) ---
+Patch Set 15:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-29 18:33:57.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-29 18:39:09.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-29 19:16:25.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128306/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-29 20:00:19.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-07-30 01:26:58.000000000) ---
+Patch Set 15:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Both of the functional ones are in the lgss_keyring / keyutils_request_t half of the module, which is also the half the commit message says was not exercised end to end.
+
+--- Message (Hiroshi Nishida, 2026-07-30 17:09:06.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-30 17:18:55.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-30 17:35:14.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-07-30 20:10:51.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-30 20:11:32.000000000) ---
+Patch Set 16:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (wc-checkpatch, 2026-07-30 20:13:00.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-30 20:13:49.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-07-30 20:37:24.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128401/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-30 20:53:36.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-07-30 21:12:31.000000000) ---
+Patch Set 16: Code-Review+1
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-07-30 21:44:13.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-07-31 02:47:14.000000000) ---
+Patch Set 16:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor comments inline on the lustre_helper_t rule set. The build/packaging side and the lctl relabel blast radius check out: on selinux-policy-44.4 the attribute set given to lustre_helper_exec_t leaves udev_t, mount_t, cluster_t, init_t and kernel_t with exactly the same file permissions they had on bin_t.

@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-02-17 16:47:13.000000000
-Updated:    2026-07-28 02:23:39.000000000
-Patch Set:  45
-Insertions: +2429
-Deletions:  -31
-Comments:   1709 (18 unresolved)
+Updated:    2026-07-31 10:29:07.000000000
+Patch Set:  46
+Insertions: +5732
+Deletions:  -1
+Comments:   1734 (7 unresolved)
 Topic:      ec2
 Hashtags:   pt_ecro
 
@@ -26,36 +26,95 @@ Hashtags:   pt_ecro
 --- Commit Message ---
 LU-12668 tests: add EC recovery tests
 
-Add EC recovery tests covering different configurations,
-I/O patterns, file sizes, failure modes, layouts, and
-stress scenarios.
+Add sanity-ec coverage for erasure-coding recovery.  Each test
+writes an EC file, resyncs parity, fails one or more OSTs, and
+verifies the client reconstructs the data from parity (CIT_EC_RD)
+against the pre-failure checksum.
 
-Tests added:
-- test_40b-d: Recovery with 2+1, 2+2, 4+1 EC configs
-- test_41a-e: Partial reads, spanning raid sets,
-  different offsets, mmap, Direct I/O with recovery
-- test_42a-d: Recovery with partial stripes, incomplete
-  raid sets, PFL component boundaries
-- test_43a-d: Single, multiple, excessive, and
-  progressive OST failures
-- test_44a-d: Error handling, parity vs data failures,
-  read errors, invalid configurations
-- test_46a-d: Recovery with 64K, 256K, 4M stripes and
-  mixed stripe sizes in PFL layout
-- test_47a-d: Multiple EC components in PFL, mixed
-  EC/non-EC components, different stripe sizes per
-  component, reads spanning component boundaries
-- test_48a-d: Stale parity recovery, partial resync,
-  overwrite scenarios
-- test_49a-d: Concurrent reads, writes, mirror resync,
-  and OST reactivation during recovery
-- test_50a-b: Multi-mount recovery scenarios
+Failure is injected with OBD_FAIL_OST_BRW_READ_BULK so the OSC
+import stays active and only bulk reads fail, which drives genuine
+parity reconstruction.  The fault is set on the OSS nodes, where
+tgt_brw_read() evaluates it, and osc.*.resend_count is dropped to 1
+for the duration so the injected -EIO reaches the LOV layer instead
+of being absorbed by an OSC resend.
 
-All tests use 4+2 EC configuration with 8 OSTs.
+Victims are chosen by stripe rather than by OST index.
+ec_pick_data_ost() walks a file's data stripes in order and takes
+the first whose OST does not also carry parity: a file smaller than
+one raid set holds data on stripe 0 alone, so picking the lowest OST
+index instead would arm the fault on an object the read never
+reaches and the test would pass without exercising recovery.
+ec_check_fault_index() skips when a target OST index is >= 16, which
+cfs_fail_index() cannot express in its 16-bit fail_val bitmask.
+ec_mirror_victims() fails one parity-free OST in every data mirror,
+since a file with more than one data copy would otherwise answer the
+read from an intact mirror rather than reconstructing anything.
+
+Reads that check a sub-range cancel their locks first: a range
+re-read after a whole-file read is otherwise served from the page
+cache, issues no BRW RPC, and so never reaches the injected fault.
+
+Geometry and I/O patterns (40b-44c):
+- 2+1, 2+2 and 4+1 EC; partial, offset, mmap, direct and async
+  reads; single, maximum and progressive OST failure; graceful
+  failure when too many OSTs are gone
+
+Failure placement and layout (45a-48c):
+- consecutive, non-consecutive, boundary and parity-only OST
+  failures; 64K, 256K and 4M stripe sizes; multiple EC and
+  mixed EC/non-EC PFL components; stale and partially stale
+  parity
+
+Concurrency and multi-mount (49b-50b):
+- background writes, mirror resync and OST reactivation during
+  recovery; both mounts reading the same EC file
+
+Core recovery (51a-53a):
+- EOF boundary recovery at RAID set / stripe set boundaries;
+  degradation limits and mixed parity+data failure; recovery at
+  non-zero read offsets
+
+Layout patterns (55a):
+- file-size boundaries (1 byte .. multi-stripe)
+
+Edge cases (58a-62d):
+- parity_used combinations and stripe rotation; sparse files
+  with holes; recovery after truncate; sub-stripe files;
+  append writes
+
+Multi-target (63a-66d):
+- OST failure cycling and multi-mount coordination; 3-4
+  component PFL with per-component EC geometry; multiple
+  EC mirror pairs
+
+Write patterns (67a-71d):
+- writes to healthy stripes during degraded mode and
+  overwrite cycles; varied geometries; O_DIRECT writes;
+  partial and mid-file overwrites; batch recovery of many
+  files
+
+Stress and admin (73a-73e, 75a-75f):
+- random reads, fallocate, truncate-extend, O_APPEND, and
+  large (128M) file recovery; stat/getattr, stress loops,
+  lfs mirror verify, directory-inherited layout, and stripe
+  rotation
+
+Tests 41d and 53a are added but listed in always_except.  A degraded
+mmap read never completes: the OSC alternates between "too many
+resent retries" and osc_brw_redo_request() forever, so -EIO never
+reaches the LOV layer and CIT_FAULT never switches to CIT_EC_RD.  A
+recovery read at a non-zero offset intermittently reconstructs wrong
+data.  Both stay off until those are fixed.
+
+enable_ec() now takes only the first line of the
+llite.*.enable_erasure_coding value.  The parameter prints one line
+per mounted client, so with $MOUNT2 up the embedded newline landed
+inside the stack_trap string and the restore tried to run the second
+value as a command.
 
 Assisted-by: ClaudeCode:opus llm_code_and_review_tools
-Test-Parameters: trivial testlist=sanity-ec
-Test-Parameters: trivial testlist=sanity-ec fstype=zfs
+Test-Parameters: trivial testlist=sanity-ec ostcount=8
+Test-Parameters: trivial testlist=sanity-ec ostcount=8 fstype=zfs
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
 Change-Id: I5a06cd166487e0bff7bfdb6a39414af3f12c4326
 
@@ -930,3 +989,45 @@ Problematic, see inline comments. The main concern is whole-patch: every new fau
 Patch Set 45:
 
 (1 comment)
+
+--- Message (Maximilian Dilger, 2026-07-31 02:01:15.000000000) ---
+Uploaded patch set 46.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-07-31 02:04:15.000000000) ---
+Patch Set 46:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-31 02:05:43.000000000) ---
+Patch Set 46:
+
+Code-wise looks good to me.
+
+--- Message (Maximilian Dilger, 2026-07-31 02:10:13.000000000) ---
+Patch Set 46:
+
+(18 comments)
+
+--- Message (jenkins, 2026-07-31 02:34:05.000000000) ---
+Patch Set 46: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128416/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-07-31 03:13:41.000000000) ---
+Patch Set 46:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-07-31 10:29:07.000000000) ---
+Patch Set 46:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One whole-patch thought: this adds ~120 subtests, several of which loop (75b does 50 write+resync+degraded-read rounds, 63b/68b iterate every OST pair) or write large files, and none of it is gated on $SLOW or scaled for $FSTYPE. With the zfs Test-Parameters line this suite is going to get very long. Would it be worth gating the repetition counts on SLOW, the way other suites do?

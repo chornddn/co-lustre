@@ -1,0 +1,34 @@
+Key:        LU-20546
+Summary:    ptlrpc: import reference leaked when idle reconnect fails
+Link:       https://jira.whamcloud.com/browse/LU-20546
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Hiroshi Nishida
+Reporter:   Hiroshi Nishida
+Created:    Fri, 31 Jul 2026 13:57:00 +0000
+Updated:    Fri, 31 Jul 2026 13:57:00 +0000
+
+--- Description ---
+Similar to LU-20050 (Gerrit 65026), the same import reference leak on a second path that patch doesn't touch.
+
+In ptlrpc_request_alloc_internal() the request gets allocated first, and  __ptlrpc_request_alloc() takes an import reference for it:
+
+request->rq_import = class_import_get(imp);
+atomic_inc(&imp->imp_reqs);
+
+If the import isn't FULL we try an idle reconnect, and the failure path looks like this:
+
+if (ptlrpc_reconnect_if_idle(imp) imp_reqs);
+        ptlrpc_request_free(request);
+        return NULL;
+}
+
+ptlrpc_request_free() only puts the request back on the slab or into the pool. It  never calls class_import_put(), so the reference taken a few lines earlier is just lost. Every failed idle reconnect leaks one, the import is never freed, client_obd_cleanup() never runs, and the LDLM namespace kobject is left behind in sysfs. The next mount of the same target then fails with -EEXIST.
+
+The easiest way to see it is to set sptlrpc.send_sepol=-1 and break l_getsepol: any client whose import has gone idle fails the reconnect, and leaks on every RPC that triggers one.
+
+The fix is to call ptlrpc_req_put() instead — it goes through _ptlrpc_free_req(), which already drops the import reference and decrements imp_reqs. The open-coded atomic_dec() has to go at the same time, otherwise the counter drops twice and the LASSERT in _ptlrpc_free_req() trips.
+
+This has been there since 93d20d171c20 ("LU-11128 ptlrpc: new request vs disconnect race"), which moved the allocation above the idle check. LU-20050 fixes the same kind of leak in ptlrpc_connect_import_locked().

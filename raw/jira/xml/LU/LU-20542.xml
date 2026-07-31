@@ -1,0 +1,242 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20542] ptlrpc/gss: server evicts client when its reverse GSS context goes stale, instead of re-establishing it</title>
+                <link>https://jira.whamcloud.com/browse/LU-20542</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;This issue was created by maloo for Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;&lt;/p&gt;
+
+&lt;p&gt;This issue relates to the following test suite run: &lt;a href="https://testing.whamcloud.com/test_sets/0c617e6f-2c6d-41c6-a029-4a9e74844b07" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/0c617e6f-2c6d-41c6-a029-4a9e74844b07&lt;/a&gt;&lt;/p&gt;
+
+&lt;p&gt;Test session details:&lt;br/&gt;
+clients: &lt;a href="https://build.whamcloud.com/job/lustre-reviews/128306" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://build.whamcloud.com/job/lustre-reviews/128306&lt;/a&gt; - 6.12.0-124.56.1.el10_1.x86_64&lt;br/&gt;
+servers: &lt;a href="https://build.whamcloud.com/job/lustre-reviews/128306" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://build.whamcloud.com/job/lustre-reviews/128306&lt;/a&gt; - 4.18.0-553.137.1.el8_10_lustre.x86_64&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Description&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;When a server needs to send a callback RPC (blocking or completion AST) to a client under SSK or Kerberos, it uses the reverse GSS context cached on the export. If the client has meanwhile discarded its side of that context, the server has no way to re-establish one: it expires its only reverse context, immediately fails to find a replacement, and evicts the client. Any in-flight client operation returns EIO.&lt;/p&gt;
+
+&lt;p&gt;The server never attempts a re-negotiation and never retries. A single stale reverse context is sufficient to evict.&lt;/p&gt;
+
+&lt;p&gt;This is the same failure mode described in &lt;a href="https://jira.whamcloud.com/browse/LU-14534" title="Client eviction on blocking AST with Kerberos or SSK enabled" class="issue-link" data-issue-key="LU-14534"&gt;&lt;del&gt;LU-14534&lt;/del&gt;&lt;/a&gt; ("servers are not able to refresh their reverse contexts by themselves"), which was resolved for 2.15.0. The specific path below is still present on master.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Symptom&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Reproduced by sanity-sec test_27d and test_27e on review-dne-selinux-ssk-part-2&lt;br/&gt;
+(el10.0 clients, el8.10 servers, 4 MDTs / 8 OSTs, SSK ski flavour):&lt;/p&gt;
+
+&lt;p&gt;    sanity-sec test_27d: @@@@@@ FAIL: unable to create file in&lt;br/&gt;
+        /mnt/lustre/d27d.sanity-sec/prim&lt;br/&gt;
+    bash: line 1: echo: write error: Input/output error&lt;/p&gt;
+
+&lt;p&gt;test_27d fails on a completion AST, test_27e on a blocking AST; both are the same defect. The failing write is the first one needing a fresh OST extent lock after the test reloads nodemap-scoped SSK keys and runs "lfs flushctx".&lt;br/&gt;
+mkdir of the same tree succeeds, because it is MDS-only metadata and needs no OST callback.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Server-side sequence&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;All four lines occur within 4 ms on the OSS:&lt;/p&gt;
+
+&lt;p&gt;    sec_gss.c:698:gss_cli_ctx_handle_err_notify()) lustre-OST0004:&lt;br/&gt;
+        unknown context (hdl 0x24e2577a1e38bb88:0x8180168a0adf9718)&lt;br/&gt;
+        from client &amp;lt;cli&amp;gt;@tcp (uid 0), retrying&lt;br/&gt;
+    sec.c:465:sptlrpc_req_get_ctx()) lustre-OST0004:&lt;br/&gt;
+        fail to get context for req ...: rc = -111&lt;br/&gt;
+    ldlm_lockd.c:727:ldlm_handle_ast_error()) ### client (nid &amp;lt;cli&amp;gt;@tcp)&lt;br/&gt;
+        returned error from completion AST (... rc -111), evict it&lt;br/&gt;
+    ldlm_lockd.c:665:ldlm_failed_ast()) lustre-OST0004: A client on nid&lt;br/&gt;
+        &amp;lt;cli&amp;gt;@tcp was evicted due to a lock completion callback time out: rc -111&lt;/p&gt;
+
+&lt;p&gt;and on the client:&lt;/p&gt;
+
+&lt;p&gt;    LustreError: lustre-OST0004-osc-...: This client was evicted by&lt;br/&gt;
+        lustre-OST0004; in progress operations using this service will fail.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Analysis&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;1. The OSS sends the AST on its cached reverse context. The client replies&lt;br/&gt;
+   GSS_S_NO_CONTEXT, having dropped that context at flushctx.&lt;/p&gt;
+
+&lt;p&gt;2. gss_cli_ctx_handle_err_notify() (lustre/ptlrpc/gss/sec_gss.c) takes the&lt;br/&gt;
+   NO_CONTEXT branch and calls sptlrpc_cli_ctx_expire(ctx). That unlinks the&lt;br/&gt;
+   context from gsec_kr-&amp;gt;gsk_clist. It was the export's only reverse context,&lt;br/&gt;
+   so the list is now empty.&lt;/p&gt;
+
+&lt;p&gt;3. It then calls sptlrpc_req_replace_dead_ctx(req, NULL), which with a NULL&lt;br/&gt;
+   sec goes to sptlrpc_req_get_ctx() -&amp;gt; get_my_ctx(sec, false).&lt;/p&gt;
+
+&lt;p&gt;4. In lustre/ptlrpc/sec.c, get_my_ctx() forces create = 0 and remove_dead = 0&lt;br/&gt;
+   for any sec carrying PTLRPC_SEC_FL_REVERSE:&lt;/p&gt;
+
+&lt;p&gt;        } else if (sec-&amp;gt;ps_flvr.sf_flags &amp;amp; (PTLRPC_SEC_FL_REVERSE |&lt;br/&gt;
+                                            PTLRPC_SEC_FL_ROOTONLY)) {&lt;br/&gt;
+                vcred.vc_uid = 0;&lt;br/&gt;
+                vcred.vc_gid = 0;&lt;br/&gt;
+                if (sec-&amp;gt;ps_flvr.sf_flags &amp;amp; PTLRPC_SEC_FL_REVERSE) &lt;/p&gt;
+{
+                        create = 0;
+                        remove_dead = 0;
+                }
+
+&lt;p&gt;5. gss_sec_lookup_ctx_kr() short-circuits for a reverse sec and returns&lt;br/&gt;
+   sec_lookup_root_ctx_kr() directly, under an assumption that no longer&lt;br/&gt;
+   holds once the context has been unlinked:&lt;/p&gt;
+
+&lt;p&gt;        if (is_root) &lt;/p&gt;
+{
+                ctx = sec_lookup_root_ctx_kr(sec);
+                /*
+                 * Only lookup directly for REVERSE sec, which should
+                 * always succeed.
+                 */
+                if (ctx || sec_is_reverse(sec))
+                        RETURN(ctx);
+        }
+
+&lt;p&gt;   With an empty gsk_clist this returns NULL.&lt;/p&gt;
+
+&lt;p&gt;6. NULL becomes -ECONNREFUSED in sptlrpc_req_get_ctx(), the AST fails, and&lt;br/&gt;
+   ldlm_handle_ast_error() evicts the client.&lt;/p&gt;
+
+&lt;p&gt;A reverse context is only ever installed from an inbound request that already carries a valid forward service context, via&lt;br/&gt;
+ptlrpc/service.c -&amp;gt; sptlrpc_target_export_check() -&amp;gt;&lt;br/&gt;
+sptlrpc_svc_install_rvs_ctx(exp-&amp;gt;exp_imp_reverse, req-&amp;gt;rq_svc_ctx).&lt;br/&gt;
+The server cannot initiate that exchange. So between the moment the client flushes and the moment it happens to re-init a forward context, every callback the server needs to send is fatal to that client.&lt;/p&gt;
+
+&lt;p&gt;gss_cli_ctx_handle_err_notify() already acknowledges the gap in a comment:&lt;/p&gt;
+
+&lt;p&gt;        /* reverse sec, just return error, don't expire this ctx because it's&lt;br/&gt;
+         * crucial to callback rpcs. note if the callback rpc failed because&lt;br/&gt;
+         * of bit flip during network transfer, the client will be evicted&lt;br/&gt;
+         * directly. so more gracefully we probably want let it retry for&lt;br/&gt;
+         * number of times.&lt;br/&gt;
+         */&lt;/p&gt;
+
+&lt;p&gt;but no retry is implemented, and the NO_CONTEXT case falls through that guard and does expire the context.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Suggested fix&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Give the server a way to survive a stale reverse context rather than evicting on first failure. Options, roughly in increasing order of effort:&lt;/p&gt;
+
+&lt;p&gt;1. Do not expire the reverse context on the first NO_CONTEXT. Retry the&lt;br/&gt;
+   callback a bounded number of times with backoff, and only evict if the&lt;br/&gt;
+   client still cannot be reached. This matches the intent already stated in&lt;br/&gt;
+   the comment above and is the smallest change.&lt;/p&gt;
+
+&lt;p&gt;2. Have ldlm_handle_ast_error() distinguish "no security context" from a real&lt;br/&gt;
+   client timeout, and let the AST be retried once the client re-establishes a&lt;br/&gt;
+   forward context, rather than treating it as a callback timeout.&lt;/p&gt;
+
+&lt;p&gt;3. Allow the reverse sec to trigger a re-negotiation, so the server is not&lt;br/&gt;
+   dependent on the client happening to re-init.&lt;/p&gt;
+
+&lt;p&gt;Option 1 alone would have avoided both failures here: the clients did re-establish forward contexts within a few seconds, so a short bounded retry would have found a fresh reverse context.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Reproducer&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;sanity-sec test_27d / test_27e with SSK enabled reproduce this on the review-dne-selinux-ssk-part-2 matrix. Note that CI reproduces it reliably only because of a second, separate issue: sanity-sec never sets the gss_identify nodemap property on the c0/c1 nodemaps it creates, so lsvcgssd's fallbacklookup of the client's cluster hash (nodemap_lookup_by_sha() -&amp;gt;&lt;br/&gt;
+nodemap_lookup_sha()) fails with -EPERM, and the client's forward context re-inits are rejected with -EIDRM for several seconds. That widens the window in which the server has no usable reverse context. That part is arguably a test gap and is worth tracking separately; the eviction defect above is independent of it.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Related&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-14534" title="Client eviction on blocking AST with Kerberos or SSK enabled" class="issue-link" data-issue-key="LU-14534"&gt;&lt;del&gt;LU-14534&lt;/del&gt;&lt;/a&gt; - Client eviction on blocking AST with Kerberos or SSK enabled&lt;br/&gt;
+  (resolved 2.15.0; this is the same mechanism, still reachable on master)&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="98734">LU-20542</key>
+            <summary>ptlrpc/gss: server evicts client when its reverse GSS context goes stale, instead of re-establishing it</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 30 Jul 2026 13:38:36 +0000</created>
+                <updated>Thu, 30 Jul 2026 13:38:36 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06xp3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
