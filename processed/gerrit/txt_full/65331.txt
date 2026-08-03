@@ -7,230 +7,43 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-14 22:35:51.000000000
-Updated:    2026-07-31 02:47:14.000000000
-Patch Set:  16
-Insertions: +625
+Updated:    2026-08-03 14:31:06.000000000
+Patch Set:  17
+Insertions: +640
 Deletions:  -0
-Comments:   116 (2 unresolved)
+Comments:   126 (0 unresolved)
 
 --- Labels ---
   Code-Review: Andreas Dilger: +1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, Sebastien Buisson, Matt Raso-Barnett
+  CC: Oleg Drokin, Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Sebastien Buisson, Shaun Tancheff, Matt Raso-Barnett
 
 --- Commit Message ---
 LU-20119 selinux: add lustre_helpers SELinux policy module
 
-On RHEL/Rocky 10+ SELinux denies every call_usermodehelper()
-spawn under enforcing mode, breaking l_getsepol (mount aborts
-after 30s), lctl (root_squash not applied), l_getidentity, and
-l_getauth. The cause differs by minor release: 10.1 and later
-(selinux-policy 42.x) dropped kernel_generic_helper_t from the
-base policy, while 10.0 (selinux-policy 40.13.26) still has the
-type but does not grant it what the helpers need.
+With SELinux enforcing on RHEL/Rocky 10+, the kernel helper
+upcalls are denied: mount hangs 30s on l_getsepol, root_squash
+is never applied, and l_getidentity and l_getauth fail. 10.1
+and later dropped kernel_generic_helper_t; 10.0 keeps it but
+grants it too little.
 
-Introduce a dedicated lustre_helper_t domain with a
-lustre_helper_exec_t file type for the Lustre helper binaries.
-A type_transition rule transitions kernel_t to lustre_helper_t
-on exec of those binaries, confining all permissions to Lustre
-helpers only -- no other call_usermodehelper() callers are
-affected.
+Add a lustre_helpers policy module giving the helpers their own
+lustre_helper_t domain, entered by a kernel_t type_transition
+on the relabeled binaries, so no other call_usermodehelper()
+caller is affected. lgss_keyring comes from the request-key
+upcall instead and runs as keyutils_request_t, so its parameter
+path and NID resolution rules are granted there; without them
+SSK mounts fail. el9 and older already work and are unchanged.
 
-On RHEL/Rocky 9 the base policy's kernel_t ->
-kernel_generic_helper_t transition covers all UMH helpers and
-Lustre works without this module. On RHEL/Rocky 10.1+ that
-transition was removed together with kernel_generic_helper_t
-itself, so kernel_t execs the helper binary directly. On
-RHEL/Rocky 10.0 the transition is still there, but the domain
-it leads to is denied security_t:file read, selinux_config_t:
-file read, debugfs_t:file write and passwd_file_t:file read,
-so the helpers fail there as well. Relabeling the binaries to
-lustre_helper_exec_t takes them out of both paths, and the
-kernel_t -> lustre_helper_t transition handles each case.
+configure enables the module on el10+ by default, overridable
+with --with/--without-selinux-policy.
 
-Additionally cover lgss_keyring, the GSS/SSK credential helper.
-Unlike the helpers above it is not run via call_usermodehelper()
-but by the kernel keyring request-key upcall
-(/etc/request-key.d/lgssc.conf), so it executes in the base
-policy's keyutils_request_t domain rather than lustre_helper_t.
-Under enforcing SELinux on el10 that domain lacks access to the
-Lustre parameter paths and, critically, to NID->hostname
-resolution: lgss_get_service_str() -> ipv4_nid2hostname() ->
-getnameinfo() is denied the NSS config reads and the DNS/netlink
-sockets it needs, so SSK context negotiation aborts and shared
-secret key mounts fail. Grant those permissions on
-keyutils_request_t directly, since the request-key upcall does
-not use the lustre_helper_exec_t label or transition.
-
-Files added/modified:
-
-  lustre/utils/selinux/lustre_helpers.te     - policy source
-  lustre/utils/selinux/lustre_helpers.fc.in  - file context
-                                               template
-  lustre/utils/selinux/Makefile.am           - build and
-                                               install rules
-
-Build-time detection in config/lustre-core.m4 via the new
-LC_CONFIG_SELINUX_POLICY macro auto-enables the module when
-PLATFORM_ID is platform:el10 or later; can be overridden with
---with/--without-selinux-policy. Requires checkmodule
-(checkpolicy) and semodule_package/semodule (policycoreutils).
-
-For direct source installs (DESTDIR unset), make install runs
-semodule -X 200 -i and restorecon immediately. For RPM installs,
-lustre.spec.in runs semodule -X 200 -i then restorecon in %post,
-and semodule -X 200 -r in %preun guarded to the final-erase case
-([ $1 -eq 0 ]) so a routine dnf upgrade does not leave the module
-unloaded. Priority 200 is the range for modules shipped by
-packages; a bare semodule -i installs at 400, which is reserved
-for an administrator's own modules and would leave no priority
-from which to override this one.
-
-The RPM bcond (lustre_selinux_policy) is enabled by default on
-RHEL 10+ (%rhel >= 10) and disabled on all other distros.
-
-RHEL 9.7 (selinux-policy-38.1.65) is unaffected as
-kernel_generic_helper_t is fully defined there. The
-call_usermodehelper helpers were tested on Rocky 10.1
-(selinux-policy-42.1.7) with SELinux enforcing. The lgss_keyring
-rules were verified on RHEL 10.2 (selinux-policy-42.1.18) with
-SELinux enforcing: with them loaded, lgss_keyring passes all
-SELinux checks (zero keyutils_request_t denials) and SSK context
-negotiation proceeds.
-
-lustre_helper_t carries the "domain" attribute so the base
-policy's per-domain baseline applies to it (the standard self:
-process/file/dir/lnk_file set, /dev/null, ld.so.cache, locale
-data, sysctl_*, security_t). Without it every one of those has
-to be hand-derived from whichever code path happened to be
-exercised, and any path that was not becomes a denial in the
-field. The explicit rules are kept alongside it: they record
-what each helper needs and keep the module working where the
-base policy's domain baseline differs.
-
-lustre_helper_exec_t carries the attribute set the base policy
-gives comparable exec types (kmod_exec_t, mount_exec_t,
-keyutils_request_exec_t) plus base_ro_file_type, which bin_t
-has, so attribute-based rules that reached these binaries
-through bin_t still reach them once they are relabeled. That
-cannot be made complete: a rule naming bin_t by type rather
-than by attribute no longer applies to /usr/sbin/lctl. lctl is
-a general-purpose admin command as well as an upcall target --
-the kernel execs it from process_param2_config() -- so the
-relabel is unavoidable, but it does reach past the upcall. The
-one such rule that matters in practice is
-"type_transition init_t bin_t:process unconfined_service_t":
-without it a systemd unit with ExecStart=/usr/sbin/lctl would
-run as init_t rather than unconfined_service_t, so the module
-re-adds the equivalent transition on lustre_helper_exec_t.
-
-Types that are not present in every base policy are required
-inside optional blocks rather than at the top level, because
-semodule -i rejects the entire module when a top-level require
-names a type the running policy does not define -- it does not
-skip the rules. That applies to keyutils_request_t and the
-systemd-userdb types, absent on el8 (selinux-policy-3.14.3),
-and to unconfined_service_t, absent wherever the unconfined
-module is (semodule -d unconfined, minimum/mls policy).
-
-lustre_helpers.fc is generated from lustre_helpers.fc.in with
-%sbindir% substituted at build time, so the labels follow the
-configured install location; with a hard-coded path and a
-non-default --prefix or --sbindir the binaries are never
-labeled and the module loads but is inert -- no transition, no
-denial, no diagnostic. The template also carries the literal
-/usr/sbin and /usr/bin paths, which the kernel upcalls use
-regardless of configure options, and which cover the merged
-/usr case: on RHEL/Rocky 10.2+ SELinux applies a "/usr/sbin =
-/usr/bin" equivalency (file_contexts.subs_dist) so only a
-/usr/bin rule matches, while on el8/el9 and el10.0/10.1 the
-/usr/sbin rule matches the real path. The build rule drops the
-entries that collide once %sbindir% is substituted.
-
-Because every permission not enumerated becomes a new denial
-once the helpers leave kernel_t, the lustre_helper_t rule set is
-derived per helper rather than from the helpers that happened to
-be exercised by hand.
-
-l_getidentity, the MDS identity upcall
-(mdt_identity_do_upcall()), resolves supplementary groups with
-getpwuid()/getgrouplist() and reads PERM_PATHNAME
-(/etc/lustre/perm.conf).  That reaches well beyond the Lustre
-parameter paths: /etc/nsswitch.conf and perm.conf are etc_t,
-/etc/passwd and /etc/group are passwd_file_t, and glibc NSS also
-walks /proc/self, /run, /var/lib and the systemd-userdb and sssd
-client sockets.  The sssd path needs more than a directory
-search -- an NSS client opens and writes the client socket under
-/var/lib/sss/pipes and connects to the daemon holding it -- and
-without it the upcall is still denied on an LDAP/AD-joined MDS,
-which is the common deployment for it.  Without these the
-identity upcall fails on every MDS running enforcing SELinux,
-whether or not GSS is used.
-
-l_getauth, the GSS server-side context upcall (rsi_do_upcall()),
-hands the request to lsvcgssd over a unix *stream* socket bound
-at GSS_SOCKET_PATH (/tmp/svcgssd.socket), so the datagram rule
-the other helpers use is not sufficient.  Connecting needs write
-on the socket file plus connectto on the listening daemon.
-lsvcgssd has no SELinux policy of its own: it runs as
-unconfined_service_t under the targeted policy, or init_t where
-the unconfined module is absent.
-
-Build and packaging:
-
-  - The .pp is built under lustre/utils/selinux, which is only
-    reached when lustre/utils is built, so both the %files
-    entry and the configure flag are conditional on
-    lustre_utils, and LC_CONFIG_SELINUX_POLICY errors out on
-    --with-selinux-policy together with --disable-utils.
-  - policycoreutils is Requires(post)/Requires(preun) as well
-    as BuildRequires, since %post and %preun run semodule and
-    restorecon on the target machine.
-  - %post runs semodule -i without a preceding semodule -r: -i
-    upgrades a module in place, so removing it first would only
-    open a window with no policy loaded.  Its errors are not
-    discarded.
-  - The source-install step is install-data-hook, which
-    automake guarantees runs after the install rules have
-    completed; install-data-local is only another prerequisite
-    of install-data-am and may run concurrently with
-    install-selinuxDATA under make -j install.
-  - restorecon is located by configure and applied to
-    $(sbindir) rather than a hard-coded /usr/sbin.
-
-The lustre_helper_t rules were additionally validated on a live
-cluster. Loading the module on a RHEL 9.7 MDS moves the helpers out of
-kernel_generic_helper_t into lustre_helper_t exactly as on el10, which
-makes the upcalls testable there. With the module loaded and the
-helpers relabeled, every call_usermodehelper() helper that can be
-triggered on el9 runs as system_u:system_r:lustre_helper_t:s0 with
-zero denials: l_getidentity on the MDS, l_getsepol on the client, and
-the kernel-launched lctl from process_param2_config(). Two of those
-need to be provoked: l_getsepol is not called at all until "lctl
-set_param sptlrpc.send_sepol=-1", because sptlrpc_sepol_get() returns
-early while send_sepol is 0, and process_param2_config() only reaches
-the upcall for a parameter whose subsystem has no kobject, since
-anything else is handled by class_set_global() or a sysfs uevent.
-Removing a single grant reproduces the matching failure: without
-passwd_file_t:file the identity upcall takes exactly one denial, on
-/etc/passwd. On a RHEL 10.2 client l_getsepol likewise runs clean, and
-removing its policy-read grants makes mount.lustre fail outright. The
-l_getauth rules follow from the code and from the observed lsvcgssd
-socket label and domain; an end-to-end GSS context negotiation was not
-exercised. The sssd rules follow the pattern the base policy uses for
-every sssd client; the lab MDS is files-backed, so that path was not
-exercised either.
-
-The module was built and loaded with semodule -i on el8.10
-(selinux-policy-3.14.3), el9.7 (38.1.65), el10.0 (40.13.26),
-el10.1 (42.1.7) and el10.2 (42.1.18); on each of them every
-optional block resolves.  On el10.2, both typeattribute sets take
-effect, lustre_helper_exec_t keeps the execute and process
-transition init_t had on bin_t, and running lctl from a systemd
-unit after restorecon produces no denials.
+Tested enforcing on el10.1 and el10.2, and on el9.7 where
+loading the module makes the upcalls reproducible with zero
+denials. Builds and loads on el8.10 through el10.2.
 
 Test-Parameters: trivial
 Test-Parameters: testgroup=review-dne-selinux-ssk-part-1 clientdistro=el10.0
@@ -2250,3 +2063,162 @@ Patch Set 16:
 AI code review results below, please doublecheck
 
 Mostly good, two minor comments inline on the lustre_helper_t rule set. The build/packaging side and the lctl relabel blast radius check out: on selinux-policy-44.4 the attribute set given to lustre_helper_exec_t leaves udev_t, mount_t, cluster_t, init_t and kernel_t with exactly the same file permissions they had on bin_t.
+
+--- Message (Hiroshi Nishida, 2026-07-31 16:44:26.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-07-31 16:45:22.000000000) ---
+Patch Set 17:
+
+This patch only contains changes that I don't know how to test or build. Skipping
+
+--- Message (Hiroshi Nishida, 2026-07-31 16:46:20.000000000) ---
+Patch Set 17:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-07-31 16:47:25.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-07-31 16:54:17.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-07-31 17:13:00.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128465/ : SUCCESS
+
+--- Message (Maloo, 2026-07-31 17:14:41.000000000) ---
+Patch Set 17:
+
+#### The following sessions will be run for Build 128465 (patch #17):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el10.0-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el10.0-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.1-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128465&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128465#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-07-31 17:48:42.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-07-31 22:34:16.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 10.1 / x86_64, RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm123: https://testing.whamcloud.com/test_sessions/2712f2d5-6bc6-4f25-93e5-87f0ff5b7d26 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-07-31 22:54:07.000000000) ---
+Patch Set 17: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm7: https://testing.whamcloud.com/test_sessions/b2afc084-2d0c-4894-8358-29e042207372 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-07-31 23:10:23.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a few packaging/build comments inline. Of the four upcall paths this fixes, the lctl one (process_param2_config() replaying a persistent set_param) is the only one with no test that would notice it staying broken - a case that sets root_squash with "lctl set_param -P", remounts and then checks the value actually took effect would cover it.
+
+--- Message (Autotest, 2026-08-01 23:05:43.000000000) ---
+Patch Set 17:
+
+Trevis Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el10.1-x86_64/ldiskfs servers and el8.10-x86_64/ldiskfs clients for build 128465 patch 17. Requested by Hiroshi Nishida because of LU-20327.
+The following test parameters were specified: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1.
+
+--- Message (Hiroshi Nishida, 2026-08-01 23:34:23.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-08-02 01:23:19.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-08-02 01:32:25.000000000) ---
+Patch Set 17: Code-Review+1
+
+--- Message (Autotest, 2026-08-02 01:55:50.000000000) ---
+Patch Set 17:
+
+Onyx Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el10.1-x86_64/ldiskfs servers and el8.10-x86_64/ldiskfs clients for build 128465 patch 17. Requested by Andreas Dilger because of LU-20327.
+The following test parameters were specified: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1.
+
+--- Message (Maloo, 2026-08-02 05:36:52.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 10.1 / x86_64, RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-154vm1: https://testing.whamcloud.com/test_sessions/901627df-10d5-4499-a6da-6d644dc45d54 ran 7 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-02 06:53:00.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 10.1 / x86_64, RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-158vm71: https://testing.whamcloud.com/test_sessions/55074223-947c-4be3-bba8-a547862398ab ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Autotest, 2026-08-02 17:52:27.000000000) ---
+Patch Set 17:
+
+Trevis Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el10.1-x86_64/ldiskfs servers and el8.10-x86_64/ldiskfs clients for build 128465 patch 17. Requested by Hiroshi Nishida because of LU-16330.
+The following test parameters were specified: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1.
+
+--- Message (Autotest, 2026-08-02 17:53:47.000000000) ---
+Patch Set 17:
+
+Trevis Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el10.1-x86_64/ldiskfs servers and el8.10-x86_64/ldiskfs clients for build 128465 patch 17. Requested by Hiroshi Nishida because of LU-16330.
+The following test parameters were specified: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1.
+
+--- Message (Maloo, 2026-08-02 22:52:56.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 10.1 / x86_64, RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-152vm6: https://testing.whamcloud.com/test_sessions/198611fd-bf1c-4274-8943-ab17df0934f2 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-02 23:02:28.000000000) ---
+Patch Set 17:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 10.1 / x86_64, RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-153vm1: https://testing.whamcloud.com/test_sessions/a66a68ef-7cc6-4686-9486-ade5b820e423 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Autotest, 2026-08-03 13:52:32.000000000) ---
+Patch Set 17:
+
+Onyx Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el10.1-x86_64/ldiskfs servers and el8.10-x86_64/ldiskfs clients for build 128465 patch 17. Requested by Hiroshi Nishida because of LU-16330.
+The following test parameters were specified: testgroup=review-dne-selinux-ssk-part-2 serverdistro=el10.1.
+
+--- Message (Timothy Day, 2026-08-03 14:31:06.000000000) ---
+Patch Set 17:
+
+(1 comment)

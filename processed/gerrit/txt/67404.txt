@@ -1,5 +1,5 @@
 Change:     67404
-Subject:    LU-20501 llite: skip dot/dotdot in NFS get_name for striped dir
+Subject:    LU-20501 llite: skip dot/dotdot in NFS get_name
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67404
 Change-Id:  I0b9854525a165780e505db977a89f91c6d11b705
 Project:    fs/lustre-release
@@ -7,57 +7,92 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-21 06:40:57.000000000
-Updated:    2026-07-30 17:04:15.000000000
-Patch Set:  4
-Insertions: +15
+Updated:    2026-08-03 14:31:13.000000000
+Patch Set:  6
+Insertions: +11
 Deletions:  -0
-Comments:   29 (7 unresolved)
+Comments:   39 (0 unresolved)
 Hashtags:   master-next, testfix
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Lai Siyao, Andreas Dilger, James Simmons
 
 --- Commit Message ---
-LU-20501 llite: skip dot/dotdot in NFS get_name for striped dir
+LU-20501 llite: skip dot/dotdot in NFS get_name
 
-sanityn test_102 intermittently fails on ZFS DNE with a spurious
-ESTALE from open_by_handle_at() of a striped subdirectory whose
-parent is also striped:
+sanityn test_102 intermittently fails on ZFS DNE with a spurious ESTALE
+from open_by_handle_at() of a striped subdirectory:
 
   open_by_handle_at(subdir) error: Stale file handle
 
-The handle decodes fine; the ESTALE is produced by the kernel NFS
-reconnect path.  reconnect_one() gets the disconnected dentry's
-parent, then calls exportfs_get_name() (ll_get_name()) to find the
-child's name in that parent, and finally lookup_one() on that name.
+The handle decodes fine.  The ESTALE comes out of the NFS reconnect:
+reconnect_one() finds the disconnected dentry's parent, calls
+exportfs_get_name() (ll_get_name()) to get the child's name in that
+parent, then lookup_one() on it.  ll_get_name() returned "..", so
+lookup_one("..") failed -EACCES, and exportfs_decode_fh() converts any
+decode error into -ESTALE.
 
-ll_get_name() walks the parent's dirents and matches each entry's FID
-against the child FID with do_nfs_get_name_filldir().  It does not
-skip the "." and ".." entries.  For a DNE striped directory the merged
-readdir rewrites the "." and ".." entries to the master / parent FID in
-lmv_striped_read_page(), using op_data->op_fid3 for "..".  ll_readdir()
-sets op_fid3, but ll_get_name() does not, so on this path ".." carries
-a stale FID that can equal the child FID being searched.  When it does,
-ll_get_name() returns "..", reconnect_one() then does lookup_one(".."),
-which fails with -EACCES, and exportfs_decode_fh() turns any decode
-error into -ESTALE -- hence the intermittent failure.
+ll_get_name() walks the parent's dirents with do_nfs_get_name_filldir(),
+matching each lde_fid against the child FID.  It matches "." and ".."
+like any other name, and it does not check LUDA_FID, which is what tells
+it whether lde_fid is meaningful at all.
 
-A child is never reached through "." or "..", so do_nfs_get_name_filldir()
-must never match them (the generic get_name() is immune because it
-matches by inode number rather than FID).  Skip both entries.
+On ZFS the ".." entry of the filesystem root has no dependable FID:
+osd-zfs osd_dir_it_rec() computes it with osd_find_parent_fid(), which
+returns -ENOENT at the root, and that path left lde_fid untouched, so it
+kept whatever the recycled dirent page held.  Instrumenting the root's
+".." FID showed it varying per run between the correct root FID, zero,
+wild values such as [0xfcaae7467e00fcaa:0xc834a400:0x450008], and real
+FIDs of unrelated objects -- and when it happened to equal the child FID
+being searched, ll_get_name() returned "..".
 
-Reproduced and fixed on a ZFS DNE cluster: sanityn test_102 failed
-~15% of runs without the fix and 0/120 runs with it.
+Skip "." and ".." outright.  A child is never reached through those
+names, so they are never a valid answer here regardless of what lde_fid
+holds.  The generic get_name() is immune already because it matches by
+inode number rather than by FID.
 
-Fixes: 0d8c5ccc4e ("LU-4603 lmv: a few fixes about readdir of striped dir.")
+Also skip any entry the server did not mark LUDA_FID.  lde_fid is only
+defined when that flag is set, and mdd_dir_page_build() already tests it
+before reading the field.  osd-zfs has a second path that leaves lde_fid
+unwritten for an ordinary name: when osd_get_fid_by_oid() fails it marks
+the entry LUDA_UNKNOWN and returns without setting the FID.  The name
+check above does not cover that one, and matching its stale FID would
+return a name the child does not have.  Skipping is the safe failure --
+ll_get_name() reports "not found" rather than a wrong name.
+
+Bound the name length in ll_dir_read() while here.  lde_namelen comes
+straight off the wire and nothing on the client bounds it:
+mdc_adjust_dirpages() only rewrites lde_reclen.  ll_dir_read()
+dereferences it immediately -- lu_dirent_type_get() reads the type word
+at lde_name plus the aligned length -- and for an encrypted directory
+hands the same length to ll_fname_disk_to_usr(), whose output buffer is
+NAME_MAX sized, both before any filldir runs.
+do_nfs_get_name_filldir() would then memcpy() that many bytes into
+ll_get_name()'s caller buffer, exportfs_decode_fh_raw()'s
+char nbuf[NAME_MAX + 1].  Skipping over-long entries where the length is
+first read covers all three; the generic filldir_one() rejects them for
+the same reason.
+
+The server side is fixed separately by the companion osd-zfs patch,
+which reports the OSD root instead of leaving lde_fid unwritten.  These
+guards are worth keeping regardless: neither depends on the FID value,
+so they also protect a new client talking to an unfixed server.
+
+Validated on a ZFS DNE cluster (2 MDT, 2 OST) together with the osd-zfs
+patch: sanityn test_102 fails 5/30 without the two patches and passes
+30/30 with them; full sanity-lfsck passes 73/73; sanity test_154f
+passes.
+
+Fixes: 96a5daa0c08d ("LU-163 MDS returns 32/64-bit dir name hash according to client type")
 Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102,ONLY_REPEAT=200
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanity-lfsck
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I0b9854525a165780e505db977a89f91c6d11b705
 
 --- Review History ---
@@ -311,3 +346,65 @@ The skip itself is correct and harmless, but the mechanism it is justified with 
 Patch Set 4:
 
 (2 comments)
+
+--- Message (Oleg Drokin, 2026-08-03 05:53:49.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-03 05:57:23.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 05:59:05.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Oleg Drokin, 2026-08-03 05:59:11.000000000) ---
+Patch Set 5:
+
+(8 comments)
+
+--- Message (Oleg Drokin, 2026-08-03 06:05:45.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased.
+
+--- Message (jenkins, 2026-08-03 06:05:52.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128572/ : ABORTED
+
+--- Message (Oleg Drokin, 2026-08-03 06:11:05.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 06:11:34.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-03 06:12:53.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-03 06:35:23.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-03 06:35:34.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128574/ : SUCCESS

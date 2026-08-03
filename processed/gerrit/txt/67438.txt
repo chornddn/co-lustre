@@ -1,5 +1,5 @@
 Change:     67438
-Subject:    LU-20501 osd-zfs: report the root as its own parent for ".."
+Subject:    LU-20501 osd-zfs: report the OSD root as the parent for ".."
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67438
 Change-Id:  I0e999b877991e3c784d3f38a8d43ada0d99e7c44
 Project:    fs/lustre-release
@@ -7,53 +7,120 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-22 02:24:37.000000000
-Updated:    2026-07-25 16:10:57.000000000
-Patch Set:  1
-Insertions: +14
+Updated:    2026-08-03 14:41:16.000000000
+Patch Set:  3
+Insertions: +17
 Deletions:  -2
-Comments:   2 (1 unresolved)
-Hashtags:   master-next, testfix
+Comments:   3 (0 unresolved)
+Hashtags:   testfix, master-next
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Andreas Dilger: +1; Alex Zhuravlev: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
   REVIEWER: Andreas Dilger, Alex Zhuravlev, James Simmons
 
 --- Commit Message ---
-LU-20501 osd-zfs: report the root as its own parent for ".."
+LU-20501 osd-zfs: report the OSD root as the parent for ".."
 
 ZFS does not store "." and ".." on disk, so osd-zfs generates them in
-osd_dir_it_rec() and derives the ".." FID from the directory's linkEA.
-The filesystem root has no linkEA, so osd_find_parent_fid() returns
--ENOENT for it.  That branch only skipped setting LUDA_FID and left
-lde_fid untouched, so the root's ".." carried whatever the recycled
-dirent page happened to contain.  Instrumenting the value showed it
-varying between the correct root FID, zero, wild values such as
-[0xfcaae7467e00fcaa:0xc834a400:0x450008], and real FIDs of unrelated
-objects.  That is how LU-20501 handed ll_get_name() a ".." entry whose
-FID matched the child being looked up.
+osd_dir_it_rec() and gets the ".." FID from osd_find_parent_fid(): from
+the directory's linkEA, or failing that from the FID of the dnode named
+by SA_ZPL_PARENT.  For the objects created directly under the OSD root
+neither works.  They have no linkEA, and because Lustre objects live in
+the OI ZAPs rather than in a POSIX tree, their SA_ZPL_PARENT names the
+OI container that indexes them rather than the OSD root; that container
+carries no LMA, so osd_get_fid_by_oid() returns -ENOENT for it.  On a
+freshly formatted MDT here the ROOT directory is dnode 525, its
+SA_ZPL_PARENT is 24 (an oi.N ZAP), and the OSD root is dnode 34.
 
-Report the root as its own parent instead.  That is what ZFS does when
-it generates ".." (the root znode's parent is itself), what POSIX says
-about "/..", and what the "." branch a few lines above already does with
-the same FID.
+That branch only skipped setting LUDA_FID and left lde_fid untouched, so
+".." kept whatever the recycled dirent page happened to contain.
+Instrumenting the value showed it varying between the correct FID, zero,
+wild values such as [0xfcaae7467e00fcaa:0xc834a400:0x450008], and real
+FIDs of unrelated objects.  That is how LU-20501 handed ll_get_name() a
+".." entry whose FID matched the child being looked up.
 
-Do not zero lde_fid here.  A zero FID on ".." is not an empty value but
-a defined one: lfsck_namespace_assistant_handler_p1() reads it as
-"parent unknown", flags the directory with LNTF_CHECK_PARENT, and when
-the LFSCK runs against all targets that feeds second-stage orphan
-handling.  Emitting it for the root on every scan is a false positive.
-An earlier version of this patch did exactly that.
+Report the OSD root.  It is the real parent -- ROOT and update_log_dir
+are entries in its ZAP -- and it is what osd-ldiskfs already reports for
+the same directories, since osd_iget_fid() maps an LMA-less root inode
+to lu_local_obj_fid(OSD_FS_ROOT_OID).  osd_scrub.c performs the same
+mapping.  That FID is in FID_SEQ_LOCAL_FILE, so
+lfsck_find_mdt_idx_by_fid() always resolves it to the local target and
+the LFSCK takes the idx == lfsck_dev_idx() path, where ".." is a no-op.
 
-osd-ldiskfs is unaffected: it keeps the ".." FID in the on-disk dirent
-and synthesises lu_local_obj_fid(OSD_FS_ROOT_OID) for the root.
+Tracing every -ENOENT through a full sanity-lfsck run on a 2-MDT DNE
+filesystem finds exactly three objects reaching this branch, all direct
+children of the OSD root:
 
-Fixes: 2acb75c365 ("LU-2449 osd: osd-zfs to handle ./.. properly")
+  lustre-MDT0000  [0x200000007:0x1:0x0]  FID_SEQ_ROOT, the fs root
+  lustre-MDT0000  [0x20000000a:0x0:0x0]  FID_SEQ_UPDATE_LOG_DIR
+  lustre-MDT0001  [0x20000000a:0x1:0x0]  FID_SEQ_UPDATE_LOG_DIR
+
+Gate that answer on the iterated object's own FID.  osd_find_parent_fid()
+returns -ENOENT for any object whose linkEA is unreadable and whose
+SA_ZPL_PARENT names an LMA-less dnode, and an object created with no
+local parent hint stores the OI ZAP there -- that covers DNE remote
+directories and striped shards.  The OSD root is not their parent, so
+only ROOT and update_log_dir take it.
+
+Everything else reaching this branch reports the object itself.  That is
+not a claim about the parent; it is the value that leaks nothing, asserts
+nothing false, and stays local, so lfsck_find_mdt_idx_by_fid() resolves
+to this target and the LFSCK dotdot check is a no-op.  LUDA_FID is left
+clear so no consumer treats it as authoritative.  Zeroing lde_fid is not
+usable here: a zero FID on ".." is a defined value that
+lfsck_namespace_assistant_handler_p1() reads as "parent unknown" and
+flags with LNTF_CHECK_PARENT, and tracing shows .lustre/fid
+([0x200000002:0x2:0x0]) reaches this branch on a healthy filesystem, so
+zeroing would raise that flag on every scan.
+
+The gate keys on the iterated object's own FID rather than on the parent
+dnode: SA_ZPL_PARENT does not name the OSD root for these objects, it
+names the OI ZAP that indexes them, so testing the dnode against
+osd->od_root never matches.  On a freshly formatted MDT here ROOT is
+dnode 525, its SA_ZPL_PARENT is 24 (an oi.N ZAP holding
+0x200000007:0x1:0x0 = 525) and the OSD root is dnode 34.
+
+fid_is_local_file() is included because the other direct children of the
+OSD root -- PENDING, CONFIGS, quota_master, REMOTE_PARENT_DIR and so on
+-- belong to the same set, and osd-ldiskfs reports the OSD root for them
+too.  Tracing shows none of them reach this branch today: their ".." is
+read through osd_dir_lookup(), not the iterator, so a full umount/mount
+cycle (which runs mdd_orphan_cleanup() over PENDING) produces no hit
+here while a client readdir of the fs root does.
+
+osd_dir_lookup() still answers -ENODATA for these same objects, so
+dt_lookup(dir, "..") and the iterator disagree where osd-ldiskfs agrees.
+That is deliberate here: no current consumer hits the divergence
+(mdd_is_parent() short-circuits on mdd_is_root(), and the LFSCK's
+dt_lookup_dir(child, dotdot) tolerates -ENODATA), and changing the lookup
+would feed the LFSCK a parent FID where it currently gets nothing, which
+wants its own patch and its own validation.
+
+The sibling case is left alone here: when osd_get_fid_by_oid() fails for
+an ordinary entry further down, lde_fid is also left unwritten but the
+entry is marked LUDA_UNKNOWN.  A zero FID there would be worse than a
+stale one, because for a name other than ".." the LFSCK treats an insane
+FID as LNIT_BAD_DIRENT and removes the name entry.  The companion llite
+patch makes the client ignore any entry without LUDA_FID, which covers
+that path from the client side.
+
+Validated on a ZFS DNE cluster (2 MDT, 2 OST) with the companion llite
+patches, tracing both arms of the gate: the fs root and both
+update_log_dir objects take the OSD root, .lustre/fid reports itself, and
+no zero FID is emitted.  sanityn test_102 fails 5/30 without the patches;
+with them full sanity-lfsck passes 73/73, sanity test_154f passes, and
+test_102 passes 29/30 -- the one failure being the unrelated "stat data
+mismatch" (LU-15842), not an ESTALE.
+
+Fixes: 0780fde4d415 ("LU-3573 osd-zfs: Only advance zap cursor as needed")
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanity-lfsck
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102,ONLY_REPEAT=200
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I0e999b877991e3c784d3f38a8d43ada0d99e7c44
 
 --- Review History ---
@@ -107,3 +174,57 @@ Patch Set 1:
 
 --- Message (Marc Vef, 2026-07-25 16:10:57.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-02 21:27:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-03 05:53:49.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-03 05:57:12.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 05:59:10.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Oleg Drokin, 2026-08-03 06:05:45.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+--- Message (jenkins, 2026-08-03 06:05:52.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128571/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-03 06:11:39.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-03 06:12:42.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-03 06:23:13.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-03 06:37:50.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128575/ : SUCCESS
