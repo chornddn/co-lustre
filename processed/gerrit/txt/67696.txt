@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-03 05:53:49.000000000
-Updated:    2026-08-03 07:28:09.000000000
-Patch Set:  2
-Insertions: +12
-Deletions:  -20
-Comments:   1 (0 unresolved)
+Updated:    2026-08-04 13:59:57.000000000
+Patch Set:  3
+Insertions: +63
+Deletions:  -23
+Comments:   4 (3 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Lustre Gerrit Janitor: -1
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-20501 llite: do not derive the dirent from the emitted name
@@ -29,7 +29,7 @@ while that name points into the lu_dirent.  ll_dir_read() has not
 guaranteed that since encrypted directories were added: for those it
 emits the name out of the separate llcrypt_fname_alloc_buffer()
 allocation, so the derived "lu_dirent" starts 32 bytes before an
-unrelated slab object and lde_attrs/lde_fid are read out of bounds.
+unrelated slab object and lde_fid is read out of bounds.
 
 Tracing the two pointers on an encrypted directory shows the derived
 entry landing at name - 0x20 for every entry, with the FID read back out
@@ -39,25 +39,43 @@ compared as a FID.  A plain directory in the same mount never diverges.
 
 Pass the lu_dirent being emitted down from ll_dir_read() so the filldir
 works from the entry itself rather than from pointer arithmetic on a name
-it does not own.
+it does not own.  Drop the (filldir_t) cast on .ctx.actor while
+here: ll_nfs_get_name_filldir() already has that prototype under both
+FILLDIR_TYPE variants, so the cast only hid the type check, and no other
+.actor assignment in the tree casts.
 
-This fixes the out-of-bounds read only.  NFS export of an encrypted
-directory still fails: ll_get_name() calls ll_dir_read() without
-llcrypt_prepare_readdir(), which ll_iterate() does before the same call,
-and the parent inode reached through ll_iget_for_nfs() ->
-search_inode_for_lustre() has no crypt info loaded.  ll_fname_disk_to_usr()
-therefore emits the no-key base64 form, and reconnect_path()'s
-lookup_one_len() cannot resolve it.  Adding llcrypt_prepare_readdir()
-here returns -ENODATA on such an inode, so that needs its own fix and is
-deliberately not attempted in this patch.
+This does not fix the failure LU-20501 was filed for.  ll_dir_read()
+emits ent->lde_name for a plain directory, so container_of() already
+recovered exactly the entry this patch passes down; only the
+IS_ENCRYPTED() path changes behaviour, and sanityn test_102a (the existing
+open-by-handle test, renamed here to make room for the new one) uses
+unencrypted directories.  This fixes the out-of-bounds read only.
 
-No suite currently drives ll_get_name() on an encrypted directory --
-sanity-sec has no name_to_handle_at()/open_by_handle_at() coverage and
-sanityn test_102 uses unencrypted directories -- so the listed suites are
-regression coverage for the readdir change rather than for the fixed
-path.  A sanity-sec case running check_fhandle_syscalls inside an
-encrypted directory is worth adding once the key-loading defect above is
-fixed, since until then it could only assert a still-failing path.
+NFS export of an encrypted directory works after this only when the
+parent inode is already warm on the mount doing the reconnect.
+ll_get_name() calls ll_dir_read() without llcrypt_prepare_readdir(),
+which ll_iterate() does before the same call, so the crypt info has to
+have been loaded by something else -- search_inode_for_lustre() starts
+with an ilookup5() and llcrypt_setup_filename() loads the info for every
+lookup inside the directory.  Measured on a dummy-encrypted mount: with
+the parent walked first, check_fhandle_syscalls passes 3/3; with
+drop_caches and the LDLM LRU cleared so the inode is instantiated cold,
+0/3, because ll_fname_disk_to_usr() then emits the no-key base64 form
+that reconnect_path()'s lookup_one_len() cannot resolve.  Adding
+llcrypt_prepare_readdir() there returns -ENODATA on a cold
+NFS-instantiated inode, so the cold case needs its own fix.
+
+The existing open-by-handle case is renamed test_102a so the new one can
+be test_102b, which is how a variant is added here rather than putting a
+102a beside a bare 102.  That does move the subtest name LU-20501's
+existing failure history is keyed on, which is accepted deliberately.
+
+sanityn test_102b covers it: it remounts both clients with
+test_dummy_encryption, walks the directory on the second mount so the
+parent's crypt info is loaded, and resolves a handle for a subdirectory
+inside it.  It fails without this patch ("check_fhandle_syscalls on an
+encrypted dir failed") and passes with it.  The cold-inode case is left
+uncovered on purpose, since it still fails for the reason above.
 
 Fixes: 4d38566a004f ("LU-13717 sec: filename encryption")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
@@ -115,3 +133,40 @@ Patch Set 2: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/128576/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-03 18:48:20.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The code change itself looks correct: for unencrypted directories the emitted name is still ent->lde_name so the derived entry and lgd_lde are identical, and for encrypted ones the entry now comes from the loop instead of pointer arithmetic on the llcrypt buffer. Both ll_dir_read() callers are updated and the Fixes: tag resolves and matches.
+
+--- Message (Oleg Drokin, 2026-08-04 04:38:00.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-04 04:40:12.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 04:43:39.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 05:23:38.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 05:34:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128628/ : SUCCESS

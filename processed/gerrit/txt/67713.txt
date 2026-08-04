@@ -1,0 +1,120 @@
+Change:     67713
+Subject:    LU-20523 target: don't scale cached statfs by tgd_blockbits
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67713
+Change-Id:  I03ff09d3218c3527c49e129b1814c72eaf747f93
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-04 01:39:19.000000000
+Updated:    2026-08-04 15:03:57.000000000
+Patch Set:  1
+Insertions: +131
+Deletions:  -15
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20523 target: don't scale cached statfs by tgd_blockbits
+
+tgd_blockbits is sampled once in tgt_init() and never updated, but
+os_bsize is not fixed for the life of a mount: osd_recordsize_changed_cb()
+follows ZFS_PROP_RECORDSIZE, so "zfs set recordsize=" on a mounted target
+moves od_max_blksz and with it the units of os_blocks/os_bfree/os_bavail.
+
+Commit 8ee6e1c8825c ("LU-14565 ofd: Do not rely on tgd_blockbit") fixed
+the statfs reporting paths in mdt_statfs() and ofd_statfs(), which is why
+df and lfs df survive a recordsize change.  The grant code was not
+covered and still pairs the cached tgd_osfs counts with the old shift:
+
+  tgt_grant_space_left()      left = tgd_osfs.os_bavail << tgd_blockbits
+  tgt_grant_sanity_check()    maxsize = tgd_osfs.os_blocks << tgd_blockbits
+  tgt_grant_create()          ted_grant >> tgd_blockbits vs os_bavail
+  tgt_grant_commit()          pending >> tgd_blockbits
+  tgt_statfs_internal()       unstable >> tgd_blockbits
+  tgt_grant_statfs()          the D_CACHE trace of free and avail
+
+Both directions are harmful.  Lowering the recordsize from 128K to 16K
+multiplies the block counts by 8 while tgd_blockbits still says 128K, so
+tgt_grant_space_left() reports eight times the space the target actually
+has; tgt_grant_alloc() bounds grant by that value, so a target close to
+full hands out grant it cannot honour and the clients hit ENOSPC on
+writeback for space they were promised.  Raising it divides the counts
+instead, and tgt_grant_sanity_check() then computes a maxsize smaller
+than the grant already outstanding and LBUGs the server on the next
+statfs.
+
+Scale the cached counts by the shift that came with them, and read them
+under tgd_osfs_lock in tgt_grant_sanity_check() and tgt_grant_create(),
+which took the counts without it: the shift and the counts have to come
+from the same statfs or the mismatch is simply reintroduced by a racing
+refresh.  While rewriting the tgt_grant_create() trace, print os_bavail
+and os_blocks separately instead of their product, which was not a
+meaningful quantity, and turn the check itself into an addition: as a
+subtraction it wrapped once the grant passed the free space, skipping
+the precreate ENOSPC exactly when the target was short.  The stale shift
+had been keeping the right hand side too small to reach that.
+
+The sites that use tgd_blockbits as the device's allocation unit - the
+extent tax, the grant chunk rounding, tgt_grant_inflate()/deflate() and
+ocd_grant_blkbits - are left alone: those are what was negotiated with
+the connected clients and must not move underneath them.
+
+This is the first of two patches on the ticket.  The LBUG it reports
+comes from a lowered ZFS dataset quota rather than a recordsize change,
+and is fixed by the second; that fix compares the outstanding grant
+against the largest size the device has reported, which is only
+meaningful once every size the grant code derives from the cached statfs
+is in the same units.
+
+Rename test_805 to test_805a, since a number and that same number with
+a suffix are not mixed in one suite.
+
+Add sanity test_805b, which emulates the recordsize change with
+OBD_FAIL_TGT_STATFS_BSIZE so it also runs on ldiskfs, and compares the
+free space the grant code computes against what df reports, with a
+reported block size of 1K and of 1M - below and above both the ldiskfs
+block size and the 128K a ZFS MDT is formatted with.
+
+Fixes: bc9eae65f088 ("LU-6152 osd-zfs: ZFS large block compat")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I03ff09d3218c3527c49e129b1814c72eaf747f93
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-04 01:39:19.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 01:44:57.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-04 01:52:02.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-04 02:12:57.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128623/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 02:25:35.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Oleg Drokin, 2026-08-04 15:03:57.000000000) ---
+Patch Set 1:
+
+(1 comment)

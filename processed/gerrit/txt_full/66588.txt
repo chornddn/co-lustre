@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-06-10 20:10:02.000000000
-Updated:    2026-07-30 08:16:37.000000000
-Patch Set:  6
-Insertions: +1033
-Deletions:  -29
-Comments:   382 (10 unresolved)
+Updated:    2026-08-04 08:35:06.000000000
+Patch Set:  7
+Insertions: +1299
+Deletions:  -19
+Comments:   416 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Cyril Bordage: +1; Manish Regmi: +1; Xinxia Qu: +1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -62,10 +62,23 @@ and run the slot->app copy-out off the CQ poller on an HCA-CPT-bound
 workqueue, with lnet_finalize() deferred behind the copy. GPUDirect
 pages bypass the bounce.
 
+The workqueue belongs to the pool and shares its lifetime, so an
+ib-bonding failover that moves the interface to a different HCA gets a
+worker on the new HCA's node together with the new pool, and the old
+pool keeps its own worker for as long as a transfer still holds one of
+its slots. The consumer reaches the worker through the slot it already
+holds, so it always finds the one on that slot's node. The deferred
+copy-out takes a connection reference of its own, dropped only once
+kiblnd_tx_done() has returned, so a copy-out is visible to anything
+that waits on ibn_nconns and the slot's pool and worker stay pinned
+through the HCA the connection holds.
+
 bounce_enable is tristate (0 off, 1 auto, 2 force) and defaults off.
 auto allocates the arena only on a multi-node NUMA box and engages
 only when the buffer is NUMA-remote (node_distance > LOCAL_DISTANCE),
-so local I/O stays zero-copy. force engages unconditionally and
+so local I/O stays zero-copy. The distance test is only sound if we
+know the HCA's own node, so when the platform won't report one auto
+warns and declines to allocate. force engages unconditionally and
 allocates even on a single-socket box, for selftests.
 
 HCA reads are barely penalized, so for a Lustre write the added
@@ -91,24 +104,39 @@ prior-transfer bytes in the untransferred tail. Zero each slot on
 release to close this; the copy-out fuses the zero into the read-out
 while the line is cache-hot, so the common path adds no separate pass.
 bounce_scrub (default on) gates the zeroing so a trusted fabric can
-drop it.
+drop it. It is writable, and turning it back on does not clean slots
+parked while it was off; each one is clean again after its next
+full-slot release, so the pool recovers over the following traffic
+rather than at once.
 
 The new module parameters are bounce_enable, bounce_pool_mb (64),
 bounce_min_nob (65536), bounce_scrub (on) and
-bounce_copyout_max_active (2), which sets the per-HCA-CPT copy-out
-workqueue concurrency. Slot size is fixed at LNET_MTU. Read
-/sys/kernel/debug/lnet/bounce_stats for the engaged, exhausted,
-inflight, fallback and byte counters. fail_loc 0xe010 forces
-engagement and 0xe011 forces the fallback, for selftests.
+bounce_copyout_max_active (2), which sets the copy-out workqueue
+concurrency. Slot size is fixed at LNET_MTU. Read
+/sys/kernel/debug/lnet/o2iblnd_bounce_stats for the engaged,
+exhausted, inflight, fallback and byte counters.
 
-At bounce_enable=0 the datapath is byte-for-byte identical to stock:
-the sink rd-build adds one predicate test and nothing reroutes. I
-validated the functional paths over SoftRoCE (byte-exact read,
-exhaustion fallback, clean teardown) and measured the numbers above on
-mlx5.
+sanity-lnet 313 covers an intact bounced read with bounce_enable=2,
+314 covers the bounced->direct fallback with fail_loc
+CFS_FAIL_O2IBLND_BOUNCE_RD, and 315 covers the pool and worker rebuild
+with dev_failover=2.
 
-Assisted-by: Claude:claude-opus-4.8
-Test-Parameters: trivial
+Two supporting refactors come with this. The kiov skip loop at the top
+of kiblnd_setup_rd_kiov() becomes kiblnd_kiov_skip(), so the sink
+rd-build and the copy-out walk the sink the same way.
+kiblnd_alloc_pages() grows a kiblnd_alloc_pages_node() variant, since
+cfs_page_cpt_alloc() rotates over every node of a CPT and cannot pin
+the arena to the HCA's node; that variant passes __GFP_THISNODE,
+because alloc_pages_node() only prefers a node and would otherwise
+leave the arena off-node under memory pressure, which defeats the
+purpose of this feature.
+
+At bounce_enable=0 the sink rd-build reads the tunable, branches and
+reroutes nothing; kiblnd_should_bounce() makes that its first test, so
+a disabled build never walks the sink kiov.
+
+Assisted-by: Claude:claude-opus-5
+Test-Parameters: trivial testlist=sanity-lnet
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: Icf39b39a7a3f3f3fdfdaa886edf9695af28eb48f
 
@@ -732,3 +760,123 @@ Some concerns, see inline comments. The pool-locality and slot-initialisation po
 Patch Set 6: Code-Review+1
 
 (1 comment)
+
+--- Message (Chris Horn, 2026-08-04 00:57:55.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-04 00:58:57.000000000) ---
+Patch Set 7:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 01:01:55.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Chris Horn, 2026-08-04 01:03:00.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 01:05:14.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67196/results.html
+
+ Commencing initial testing: runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special7@zfs+DNE sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-04 01:06:02.000000000) ---
+Patch Set 7:
+
+(18 comments)
+
+20 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 01:28:42.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 01:33:11.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128621/ : SUCCESS
+
+--- Message (Maloo, 2026-08-04 01:34:51.000000000) ---
+Patch Set 7:
+
+#### The following sessions will be run for Build 128621 (patch #7):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128621&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128621#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 02:15:14.000000000) ---
+Patch Set 7:
+
+Initial testing failed:
+
+> sanity-lnet-special7@zfs+DNE Timeout(3580s)
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey sanity-lnet@ldiskfs+DNE sanity-lnet-special1@ldiskfs+DNE sanity-lnet-special1@ldiskfs sanity-lnet-special2@ldiskfs+DNE sanity-lnet-special2@ldiskfs sanity-lnet-special3@ldiskfs+DNE sanity-lnet-special3@ldiskfs sanity-lnet-special4@ldiskfs+DNE sanity-lnet-special4@ldiskfs sanity-lnet-special5@ldiskfs+DNE sanity-lnet-special5@ldiskfs sanity-lnet-special6@ldiskfs+DNE sanity-lnet-special6@ldiskfs sanity-lnet-special7@ldiskfs+DNE sanity-lnet-special7@ldiskfs sanity-lnet-special8@ldiskfs+DNE sanity-lnet-special8@ldiskfs sanity-lnet-special9@ldiskfs+DNE sanity-lnet-special9@ldiskfs sanity-lnet-special10@ldiskfs+DNE sanity-lnet-special10@ldiskfs sanity-lnet@zfs sanity-lnet-special1@zfs sanity-lnet-special1@zfs+DNE sanity-lnet-special2@zfs sanity-lnet-special2@zfs+DNE sanity-lnet-special3@zfs sanity-lnet-special3@zfs+DNE sanity-lnet-special4@zfs sanity-lnet-special4@zfs+DNE sanity-lnet-special5@zfs sanity-lnet-special5@zfs+DNE sanity-lnet-special6@zfs sanity-lnet-special6@zfs+DNE sanity-lnet-special7@zfs sanity-lnet-special8@zfs sanity-lnet-special8@zfs+DNE sanity-lnet-special9@zfs sanity-lnet-special9@zfs+DNE sanity-lnet-special10@zfs sanity-lnet-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67196/results.html
+
+--- Message (Maloo, 2026-08-04 08:07:33.000000000) ---
+Patch Set 7: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-158vm164: https://testing.whamcloud.com/test_sessions/126ec12a-4eee-4a3c-b5d6-5628fb572645 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 08:35:06.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor comments inline. The bounced-read lifetime argument holds up under tracing: the extra kiblnd_conn_addref() in kiblnd_tx_done() pins conn->ibc_hdev (taken in kiblnd_create_conn(), dropped in kiblnd_destroy_conn()), so the slot's pool, its workqueue, the tx pool and the sink kiov all outlive the deferred copy-out, and it also keeps kiblnd_pool_free_node()->kiblnd_unmap_tx_pool()->kiblnd_hdev_decref() from reaching zero and calling destroy_workqueue() from inside a work item of that same queue.

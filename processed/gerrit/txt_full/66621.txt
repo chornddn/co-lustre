@@ -1,5 +1,5 @@
 Change:     66621
-Subject:    LU-20357 ptlrpc: clear idle NID statistics on server
+Subject:    LU-20357 obdclass: clear idle NID statistics on server
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66621
 Change-Id:  I511de0c1205105708e9aa89fe9f1cff915dbe2b8
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Jinshan Xiong
 Created:    2026-06-12 06:07:27.000000000
-Updated:    2026-07-28 14:20:55.000000000
-Patch Set:  17
-Insertions: +392
-Deletions:  -87
-Comments:   300 (18 unresolved)
+Updated:    2026-08-04 12:00:29.000000000
+Patch Set:  18
+Insertions: +434
+Deletions:  -93
+Comments:   331 (8 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -22,7 +22,7 @@ Comments:   300 (18 unresolved)
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Timothy Day, Robert Read
 
 --- Commit Message ---
-LU-20357 ptlrpc: clear idle NID statistics on server
+LU-20357 obdclass: clear idle NID statistics on server
 
 Introduce configurable nid_stats_idle_time per target device
 to automatically garbage collect stale NID statistics structures
@@ -34,10 +34,12 @@ High-Level Design:
   cleaned up. If no other exports are using the same NID, the corresponding
   NID statistics structure (`nid_stat`) is marked as "idle" and moved to an
   idle list.
-- **Background Purging**: A background thread (the pinger) periodically
-  scans the idle list. If an entry has been idle for longer than the
-  configurable `nid_stats_idle_time` timeout, it is evicted from the hash
-  table and freed, along with its associated debugfs files.
+- **Background Purging**: The ping evictor thread (ping_evictor_main())
+  periodically scans the idle list. The thread's wait loop is converted
+  from wait_event_idle() to a 60-second timed wait to trigger periodic
+  scans. If an entry has been idle for longer than the configurable
+  `nid_stats_idle_time` timeout, it is evicted from the hash table and
+  freed, along with its associated debugfs files.
 - **Manual Clearing**: Users can also force-clear all idle statistics
   immediately by writing to the `nid_stats_clear` control file.
 
@@ -46,8 +48,21 @@ Key Implementation Details:
 - Added `nid_last_idle` timestamp to `struct nid_stat` to track idle duration.
 - Idle entries are moved to `obd_nid_stats_idle` list during export cleanup.
 - Target devices are marked in `obd_devs` xarray for efficient scanning by
-  the pinger thread.
-- Added `nid_stats_clear` debugfs interface.
+  the ping evictor thread.
+- Reimplemented `nid_stats_clear` debugfs interface to clear active stats
+  and immediately evict idle stats.
+- Added `idle_seconds` output to `exports/*/export` debugfs files to show
+  how long the NID has been idle.
+- Renamed `obd_nid_stats_get()/obd_nid_stats_put()` to
+  `obd_nid_stats_insert()/obd_nid_stats_remove()` to better reflect their
+  hash table operations.
+- Fixed a potential Use-After-Free by moving NID stats hash destruction
+  from class_cleanup() to class_free_dev().
+- Fixed a race causing EEXIST on debugfs creation by destroying the
+  debugfs entry before removing the nid_stat from the hash table in
+  obd_nid_stats_remove().
+- Fixed a bug where obd_nid_stats_insert() could sleep under RCU read
+  lock when retrying by releasing the RCU lock before sleeping.
 
 Signed-off-by: Jinshan Xiong <jinshanx@google.com>
 Change-Id: I511de0c1205105708e9aa89fe9f1cff915dbe2b8
@@ -4729,3 +4744,453 @@ The new sanity test only exercises automatic GC on the MDT. Coverage for the nid
 Patch Set 17:
 
 Failed optional test review-dne-part-3 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm140: https://testing.whamcloud.com/test_sessions/fc75aec1-3277-4433-8b2b-ce103d852594 ran 3 tests.  1 tests failed: conf-sanity.
+
+--- Message (Jinshan Xiong, 2026-08-04 01:39:22.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Jinshan Xiong, 2026-08-04 01:39:27.000000000) ---
+Patch Set 17:
+
+(16 comments)
+
+--- Message (Jinshan Xiong, 2026-08-04 01:40:00.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 01:45:37.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 01:45:50.000000000) ---
+Patch Set 18:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67199/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-special1@ldiskfs+DNE sanity-special1@ldiskfs sanity-special2@ldiskfs+DNE sanity-special2@ldiskfs sanity-special3@ldiskfs+DNE sanity-special3@ldiskfs sanity-special4@ldiskfs+DNE sanity-special4@ldiskfs sanity-special5@ldiskfs+DNE sanity-special5@ldiskfs sanity-special6@ldiskfs+DNE sanity-special6@ldiskfs sanity-special7@ldiskfs+DNE sanity-special7@ldiskfs sanity-special8@ldiskfs+DNE sanity-special8@ldiskfs sanity-special9@ldiskfs+DNE sanity-special9@ldiskfs sanity-special10@ldiskfs+DNE sanity-special10@ldiskfs sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-special1@zfs sanity-special1@zfs+DNE sanity-special2@zfs sanity-special2@zfs+DNE sanity-special3@zfs sanity-special3@zfs+DNE sanity-special4@zfs sanity-special4@zfs+DNE sanity-special5@zfs sanity-special5@zfs+DNE sanity-special6@zfs sanity-special6@zfs+DNE sanity-special7@zfs sanity-special7@zfs+DNE sanity-special8@zfs sanity-special8@zfs+DNE sanity-special9@zfs sanity-special9@zfs+DNE sanity-special10@zfs sanity-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-04 01:51:40.000000000) ---
+Patch Set 18:
+
+(6 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 02:00:54.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 02:18:15.000000000) ---
+Patch Set 18: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128624/ : FAILURE
+
+--- Message (Jinshan Xiong, 2026-08-04 03:23:24.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-04 04:37:51.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128625/ : SUCCESS
+
+--- Message (Maloo, 2026-08-04 04:39:28.000000000) ---
+Patch Set 18:
+
+#### The following sessions will be run for Build 128625 (patch #18):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+#### The following sessions were skipped because they are untestable:
+
+#### Untestable Optional:
+
+- Test Config #42: review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #43: review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #44: review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #45: review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #46: review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #47: review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #48: review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #49: review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #50: review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #51: review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #52: review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #53: review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #54: review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #55: review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #56: review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #57: review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #74: review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+  - server: el9.8 - x86_64 | lustre-reviews #128625
+
+- Test Config #83: review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+  - client: el9.8 - x86_64 | lustre-reviews #128625
+
+#### Supported build configurations for lustre-reviews #128625:
+
+#### Clients
+
+  - rocky9.5   - aarch64 - inkernel
+
+  - el10.0     - x86_64  - inkernel
+
+  - el10.1     - x86_64  - inkernel
+
+  - el8.10     - x86_64  - inkernel
+
+  - el9.5      - x86_64  - inkernel
+
+  - el9.7      - x86_64  - inkernel
+
+  - rocky9.5   - x86_64  - inkernel
+
+  - sles15sp7  - x86_64  - inkernel
+
+  - ubuntu2404 - x86_64  - inkernel
+
+  - ubuntu2604 - x86_64  - inkernel
+
+#### Servers
+
+  - el10.0 - x86_64 - inkernel
+
+  - el10.1 - x86_64 - inkernel
+
+  - el8.10 - x86_64 - inkernel
+
+  - el9.5  - x86_64 - inkernel
+
+  - el9.7  - x86_64 - inkernel
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128625&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128625#redirect
+
+--- Message (Maloo, 2026-08-04 05:30:38.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm40: https://testing.whamcloud.com/test_sessions/d908e76e-4c32-49e0-9e02-7b30c5d02edb ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 05:37:06.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-156vm85: https://testing.whamcloud.com/test_sessions/ec6f1c99-4633-4632-9bda-df596ae73965 ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 05:40:51.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-152vm1: https://testing.whamcloud.com/test_sessions/2b924475-93c4-4e76-9a32-b55c9374d252 ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 05:49:26.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-3 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-156vm73: https://testing.whamcloud.com/test_sessions/7e8c818e-8a13-48bc-a9ca-436d4bffbd78 ran 3 tests.  1 tests failed: conf-sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 06:53:50.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-154vm36: https://testing.whamcloud.com/test_sessions/a1abb917-447d-4dd4-9a24-7f5a6c3396d4 ran 6 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 07:11:47.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-6 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm16: https://testing.whamcloud.com/test_sessions/479cd694-3dbf-4f12-b73c-e23a3655c4de ran 6 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 07:12:22.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-153vm10: https://testing.whamcloud.com/test_sessions/c1185d04-a127-4a9c-b943-42836cbc60c9 ran 6 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 07:23:38.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-6 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-155vm65: https://testing.whamcloud.com/test_sessions/573974b6-48d8-4068-99b8-6a841a654813 ran 6 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 08:13:21.000000000) ---
+Patch Set 18:
+
+Initial testing failed:
+
+> sanity1@ldiskfs+DNE Timeout(15010s)
+> sanity2@ldiskfs+DNE Timeout(20012s)
+> sanity2@zfs Timeout(20013s)
+> sanity-special3@zfs Timeout(3585s)
+- (Crash processing failed with code 1 stdout: Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+ stderr: )(Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+)
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-special1@ldiskfs+DNE sanity-special1@ldiskfs sanity-special2@ldiskfs+DNE sanity-special2@ldiskfs sanity-special3@ldiskfs+DNE sanity-special3@ldiskfs sanity-special4@ldiskfs+DNE sanity-special4@ldiskfs sanity-special5@ldiskfs+DNE sanity-special5@ldiskfs sanity-special6@ldiskfs+DNE sanity-special6@ldiskfs sanity-special7@ldiskfs+DNE sanity-special7@ldiskfs sanity-special8@ldiskfs+DNE sanity-special8@ldiskfs sanity-special9@ldiskfs+DNE sanity-special9@ldiskfs sanity-special10@ldiskfs+DNE sanity-special10@ldiskfs sanity1@zfs sanity3@zfs sanity-slow@zfs sanity-special1@zfs sanity-special1@zfs+DNE sanity-special2@zfs sanity-special2@zfs+DNE sanity-special3@zfs+DNE sanity-special4@zfs sanity-special4@zfs+DNE sanity-special5@zfs sanity-special5@zfs+DNE sanity-special6@zfs sanity-special6@zfs+DNE sanity-special7@zfs sanity-special7@zfs+DNE sanity-special8@zfs sanity-special8@zfs+DNE sanity-special9@zfs sanity-special9@zfs+DNE sanity-special10@zfs sanity-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67199/results.html
+
+--- Message (Maloo, 2026-08-04 08:55:34.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-155vm6: https://testing.whamcloud.com/test_sessions/816a007f-7d4d-4305-863b-7c1ce166fff9 ran 10 tests.  1 tests failed: replay-single.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 09:53:43.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-5 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-157vm31: https://testing.whamcloud.com/test_sessions/91b16582-eee6-4f60-a14a-1fe006368eaa ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-04 10:13:45.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-155vm50: https://testing.whamcloud.com/test_sessions/695c50f2-3181-44eb-a30b-f9166517a3c0 ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2026-08-04 10:15:37.000000000) ---
+Patch Set 18:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest from onyx-159vm25: https://testing.whamcloud.com/test_sessions/db1f375b-a3be-494f-b8a3-52c9fb8be9f1 ran 6 tests.  3 tests failed: sanity-sec, sanity-lnet, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 10:41:58.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm6: https://testing.whamcloud.com/test_sessions/fa8020ba-c94a-475c-915d-568bc6c2edb3 ran 11 tests.  1 tests failed: mmp.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 10:47:24.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-155vm24: https://testing.whamcloud.com/test_sessions/927115d5-dc59-4624-8e14-e6a4cb31eb54 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-04 10:57:23.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-9 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-155vm126: https://testing.whamcloud.com/test_sessions/8c991f46-e043-4006-b11a-09ecb65c1ebc ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-08-04 11:17:36.000000000) ---
+Patch Set 18:
+
+Failed enforced test review-dne-part-4 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-154vm56: https://testing.whamcloud.com/test_sessions/b1bf067e-529c-45de-b048-51ad1de01be3 ran 11 tests.  2 tests failed: sanity-quota, mmp.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 11:36:09.000000000) ---
+Patch Set 18:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-155vm63: https://testing.whamcloud.com/test_sessions/d56509f1-b180-4acb-8f75-d10b874171ce ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-04 11:41:36.000000000) ---
+Patch Set 18: Verified-1
+
+Passed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Trevis Autotest from trevis-154vm83: https://testing.whamcloud.com/test_sessions/aab4b16a-1fd1-4287-81e6-6614f0228205 ran 6 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 12:00:29.000000000) ---
+Patch Set 18:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.

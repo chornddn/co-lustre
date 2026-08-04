@@ -1,5 +1,5 @@
 Change:     66621
-Subject:    LU-20357 ptlrpc: clear idle NID statistics on server
+Subject:    LU-20357 obdclass: clear idle NID statistics on server
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66621
 Change-Id:  I511de0c1205105708e9aa89fe9f1cff915dbe2b8
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Jinshan Xiong
 Created:    2026-06-12 06:07:27.000000000
-Updated:    2026-07-28 14:20:55.000000000
-Patch Set:  17
-Insertions: +392
-Deletions:  -87
-Comments:   300 (18 unresolved)
+Updated:    2026-08-04 12:00:29.000000000
+Patch Set:  18
+Insertions: +434
+Deletions:  -93
+Comments:   331 (8 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -22,7 +22,7 @@ Comments:   300 (18 unresolved)
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Timothy Day, Robert Read
 
 --- Commit Message ---
-LU-20357 ptlrpc: clear idle NID statistics on server
+LU-20357 obdclass: clear idle NID statistics on server
 
 Introduce configurable nid_stats_idle_time per target device
 to automatically garbage collect stale NID statistics structures
@@ -34,10 +34,12 @@ High-Level Design:
   cleaned up. If no other exports are using the same NID, the corresponding
   NID statistics structure (`nid_stat`) is marked as "idle" and moved to an
   idle list.
-- **Background Purging**: A background thread (the pinger) periodically
-  scans the idle list. If an entry has been idle for longer than the
-  configurable `nid_stats_idle_time` timeout, it is evicted from the hash
-  table and freed, along with its associated debugfs files.
+- **Background Purging**: The ping evictor thread (ping_evictor_main())
+  periodically scans the idle list. The thread's wait loop is converted
+  from wait_event_idle() to a 60-second timed wait to trigger periodic
+  scans. If an entry has been idle for longer than the configurable
+  `nid_stats_idle_time` timeout, it is evicted from the hash table and
+  freed, along with its associated debugfs files.
 - **Manual Clearing**: Users can also force-clear all idle statistics
   immediately by writing to the `nid_stats_clear` control file.
 
@@ -46,8 +48,21 @@ Key Implementation Details:
 - Added `nid_last_idle` timestamp to `struct nid_stat` to track idle duration.
 - Idle entries are moved to `obd_nid_stats_idle` list during export cleanup.
 - Target devices are marked in `obd_devs` xarray for efficient scanning by
-  the pinger thread.
-- Added `nid_stats_clear` debugfs interface.
+  the ping evictor thread.
+- Reimplemented `nid_stats_clear` debugfs interface to clear active stats
+  and immediately evict idle stats.
+- Added `idle_seconds` output to `exports/*/export` debugfs files to show
+  how long the NID has been idle.
+- Renamed `obd_nid_stats_get()/obd_nid_stats_put()` to
+  `obd_nid_stats_insert()/obd_nid_stats_remove()` to better reflect their
+  hash table operations.
+- Fixed a potential Use-After-Free by moving NID stats hash destruction
+  from class_cleanup() to class_free_dev().
+- Fixed a race causing EEXIST on debugfs creation by destroying the
+  debugfs entry before removing the nid_stat from the hash table in
+  obd_nid_stats_remove().
+- Fixed a bug where obd_nid_stats_insert() could sleep under RCU read
+  lock when retrying by releasing the RCU lock before sleeping.
 
 Signed-off-by: Jinshan Xiong <jinshanx@google.com>
 Change-Id: I511de0c1205105708e9aa89fe9f1cff915dbe2b8
@@ -762,3 +777,68 @@ AI code review results below, please doublecheck
 Some concerns, see inline comments. The main one is object lifetime in the new pinger path: class_incref() does not hold off class_cleanup(), so the ping evictor can touch obd_nid_stats_hash after it has been destroyed.
 
 The new sanity test only exercises automatic GC on the MDT. Coverage for the nid_stats_clear write path and for nid_stats_idle_time=0 (GC disabled) would be worth adding, since both are new behavior.
+
+--- Message (Jinshan Xiong, 2026-08-04 01:39:22.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Jinshan Xiong, 2026-08-04 01:39:27.000000000) ---
+Patch Set 17:
+
+(16 comments)
+
+--- Message (Jinshan Xiong, 2026-08-04 01:40:00.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 01:45:37.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-08-04 01:51:40.000000000) ---
+Patch Set 18:
+
+(6 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 02:00:54.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 02:18:15.000000000) ---
+Patch Set 18: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/128624/ : FAILURE
+
+--- Message (Jinshan Xiong, 2026-08-04 03:23:24.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-04 04:37:51.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128625/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-04 12:00:29.000000000) ---
+Patch Set 18:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.

@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-03 05:53:49.000000000
-Updated:    2026-08-03 07:28:09.000000000
-Patch Set:  2
-Insertions: +12
-Deletions:  -20
-Comments:   1 (0 unresolved)
+Updated:    2026-08-04 13:59:57.000000000
+Patch Set:  3
+Insertions: +63
+Deletions:  -23
+Comments:   4 (3 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Lustre Gerrit Janitor: -1
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-20501 llite: do not derive the dirent from the emitted name
@@ -29,7 +29,7 @@ while that name points into the lu_dirent.  ll_dir_read() has not
 guaranteed that since encrypted directories were added: for those it
 emits the name out of the separate llcrypt_fname_alloc_buffer()
 allocation, so the derived "lu_dirent" starts 32 bytes before an
-unrelated slab object and lde_attrs/lde_fid are read out of bounds.
+unrelated slab object and lde_fid is read out of bounds.
 
 Tracing the two pointers on an encrypted directory shows the derived
 entry landing at name - 0x20 for every entry, with the FID read back out
@@ -39,25 +39,43 @@ compared as a FID.  A plain directory in the same mount never diverges.
 
 Pass the lu_dirent being emitted down from ll_dir_read() so the filldir
 works from the entry itself rather than from pointer arithmetic on a name
-it does not own.
+it does not own.  Drop the (filldir_t) cast on .ctx.actor while
+here: ll_nfs_get_name_filldir() already has that prototype under both
+FILLDIR_TYPE variants, so the cast only hid the type check, and no other
+.actor assignment in the tree casts.
 
-This fixes the out-of-bounds read only.  NFS export of an encrypted
-directory still fails: ll_get_name() calls ll_dir_read() without
-llcrypt_prepare_readdir(), which ll_iterate() does before the same call,
-and the parent inode reached through ll_iget_for_nfs() ->
-search_inode_for_lustre() has no crypt info loaded.  ll_fname_disk_to_usr()
-therefore emits the no-key base64 form, and reconnect_path()'s
-lookup_one_len() cannot resolve it.  Adding llcrypt_prepare_readdir()
-here returns -ENODATA on such an inode, so that needs its own fix and is
-deliberately not attempted in this patch.
+This does not fix the failure LU-20501 was filed for.  ll_dir_read()
+emits ent->lde_name for a plain directory, so container_of() already
+recovered exactly the entry this patch passes down; only the
+IS_ENCRYPTED() path changes behaviour, and sanityn test_102a (the existing
+open-by-handle test, renamed here to make room for the new one) uses
+unencrypted directories.  This fixes the out-of-bounds read only.
 
-No suite currently drives ll_get_name() on an encrypted directory --
-sanity-sec has no name_to_handle_at()/open_by_handle_at() coverage and
-sanityn test_102 uses unencrypted directories -- so the listed suites are
-regression coverage for the readdir change rather than for the fixed
-path.  A sanity-sec case running check_fhandle_syscalls inside an
-encrypted directory is worth adding once the key-loading defect above is
-fixed, since until then it could only assert a still-failing path.
+NFS export of an encrypted directory works after this only when the
+parent inode is already warm on the mount doing the reconnect.
+ll_get_name() calls ll_dir_read() without llcrypt_prepare_readdir(),
+which ll_iterate() does before the same call, so the crypt info has to
+have been loaded by something else -- search_inode_for_lustre() starts
+with an ilookup5() and llcrypt_setup_filename() loads the info for every
+lookup inside the directory.  Measured on a dummy-encrypted mount: with
+the parent walked first, check_fhandle_syscalls passes 3/3; with
+drop_caches and the LDLM LRU cleared so the inode is instantiated cold,
+0/3, because ll_fname_disk_to_usr() then emits the no-key base64 form
+that reconnect_path()'s lookup_one_len() cannot resolve.  Adding
+llcrypt_prepare_readdir() there returns -ENODATA on a cold
+NFS-instantiated inode, so the cold case needs its own fix.
+
+The existing open-by-handle case is renamed test_102a so the new one can
+be test_102b, which is how a variant is added here rather than putting a
+102a beside a bare 102.  That does move the subtest name LU-20501's
+existing failure history is keyed on, which is accepted deliberately.
+
+sanityn test_102b covers it: it remounts both clients with
+test_dummy_encryption, walks the directory on the second mount so the
+parent's crypt info is loaded, and resolves a handle for a subdirectory
+inside it.  It fails without this patch ("check_fhandle_syscalls on an
+encrypted dir failed") and passes with it.  The cold-inode case is left
+uncovered on purpose, since it still fails for the reason above.
 
 Fixes: 4d38566a004f ("LU-13717 sec: filename encryption")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
@@ -286,3 +304,312 @@ Succeeded:
 (rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67148/results.html
 Commencing standard testing: 
 - conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-08-03 16:41:42.000000000) ---
+Patch Set 2:
+
+Testing has completed with errors!
+
+> conf-sanity4@ldiskfs+DNE Failure(15271s)
+- 135(creation thread is running. Is changelog reader stuck?) 
+> replay-dual@ldiskfs+DNE Timeout(377s)
+> replay-dual@zfs Timeout(342s)
+> replay-vbr@ldiskfs+DNE Timeout(3576s)
+- (Crash processing failed with code 1 stdout: Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+ stderr: )(Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+)
+> sanity-ec@zfs Failure(1183s)
+- 5b(mirror resync failed) 
+> sanity-hsm@ldiskfs+DNE Failure(7370s)
+- 12u(request on 0x200000403:0x35:0x0 is not SUCCEED on mds1) 
+> sanity-pcc@ldiskfs+DNE Failure(4873s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(4377s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67148/results.html
+
+--- Message (Maloo, 2026-08-03 18:35:23.000000000) ---
+Patch Set 2: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-153vm163: https://testing.whamcloud.com/test_sessions/8854b545-fb52-4414-8755-97bf7f892bef ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-03 18:48:20.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The code change itself looks correct: for unencrypted directories the emitted name is still ent->lde_name so the derived entry and lgd_lde are identical, and for encrypted ones the entry now comes from the loop instead of pointer arithmetic on the llcrypt buffer. Both ll_dir_read() callers are updated and the Fixes: tag resolves and matches.
+
+--- Message (Oleg Drokin, 2026-08-04 04:38:00.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-04 04:40:12.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 04:43:35.000000000) ---
+Patch Set 3:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67201/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-04 04:43:39.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 05:03:59.000000000) ---
+Patch Set 3:
+
+Test script sanityn subtest test_102a that was touched by this patch failed with 'check_fhandle_syscalls d102a.sanityn.remote/subdir fail'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (Lustre RISC-V Builder, 2026-08-04 05:23:38.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-04 05:34:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128628/ : SUCCESS
+
+--- Message (Maloo, 2026-08-04 05:36:24.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 128628 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128628&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128628#redirect
+
+--- Message (Maloo, 2026-08-04 06:34:28.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm165: https://testing.whamcloud.com/test_sessions/b3a0c969-b70f-4a10-9fe4-1a5b78b023df ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-08-04 06:42:23.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm152: https://testing.whamcloud.com/test_sessions/da714369-17f9-40ff-8f9a-809e8a8f2197 ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-08-04 06:45:14.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-159vm98: https://testing.whamcloud.com/test_sessions/2d1619a7-66a6-4274-a43b-f02977f3464b ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-04 08:19:50.000000000) ---
+Patch Set 3: Code-Review-1
+
+Newly added or changed test failed in initial testing:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- runtests-ssk@ldiskfs+SharedKey:test_1(Seen in reviews: 67662 67459 66183 65628 65064 65062 64955 64320 64318 62946 62689 62571 62135 55878 55818 54267 53359 52788 52722 52595 52488 52487 52382 52331 52268 52243 52242 52240 52235 52226 52224 52208 52206 52205 52188 52187 52182 52167 52160 52140 52113 52110 52107 52104 52102 52082 52080 52075 51850 51592 51126 51125 50966 50677 50493 50296 49989 49978 49517 49125 46360 46293 45616 45544 45532 45421 45407 45386 45322 45317 45271 45234 45211 45202 45181 45174 45160 45153 45143 45133 45069 45042 45023 45004 45000 44969 44957 44885 44855 44853 44846 44843 44838 44829 44824 44822 44782 44766 44765 44761)
+
+
+> runtests-ssk@ldiskfs+SharedKey Failure(1183s)
+- 1(can't cp /etc/hosts to /mnt/lustre/hosts.9204) 
+> sanityn-special2@zfs+DNE Failure(581s)
+- 102a(check_fhandle_syscalls d102a.sanityn.remote/subdir fail) 
+> sanityn-special4@zfs+DNE Failure(571s)
+- 102a(check_fhandle_syscalls d102a.sanityn.remote failed) 
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67201/results.html
+
+--- Message (Maloo, 2026-08-04 09:19:43.000000000) ---
+Patch Set 3:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-155vm212: https://testing.whamcloud.com/test_sessions/9f81ed56-d9fe-4573-bbef-cfcacb60e7b3 ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 10:46:42.000000000) ---
+Patch Set 3:
+
+Failed optional test review-dne-part-5 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-157vm233: https://testing.whamcloud.com/test_sessions/f212fea3-74d8-4d92-b025-6b4a10377fbd ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-04 11:44:37.000000000) ---
+Patch Set 3:
+
+Failed optional test review-dne-zfs-part-2 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-153vm191: https://testing.whamcloud.com/test_sessions/91be286c-b009-41d1-b5dd-b04aa98d67b2 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-04 12:07:15.000000000) ---
+Patch Set 3:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-155vm80: https://testing.whamcloud.com/test_sessions/b8a1f2f2-c164-407b-8c5e-f304f56918d9 ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-08-04 12:54:52.000000000) ---
+Patch Set 3:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-155vm213: https://testing.whamcloud.com/test_sessions/cbee9ff4-40eb-4424-a638-cf8ddc0897d5 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-04 13:44:29.000000000) ---
+Patch Set 3:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest from onyx-155vm42: https://testing.whamcloud.com/test_sessions/09067cc8-dd2f-426b-829a-18b04ac2448a ran 6 tests.  3 tests failed: sanity-sec, sanity-lnet, sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-04 13:59:57.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest from onyx-156vm106: https://testing.whamcloud.com/test_sessions/d53de746-87b4-43f3-a2a0-2aa36c65f093 ran 6 tests.  1 tests failed: sanity-lnet.
