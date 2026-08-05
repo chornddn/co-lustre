@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Serguei Smirnov
 Created:    2026-07-09 01:30:32.000000000
-Updated:    2026-07-31 16:26:01.000000000
-Patch Set:  10
-Insertions: +846
-Deletions:  -31
-Comments:   70 (26 unresolved)
+Updated:    2026-08-05 09:22:39.000000000
+Patch Set:  11
+Insertions: +1072
+Deletions:  -45
+Comments:   99 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -32,28 +32,67 @@ LNet API rather than inferred from interface topology. The policy
 contributes visibility groups through the generic discovery visibility
 framework and participates in normal visibility composition.
 
-The module parameter alone puts the policy in force. A count of the
-registered servicenodes must not control it. Discovery operates as
-soon as LNet starts, but a servicenode registers only when a target
-mounts. If the count controlled the policy, the node would send all
-of its NIDs between these two times, and a peer would merge them into
-one multi-rail peer. No later group corrects this.
+LNetDiscServiceNodePolicySet() alone puts the policy in force. A count
+of the registered servicenodes must not control it. Discovery operates
+as soon as LNet starts, but a servicenode registers only when a target
+mounts. If the count controlled the policy, the node would send all of
+its NIDs between these two times, and a peer would merge them into one
+multi-rail peer. No later group corrects this.
+
+The policy set can now change while LNet runs, so the enable and
+disable helpers are replaced by a scratch set that is filled in and
+then published in one step. Publication stores the slots before it
+grows the count, and the two full-view voters read the slots with
+READ_ONCE() and skip an empty one. Those voters run under the net
+lock, not under ln_api_mutex, and thus can read the set as it
+changes. A change of servicenode membership leaves the set alone and
+only rebuilds the views.
+
+The new group algebra needs groups of a size that is known only at
+run time, so a lnet_group_alloc() and lnet_group_free() pair replaces
+the open-coded allocation. The existing collect and release paths are
+converted to it. This is a mechanical change with no effect on
+behavior.
 
 A servicenode group contains only the NIDs of a target that is
-already mounted, and the policy refuses the full view to all of the
-local NIDs. A NID that no group contains would thus match no view and
-would also get no full view. The node would drop all discovery GETs
-to that NID, and no peer could find it. A target that registers on
-that NID could not mount. The enumerate pass therefore makes a group
-of one NID for each live NI that no other group contains. Each NI
-stays discoverable, and the node keeps the groups separate.
+already mounted, and the policy refuses the full view on all nets but
+lo0. A NID that no group contains would thus match no view and would
+also get no full view. The node would drop all discovery GETs to that
+NID, and no peer could find it. A target that registers on that NID
+could not mount. The enumerate pass therefore makes a group of one
+NID for each live NI that no other group contains. Each NI stays
+discoverable, and the node keeps the groups separate. lo0 keeps the
+full view instead of a group of its own, because the peer on the far
+side of it is this node.
+
+Groups that share a NID are folded into one. Two such groups cannot
+be kept apart: a peer that reaches this node on the shared NID gets
+one group's NIDs, a peer that reaches it on a NID private to the
+other group gets that group's NIDs, and the shared NID makes the peer
+merge the two sets. The usual case is exact duplication, because all
+of the targets of a server register the same NID list, and each group
+costs a view with a ping buffer and an MD.
+
+The Push path keys on the destination when the peer never reached
+this node on a local NI. A destination behind a router is on a net
+that no group holds a NID on, so no view claims the Push and the
+group is chosen on the route to the destination. The policy keeps the
+full view for the destination that no group can route to at all,
+because the alternative is to abort the Push and end discovery for
+that peer.
+
+A base source composes with the servicenode groups through an
+intersection, which keeps the ingress semantics of the base group.
+The Push path keys a group on the destination net only for the
+per-ni kind. Only per-ni makes all of the groups on a net equal, one
+NI each, and lets the first match stand for all of them.
 
 This patch introduces only the LNet policy implementation and its
 internal interfaces. Subsequent patches will populate servicenode
 membership from Lustre.
 
-Assisted-by: Claude:claude-opus-4.8
 Test-Parameters: trivial testlist=sanity-lnet
+Assisted-by: Claude:claude-opus-4.8
 Signed-off-by: Serguei Smirnov <ssmirnov@thelustrecollective.com>
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: I15eeafdcbd579e0efc95b983329086884861ade8
@@ -1041,3 +1080,86 @@ Succeeded:
 - conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
 
 (rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66981/results.html
+
+--- Message (Chris Horn, 2026-08-05 05:05:25.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-05 05:05:53.000000000) ---
+Patch Set 11:
+
+(26 comments)
+
+--- Message (wc-checkpatch, 2026-08-05 05:13:26.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 05:14:33.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67268/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-lnet@ldiskfs+DNE sanity-lnet@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 05:14:50.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 05:32:08.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 07:29:09.000000000) ---
+Patch Set 11:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-lnet@ldiskfs+DNE sanity-lnet@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67268/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-08-05 09:21:46.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128709/ : SUCCESS
+
+--- Message (Maloo, 2026-08-05 09:22:39.000000000) ---
+Patch Set 11:
+
+#### The following sessions will be run for Build 128709 (patch #11):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128709&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128709#redirect
