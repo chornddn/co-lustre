@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-05-16 02:27:33.000000000
-Updated:    2026-07-27 23:13:49.000000000
-Patch Set:  8
-Insertions: +1750
-Deletions:  -63
-Comments:   238 (40 unresolved)
+Updated:    2026-08-06 13:59:37.000000000
+Patch Set:  10
+Insertions: +1622
+Deletions:  -82
+Comments:   313 (6 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -40,21 +40,68 @@ Add three EC modes to 'lfs mirror extend':
                          Covers the non-FLR case where the user just
                          wants to add EC protection to a plain file.
 
-By default the new mirrors are in sync when the command returns,
-matching the regular extend behavior of never leaving a new mirror
-stale: new data mirrors are populated by a copy before the layout
-merge, and new parity mirrors are computed in place with the same
-client-side machinery 'lfs mirror resync' uses. The new --no-resync
-option (same name and semantics as the LU-17531 work) skips that and
-leaves the new mirrors stale for a later 'lfs mirror resync'.
+The new mirrors are in sync when the command returns, matching the
+regular extend behavior of never leaving a new mirror stale: new data
+mirrors are populated by a copy before the layout merge, and new
+parity mirrors are computed in place with the same client-side
+machinery 'lfs mirror resync' uses.
+
+A parity mirror is attached by merging a layout that holds only the
+new parity components, while the data mirror they protect stays where
+it is. Splitting the pair across two files this way needs two changes
+in lod.
+
+lod_qos_prep_create() sizes a parity component from the data component
+it protects and rejects a parity component that has none. The data
+component of an extend is not in the volatile file being created, so
+the client sends that component's stripe count as the parity
+component's own stripe count, and lod derives the raidset count from
+it when there is no local data component to pair with. A transient
+link id is still required to resolve within one layout.
+
+lod_declare_layout_merge() copies the incoming entries verbatim, so
+only the parity -> data half of the link would be stored. It now also
+stamps the matching data component with the mirror id assigned to the
+parity component, so an EC pair created by 'lfs mirror extend' is
+linked in both directions like one created by 'lfs setstripe --ec'.
+Without this 'lfs mirror split' cannot see the pair from the data
+side and leaves the parity mirror behind when the data mirror it
+protects is split out.
+
+The new llapi_layout_comp_add_parity_only() builds the parity-only
+layout. llapi_layout_comp_add_ec() cannot serve that case: it derives
+the parity extent, stripe size and pool by searching for the data
+component in the same buffer, and pairs the two with a transient link
+id that is resolved during creation. The two functions share their EC
+stripe-count validation. Client-side layout sanity likewise had to
+stop requiring a data component for every parity component.
+
+Attaching a second parity mirror of a different geometry to one data
+mirror, which would let a file's EC protection change without
+rewriting its data, is not implemented: the merge ioctl takes one
+mirror at a time and lod_qos_prep_create() resolves a parity component
+to a single data component. It is rejected for now, and no test
+asserts that rejection.
 
 '--mirror-id 0' is rejected by the parser; id 0 is reserved for
 non-FLR layouts and is not a valid target. Use auto mode instead.
 
-Assisted-by: Fable 5
+Because an MDS that predates this change refuses a parity-only create
+buffer outright, the new sanity-ec subtests are gated on the server
+version so an interop run skips them instead of failing.
+
+collect_mirror_id() writes into a caller-supplied array with no way
+to tell where it ends, and three of its callers sized that array for
+128 mirror ids while a file may carry LUSTRE_MIRROR_COUNT_MAX (256).
+Raising lod.*.mirror_count_max past 128 and creating that many
+mirrors would run off the end of the stack array. struct
+collect_ids_data gains a cid_max capacity that the callback honors,
+and the three arrays are sized from LUSTRE_MIRROR_COUNT_MAX. Two new
+callers are added here, which is why the fix rides along.
 
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
+Assisted-by: ClaudeCode:Fable-5 llm_code_and_review_tools
 Change-Id: I8d670f0558521063af425e2c75a56b00cdd294d7
 
 --- Review History ---
@@ -2306,3 +2353,342 @@ Patch Set 8:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The main one: a parity mirror created by this path is only linked parity -> data, and mdd_split_ea() (added by b3233b2527 earlier in this series) reads the link from the *data* side to decide what to co-split, so 'lfs mirror split' behaves differently on a file EC-protected by 'mirror extend' than on one created by 'setstripe --ec'.
+
+--- Message (Maximilian Dilger, 2026-08-05 22:46:45.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 22:49:39.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 22:50:29.000000000) ---
+Patch Set 9:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67322/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-05 22:53:47.000000000) ---
+Patch Set 9:
+
+(14 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 22:58:24.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maximilian Dilger, 2026-08-05 22:59:25.000000000) ---
+Patch Set 9:
+
+(40 comments)
+
+--- Message (jenkins, 2026-08-06 00:12:01.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128765/ : SUCCESS
+
+--- Message (Maloo, 2026-08-06 00:13:17.000000000) ---
+Patch Set 9:
+
+#### Build 128765 (patch #9) will not be tested because: the Test-Parameters contain an error: Unknown version: 2.17.52
+
+--- Message (Maximilian Dilger, 2026-08-06 00:14:01.000000000) ---
+Patch Set 10: Commit message was updated.
+
+Copied Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Maximilian Dilger, 2026-08-06 00:14:11.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-06 00:16:45.000000000) ---
+Patch Set 10:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67334/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-06 00:17:01.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-06 00:27:29.000000000) ---
+Patch Set 10:
+
+(14 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-06 01:28:14.000000000) ---
+Patch Set 10:
+
+Initial testing failed:
+
+> sanity-ec@zfs Failure(1263s)
+- 5b(mirror resync failed) 
+> sanity-ec-special7@zfs+DNE Timeout(3581s)
+- (Crash processing failed with code 1 stdout: Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+ stderr: )(Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+)
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67334/results.html
+
+--- Message (Lustre RISC-V Builder, 2026-08-06 01:40:46.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-06 01:41:38.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128778/ : SUCCESS
+
+--- Message (Maloo, 2026-08-06 01:42:22.000000000) ---
+Patch Set 10:
+
+#### The following sessions will be run for Build 128778 (patch #10):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128778&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128778#redirect
+
+--- Message (Maloo, 2026-08-06 02:32:31.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-152vm175: https://testing.whamcloud.com/test_sessions/276ce761-dc04-4be7-9cf3-163a76419518 ran 2 tests.  1 tests failed: lustre-initialization.
+
+--- Message (Maloo, 2026-08-06 05:47:46.000000000) ---
+Patch Set 10:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-155vm145: https://testing.whamcloud.com/test_sessions/d7c671da-38ae-4208-972c-57abab9c1df9 ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-06 06:45:04.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-157vm167: https://testing.whamcloud.com/test_sessions/a4022926-5639-4f95-a2c4-97fd8a78bbd1 ran 5 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-08-06 06:52:23.000000000) ---
+Patch Set 10:
+
+Failed optional test review-dne-part-5 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-153vm7: https://testing.whamcloud.com/test_sessions/60ba29be-2e75-4d09-9452-e9a0495a2f62 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-06 08:43:12.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-146vm17: https://testing.whamcloud.com/test_sessions/8efc5e54-7a4b-4e16-bfe7-df72c183e4eb ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-06 08:55:26.000000000) ---
+Patch Set 10:
+
+Failed optional test review-dne-part-9 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-155vm16: https://testing.whamcloud.com/test_sessions/60303755-b828-42fa-a73f-e9ae1505176d ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-08-06 08:59:04.000000000) ---
+Patch Set 10:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-153vm232: https://testing.whamcloud.com/test_sessions/eb5107ec-e4c6-49c1-8a48-c207c9b448b7 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-06 09:00:16.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-157vm19: https://testing.whamcloud.com/test_sessions/578763df-123f-4429-9d54-28550161f9a1 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-06 13:38:29.000000000) ---
+Patch Set 10: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm140: https://testing.whamcloud.com/test_sessions/4a9d533f-955b-4889-bf8f-e70ee3d15e0e ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-06 13:59:37.000000000) ---
+Patch Set 10:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The main functional concern is that two of the three new mirror_extend_set_ec() call sites report a usage error but return success.

@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-17 05:14:38.000000000
-Updated:    2026-07-28 04:37:18.000000000
-Patch Set:  11
-Insertions: +599
-Deletions:  -42
-Comments:   152 (7 unresolved)
+Updated:    2026-08-06 11:26:13.000000000
+Patch Set:  12
+Insertions: +725
+Deletions:  -47
+Comments:   159 (13 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -30,23 +30,54 @@ bidirectional link (lcme_mirror_link_id). Splitting one mirror
 without the other strands a parity mirror that protects no data,
 or leaves a data mirror with no EC protection.
 
-When splitting a data mirror, the MDS now splits (or destroys)
-its paired parity mirror in the same atomic operation. The pair
-is found via the mirror link id rather than by assuming the data
-and parity components are adjacent in the layout, and the link on
-any mirror left behind is cleared so no dangling reference
-remains. A split that would remove every mirror, such as a lone
-data+parity pair, is refused.
+When splitting a data mirror, the MDS now splits (or destroys) its
+paired parity mirror in the same atomic operation. The pair is
+found via the mirror link id rather than by assuming the data and
+parity components are adjacent in the layout, and the link is only
+followed while it still describes an intact pair: the linked mirror
+must exist, carry LCME_FL_PARITY and link back. A link failing
+those tests is stale, and following it would co-split an unrelated
+mirror. The link on any mirror left behind is cleared so no
+dangling reference remains.
 
 Add the --force-no-ec option to split a data mirror on its own,
-leaving its parity mirror in place. When splitting a parity
-mirror directly, --force-no-ec also suppresses the warning that
-removing the parity eliminates EC protection of the data mirror.
+leaving its parity mirror in place. Since lfs mirror delete is
+lfs mirror split -d under another name, the option applies to it
+as well.
 
-Assisted-by: Claude Opus 4.8
+A split is refused if it would remove every mirror, and also if it
+would leave the file without a data mirror. Parity mirrors alone
+cannot serve reads: with no data mirror the layout is no longer
+FLR, so lov_io_mirror_init() returns at its !lov_is_flr() check
+ahead of the parity checks, the parity mirror is picked for IO, and
+reads hand back parity stripes as file data. This covers a
+--force-no-ec split of the last data mirror too, so a lone
+data+parity pair cannot be taken apart by splitting the data
+mirror; split the parity mirror instead to turn the file back into
+a plain data file.
+
+Splitting a parity mirror directly no longer requires -d. That
+restriction, added by commit dfb93e4978b0 ("LU-19548 lfs: mirror
+split -d for parity mirrors"), existed to keep a parity-only
+layout off a real file. Refusing to strand the data side now covers
+the source file, and a victim file holding only the parity mirror
+reports size 0, because lov_attr_get_composite() does not take size
+from parity components, so it cannot pass parity off as file data.
+A warning is printed instead, since removing the parity eliminates
+EC protection of the data mirror; --force-no-ec suppresses it.
+test_7b is updated for the new behaviour.
+
+A victim that receives a data+parity pair keeps its LCME_FL_STALE
+markers, so a parity mirror that was stale at split time no longer
+lands in a victim that claims an in-sync pair.
+
+Also fix endian handling in the rewritten function: lcm_flags was
+converted twice, and lcm_entry_count is a __u16 written with
+cpu_to_le32().
 
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
 Change-Id: I69ca706127e8e0b0e26c88525ac5509e22fa912a
 
 --- Review History ---
@@ -492,3 +523,44 @@ Patch Set 11:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The co-split logic and the link-id based pairing look right, but two paths can now leave a file (or a victim file) whose only remaining mirror is a parity mirror, which the client no longer recognises as EC once the FLR flags are cleared.
+
+--- Message (Maximilian Dilger, 2026-08-05 17:54:59.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 17:58:14.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-05 18:03:48.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-05 18:33:35.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128757/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 18:45:15.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-06 11:26:13.000000000) ---
+Patch Set 12:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the state `--force-no-ec` deliberately creates (a parity mirror whose data mirror is gone) is not handled by `lfs mirror verify`/`resync`; test_7f and test_7g build that state but never run either command against the file afterwards, so the coverage would benefit from a resync/verify step once the behaviour is settled.

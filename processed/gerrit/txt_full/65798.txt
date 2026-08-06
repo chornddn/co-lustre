@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-05-11 00:30:11.000000000
-Updated:    2026-07-27 21:45:32.000000000
-Patch Set:  12
-Insertions: +2871
-Deletions:  -41
-Comments:   324 (9 unresolved)
+Updated:    2026-08-06 14:49:29.000000000
+Patch Set:  14
+Insertions: +3094
+Deletions:  -42
+Comments:   351 (0 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -25,106 +25,42 @@ Hashtags:   pt_ecro
 --- Commit Message ---
 LU-20238 ec: GFNI-accelerated EC primitives
 
-Portable C-intrinsics build of ISA-L that drops the patented
-PSHUFB nibble-table technique used by the AVX2/SSE kernels.
-A follow-on patch in this series adds a non-GFNI byte-indexed
-table-lookup (GF_REGION_MUL) for the scalar fallback path.
+Add a runtime-dispatched GFNI fast path to libec.a (LU-19465).
+On x86_64 with GFNI, ec_encode_data(), ec_encode_data_update(),
+ec_init_tables(), gf_vect_dot_prod() and gf_vect_mad() route to
+AVX-512 or AVX2 GFNI kernels; everywhere else the existing
+ec_*_base() path is used unchanged.
 
-Add a runtime-dispatched GFNI fast path to the existing libec.a
-(LU-19465).
+The kernels are C intrinsics (_mm{256,512}_gf2p8affine_epi64_epi8)
+gated per-function with __attribute__((target(...))), so the build
+needs only GCC >= 8 / clang >= 8 and no NASM.  They use only the
+GF(2^8) affine instruction and XOR/load/store, not the PSHUFB
+nibble-table lookup the ISA-L AVX2/SSE kernels rely on.
 
-On x86_64 CPUs with GFNI:
+The multi-output AVX-512 kernels take the coefficient as an EVEX
+{1to8} embedded broadcast to keep it off Port5; compilers will not
+emit {1to8} from intrinsics, so a short inline-asm macro is used.
+Against ISA-L's NASM kernels this reaches parity on AVX-512 (+1%
+to -5%) and matches or beats NASM on 4 of 5 AVX2 benchmarks, the
+one slower case by 6%.
 
-  - AVX-512 + GFNI: ec_encode_data / ec_encode_data_update /
-    ec_init_tables route to AVX-512 GFNI kernels.  Both encode
-    (dot_prod) and update (mad) peel parity rows off in groups
-    of up to 6 per FPU pass (full 1/2/3/4/5/6-output kernel
-    ladder is shipped for each); arbitrary m is supported via
-    repeated passes.
-  - AVX2 + GFNI:    same dispatcher with AVX2 GFNI kernels.
-    Encode peels in groups of up to 3 per pass (kernels for
-    1/2/3 outputs); arbitrary m via repeated passes.
-  - Everywhere else (or when GFNI isn't compiled in): the
-    existing ec_*_base() path is used, unchanged.
+A configure probe (EC_GFNI_SUPPORT) compile-tests the intrinsic
+and defines LUSTRE_EC_GFNI for the libec.a build only.  Every
+dispatch block is guarded by the pair defined(LUSTRE_EC_GFNI) &&
+!defined(__KERNEL__), so no shipped consumer reaches a GFNI kernel
+yet: ec.ko and liblustreapi both take the base path, and the
+numbers above compare kernels directly rather than describing a
+user-visible speedup.  Follow-on patches add the Kbuild plumbing
+and the liblustreapi wiring.
 
-The GFNI kernels are written in C using compiler intrinsics
-(_mm{256,512}_gf2p8affine_epi64_epi8) gated per-function with
-__attribute__((target("avx2,gfni"))) or
-target("avx512f,avx512bw,gfni"), so the build needs only
-GCC >= 8 / clang >= 8 and does NOT depend on NASM.  The encode
-path uses only the GF(2^8) affine intrinsic (vgf2p8affineqb)
-and standard XOR / load / store; no PSHUFB-style nibble-table
-lookup is used anywhere.
-
-The multi-output AVX-512 kernels read the GF coefficient as an
-EVEX {1to8} embedded-broadcast operand of vgf2p8affineqb, so
-the 8-byte broadcast folds into the affine's own load micro-op.
-This keeps the broadcast off the vector-ALU port: gcc/clang
-lower _mm512_set1_epi64()+affine to a GPR-source vpbroadcastq
-on Port5, which made the first-gen multi-vect encode ~25%
-slower than NASM on Sapphire Rapids.  The compilers will not
-emit {1to8} from intrinsics, so a short inline-asm macro is
-used.  The single-output kernels keep the plain set1 form (no
-competing affines, so no Port5 contention to avoid).
-
-Performance on rd07 (Intel Raptor Lake-P, AVX2 + GFNI, single
-thread, median of 3) vs ISA-L's NASM kernels on the same host:
-
-  Benchmark                            | NASM      | C intrinsics
-  -------------------------------------+-----------+--------------
-  gf_vect_mul_perf                     | 42.5 GB/s | 56.8 (+34%)
-  gf_vect_dot_prod_perf                | 50.1 GB/s |  46.9 (-6%)
-  erasure_code_perf encode             | 18.2 GB/s | 20.0 (+10%)
-  erasure_code_perf decode             | 20.8 GB/s |  22.5 (+8%)
-  erasure_code_update_perf encode      | 16.4 GB/s |  16.8 (+2%)
-  erasure_code_update_perf single_src  | 54.7 GB/s |  56.8 (+4%)
-
-Intrinsics match or beat NASM on 5 of 6 AVX2 benchmarks; the
-one slower case is by 6%.
-
-AVX-512 + GFNI on a Xeon Platinum 8481C (Sapphire Rapids, GCP
-c3, single thread, median of 3), same benchmarks, dispatch-
-confirmed (gdb) to the *_avx512_gfni kernels on both builds:
-
-  Benchmark                            |    NASM    | C intrinsics
-  -------------------------------------+------------+-------------
-  gf_vect_mul_perf                     |  31.1 GB/s |  31.4 (+1%)
-  gf_vect_dot_prod_perf                |  79.0 GB/s |  79.7 (+1%)
-  erasure_code_perf encode             |  44.0 GB/s |  43.0 (-2%)
-  erasure_code_perf decode             |  54.3 GB/s |  51.4 (-5%)
-  erasure_code_update_perf encode      |  35.8 GB/s |  35.9 (+0%)
-  erasure_code_update_perf single_src  | 115.8 GB/s | 115.2 (-1%)
-
-The {1to8} embedded broadcast brings the AVX-512 multi-vect
-dot_prod kernels to parity with NASM (+1% to -5%), closing the
-~25% gap the first-gen set1-broadcast intrinsics showed.
-
-A configure-time probe (EC_GFNI_SUPPORT in
-config/lustre-erasurecode.m4) compile-tests the affine intrinsic
-and, on success, defines LUSTRE_EC_GFNI for the libec.a build
-and enables the new sources via the EC_GFNI automake conditional.
-When the probe fails (non-x86_64, older toolchain), no GFNI
-objects are built and ec_base_aliases.c collapses to the base
-path unchanged.
-
-For this patch, the dispatcher is gated to userspace only by the
-guard #if defined(LUSTRE_EC_GFNI) && !defined(__KERNEL__).  The C
-sources are already __KERNEL__-aware and build into ec.ko;
-a follow-on patch in this series will add the lustre/ec/Makefile
-(Kbuild) plumbing and define LUSTRE_EC_GFNI for the kernel build
-so ec.ko also dispatches to GFNI.
-
-A standalone smoke test (gfni_ec_test, noinst_PROGRAMS) is built
-inside the tree and verifies that the GFNI dispatcher and base
-path produce byte-identical output on randomised input.  It
-accepts k/m/len command-line arguments (default k=4 m=2
-len=4096, constraint 1<=k, 1<=m, k+m<=256).  lustre/tests/
-sanity-ec.sh test_0 sweeps a representative set of geometries
-through it.
+gfni_ec_test checks that the GFNI and base paths produce identical
+output, and exits 77 without GFNI so a caller can skip instead of
+recording a base-against-base pass.  It installs with the test
+suite; sanity-ec.sh test_0 sweeps geometries and lengths through
+it.
 
 The vendored gf_*_gfni.c kernels are reflowed for lustre
-checkpatch and intentionally diverge from canonical isa-l;
-see lustre/utils/erasurecode/GFNI_VENDORED.md.
+checkpatch; see lustre/utils/erasurecode/GFNI_VENDORED.md.
 
 Test-Parameters: testlist=sanity-ec
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
@@ -2190,3 +2126,265 @@ Patch Set 12:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The main one is reachability: -DLUSTRE_EC_GFNI is only applied to libec.a, and libec.a is a noinst_LIBRARIES archive that nothing links except the new gfni_ec_test. The production userspace EC path is lfs mirror resync -> llapi_ec_resync_many_params() -> llapi_ec_compute_parities() -> ec_init_tables()/ec_encode_data(), and those symbols come from liblustreapi's own copy of erasurecode/ec_base_aliases.c (lustre/utils/Makefile.am), which is built without EC_GFNI_CFLAGS. So as it stands no shipped consumer, kernel or userspace, ever reaches a GFNI kernel; only the self-test does. Was liblustreapi meant to be wired up here, or is that also deferred to a follow-on? It would also be good to extend gfni_ec_test to cover ec_encode_data_update() and non-64-byte-multiple lengths, since none of the mad kernels or the masked/short tails are exercised today.
+
+--- Message (Hiroshi Nishida, 2026-08-05 14:54:27.000000000) ---
+Patch Set 12:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-08-05 14:54:28.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-05 14:58:00.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-05 14:58:53.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 14:59:16.000000000) ---
+Patch Set 13:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67302/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (jenkins, 2026-08-05 15:36:23.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128742/ : SUCCESS
+
+--- Message (Maloo, 2026-08-05 15:37:54.000000000) ---
+Patch Set 13:
+
+#### The following sessions will be run for Build 128742 (patch #13):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=128742&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=128742#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-05 15:49:46.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-05 16:43:33.000000000) ---
+Patch Set 13:
+
+Initial testing failed:
+
+> sanity-ec@zfs Timeout(3582s)
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67302/results.html
+
+--- Message (Maloo, 2026-08-06 01:15:09.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-155vm197: https://testing.whamcloud.com/test_sessions/4ca55255-c69d-4df2-acd5-633303f54f6b ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-08-06 01:41:21.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-158vm85: https://testing.whamcloud.com/test_sessions/eaceb102-3a33-4440-acd1-690641c5710e ran 5 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-08-06 08:22:32.000000000) ---
+Patch Set 13: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm48: https://testing.whamcloud.com/test_sessions/4300dee9-709a-4809-911b-f3611dc1c474 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-06 08:43:47.000000000) ---
+Patch Set 13:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the GF affine table, the table layout and the per-kernel row indexing all check out. One build-configuration problem and some smaller comments inline.
+
+--- Message (Hiroshi Nishida, 2026-08-06 14:24:56.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-06 14:25:38.000000000) ---
+Patch Set 13:
+
+(9 comments)
+
+All 9 comments addressed in PS14.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-06 14:28:25.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-06 14:29:33.000000000) ---
+Patch Set 14:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67375/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-06 14:32:07.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-06 14:49:29.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
