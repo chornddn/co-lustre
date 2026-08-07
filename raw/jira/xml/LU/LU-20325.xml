@@ -39,7 +39,7 @@ sanity-compr test_2030 - Timeout occurred after 177 minutes, last suite running 
                         <labels>
                     </labels>
                 <created>Tue, 2 Jun 2026 10:06:00 +0000</created>
-                <updated>Wed, 10 Jun 2026 06:53:16 +0000</updated>
+                <updated>Fri, 7 Aug 2026 10:02:35 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
                                     <watches>1</watches>
@@ -128,6 +128,58 @@ sanity-compr test_2030 - Timeout occurred after 177 minutes, last suite running 
 &lt;p&gt;It would be helpful to find out who's holding the rwsem, which caused the umount process to D state.&lt;/p&gt;
 
 &lt;p&gt;But I don't know how to download the kernel and corresponding crash from maloo.&lt;/p&gt;</comment>
+                            <comment id="499250" author="JIRAUSER22000" created="Fri, 7 Aug 2026 09:45:19 +0000">&lt;p&gt;In previous comment, I suspect the error is from Linux cgroup/semaphore/mutex, so I send it to AI.&lt;/p&gt;
+
+&lt;p&gt;AI used  stack-fingerprint search against known upstream/OSV issues, and found these:&lt;/p&gt;
+
+&lt;p&gt;Qi Zheng's patch series "mm: shrinkers: convert shrinker_rwsem to mutex" (2023, merged in Linux 6.4):&lt;br/&gt;
+  &lt;a href="https://lkml.org/lkml/2023/2/26/227" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://lkml.org/lkml/2023/2/26/227&lt;/a&gt;&lt;br/&gt;
+  &lt;a href="https://patchwork.ozlabs.org/project/linux-ext4/patch/20230622085335.77010-29-zhengqi.arch@bytedance.com/" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://patchwork.ozlabs.org/project/linux-ext4/patch/20230622085335.77010-29-zhengqi.arch@bytedance.com/&lt;/a&gt;&lt;br/&gt;
+  Its description explicitly warns about "deadlock on the shrinker_rwsem" when unregistering a shrinker from within the shrinker path.&lt;/p&gt;
+
+&lt;p&gt;Red Hat Solution 5782891:&lt;br/&gt;
+  &lt;a href="https://access.redhat.com/solutions/5782891" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://access.redhat.com/solutions/5782891&lt;/a&gt;&lt;br/&gt;
+  Its abstract describes the very same stack.&lt;/p&gt;
+
+&lt;p&gt;RHEL 5782891 ("RHEL7.9 standard (non-RT) and Realtime (kernel-rt) crash due to a blocked task detection") documents:&lt;/p&gt;
+
+&lt;blockquote&gt;
+&lt;p&gt;The blocked task is stuck in unregister_shrinker() trying to take shrinker_rwsem in write mode where multiple other tasks are fighting over a dentry's d_lockref lock / rt_mutex with that shrinker_rwsem being held in read mode. Those tasks have taken that shrinker_rwsem in shrink_slab().&lt;/p&gt;&lt;/blockquote&gt;
+
+&lt;p&gt;Its main stack matches ours 1:1 (unregister_shrinker -&amp;gt; deactivate_locked_super -&amp;gt; deactivate_super -&amp;gt; cleanup_mnt -&amp;gt; __cleanup_mnt -&amp;gt; task_work_run), and the case ended in a hung-task kernel panic.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Root cause of the Lustre-side issue, established by cross-checking our stack traces with the RHEL case:&lt;/b&gt;&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;The Lustre test client hit the &lt;b&gt;same Linux kernel shrinker_rwsem lock-order deadlock&lt;/b&gt;:
+	&lt;ul&gt;
+		&lt;li&gt;umount requests the &lt;b&gt;write lock&lt;/b&gt; (unregister_shrinker, generic VFS path).&lt;/li&gt;
+		&lt;li&gt;The &lt;b&gt;read lock&lt;/b&gt; is held by the shrink_slab() / memory-reclaim path, whose shrinker callback is itself blocked on a third-party lock.&lt;/li&gt;
+		&lt;li&gt;In our case the third lock chain is the &lt;b&gt;cgroup/memcg/bpf&lt;/b&gt; subsystem (stack evidence):&lt;/li&gt;
+	&lt;/ul&gt;
+	&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+kworker/1:4  (D)  rwsem_down_read_slowpath -&amp;gt; reparent_shrinker_deferred -&amp;gt; mem_cgroup_css_offline
+kworker/1:1  (D)  mutex_lock -&amp;gt; cgroup_bpf_release
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;In brief, the RHEL solution showes a highly identical kernel stack.&lt;/p&gt;
+
+&lt;p&gt;And it Identify that the fault is not Lustre-specific, but a Linux kernel problem.&lt;/p&gt;</comment>
+                            <comment id="499253" author="JIRAUSER22000" created="Fri, 7 Aug 2026 10:02:35 +0000">&lt;p&gt;The fix exists upstream (Qi Zheng's series, Linux 6.4+); the RHEL 9.5 kernel (5.14.0-503, 5.14-based) apparently has not backported it.&lt;/p&gt;
+
+&lt;p&gt;When using Rocky9.5(5.14.0-503, 5.14-based), it always has a chance to trigger the BUG.&lt;/p&gt;
+
+&lt;p&gt;Additionally, running sanity_compr/test_2030 on aarch64 with 64KB page increases the memory pressure and raises the BUG rate.&lt;/p&gt;
+
+&lt;p&gt;The only way to solve  the problem is to upgrade the kernel version.&lt;/p&gt;
+
+&lt;p&gt;But add some command to release cache before umount, may decrease the memory pressure and lower the BUG rate.&lt;/p&gt;</comment>
                     </comments>
                     <attachments>
                             <attachment id="65104" name="image-2026-06-10-14-19-31-032.png" size="129846" author="xiwang" created="Wed, 10 Jun 2026 06:19:33 +0000" />

@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-26 17:29:37.000000000
-Updated:    2026-07-27 21:57:42.000000000
-Patch Set:  11
-Insertions: +4081
-Deletions:  -0
-Comments:   55 (16 unresolved)
+Updated:    2026-08-07 09:33:58.000000000
+Patch Set:  12
+Insertions: +4072
+Deletions:  -2
+Comments:   63 (24 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -24,23 +24,63 @@ Comments:   55 (16 unresolved)
 --- Commit Message ---
 LU-12668 tests: add EC failure orchestrator
 
---WIP--
+Add ec_fault_orchestrator.py, a fault-injection and verification tool
+for erasure-coded files, plus the sanity-ec tests that drive it.
 
-This is an early version of an automated stresstest / failure
-injection / benchmarking tool for EC. It can currently only be run
-by the user, but will be adapted to allow integration to sanity-ec.
+The tool arms OBD_FAIL_OST_BRW_READ_BULK on the OSS owning each target
+OST, so a read really has to reconstruct from parity rather than being
+served from cache or a healthy stripe.  Every fault is read back from
+the owning OSS before the read is issued, so a fault that failed to
+arm is reported instead of passing as a successful reconstruction.
+Reads are compared against an md5 of the bytes as they were written,
+captured via tee at write time, rather than against an earlier read of
+the same file that may already be wrong.
 
-At its current state the user can disabled specific OSTs, see
-which OSTs contain the parity information, run a basic read on a
-created file and see the results. 8 OSTs are required to run for
-now.
+Four non-interactive modes, each returning its verdict as an exit
+code:
 
-Added different layout options and added action logging for
-bug recreation.
+- --soak: randomized layout, geometry and size per iteration, with a
+  fault injected mid-I/O.  Records MB/s and the degraded-vs-baseline
+  slowdown per iteration, and gates on a kernel-health check (the
+  catastrophe flag on every OSS plus the dmesg corruption markers
+  test-framework.sh already curates).
+- --matrix: on a single-RAID-set file, faults every combination of
+  1..P stripes and requires reconstruction, then P+1 and requires the
+  read to fail.  Bounded by --matrix-budget and --matrix-read-timeout:
+  combinations left unrun when the budget expires are reported as a
+  failure naming the count, never silently dropped.
+- --write-verify: the write/resync/verify behaviors -- parity goes
+  stale on write while data stays init, resync restores init with the
+  md5 unchanged, one resync clears a stale plain mirror and stale
+  parity together, writes are refused on a stale data mirror but
+  allowed on stale parity, and 'lfs mirror verify' flags both stale
+  parity and real on-disk corruption of a data or a parity object. The
+  corruption checks take one OST down, corrupt a block on the raw
+  ldiskfs backend and put it back; they self-skip on other backends.
+- --layout-audit: sweeps EC geometries and checks the OST allocation
+  the kernel produced against a Python port of ec_split_stripes(),
+  including uneven splits.  Pure layout, no I/O.
 
-Added basic sanity integration.
+A curses TUI (ec_fault_gui.py) drives the same object interactively
+for manual investigation.  Every non-interactive mode writes a report
+directory (run.info, summary.txt, and 'lctl dk' plus dmesg captured on
+failure) so a run that crashes the node leaves evidence behind.
+
+Server-side actions are routed to the OSS owning each OST through an
+--ost-host map, so the tool works multi-node; sanity-ec builds that
+map from facet_host.  On a single node the hosts resolve local and no
+ssh is issued.
+
+Tests 76a (soak), 76b (matrix) and 76c (write-verify) wrap the modes.
+The geometry scales to the active OST count, so all three run on as
+few as 3 OSTs (2+1); more OSTs widen the parity coverage rather than
+being required.  76a and 76b need <= 16 OSTs because the fail_val OST
+mask is a 16-bit field, and are gated behind SLOW since the soak and
+the matrix are long-running.  76c registers a stack_trap to put an OST
+back if the orchestrator is killed outright mid-corruption.
 
 Test-Parameters: testlist=sanity-ec ostcount=8 env=SLOW=yes
+Test-Parameters: testlist=sanity-ec ostcount=3
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Change-Id: Ic53df83e733c8850a9435b6793e4be431156b24a
 
@@ -402,3 +442,40 @@ Patch Set 11:
 AI code review results below, please doublecheck
 
 Problematic, see inline comments. The change bundles two independently landable pieces: the standalone orchestrator (plus its curses TUI) and the sanity-ec side; within sanity-ec, 40b/40c/40d are plain fail_loc tests that never touch the orchestrator and would be much easier to review and land as their own change. Several of the findings below would make the new subtests fail outright, or pass without testing anything, on an ordinary autotest node.
+
+--- Message (Maximilian Dilger, 2026-08-06 17:11:14.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-06 17:14:39.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-06 17:20:14.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-06 17:28:23.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-06 18:11:22.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/128832/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-07 09:33:58.000000000) ---
+Patch Set 12:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The commit message describes four non-interactive modes, but only --soak, --matrix and --write-verify get a sanity-ec wrapper; --layout-audit (and --cli) ship with no test driving them, so a regression in the allocator audit would never be noticed. Could a 76d wrap --layout-audit? It is pure layout with no I/O, so it should be cheap enough to run ungated.

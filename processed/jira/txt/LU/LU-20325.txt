@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Maloo
 Created:    Tue, 2 Jun 2026 10:06:00 +0000
-Updated:    Wed, 10 Jun 2026 06:53:16 +0000
+Updated:    Fri, 7 Aug 2026 10:02:35 +0000
 Attachments: image-2026-06-10-14-19-31-032.png
 
 --- Description ---
@@ -112,3 +112,59 @@ Considering it happens only with  Rocky 9.5（aarch64）, i wonder if it is a e
 It would be helpful to find out who's holding the rwsem, which caused the umount process to D state.
 
 But I don't know how to download the kernel and corresponding crash from maloo.
+
+--- Comment (JIRAUSER22000, Fri, 7 Aug 2026 09:45:19 +0000) ---
+In previous comment, I suspect the error is from Linux cgroup/semaphore/mutex, so I send it to AI.
+
+AI used  stack-fingerprint search against known upstream/OSV issues, and found these:
+
+Qi Zheng's patch series "mm: shrinkers: convert shrinker_rwsem to mutex" (2023, merged in Linux 6.4):
+
+  https://lkml.org/lkml/2023/2/26/227
+
+  https://patchwork.ozlabs.org/project/linux-ext4/patch/20230622085335.77010-29-zhengqi.arch@bytedance.com/
+
+  Its description explicitly warns about "deadlock on the shrinker_rwsem" when unregistering a shrinker from within the shrinker path.
+
+Red Hat Solution 5782891:
+
+  https://access.redhat.com/solutions/5782891
+
+  Its abstract describes the very same stack.
+
+RHEL 5782891 ("RHEL7.9 standard (non-RT) and Realtime (kernel-rt) crash due to a blocked task detection") documents:
+
+The blocked task is stuck in unregister_shrinker() trying to take shrinker_rwsem in write mode where multiple other tasks are fighting over a dentry's d_lockref lock / rt_mutex with that shrinker_rwsem being held in read mode. Those tasks have taken that shrinker_rwsem in shrink_slab().
+
+Its main stack matches ours 1:1 (unregister_shrinker -> deactivate_locked_super -> deactivate_super -> cleanup_mnt -> __cleanup_mnt -> task_work_run), and the case ended in a hung-task kernel panic.
+
+Root cause of the Lustre-side issue, established by cross-checking our stack traces with the RHEL case:
+
+	The Lustre test client hit the same Linux kernel shrinker_rwsem lock-order deadlock:
+	
+		umount requests the write lock (unregister_shrinker, generic VFS path).
+
+		The read lock is held by the shrink_slab() / memory-reclaim path, whose shrinker callback is itself blocked on a third-party lock.
+
+		In our case the third lock chain is the cgroup/memcg/bpf subsystem (stack evidence):
+
+	
+	
+
+kworker/1:4  (D)  rwsem_down_read_slowpath -> reparent_shrinker_deferred -> mem_cgroup_css_offline
+kworker/1:1  (D)  mutex_lock -> cgroup_bpf_release
+
+In brief, the RHEL solution showes a highly identical kernel stack.
+
+And it Identify that the fault is not Lustre-specific, but a Linux kernel problem.
+
+--- Comment (JIRAUSER22000, Fri, 7 Aug 2026 10:02:35 +0000) ---
+The fix exists upstream (Qi Zheng's series, Linux 6.4+); the RHEL 9.5 kernel (5.14.0-503, 5.14-based) apparently has not backported it.
+
+When using Rocky9.5(5.14.0-503, 5.14-based), it always has a chance to trigger the BUG.
+
+Additionally, running sanity_compr/test_2030 on aarch64 with 64KB page increases the memory pressure and raises the BUG rate.
+
+The only way to solve  the problem is to upgrade the kernel version.
+
+But add some command to release cache before umount, may decrease the memory pressure and lower the BUG rate.

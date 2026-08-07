@@ -1,0 +1,177 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20559] obd2obt() obt_magic assertion failure destroying exports of a failed server mount</title>
+                <link>https://jira.whamcloud.com/browse/LU-20559</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;b&gt;AI generated summary report:&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;A server mount that fails inside tgt_init(), after tgt_server_data_init() has&lt;br/&gt;
+already run, panics the node from the zombie export workqueue:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LustreError: 16232:0:(osd_handler.c:215:osd_trans_start()) lustre-MDT0000: can't assign tx: rc = -122
+LustreError: 16232:0:(tgt_lastrcvd.c:1238:tgt_client_del()) lustre-MDT0000: failed to update server data, skip client eccb9bda-5939-46e6-a0f6-3f152cfdf2eb zeroing, rc -122
+LustreError: 1594:0:(obd_target.h:61:obd2obt()) ASSERTION( obt-&amp;gt;obt_magic == 0xBDDECEAE ) failed:
+LustreError: 1594:0:(obd_target.h:61:obd2obt()) LBUG
+CPU: 1 PID: 1594 Comm: kworker/u9:0
+Workqueue: obd_zombid obd_zombie_exp_cull [obdclass]
+Call Trace:
+ dump_stack_lvl+0x34/0x48
+ lbug_with_loc.cold+0x5/0x50 [libcfs]
+ tgt_grant_sanity_check+0x58e/0x5f0 [ptlrpc]
+ mdt_destroy_export+0x245/0x340 [mdt]
+ class_export_destroy+0x114/0x580 [obdclass]
+ obd_zombie_exp_cull+0xe/0x70 [obdclass]
+ process_one_work+0x196/0x380
+Kernel panic - not syncing: LBUG
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;h2&gt;&lt;a name="Rootcause"&gt;&lt;/a&gt;Root cause&lt;/h2&gt;
+
+&lt;p&gt;tgt_init() -&amp;gt; tgt_server_data_init() -&amp;gt; tgt_clients_data_init()&lt;br/&gt;
+(lustre/target/tgt_lastrcvd.c) creates one obd_export per non-zero last_rcvd&lt;br/&gt;
+client slot. The tgt_server_data_update() immediately after it then fails, and&lt;br/&gt;
+err_client: calls class_disconnect_exports(), which only &lt;b&gt;queues&lt;/b&gt; those exports&lt;br/&gt;
+on the obd_zombid workqueue – teardown is asynchronous and nothing waits for it.&lt;/p&gt;
+
+&lt;p&gt;tgt_server_data_init() returns the error to tgt_init(), which takes its out_put:&lt;br/&gt;
+label and zeroes obt_magic (lustre/target/tgt_main.c:615 – the only place in the&lt;br/&gt;
+tree that ever writes zero there). The zombie worker then runs&lt;br/&gt;
+class_export_destroy() -&amp;gt; mdt_destroy_export() -&amp;gt; tgt_grant_sanity_check(), whose&lt;br/&gt;
+first statement is obd2obt(obd)-&amp;gt;obt_lut, and the assertion inside obd2obt()&lt;br/&gt;
+fires.&lt;/p&gt;
+
+&lt;p&gt;A zeroed obt_magic is the &lt;b&gt;intended&lt;/b&gt; signal that the target is gone: the&lt;br/&gt;
+lu_target lives inside the mdt_device that mdt_init0() frees on failure.&lt;br/&gt;
+class_exp2tgt(), tgt_client_free() and tgt_grant_discard() all honour that&lt;br/&gt;
+signal already. tgt_grant_sanity_check(), and the tgd_tot_granted_clients&lt;br/&gt;
+decrements next to it in mdt_destroy_export() and ofd_destroy_export(), never&lt;br/&gt;
+did.&lt;/p&gt;
+
+&lt;p&gt;The console ordering pins the race: tgt_client_del() at 2081.675 got past&lt;br/&gt;
+class_exp2tgt()'s magic guard, so obt_magic was still valid then; the LBUG&lt;br/&gt;
+followed 4.4 ms later. (Only one "can't assign tx" line appears for two failures&lt;br/&gt;
+because CERROR is CDEBUG_LIMIT with a per-call-site rate limiter – a sibling&lt;br/&gt;
+crash on the same cluster shows the matching "Skipped 3 previous similar&lt;br/&gt;
+messages".)&lt;/p&gt;
+&lt;h2&gt;&lt;a name="History"&gt;&lt;/a&gt;History&lt;/h2&gt;
+&lt;ul&gt;
+	&lt;li&gt;0d3a07a8aa46 "&lt;a href="https://jira.whamcloud.com/browse/LU-7430" title="General protection fault: 0000 upon mounting MDT" class="issue-link" data-issue-key="LU-7430"&gt;&lt;del&gt;LU-7430&lt;/del&gt;&lt;/a&gt; mdt: better handle MDT recovery error path" (2015-12,&lt;br/&gt;
+2.7.65) created the contract – it added the obt_magic zeroing to tgt_init()'s&lt;br/&gt;
+error path and guarded exactly one consumer, tgt_client_free().&lt;/li&gt;
+	&lt;li&gt;0697cf73c74d "&lt;a href="https://jira.whamcloud.com/browse/LU-3285" title="Data on MDT" class="issue-link" data-issue-key="LU-3285"&gt;&lt;del&gt;LU-3285&lt;/del&gt;&lt;/a&gt; mdt: use generic grant code at MDT" (2016-12, 2.10.56)&lt;br/&gt;
+added three new unguarded consumers on the same export-destroy path, including&lt;br/&gt;
+the tgt_grant_sanity_check() call that panics here.&lt;/li&gt;
+	&lt;li&gt;5ed65fd05947 "&lt;a href="https://jira.whamcloud.com/browse/LU-10806" title="Hard crash when mounting DNE MDT" class="issue-link" data-issue-key="LU-10806"&gt;&lt;del&gt;LU-10806&lt;/del&gt;&lt;/a&gt; target: skip discard for a missing obt_lut" (2018-09,&lt;br/&gt;
+2.11.56) diagnosed this exact scenario – its commit message reads "If error&lt;br/&gt;
+happens at tgt_init, obt_lut is zeroed. The error handle path destroys export&lt;br/&gt;
+and calls tgt_grant_discard which access to non allocated memory" – but&lt;br/&gt;
+guarded only tgt_grant_discard(), one line short of the two derefs that crash.&lt;/li&gt;
+	&lt;li&gt;888962496078 "&lt;a href="https://jira.whamcloud.com/browse/LU-8837" title="Cleanly separate server code from client code." class="issue-link" data-issue-key="LU-8837"&gt;LU-8837&lt;/a&gt; lustre: remove target declarations from obd.h"&lt;br/&gt;
+(2022-11, 2.15.53) hoisted an unconditional LASSERT() into obd2obt(). Before&lt;br/&gt;
+it, the NULL obt_lut was used only for pointer arithmetic and&lt;br/&gt;
+tgt_grant_sanity_check() returned harmlessly at the following&lt;br/&gt;
+list_empty(&amp;amp;obd-&amp;gt;obd_exports) test – obd_exports is empty here, having just&lt;br/&gt;
+been spliced away by class_disconnect_exports(). That commit turned a benign&lt;br/&gt;
+path into a panic, which is why this signature only exists on 2.15.53+.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Occurrence"&gt;&lt;/a&gt;Occurrence&lt;/h2&gt;
+
+&lt;p&gt;Seen on lustre-master-next build 1001,&lt;br/&gt;
+lustre-master-next-el9.7-x86_64_lustre-b2_15-el8.10-x86_64-rolling-downgrade-client1-zfs&lt;br/&gt;
+(&lt;a href="https://testing.whamcloud.com/test_sets/7234a5bd-e764-4e38-9b37-08a3024d775d" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/7234a5bd-e764-4e38-9b37-08a3024d775d&lt;/a&gt;).&lt;/p&gt;
+
+&lt;p&gt;The crash-database signature records 56 occurrences, but 55 of them come from a&lt;br/&gt;
+single unlanded Gerrit change (58592, "&lt;a href="https://jira.whamcloud.com/browse/LU-8130" title="Migrate from libcfs hash to rhashtable" class="issue-link" data-issue-key="LU-8130"&gt;LU-8130&lt;/a&gt; obd: replace gen hash with&lt;br/&gt;
+Xarray") in two autotest runs, where that patch's own&lt;br/&gt;
+"tgt_clients_data_init() duplicate export for client generation" error reaches&lt;br/&gt;
+the same path. This is the only sighting on landed code.&lt;/p&gt;
+
+&lt;p&gt;The bug is &lt;b&gt;not&lt;/b&gt; interop-, ZFS- or arch-specific: the 58592 cluster fired on&lt;br/&gt;
+plain review-ldiskfs across el8/el9/el10/sles/ubuntu and aarch64, and the failure&lt;br/&gt;
+reproduces on ldiskfs (see below). Only the trigger in this instance was ZFS.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Triggerinthisinstance"&gt;&lt;/a&gt;Trigger in this instance&lt;/h2&gt;
+
+&lt;p&gt;The MDT dataset was at its ZFS quota, so the first transaction of the mount&lt;br/&gt;
+returned -EDQUOT. The immediately preceding session on the same node&lt;br/&gt;
+(rolling-upgrade-client2-zfs) had CRASHed in sanity test_805, which does&lt;br/&gt;
+"zfs set quota=..." on the MDT dataset and only restores it if it survives; the&lt;br/&gt;
+rolling upgrade/downgrade groups never reformat, so the reduced quota carried&lt;br/&gt;
+into the next session. That preceding crash is a separate, already-diagnosed&lt;br/&gt;
+grant-accounting LBUG whose fix was not in the tested build.&lt;/p&gt;
+
+&lt;p&gt;Any error out of tgt_server_data_init() reaches the same race, so the -EDQUOT is&lt;br/&gt;
+incidental.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h2&gt;
+
+&lt;p&gt;conf-sanity test_138 (added with the fix). It keeps a client's last_rcvd slot&lt;br/&gt;
+across an MDT umount with OBD_FAIL_TGT_CLIENT_DEL, then injects -EDQUOT into the&lt;br/&gt;
+tgt_server_data_update() that follows tgt_clients_data_init() so the genuine&lt;br/&gt;
+err_client path runs. On an unfixed build the node panics with the stack above;&lt;br/&gt;
+with the fix the mount fails cleanly with -EDQUOT and the server stays up.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h2&gt;
+
+&lt;p&gt;Guard the consumers, as &lt;a href="https://jira.whamcloud.com/browse/LU-7430" title="General protection fault: 0000 upon mounting MDT" class="issue-link" data-issue-key="LU-7430"&gt;&lt;del&gt;LU-7430&lt;/del&gt;&lt;/a&gt; and &lt;a href="https://jira.whamcloud.com/browse/LU-10806" title="Hard crash when mounting DNE MDT" class="issue-link" data-issue-key="LU-10806"&gt;&lt;del&gt;LU-10806&lt;/del&gt;&lt;/a&gt; already did for their siblings: add&lt;br/&gt;
+a non-asserting obd2obt_safe() accessor and use it in tgt_grant_sanity_check()&lt;br/&gt;
+and in the tgd_tot_granted_clients decrements in mdt_destroy_export() and&lt;br/&gt;
+ofd_destroy_export().&lt;/p&gt;
+
+&lt;p&gt;Draining the zombie queue before obt_magic is cleared is not a workable&lt;br/&gt;
+alternative: the tgt_init() error paths that do not go through&lt;br/&gt;
+tgt_server_data_init()'s err_client label leave the exports still linked on&lt;br/&gt;
+obd_exports with nothing to disconnect them, so obd_exports_barrier() there would&lt;br/&gt;
+never return.&lt;/p&gt;</description>
+                <environment />
+        <key id="98816">LU-20559</key>
+            <summary>obd2obt() obt_magic assertion failure destroying exports of a failed server mount</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="green">Oleg Drokin</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 6 Aug 2026 19:45:30 +0000</created>
+                <updated>Thu, 6 Aug 2026 19:45:30 +0000</updated>
+                                            <version>Lustre 2.16.0</version>
+                    <version>Lustre 2.17.0</version>
+                    <version>Lustre 2.18.0</version>
+                                    <fixVersion>Lustre 2.18.0</fixVersion>
+                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06y0f:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
