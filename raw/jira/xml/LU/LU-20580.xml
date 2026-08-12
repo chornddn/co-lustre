@@ -1,0 +1,151 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20580] o2iblnd: sleeping in atomic in kiblnd_startup() via rtnl_lock()</title>
+                <link>https://jira.whamcloud.com/browse/LU-20580</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;kiblnd_startup() calls lnet_get_link_status() from inside the&lt;br/&gt;
+write_lock_irqsave(&amp;amp;kiblnd_data.kib_global_lock) section:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;  write_lock_irqsave(&amp;amp;kiblnd_data.kib_global_lock, flags);
+  ibdev-&amp;gt;ibd_nnets++;
+  list_add_tail(&amp;amp;net-&amp;gt;ibn_list, &amp;amp;ibdev-&amp;gt;ibd_nets);
+  if (ibdev-&amp;gt;ibd_hdev-&amp;gt;ibh_state == IBLND_DEV_PORT_DOWN)
+          kiblnd_set_ni_fatal_on(ibdev-&amp;gt;ibd_hdev, 1);
+
+  netdev = dev_get_by_name(ni-&amp;gt;ni_net_ns, net-&amp;gt;ibn_dev-&amp;gt;ibd_ifname);
+
+  if (netdev &amp;amp;&amp;amp;
+      ((netdev-&amp;gt;reg_state == NETREG_UNREGISTERING) ||
+       (netdev-&amp;gt;operstate != IF_OPER_UP) ||
+      (lnet_get_link_status(netdev) == 0))) {
+          kiblnd_set_ni_fatal_on(ibdev-&amp;gt;ibd_hdev, 1);
+  }
+  dev_put(netdev);
+  write_unlock_irqrestore(&amp;amp;kiblnd_data.kib_global_lock, flags);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;lnet_get_link_status() takes rtnl_lock() and netdev_lock_ops(). rtnl_lock()&lt;br/&gt;
+is mutex_lock(), which can sleep. We call it with preemption disabled and&lt;br/&gt;
+interrupts off.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20102" title="“BUG: scheduling while atomic: …” due to rtnl_lock() being called from a RCU read-side critical section" class="issue-link" data-issue-key="LU-20102"&gt;&lt;del&gt;LU-20102&lt;/del&gt;&lt;/a&gt; removed the rcu_read_lock() around this code but left the call&lt;br/&gt;
+inside the rwlock section, so the sleep in atomic context stays.&lt;/p&gt;
+
+&lt;p&gt;The failure is silent while rtnl_mutex is free, because the mutex fast path&lt;br/&gt;
+does not schedule, and might_sleep() reports nothing unless&lt;br/&gt;
+CONFIG_DEBUG_ATOMIC_SLEEP is set. When rtnl_mutex is held by another task,&lt;br/&gt;
+__mutex_lock_slowpath() calls schedule_preempt_disabled() and the kernel&lt;br/&gt;
+reports:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;  BUG: scheduling while atomic: lnetctl/8668/0x00000002
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;preempt_count 0x2 is 1 from write_lock_irqsave() and 1 from&lt;br/&gt;
+schedule_preempt_disabled().&lt;/p&gt;
+
+&lt;p&gt;This was seen on an aarch64 client (kernel 7.0.0-1013-nvidia-64k, 64K pages,&lt;br/&gt;
+NVIDIA GB300 NVL) during boot, when systemd-networkd and udev hold&lt;br/&gt;
+rtnl_mutex while LNet is configured. The node does not boot.&lt;/p&gt;
+
+&lt;p&gt;After the report the node panics. schedule_debug() calls __schedule_bug()&lt;br/&gt;
+and then preempt_count_set(PREEMPT_DISABLED), so the later unlocks no longer&lt;br/&gt;
+balance. The task returns to user space with a non-zero preempt count, and&lt;br/&gt;
+the next ordinary user page fault takes the faulthandler_disabled() path:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;  Unable to handle kernel paging request at virtual address 0000fffff7cc59f4
+  ESR = 0x0000000082000007
+  EC = 0x20: IABT (lower EL), IL = 32 bits
+  pc : 0000fffff7cc59f4
+  lr : 0000fffff7fb4910
+  ...
+  Kernel panic - not syncing: Aiee, killing interrupt handler!
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The address is a user address (x16 is the aarch64 PLT register and holds the&lt;br/&gt;
+same value), so the Oops carries no kernel call trace.&lt;/p&gt;
+
+&lt;p&gt;The fix is to read the net device state before the lock is taken, and to&lt;br/&gt;
+take kib_global_lock only to publish the result.&lt;/p&gt;</description>
+                <environment />
+        <key id="98900">LU-20580</key>
+            <summary>o2iblnd: sleeping in atomic in kiblnd_startup() via rtnl_lock()</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 11 Aug 2026 17:59:22 +0000</created>
+                <updated>Tue, 11 Aug 2026 19:57:18 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="499465" author="hornc" created="Tue, 11 Aug 2026 18:04:20 +0000">&lt;p&gt;Two adjacent defects found in the same read. They are not the cause of this panic and are not addressed by the fix for this ticket.&lt;/p&gt;
+
+&lt;p&gt;1. kiblnd_dev_failover() (o2iblnd.c, set_fatal branch) calls kiblnd_set_ni_fatal_on() outside kib_global_lock. That function walks hdev-&amp;gt;ibh_dev-&amp;gt;ibd_nets, which the lock protects.&lt;/p&gt;
+
+&lt;p&gt;2. ksocknal_ip2index() (socklnd.c) uses 'dev' after rcu_read_unlock() with no reference held. When for_each_netdev_rcu() finds no match, 'dev' also holds the loop-terminal value, so dev-&amp;gt;reg_state and lnet_get_link_status(dev) read an invalid pointer.&lt;/p&gt;
+
+&lt;p&gt;Each needs its own ticket.&lt;/p&gt;</comment>
+                            <comment id="499466" author="hornc" created="Tue, 11 Aug 2026 18:50:33 +0000">&lt;p&gt;Correction to the analysis above: the sleep in atomic context was introduced by aebedbe75007 ("&lt;a href="https://jira.whamcloud.com/browse/LU-19707" title="RTNL assert in LNet on v6.15" class="issue-link" data-issue-key="LU-19707"&gt;&lt;del&gt;LU-19707&lt;/del&gt;&lt;/a&gt; lnet: fix RTNL assert in LNet on v6.15"), which added rtnl_lock() to lnet_get_link_status(). The query in kiblnd_startup() was already inside the write_lock_irqsave(kib_global_lock) section before that commit, but did not sleep. e3a0dfd046fb (&lt;a href="https://jira.whamcloud.com/browse/LU-20102" title="“BUG: scheduling while atomic: …” due to rtnl_lock() being called from a RCU read-side critical section" class="issue-link" data-issue-key="LU-20102"&gt;&lt;del&gt;LU-20102&lt;/del&gt;&lt;/a&gt;) removed the surrounding RCU read section and left the sleep in place; it is not the commit that introduced the defect.&lt;/p&gt;
+
+&lt;p&gt;This matters for backports: a tree that carries aebedbe75007 without e3a0dfd046fb has the same defect.&lt;/p&gt;</comment>
+                            <comment id="499469" author="gerrit" created="Tue, 11 Aug 2026 19:57:18 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/67927" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/67927&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20580" title="o2iblnd: sleeping in atomic in kiblnd_startup() via rtnl_lock()" class="issue-link" data-issue-key="LU-20580"&gt;LU-20580&lt;/a&gt; o2iblnd: don't sleep in atomic in kiblnd_startup()&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: bb82221cc7a082f30faf075aae249a9ea111050a&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="97017">LU-20102</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="94086">LU-19707</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06y87:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

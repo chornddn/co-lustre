@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Serguei Smirnov
 Created:    2026-07-09 01:30:32.000000000
-Updated:    2026-08-05 22:04:52.000000000
-Patch Set:  11
-Insertions: +1072
-Deletions:  -45
-Comments:   104 (5 unresolved)
+Updated:    2026-08-12 06:01:39.000000000
+Patch Set:  13
+Insertions: +1132
+Deletions:  -84
+Comments:   137 (9 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -24,71 +24,36 @@ Comments:   104 (5 unresolved)
 --- Commit Message ---
 LU-20290 lnet: add servicenode discovery visibility policy
 
-Add a discovery visibility policy that groups local server NIDs by
+Add a discovery visibility policy that partitions local server NIDs by
 servicenode.
 
-Servicenode membership is explicitly provided through a new internal
+Servicenode membership is provided explicitly through a new internal
 LNet API rather than inferred from interface topology. The policy
-contributes visibility groups through the generic discovery visibility
-framework and participates in normal visibility composition.
+contributes partitions through the generic discovery visibility
+framework and composes with the existing self/NUMA visibility policy.
 
-LNetDiscServiceNodePolicySet() alone puts the policy in force. A count
-of the registered servicenodes must not control it. Discovery operates
-as soon as LNet starts, but a servicenode registers only when a target
-mounts. If the count controlled the policy, the node would send all of
-its NIDs between these two times, and a peer would merge them into one
-multi-rail peer. No later group corrects this.
+LNetDiscServiceNodePolicySet() alone controls whether the policy is
+active. Activation must not depend on the number of registered
+servicenodes because discovery starts before Lustre targets register.
+Otherwise the node could advertise all of its NIDs during startup,
+causing peers to permanently merge them into a single multi-rail peer.
 
-The policy set can now change while LNet runs, so the enable and
-disable helpers are replaced by a scratch set that is filled in and
-then published in one step. Publication stores the slots before it
-grows the count, and the two full-view voters read the slots with
-READ_ONCE() and skip an empty one. Those voters run under the net
-lock, not under ln_api_mutex, and thus can read the set as it
-changes. A change of servicenode membership leaves the set alone and
-only rebuilds the views.
+Servicenode membership can change while LNet is running. Policy updates
+are therefore published atomically, while membership changes rebuild
+the affected discovery views without changing the active policy set.
 
-The new group algebra needs groups of a size that is known only at
-run time, so a lnet_group_alloc() and lnet_group_free() pair replaces
-the open-coded allocation. The existing collect and release paths are
-converted to it. This is a mechanical change with no effect on
-behavior.
+The policy does not permit the unrestricted merged view on non-loopback
+networks. To keep every live NI discoverable, the collection pass
+creates a singleton partition for each local NI that is not covered by
+any servicenode group. Overlapping servicenode groups are folded
+together because a shared NID inevitably causes peers to merge them.
 
-A servicenode group contains only the NIDs of a target that is
-already mounted, and the policy refuses the full view on all nets but
-lo0. A NID that no group contains would thus match no view and would
-also get no full view. The node would drop all discovery GETs to that
-NID, and no peer could find it. A target that registers on that NID
-could not mount. The enumerate pass therefore makes a group of one
-NID for each live NI that no other group contains. Each NI stays
-discoverable, and the node keeps the groups separate. lo0 keeps the
-full view instead of a group of its own, because the peer on the far
-side of it is this node.
+Servicenode is an independent visibility policy. The generic discovery
+framework composes its partitions with the existing group policy to
+produce the discovery views used for GET and Push operations.
 
-Groups that share a NID are folded into one. Two such groups cannot
-be kept apart: a peer that reaches this node on the shared NID gets
-one group's NIDs, a peer that reaches it on a NID private to the
-other group gets that group's NIDs, and the shared NID makes the peer
-merge the two sets. The usual case is exact duplication, because all
-of the targets of a server register the same NID list, and each group
-costs a view with a ping buffer and an MD.
-
-The Push path keys on the destination when the peer never reached
-this node on a local NI. A destination behind a router is on a net
-that no group holds a NID on, so no view claims the Push and the
-group is chosen on the route to the destination. The policy keeps the
-full view for the destination that no group can route to at all,
-because the alternative is to abort the Push and end discovery for
-that peer.
-
-A base source composes with the servicenode groups through an
-intersection, which keeps the ingress semantics of the base group.
-The Push path keys a group on the destination net only for the
-per-ni kind. Only per-ni makes all of the groups on a net equal, one
-NI each, and lets the first match stand for all of them.
-
-This patch introduces only the LNet policy implementation and its
-internal interfaces. Subsequent patches will populate servicenode
+This patch introduces the LNet servicenode visibility policy and its
+internal interfaces. Subsequent patches populate servicenode
 membership from Lustre.
 
 Test-Parameters: trivial testlist=sanity-lnet
@@ -503,3 +468,51 @@ Patch Set 11:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments.
+
+--- Message (Serguei Smirnov, 2026-08-11 22:34:57.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Serguei Smirnov, 2026-08-11 22:35:32.000000000) ---
+Patch Set 13: Patch Set 12 was rebased
+
+--- Message (jenkins, 2026-08-11 22:35:34.000000000) ---
+Patch Set 12:
+
+No Builds Executed
+
+--- Message (wc-checkpatch, 2026-08-11 22:46:23.000000000) ---
+Patch Set 13:
+
+(28 comments)
+
+31 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-11 23:05:54.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129136/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-11 23:21:15.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-12 04:25:37.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The reworked unconstrained-Push selection is reachable today through lnet_self_nets/lnet_group_numa_nets, so it could get a sanity-lnet case of its own; the NUMA group-source patch earlier in this series added coverage there, and this one adds none.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-12 04:38:50.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.

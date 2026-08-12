@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-17 05:14:38.000000000
-Updated:    2026-08-06 11:26:13.000000000
-Patch Set:  12
-Insertions: +725
-Deletions:  -47
-Comments:   159 (13 unresolved)
+Updated:    2026-08-12 09:46:20.000000000
+Patch Set:  14
+Insertions: +892
+Deletions:  -57
+Comments:   177 (4 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -45,6 +45,36 @@ leaving its parity mirror in place. Since lfs mirror delete is
 lfs mirror split -d under another name, the option applies to it
 as well.
 
+--force-no-ec has no wire field of its own. It rides bit 15
+(MIRROR_ID_NEG) of the mirror id the client already sends for a
+split, ll_ioc_lease.lil_ids[1] -> close_data.cd_mirror_id ->
+mrd_mirror_id. Real mirror ids never use that bit (MIRROR_ID_MASK
+is 0x7FFF0000), and lfs mirror resync already carries the same flag
+on lil_mirror_id for lod_prepare_resync_mirror() to strip.
+ll_file_unlock_lease() therefore range checks only the low 15 bits,
+so the flag survives to mdd_split_ea(). lfs sets the bit only where
+it changes what the MDS does, namely when the target is a data
+mirror that still has a parity mirror to co-split, so an MDS that
+does not know the flag is never handed it for an ordinary split.
+Where it is sent to an MDS that is too old, the whole field reads
+as a mirror id, no component matches and the split fails with
+-EINVAL, which lfs now reports as a possible lack of --force-no-ec
+support rather than as a bare "Invalid argument".
+
+A parity mirror left behind by --force-no-ec has no data mirror to
+pair with, and its link is cleared. lfs mirror verify and lfs
+mirror resync resolve a parity component to its data component
+through that link, in
+__llapi_layout_find_data_comp_by_parity(), so both used to fail
+the whole file with -ENOENT; once anything was written to the file
+the orphan was marked stale and could never be resynced again.
+Skip a parity component that has no data component to pair with
+instead, and have lfs mirror split report that the parity mirror it
+leaves behind protects no data and can be deleted. The pair lookup
+that report needs is added to llapi as
+llapi_layout_mirror_link_id_get(), which returns the mirror a given
+mirror id is linked to without moving the component cursor.
+
 A split is refused if it would remove every mirror, and also if it
 would leave the file without a data mirror. Parity mirrors alone
 cannot serve reads: with no data mirror the layout is no longer
@@ -71,10 +101,26 @@ A victim that receives a data+parity pair keeps its LCME_FL_STALE
 markers, so a parity mirror that was stale at split time no longer
 lands in a victim that claims an in-sync pair.
 
-Also fix endian handling in the rewritten function: lcm_flags was
-converted twice, and lcm_entry_count is a __u16 written with
-cpu_to_le32().
+lod_declare_layout_purge() refused a purge buffer holding more than
+one mirror. lfs mirror delete of a data mirror now hands it the
+data+parity pair, so the check is relaxed from lcm_mirror_count
+!= 0 to > 1.
 
+Also fix two endian bugs that predate this work in the rewritten
+function, harmless on little-endian but wrong on big-endian:
+lcm_flags was converted twice, and the __u16 lcm_entry_count was
+written with cpu_to_le32().
+
+collect_mirror_id() fills an array owned by its caller but never
+knew how large that array was, and every caller passed 128 entries
+while lod.*.mirror_count_max accepts up to LUSTRE_MIRROR_COUNT_MAX
+mirrors. Splitting a mirror out of a file with more mirrors than
+that wrote past the end of a stack array. Carry the array size in
+struct collect_ids_data, check it in the callback, and size the
+arrays LUSTRE_MIRROR_COUNT_MAX so the check cannot be reached.
+
+Fixes: 23b2d4781899 ("LU-10420 flr: split a mirror from mirrored file")
+Fixes: fb790204ce3e ("LU-17908 layout: preserve non-FLR state layout flags")
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
@@ -564,3 +610,61 @@ Patch Set 12:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The main one is that the state `--force-no-ec` deliberately creates (a parity mirror whose data mirror is gone) is not handled by `lfs mirror verify`/`resync`; test_7f and test_7g build that state but never run either command against the file afterwards, so the coverage would benefit from a resync/verify step once the behaviour is settled.
+
+--- Message (Maximilian Dilger, 2026-08-11 21:25:22.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Maximilian Dilger, 2026-08-11 21:27:22.000000000) ---
+Uploaded patch set 14.
+
+--- Message (jenkins, 2026-08-11 21:27:23.000000000) ---
+Patch Set 13:
+
+No Builds Executed
+
+--- Message (Lustre Gerrit Janitor, 2026-08-11 21:28:36.000000000) ---
+Patch Set 13:
+
+Newer revision detected, aborting all work on revision 13
+
+--- Message (wc-checkpatch, 2026-08-11 21:29:42.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Maximilian Dilger, 2026-08-11 21:29:54.000000000) ---
+Patch Set 14:
+
+(13 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-11 21:39:39.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-11 21:54:06.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129130/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-12 04:28:10.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-12 09:15:19.000000000) ---
+Patch Set 14:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One coverage gap worth closing: the workflow the new warning tells the user to run - split a data mirror with --force-no-ec, then 'lfs mirror delete' the parity mirror it leaves behind - is never exercised. test_7f and test_7g stop after checking the orphan's link is cleared, so nothing tests deleting it.
