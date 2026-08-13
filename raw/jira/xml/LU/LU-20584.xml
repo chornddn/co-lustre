@@ -1,0 +1,130 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20584] tgt_import_update() reads uninitialized nfd_skip_ipv6, dropping all large NIDs</title>
+                <link>https://jira.whamcloud.com/browse/LU-20584</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Summary"&gt;&lt;/a&gt;Summary&lt;/h2&gt;
+
+&lt;p&gt;&lt;tt&gt;tgt_import_update()&lt;/tt&gt; in &lt;tt&gt;lustre/target/tgt_mount.c&lt;/tt&gt; declares an on-stack&lt;br/&gt;
+&lt;tt&gt;struct nid_fetch_data nfd&lt;/tt&gt; and initializes only &lt;tt&gt;nfd_lmd&lt;/tt&gt; and &lt;tt&gt;nfd_pos&lt;/tt&gt;.&lt;br/&gt;
+&lt;tt&gt;nfd_skip_ipv6&lt;/tt&gt; and &lt;tt&gt;nfd_has_ipv6&lt;/tt&gt; are left uninitialized.&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;server_nid2radix()&lt;/tt&gt;, the callback passed to &lt;tt&gt;LNetFetchNIDs()&lt;/tt&gt;, drops every&lt;br/&gt;
+non-nid4 NID when &lt;tt&gt;nfd_skip_ipv6&lt;/tt&gt; is set:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;	/* skip IPv6 NIDs for an old server */
+	if (!nid_is_nid4(nid)) {
+		if (nfd-&amp;gt;nfd_skip_ipv6)
+			return 0;
+		nfd-&amp;gt;nfd_has_ipv6 = true;
+	}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;On a server whose NIDs are all IPv6, an uninitialized non-zero&lt;br/&gt;
+&lt;tt&gt;nfd_skip_ipv6&lt;/tt&gt; therefore drops every NID, &lt;tt&gt;nfd_pos&lt;/tt&gt; stays 0, and the&lt;br/&gt;
+target logs:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;tgt_mount.c:1612:tgt_import_update()) MGC: can't get local NIDs from LNet, rc = -100
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The bug is invisible on IPv4, because the flag is only consulted for non-nid4&lt;br/&gt;
+NIDs.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Impact"&gt;&lt;/a&gt;Impact&lt;/h2&gt;
+
+&lt;p&gt;&lt;tt&gt;tgt_import_update()&lt;/tt&gt; is the upcall that re-reports a target's NID list to the&lt;br/&gt;
+MGS after the target's MGC reconnects. It is how the MGS nidtbl is restored&lt;br/&gt;
+after an MGS restart for targets that did not restart with it (&lt;a href="https://jira.whamcloud.com/browse/LU-19692" title="MGS NID tables are lost after failover and need to be rebuilt" class="issue-link" data-issue-key="LU-19692"&gt;LU-19692&lt;/a&gt;).&lt;/p&gt;
+
+&lt;p&gt;When it fails, the MGS never relearns those NIDs. A client that can only reach&lt;br/&gt;
+that target over one of them gets no usable import connection:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LustreError: import.c:553:import_select_connection()) lustre-OST0000-osc-...: no connections available: rc = -22
+LustreError: lov_obd.c:150:lov_connect_osc()) lustre-OST0000_UUID: target connect error: rc = -22
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h2&gt;
+
+&lt;p&gt;conf-sanity test_73e in an IPv6 environment. The test adds nets tcp10..tcp50 to&lt;br/&gt;
+both servers, moves the client to tcp50, then restarts only the MGS/MDS. The&lt;br/&gt;
+OSS is not restarted, so its NIDs must come back through&lt;br/&gt;
+&lt;tt&gt;tgt_import_update()&lt;/tt&gt;. They do not, and the test fails at:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;cp: cannot fstat '/mnt/lustre/a': Permission denied
+ conf-sanity test_73e: @@@@@@ FAIL: check client /mnt/lustre failed
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Verified on a 3-node VM cluster (2.17.57): test_73e fails on IPv6, passes on&lt;br/&gt;
+IPv4, and passes on IPv6 once both flags are initialized.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h2&gt;
+
+&lt;p&gt;Initialize both fields in &lt;tt&gt;tgt_import_update()&lt;/tt&gt;. This notification always&lt;br/&gt;
+carries large NIDs (&lt;tt&gt;tgt_nids_notify()&lt;/tt&gt; sets &lt;tt&gt;LDD_F_LARGE_NID&lt;/tt&gt; and the RPC&lt;br/&gt;
+requires &lt;tt&gt;OBD_CONNECT_MGS_NIDLIST&lt;/tt&gt;), so &lt;tt&gt;nfd_skip_ipv6&lt;/tt&gt; should be false.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Regressingcommit"&gt;&lt;/a&gt;Regressing commit&lt;/h2&gt;
+
+&lt;p&gt;The two fields were added by 2867efe066c8 ("&lt;a href="https://jira.whamcloud.com/browse/LU-20054" title="sanity check of incoming buffer in mgs_target_reg()" class="issue-link" data-issue-key="LU-20054"&gt;&lt;del&gt;LU-20054&lt;/del&gt;&lt;/a&gt; mgs: more checks for&lt;br/&gt;
+incoming buffers"), which initialized them in &lt;tt&gt;server_lsi2mti()&lt;/tt&gt; but not in&lt;br/&gt;
+&lt;tt&gt;tgt_import_update()&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;Related: &lt;a href="https://jira.whamcloud.com/browse/LU-19692" title="MGS NID tables are lost after failover and need to be rebuilt" class="issue-link" data-issue-key="LU-19692"&gt;LU-19692&lt;/a&gt; (added tgt_import_update()), &lt;a href="https://jira.whamcloud.com/browse/LU-19700" title="Reliable way to keep MGS NID tables in-sync with targets" class="issue-link" data-issue-key="LU-19700"&gt;LU-19700&lt;/a&gt; (making MGS NID tables&lt;br/&gt;
+reliably in sync).&lt;/p&gt;</description>
+                <environment />
+        <key id="98913">LU-20584</key>
+            <summary>tgt_import_update() reads uninitialized nfd_skip_ipv6, dropping all large NIDs</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 13 Aug 2026 01:57:03 +0000</created>
+                <updated>Thu, 13 Aug 2026 02:10:15 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06yb3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

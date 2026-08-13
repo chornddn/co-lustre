@@ -1,5 +1,5 @@
 Change:     67584
-Subject:    LU-20527 osp: don't trust an OST LAST_ID past the precreate window
+Subject:    LU-20527 osp: don't trust OST LAST_ID past precreate window
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67584
 Change-Id:  I9a646bf7f8d13d92f73668729e68925bbe21a6a5
 Project:    fs/lustre-release
@@ -7,53 +7,72 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-28 04:47:22.000000000
-Updated:    2026-07-28 19:19:32.000000000
-Patch Set:  1
-Insertions: +25
-Deletions:  -1
-Comments:   2 (2 unresolved)
+Updated:    2026-08-13 13:56:22.000000000
+Patch Set:  2
+Insertions: +60
+Deletions:  -3
+Comments:   3 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Alex Zhuravlev
+  REVIEWER: Oleg Drokin, Alex Zhuravlev
 
 --- Commit Message ---
-LU-20527 osp: don't trust an OST LAST_ID past the precreate window
+LU-20527 osp: don't trust OST LAST_ID past precreate window
 
 ofd_create_hdl() answers a precreate request whose last OID is below
 the OST LAST_ID with the OST's own LAST_ID + 1 ("trust the OST") and
 precreates nothing.  osp_precreate_send() stores that reply into
-opd_pre_last_created_fid without touching opd_pre_used_fid, so the OSP
-then advertises every object in between as precreated, although the OST
-created none of them for this request.  Once the jump exceeds
+opd_pre_last_created_fid without touching opd_pre_used_fid, so the
+OSP then advertises every object in between as precreated, although
+the OST created none of them for this request.  Once the jump exceeds
 OST_MAX_PRECREATE * 2 the next lod_statfs_and_check() trips
 
   ASSERTION( sfs->os_fprecreated <= OST_MAX_PRECREATE * 2 ) failed:
-  last_created [0x280000401:0xff02:0x0], next_fid [0x280000401:0x1:0x0]
+  last_created [0x280000401:0xff02:0x0],
+  next_fid [0x280000401:0x1:0x0], reserved 0
 
-LU-15009 introduced that reply, but capped the jump at OST_MAX_PRECREATE
-so os_fprecreated stayed under the assertion; LU-17987 dropped the cap
-and an arbitrarily large jump now reaches it.
+LU-15009 introduced that reply, but only for a gap below
+OST_MAX_PRECREATE; a larger one was still refused with -EINVAL, so
+os_fprecreated stayed under the assertion.  LU-17987 dropped that
+refusal and an arbitrarily large jump now reaches it.
 
 Treat a reply beyond the range we asked for as a resync: move
-opd_pre_used_fid up together with opd_pre_last_created_fid, leaving an
-empty precreate window, the same way osp_precreate_cleanup_orphans()
-handles the equivalent delorphan reply.
+opd_pre_used_fid up together with opd_pre_last_created_fid, leaving
+an empty precreate window, the same way that
+osp_precreate_cleanup_orphans() handles the equivalent delorphan
+reply.
+
+Do this only while the window is already empty, which is the state
+the reply is answered in here - it follows a sequence rollover, and
+the crash above reports "reserved 0".  It is also the only state in
+which moving opd_pre_used_fid is safe: osp_precreate_reserve() grants
+a reservation only while opd_pre_reserved is below the number of
+precreated objects, so an empty window has nothing reserved from it,
+while emptying a window which has would leave opd_pre_reserved above
+it and underflow the __u32 os_fprecreated in osp_statfs() - the same
+assertion, from the other side.  A non-empty window keeps behaving as
+before, so an OSP which simply missed a precreate reply still adopts
+the objects the OST really created for it.
 
 conf-sanity test_122a reaches this whenever an OSP rolls over to a
-fresh sequence while OBD_FAIL_OFD_SET_OID is still set: the OST stamps
-the new sequence's LAST_ID at seq_width - 255 and reports it back.
-MDT0000's OSP always rolls over, since it starts on the IDIF sequence,
-so create through MDT0000 as well to exercise it every run.
+fresh sequence while OBD_FAIL_OFD_SET_OID is still set: the OST
+stamps the new sequence's LAST_ID at seq_width - 255 and reports it
+back.  MDT0000's OSP always rolls over, since it starts on the IDIF
+sequence, so create through MDT0000 as well, and hold the fail_loc
+until that OSP has really been given the inflated LAST_ID rather
+than racing its rollover.  Check the resulting window directly too:
+the os_fprecreated assertion is only reached while seq_width, which
+the test framework sets to OSTSEQWIDTH / OSTCOUNT, is above
+OST_MAX_PRECREATE * 2.
 
-Fixes: 1711e26ae861 ("LU-15009 ofd: continue precreate if LAST_ID is less on MDT")
 Fixes: 53940ff3eee8 ("LU-17987 ofd: always trust OST last_id")
 Test-Parameters: mdtcount=2 ostcount=2 testlist=conf-sanity env=ONLY=122a,ONLY_REPEAT=20
-Test-Parameters: mdtcount=2 testlist=conf-sanity
+Test-Parameters: mdtcount=2 ostcount=4 testlist=conf-sanity env=ONLY=122a,ONLY_REPEAT=10
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I9a646bf7f8d13d92f73668729e68925bbe21a6a5
@@ -93,3 +112,25 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The resync itself looks like the right shape for the LU-20527 case, but it empties the precreate window without the reservation drain that the delorphan path it is modelled on performs.
+
+--- Message (Oleg Drokin, 2026-08-13 03:11:59.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-13 13:46:20.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 13:50:49.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 13:56:22.000000000) ---
+Patch Set 2:
+
+Looks good to me.

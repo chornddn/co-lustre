@@ -1,5 +1,5 @@
 Change:     67341
-Subject:    LU-19569 tests: guard sanity-lfsck test_45 against ENOSPC
+Subject:    LU-19569 tests: fix sanity-lfsck test_45 ENOSPC on a small OST
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67341
 Change-Id:  I9a1a74cb1b2a6787508cc34787c77031d8f5ed36
 Project:    fs/lustre-release
@@ -7,27 +7,27 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-17 19:14:04.000000000
-Updated:    2026-08-10 07:49:02.000000000
-Patch Set:  2
-Insertions: +43
-Deletions:  -16
-Comments:   10 (7 unresolved)
+Updated:    2026-08-13 13:56:00.000000000
+Patch Set:  3
+Insertions: +90
+Deletions:  -18
+Comments:   11 (7 unresolved)
 Hashtags:   testfix
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Lai Siyao, Andreas Dilger
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger
 
 --- Commit Message ---
-LU-19569 tests: guard sanity-lfsck test_45 against ENOSPC
+LU-19569 tests: fix sanity-lfsck test_45 ENOSPC on a small OST
 
-sanity-lfsck formats 100MB OSTs (~69MB usable), and test_45 forces a
-30MB write onto OST0000 with "setstripe -i 0 -c 1".  In aggregate runs
-that dd fails with ENOSPC:
+sanity-lfsck formats small OSTs (100MB, 300MB on ZFS), and test_45
+forces a 30MB write onto OST0000 with "setstripe -i 0 -c 1".  In
+aggregate runs that dd fails with ENOSPC:
 
   dd: error writing '/mnt/lustre//f45.sanity-lfsck-0': No space left on device
   sanity-lfsck test_45: @@@@@@ FAIL: write /mnt/lustre//f45.sanity-lfsck-0 failed
@@ -44,19 +44,40 @@ subtracts dirty and pending from os_bavail, but not the space already
 granted to the other client mounts, so the free space it reports is not
 the space the OST can still hand out.
 
-Ask for less space, reclaim the grant the clients are not using, place
-the file on whichever OST the MDS considers emptiest, and check the
-space that OST can actually grant instead of what "lfs df" reports on
-its own.  The subsequent stop/mount/chown/start of the backing
-filesystem and the LFSCK status wait now follow the OST that was picked
-instead of always using ost1.
+Ask for less space, and free some before asking: unlike most subtests
+here, test_45 never called check_mount_and_prep(), so what the
+previous subtest wrote -- lfsck_prep() copies the test scripts, some
+5MB today -- was still sitting on those OSTs.  Run it, wait for the
+unlinks to be destroyed, hand back the grant the clients are not using,
+and put the file on the OST with the most grantable space rather than
+on OST0000 unconditionally.  The grant shrink reaches the OSTs
+asynchronously, so the measurement is retried for a few seconds before
+giving up.  "setstripe -i" is only a preference: when the requested OST
+cannot take the object lod_ost_alloc_specific() moves on to the next
+one, so where the object landed is checked before it is written to,
+and the subtest gives up rather than measure one OST and fill another.
+The stop/mount/chown/start of the backing filesystem and the LFSCK
+status wait follow the OST that was picked instead of always ost1.
+The file is removed when the test ends so it does not eat into later
+runs.
+
+The test file also moves to $DIR/$tdir, which check_mount_and_prep()
+creates.  It was written as $DIR/$tdri, and as nothing sets $tdri it
+landed in the root of the mount -- the doubled slash in the failure
+quoted above.
+
+The per-OST free space is read with "lfs df --output", which needs lfs
+2.16.59.  That needs no version gate: lustre-tests "Requires: lustre =
+%{version}", so the lfs on a client running this test is always built
+from the same tree as the test.  Its value is matched against digits
+before use because "lfs df" prints "<uuid>: <strerror>" for an OST it
+cannot stat, and while that is merely false inside (( )), it is fatal
+to the shell inside $(( )).
 
 Reproduced by mounting eight extra client instances so that OST0000
 holds 62668KB free but 44966464 bytes granted: the unpatched test fails
-with ENOSPC after 25 of 30MB, while the patched test passes both when
-the file lands on OST0000 and when it lands on OST0001.
+with ENOSPC after 25 of 30MB, while the patched test passes.
 
-Test-Parameters: trivial testlist=sanity-lfsck
 Fixes: ee292c13e2 ("LU-16266 lfsck: fix the PROJID of OST object")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -171,3 +192,25 @@ Patch Set 2:
 
 --- Message (Marc Vef, 2026-08-10 07:49:02.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-13 03:04:33.000000000) ---
+Patch Set 2: Code-Review-1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-13 13:50:55.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 13:54:27.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 13:56:00.000000000) ---
+Patch Set 3:
+
+Looks good to me.

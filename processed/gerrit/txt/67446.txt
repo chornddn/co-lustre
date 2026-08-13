@@ -7,26 +7,27 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-22 07:12:02.000000000
-Updated:    2026-08-03 20:50:03.000000000
-Patch Set:  2
-Insertions: +9
-Deletions:  -2
-Comments:   0 (0 unresolved)
+Updated:    2026-08-13 14:01:41.000000000
+Patch Set:  4
+Insertions: +11
+Deletions:  -4
+Comments:   2 (2 unresolved)
 Hashtags:   master-next
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Andreas Dilger: +1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger
 
 --- Commit Message ---
 LU-20510 osc: wait for OST_SYNC issued on the fsync error path
 
-osc_io_fsync_start() issues the asynchronous OST_SYNC RPC unconditionally
-via osc_fsync_ost(), but only records that it is in flight when no earlier
-error has been latched:
+osc_io_fsync_start() issues asynchronous OST_SYNC RPCs unconditionally
+via osc_fsync_ost(), but only records that it is in flight when no
+earlier error has been latched:
 
 	rc = osc_fsync_ost(env, osc, fio);
 	if (result == 0) {
@@ -35,10 +36,10 @@ error has been latched:
 	}
 
 osc_io_fsync_end() waits only when opc_rpc_sent is set, so once
-osc_cache_writeback_range() or osc_cache_wait_range() has failed, the io is
-torn down with the RPC still in flight. Its completion then runs
-osc_async_upcall() on &oio->oi_cbarg, which lives inside struct osc_session
--- memory already returned to osc_session_kmem. The resulting freelist
+osc_cache_writeback_range() or osc_cache_wait_range() has failed, the
+io is torn down with the RPC still in flight. Its completion then runs
+osc_async_upcall() on &oio->oi_cbarg, which is in struct osc_session,
+memory already returned to osc_session_kmem. The resulting freelist
 corruption surfaces later, at an unrelated allocation, typically as:
 
   general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC
@@ -52,13 +53,15 @@ The window is normally unreachable, since nothing fails writeback on a
 healthy client, but it opens on OST I/O errors or client eviction, and
 CL_FSYNC_RECLAIM makes it reachable from background reclaim writeback.
 
-Record the RPC as in flight whenever it was actually sent, regardless of any
+Record RPC as in flight whenever it was actually sent, regardless of
 previously latched error, so osc_io_fsync_end() always waits for it.
 
-Verified on a slab-debug kernel with writeback-error injection: without this
-patch 6 of 13 runs crashed, with the crash occurring in exactly the runs that
-entered the window; with it, 0 of 10 runs crashed while 5 still entered the
-same window.
+Verified on slab-debug kernel with writeback-error injection. Without
+this patch 6/13 runs crashed, with crash occurring in runs that
+entered the window; with it, 0 of 10 runs crashed while 5 still
+entered the same window.
+
+Fix identical issue added in the same patch in mdc_io_fsync_start().
 
 Fixes: 8aa231a99468 ("LU-16713 llite: writeback/commit pages under memory pressure")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
@@ -130,3 +133,62 @@ https://build.whamcloud.com/job/lustre-reviews/128577/ : SUCCESS
 Patch Set 2:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-12 19:29:29.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+The osc side of this looks correct, but I have one concern about completeness -- see the inline comment.
+
+--- Message (Andreas Dilger, 2026-08-13 00:54:10.000000000) ---
+Patch Set 3: Published edit on patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-08-13 00:54:22.000000000) ---
+Patch Set 4: Patch Set 3 was rebased
+
+--- Message (jenkins, 2026-08-13 00:54:24.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (Andreas Dilger, 2026-08-13 00:54:40.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 00:59:50.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 01:01:08.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-13 01:28:54.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129191/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-13 02:01:59.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-13 14:01:41.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+The fix itself looks correct: osc_sync_base() only returns 0 after ptlrpc_set_add_req(PTLRPCD_SET) has queued the request, so rc == 0 really does mean "an upcall on &oio->oi_cbarg is coming", and cl_io_loop() always runs cl_io_end() (and lov_io_end() reaches every sub-io whose ci_state is CIS_IO_GOING), so the wait is always reached now. One commit-message note inline.
+
+Since the reproducer relied on out-of-tree writeback-error injection, would it be worth landing that injection as a CFS_FAIL_CHECK() in osc_cache_writeback_range() plus a sanity subtest, so the window stays covered?

@@ -7,44 +7,37 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-25 18:39:08.000000000
-Updated:    2026-08-10 07:48:21.000000000
-Patch Set:  1
-Insertions: +65
-Deletions:  -3
-Comments:   4 (4 unresolved)
-Hashtags:   master-next
+Updated:    2026-08-13 13:20:54.000000000
+Patch Set:  2
+Insertions: +158
+Deletions:  -14
+Comments:   9 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin
 
 --- Commit Message ---
 LU-20522 obdclass: bound llog header length before using the tail
 
 LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes
-from the start of the header buffer.  lustre_swab_llog_hdr() uses it
-twice without ever checking lrh_len, which at that point is raw data
-from disk or the wire:
-
-  print_llog_hdr()	CDEBUG(D_OTHER) of LLOG_HDR_TAIL(h)->lrt_index
-			and ->lrt_len -- an out-of-bounds read
-  lustre_swab_llog_rec()	__swab32s() of the same two fields via
-			tail = LLOG_HDR_TAIL(llh) -- an out-of-bounds
-			*write*
-
-The first print_llog_hdr() call happens before the header is swabbed,
-so lrh_len is still in the peer's byte order.  Even a perfectly valid
-foreign-endian header therefore reads ~2MB past an 8KB buffer:
-__swab32(8192) == 0x00200000.
+from the start of the header buffer.  lustre_swab_llog_hdr() dereferences
+it twice -- print_llog_hdr() reads lrt_index and lrt_len, and
+lustre_swab_llog_rec() swabs them -- without ever checking lrh_len,
+which at that point is raw data from disk or the wire.  The first
+print_llog_hdr() runs before the header is swabbed, so lrh_len is still
+in the peer's byte order: even a valid foreign-endian 8KB header reads
+~2MB past the buffer, because __swab32(8192) is 0x00200000.
 
 recovery-small test_154a overwrites an update log catalog with
-/dev/urandom and expects the corrupt log to be rejected.  Roughly 1
+/dev/urandom and expects the corrupt log to be rejected.  Roughly one
 random lrh_type in 4096 satisfies LLOG_REC_HDR_NEEDS_SWABBING(), which
-sends that random header into lustre_swab_llog_hdr() and dereferences
-the tail at a random multi-gigabyte offset:
+feeds that random header to lustre_swab_llog_hdr() and dereferences the
+tail at a random multi-gigabyte offset:
 
   BUG: unable to handle kernel paging request at ffff9857f0a959ca
   RIP: print_llog_hdr+0x568/0x6b0 [obdclass]
@@ -55,36 +48,51 @@ the tail at a random multi-gigabyte offset:
    lod_sub_prep_llog+0x581/0xcd9 [lod]
    lod_sub_recovery_thread+0xd6/0xef0 [lod]
 
-RAX held the on-disk lrh_len 0xdc75d9ce and RBX the header at
-ffff985714338000; the faulting insn is "mov edx,[rbx+rax-4]", i.e.
-LLOG_HDR_TAIL(h)->lrt_index exactly.
+Pass the size of the buffer the header was read into to
+lustre_swab_llog_hdr(), and only touch the tail when lrh_len places it
+within that buffer.  The bound has to be the caller's buffer and not a
+tree-wide maximum, because the buffer sizes differ: 8KB for
+lod_update_log_stale() and for the RMF_LLOG_LOG_HDR reply, but up to 32KB
+for an update log read by llog_osd_read_header().  A bound of 32KB would
+still let a legitimate big-endian 32KB header write eight bytes past the
+two 8KB buffers.  The tail swab therefore moves out of
+lustre_swab_llog_rec(), which has no way to know the buffer size, and
+into lustre_swab_llog_hdr().
 
-Validate lrh_len against the range llog_init_handle() can actually
-allocate before dereferencing the tail, in both places.  Callers detect
-the still-unswabbed header through their existing lrh_type and lrh_len
-checks and return -EINVAL, which is what lod_sub_prep_llog() already
-handles by renewing the log.  This also covers the two other callers
-that swab an unvalidated header: lod_update_log_stale() and the
-RMF_LLOG_LOG_HDR reply swabber, where a foreign-endian peer can reach
-the out-of-bounds write over the network.
+Bounding the tail is not enough on its own.  LLOG_REC_HDR_NEEDS_SWABBING()
+only matches the 12-bit LLOG_OP_MASK prefix, so a header buffer whose
+lrh_type swabs to CHANGELOG_REC or UPDATE_REC is handed to a record
+swabber that locates its tail, or sizes its loops, from the very lrh_len
+being distrusted -- the same unbounded write a few lines further on.  So
+also refuse to interpret the buffer as anything but a log header.
 
-Add LLOG_MAX_CHUNK_SIZE for the bound and use it where the update log
-chunk size is set, so the two cannot drift apart.
+Callers reject the untouched header through their existing lrh_type and
+lrh_len checks and return -EINVAL, which is what lod_sub_prep_llog()
+already handles by renewing the log.
 
-recovery-small test_154c reproduces this deterministically instead of
-waiting for the 1-in-4096 draw.
+llog_client_read_header() then bounds lrh_len itself before it uses it.
+It has the same checks already, but they run after the memcpy and after
+LLOG_HDR_TAIL(), so a peer sending an lrh_len below the tail size read
+before the buffer, and one above the reply size read past it.  That path
+needs no byte-order difference at all: a same-endian peer is never
+swabbed, so nothing looks at the value first.
 
-The dereference has been unbounded since 2015, but nothing fed it a
-corrupt header until test_154a landed in 54301fe4f5 ("LU-15934 tests: add
-a test case for update llog"), which is why this only shows up in results
-from 2024 on.  It is not test-only, though: lod_update_log_stale() swabs
-an on-disk header during normal stale update log cleanup with no length
-check at all.
+This is not test-only.  lod_update_log_stale() swabs an on-disk header
+during ordinary stale update log cleanup with no length check at all, and
+a foreign-endian peer reaches the out-of-bounds write over the network
+through RMF_LLOG_LOG_HDR.
 
-Change-Id: I484be880d2ede4e9ab9fdfedfe22969355bd7601
+recovery-small test_154c plants both shapes -- a byte-swapped
+LLOG_HDR_MAGIC and a byte-swapped CHANGELOG_REC -- with an out-of-range
+lrh_len, so the bad dereference is reached on every run instead of on a
+1-in-4096 draw.  Whether it faults still depends on what happens to sit
+at the out-of-bounds address, so the test does not wait for a crash: it
+checks that the MDS read the log and rejected it.
+
 Fixes: dc689955366c ("LU-6602 obdclass: variable llog chunk size")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I484be880d2ede4e9ab9fdfedfe22969355bd7601
 
 --- Review History ---
 
@@ -138,4 +146,54 @@ Patch Set 1:
 [Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
 
 --- Message (Marc Vef, 2026-08-10 07:48:21.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-13 03:08:54.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-13 05:55:40.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-08-13 05:57:24.000000000) ---
+Patch Set 1: -Code-Review
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 06:02:34.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 06:12:28.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-13 06:50:00.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129209/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-13 09:28:38.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-13 13:20:53.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:20:53.000000000) ---
+Patch Set 2:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-13 13:20:54.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.

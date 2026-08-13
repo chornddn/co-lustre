@@ -1,0 +1,133 @@
+Change:     67956
+Subject:    LU-20522 obdclass: bound llog record length before using the tail
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67956
+Change-Id:  Ib3e5518947abe458a1be4c1e210ca2064b769322
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-13 05:55:40.000000000
+Updated:    2026-08-13 09:42:13.000000000
+Patch Set:  1
+Insertions: +168
+Deletions:  -40
+Comments:   4 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20522 obdclass: bound llog record length before using the tail
+
+lustre_swab_llog_rec() has the same defect the previous patch fixed for
+the log header, still live for every other record type.  It swabs
+lrh_len out of untrusted bytes and every variable-length case then
+locates its tail from it:
+
+  CHANGELOG_REC, CHANGELOG_USER_REC, CHANGELOG_USER_REC2
+	tail = (char *)rec + rec->lrh_len - sizeof(*tail)
+  UPDATE_REC
+	tail = (char *)record + update_records_size(record)
+
+so __swab32s(&tail->lrt_len) writes eight bytes up to 4GB past the chunk
+buffer.  Both readers swab before they validate:
+
+  llog_process_thread()		llog.c: swab, llog_verify_record() later
+  llog_osd_next_block()		llog_osd.c: swab, llog_verify_record() later
+
+and a foreign-endian peer reaches it over the network, because
+llog_client_next_block() copies the reply into the chunk buffer and
+leaves the records to be swabbed during processing.
+
+UPDATE_REC is worse than an eight byte write.  ur_update_count and each
+op's uop_param_count are untrusted, and update_op is variable-length, so
+lustre_swab_update_ops() walks and writes for as long as those counts
+say.  update_records_size() walks the same counts to place the tail.
+
+Pass the number of bytes readable at the record to
+lustre_swab_llog_rec() and reject an lrh_len that does not place the
+tail inside them; every case is then bounded by the record's own extent,
+which that check has just proved lies within the buffer.  Each case also
+needs the length its fixed fields actually occupy, which is not always
+the size of the struct it casts to: llog_changelog_rec ends in a
+for_sizeof_only llog_rec_tail, so a legitimate 80 byte CL_MARK record is
+shorter than sizeof(*cr), and a v1 CHANGELOG_USER_REC is half the size
+of the v2 struct the case uses.
+
+MDS_SETATTR64_REC picked its v2 layout on lrh_len > sizeof(the v1
+struct), so an lrh_len between the two sizes put the tail at offset 80,
+past the record and on top of whatever followed it in the chunk.  It now
+takes the v2 layout only when the v2 struct fits.
+
+Walk the update ops against the end of the record and give up if they
+run past it, and locate the UPDATE_REC tail from lrh_len like every
+other variable-length record: llog_update_record_size() puts it at the
+very end, so the two agree for any record that is well formed and the
+walk is no longer needed to find it.
+
+The ops walk now steps with update_op_next_op() instead of indexing
+uops_op[] by a fixed stride.  That is required to know where an op ends,
+and it also matches how update_ops_size() has always walked them.
+
+A record too short for its own type is left with just its llog_rec_hdr
+swabbed, and one whose lrh_len puts the tail outside the buffer keeps
+its body but not its tail.  Neither is handed to a callback in a state
+llog_verify_record() will always catch, so this is hardening of the
+memory access rather than of the record contents.
+
+Two callers can hand the swabber a record that has already left the
+buffer, so they now bail out instead: llog_reverse_process() advances by
+an lrh_len it has not checked, and llog_osd_next_block() derives last_rec
+by subtracting an untrusted tail length from a pointer, which can land on
+either side of the block.  llog_reverse_process() also locates its own
+tail from that unchecked lrh_len, so bound it there too.
+
+There is no new test.  These swabbers only run when the data is in the
+opposite byte order, so a same-endian cluster reaches them solely through
+corruption that happens to set LLOG_REC_HDR_NEEDS_SWABBING(), and unlike
+the log header there is no point in recovery-small where a catalog holds
+both a valid header and a record to corrupt -- the update log catalog is
+still empty there, so processing stops on the header instead.  A test
+that plants a record anyway passes with or without this patch, which is
+worse than none.
+
+Fixes: 4f53536d002c ("LU-3540 lod: update recovery thread")
+Fixes: a15eb4f13224 ("LU-13055 mdd: per-user changelog names and mask")
+Fixes: 97fbb61dbe26 ("LU-4017 quota: add project id support")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ib3e5518947abe458a1be4c1e210ca2064b769322
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-13 05:55:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 06:02:40.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 06:12:17.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-13 07:23:00.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129208/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-13 09:42:13.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful

@@ -7,44 +7,37 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-25 18:39:08.000000000
-Updated:    2026-08-10 07:48:21.000000000
-Patch Set:  1
-Insertions: +65
-Deletions:  -3
-Comments:   4 (4 unresolved)
-Hashtags:   master-next
+Updated:    2026-08-13 13:20:54.000000000
+Patch Set:  2
+Insertions: +158
+Deletions:  -14
+Comments:   9 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin
 
 --- Commit Message ---
 LU-20522 obdclass: bound llog header length before using the tail
 
 LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes
-from the start of the header buffer.  lustre_swab_llog_hdr() uses it
-twice without ever checking lrh_len, which at that point is raw data
-from disk or the wire:
-
-  print_llog_hdr()	CDEBUG(D_OTHER) of LLOG_HDR_TAIL(h)->lrt_index
-			and ->lrt_len -- an out-of-bounds read
-  lustre_swab_llog_rec()	__swab32s() of the same two fields via
-			tail = LLOG_HDR_TAIL(llh) -- an out-of-bounds
-			*write*
-
-The first print_llog_hdr() call happens before the header is swabbed,
-so lrh_len is still in the peer's byte order.  Even a perfectly valid
-foreign-endian header therefore reads ~2MB past an 8KB buffer:
-__swab32(8192) == 0x00200000.
+from the start of the header buffer.  lustre_swab_llog_hdr() dereferences
+it twice -- print_llog_hdr() reads lrt_index and lrt_len, and
+lustre_swab_llog_rec() swabs them -- without ever checking lrh_len,
+which at that point is raw data from disk or the wire.  The first
+print_llog_hdr() runs before the header is swabbed, so lrh_len is still
+in the peer's byte order: even a valid foreign-endian 8KB header reads
+~2MB past the buffer, because __swab32(8192) is 0x00200000.
 
 recovery-small test_154a overwrites an update log catalog with
-/dev/urandom and expects the corrupt log to be rejected.  Roughly 1
+/dev/urandom and expects the corrupt log to be rejected.  Roughly one
 random lrh_type in 4096 satisfies LLOG_REC_HDR_NEEDS_SWABBING(), which
-sends that random header into lustre_swab_llog_hdr() and dereferences
-the tail at a random multi-gigabyte offset:
+feeds that random header to lustre_swab_llog_hdr() and dereferences the
+tail at a random multi-gigabyte offset:
 
   BUG: unable to handle kernel paging request at ffff9857f0a959ca
   RIP: print_llog_hdr+0x568/0x6b0 [obdclass]
@@ -55,36 +48,51 @@ the tail at a random multi-gigabyte offset:
    lod_sub_prep_llog+0x581/0xcd9 [lod]
    lod_sub_recovery_thread+0xd6/0xef0 [lod]
 
-RAX held the on-disk lrh_len 0xdc75d9ce and RBX the header at
-ffff985714338000; the faulting insn is "mov edx,[rbx+rax-4]", i.e.
-LLOG_HDR_TAIL(h)->lrt_index exactly.
+Pass the size of the buffer the header was read into to
+lustre_swab_llog_hdr(), and only touch the tail when lrh_len places it
+within that buffer.  The bound has to be the caller's buffer and not a
+tree-wide maximum, because the buffer sizes differ: 8KB for
+lod_update_log_stale() and for the RMF_LLOG_LOG_HDR reply, but up to 32KB
+for an update log read by llog_osd_read_header().  A bound of 32KB would
+still let a legitimate big-endian 32KB header write eight bytes past the
+two 8KB buffers.  The tail swab therefore moves out of
+lustre_swab_llog_rec(), which has no way to know the buffer size, and
+into lustre_swab_llog_hdr().
 
-Validate lrh_len against the range llog_init_handle() can actually
-allocate before dereferencing the tail, in both places.  Callers detect
-the still-unswabbed header through their existing lrh_type and lrh_len
-checks and return -EINVAL, which is what lod_sub_prep_llog() already
-handles by renewing the log.  This also covers the two other callers
-that swab an unvalidated header: lod_update_log_stale() and the
-RMF_LLOG_LOG_HDR reply swabber, where a foreign-endian peer can reach
-the out-of-bounds write over the network.
+Bounding the tail is not enough on its own.  LLOG_REC_HDR_NEEDS_SWABBING()
+only matches the 12-bit LLOG_OP_MASK prefix, so a header buffer whose
+lrh_type swabs to CHANGELOG_REC or UPDATE_REC is handed to a record
+swabber that locates its tail, or sizes its loops, from the very lrh_len
+being distrusted -- the same unbounded write a few lines further on.  So
+also refuse to interpret the buffer as anything but a log header.
 
-Add LLOG_MAX_CHUNK_SIZE for the bound and use it where the update log
-chunk size is set, so the two cannot drift apart.
+Callers reject the untouched header through their existing lrh_type and
+lrh_len checks and return -EINVAL, which is what lod_sub_prep_llog()
+already handles by renewing the log.
 
-recovery-small test_154c reproduces this deterministically instead of
-waiting for the 1-in-4096 draw.
+llog_client_read_header() then bounds lrh_len itself before it uses it.
+It has the same checks already, but they run after the memcpy and after
+LLOG_HDR_TAIL(), so a peer sending an lrh_len below the tail size read
+before the buffer, and one above the reply size read past it.  That path
+needs no byte-order difference at all: a same-endian peer is never
+swabbed, so nothing looks at the value first.
 
-The dereference has been unbounded since 2015, but nothing fed it a
-corrupt header until test_154a landed in 54301fe4f5 ("LU-15934 tests: add
-a test case for update llog"), which is why this only shows up in results
-from 2024 on.  It is not test-only, though: lod_update_log_stale() swabs
-an on-disk header during normal stale update log cleanup with no length
-check at all.
+This is not test-only.  lod_update_log_stale() swabs an on-disk header
+during ordinary stale update log cleanup with no length check at all, and
+a foreign-endian peer reaches the out-of-bounds write over the network
+through RMF_LLOG_LOG_HDR.
 
-Change-Id: I484be880d2ede4e9ab9fdfedfe22969355bd7601
+recovery-small test_154c plants both shapes -- a byte-swapped
+LLOG_HDR_MAGIC and a byte-swapped CHANGELOG_REC -- with an out-of-range
+lrh_len, so the bad dereference is reached on every run instead of on a
+1-in-4096 draw.  Whether it faults still depends on what happens to sit
+at the out-of-bounds address, so the test does not wait for a crash: it
+checks that the MDS read the log and rejected it.
+
 Fixes: dc689955366c ("LU-6602 obdclass: variable llog chunk size")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I484be880d2ede4e9ab9fdfedfe22969355bd7601
 
 --- Review History ---
 
@@ -367,4 +375,221 @@ Patch Set 1:
 [Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
 
 --- Message (Marc Vef, 2026-08-10 07:48:21.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-13 03:08:54.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-13 05:55:40.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Oleg Drokin, 2026-08-13 05:57:24.000000000) ---
+Patch Set 1: -Code-Review
+
+(4 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 06:00:40.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67772/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 06:02:34.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-13 06:12:28.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-13 06:50:00.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129209/ : SUCCESS
+
+--- Message (Maloo, 2026-08-13 06:52:13.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 129209 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129209&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129209#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 08:42:22.000000000) ---
+Patch Set 2:
+
+Initial testing succeeded.
+
+Succeeded:
+- recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67772/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-08-13 09:28:38.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-13 13:20:53.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-13 13:20:53.000000000) ---
+Patch Set 2:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-13 13:20:54.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
