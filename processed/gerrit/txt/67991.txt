@@ -1,0 +1,111 @@
+Change:     67991
+Subject:    LU-20527 osp: report the real next precreate id
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67991
+Change-Id:  I9e144e66dbc7d7d9c40bb7cebcd4465895607b39
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-14 01:41:25.000000000
+Updated:    2026-08-14 12:50:42.000000000
+Patch Set:  1
+Insertions: +67
+Deletions:  -21
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20527 osp: report the real next precreate id
+
+osp.*.prealloc_next_id reports 1, instead of the object which will
+really be handed out next, once the last used object has reached the
+end of the OSP's sequence:
+
+	id = unlikely(fid_oid(fid) >= min(OBIF_MAX_OID, seq_width)) ?
+		1 : fid_oid(fid) + 1;
+
+Nothing has rolled over at that point.  osp_precreate_thread() only
+starts a new sequence once the precreate window is empty, and
+osp_precreate_rollover_new_seq() then starts it with oid 1 already
+used, so 1 is neither the next object of the current sequence nor the
+next object of the one which follows it.  prealloc_next_seq keeps
+naming the current sequence and prealloc_last_id has no such special
+case, so the three files describe an object which was consumed long
+ago.
+
+The window is also left behind the end of the sequence with no
+rollover in sight whenever seq.*.width is lowered below the id already
+in use: the OST returns its current width in every precreate reply
+(ofd_create_hdl()), the OSP keeps it in opd_pre_seq_width, and it then
+precreates nothing more until the objects it already has are consumed.
+The test framework lowers the width at every OST mount.  Shrinking it
+by hand under an idle OSP shows how long the wrong value survives:
+
+  before shrink: next_id=502 last_id=545 next_seq=last_seq=0x2c0000401
+  # lctl set_param -n seq.cli-lustre-OST0000-super.width=200
+  settled:       next_id=1   last_id=577 next_seq=last_seq=0x2c0000401
+
+where the window really is 536-577.
+
+Every consumer of the file turns the pair into a count, so all of them
+are then wrong by the length of the sequence:
+
+	createmany -o $dir/f $next_id $((last_id - next_id + extra))
+
+that is consume_precreations() and precreated_ost_obj_count() in
+test-framework.sh - and through them exhaust_precreations() and
+force_new_seq(), which the replay suites run at setup - along with
+sanity test_27y and test_220, and replay-single test_67b and test_88.
+
+Report opd_pre_used_fid + 1 unconditionally, and take the id out of
+the fid with osp_fid_to_obdid(), which prealloc_last_id_show() is
+switched to here as well so that the two cannot drift apart again.
+Add conf-sanity test_122c: within one sequence the id the OSP will
+hand out next only moves forward, so lowering the OST's width under a
+live window must not send it back to 1.
+
+This is not the LU-20527 LBUG, but it is filed under it because the
+window check in conf-sanity test_122d, which the next patch adds,
+reads this value: without this fix that check misreads a healthy
+32-object window as 33554208 objects and fails.
+
+Fixes: 0ecb2a167c56 ("LU-11912 ofd: reduce LUSTRE_DATA_SEQ_MAX_WIDTH")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I9e144e66dbc7d7d9c40bb7cebcd4465895607b39
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-14 01:41:25.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 01:45:33.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-14 01:48:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-14 04:31:52.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129322/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 06:42:45.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful

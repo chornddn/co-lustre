@@ -8,9 +8,9 @@ Resolution: Unresolved
 Assignee:   Tim Day
 Reporter:   Andreas Dilger
 Created:    Thu, 26 Feb 2026 20:40:59 +0000
-Updated:    Thu, 13 Aug 2026 13:37:05 +0000
+Updated:    Fri, 14 Aug 2026 09:44:23 +0000
 Links:      Duplicate: duplicates LU-19536; Related: is related to  LU-5469; Related: is related to LU-19536
-Attachments: patched_2-15-90client_debug.log, patched_2-17client_debug.log
+Attachments: 119s.tgz, patched_2-15-90client_debug.log, patched_2-17client_debug.log
 
 --- Description ---
 I was testing out a workload that was reported in GitHub:
@@ -261,3 +261,37 @@ Commit: 6b6a551e5b1deed781043880749caeb0e1b18ce3
 
 --- Comment (JIRAUSER18433, Mon, 10 Aug 2026 20:43:09 +0000) ---
 Re-opening, just because I think we should have some kind of test to definitively validate that the original workload works now. I pushed a test case.
+
+--- Comment (JIRAUSER22500, Fri, 14 Aug 2026 07:05:12 +0000) ---
+Test reproduced the failure on the code without fixes: https://testing.whamcloud.com/test_sets/9d5fd7ad-525d-45dd-a8fb-e0099f15354f
+
+--- Comment (JIRAUSER22500, Fri, 14 Aug 2026 09:40:14 +0000) ---
+Client doesn't crash on the top of b_es7_0, but the test did not pass.  
+
+The fixed-code reproducer was run https://review.whamcloud.com/c/ex/lustre-release/+/68001
+
+Test session:
+
+https://testing.whamcloud.com/test_sessions/c8cc9d80-2552-4fbf-9f19-c919e5ce4ad0
+
+No client kernel crash, BUG, or Oops was observed. Therefore, the fix prevents the previous crash issue.
+
+However, NumPy workload still fails:
+
+  OSError: 120000000 requested and 0 written
+
+ 
+
+Test logs attached: 119s.tgz
+
+ 
+
+ 
+
+AI analysis
+
+The trace shows that np.save() writes the 128-byte .npy header and then hybrid I/O switches the following large write to unaligned DIO. Lustre attempts to allocate a single unaligned DIO buffer for 959,995,904 bytes (14,649 64K pages). obd_pool_get_pages_array() rejects this request with -EINVAL because it exceeds the maximum number of objects allowed in the OBD page pool.
+
+The existing drain-and-retry logic only handles -ENOMEM after in-flight sub-DIOs have consumed the pool. It is not reached for this oversized single allocation, which fails immediately with -EINVAL.
+
+Conclusion: the LU-19536 fixes remove the kernel crash, but they do not yet make the original large unaligned hybrid-DIO NumPy write succeed on an aarch64/64K-page client. A further fix is needed to split or cap each unaligned DIO sub-request to the OBD page-pool maximum, allowing the drain-and-retry path to make progress.

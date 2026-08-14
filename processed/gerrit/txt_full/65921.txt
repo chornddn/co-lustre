@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-05-16 02:27:33.000000000
-Updated:    2026-08-12 21:34:13.000000000
-Patch Set:  11
-Insertions: +1789
+Updated:    2026-08-14 07:12:28.000000000
+Patch Set:  12
+Insertions: +1716
 Deletions:  -79
-Comments:   344 (9 unresolved)
+Comments:   369 (1 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -28,103 +28,70 @@ LU-19548 lfs: mirror extend support for EC
 Add three EC modes to 'lfs mirror extend':
 
 --mirror-id N --ec D+P   attach a parity mirror to existing data
-                         mirror N (N >= 1)
+                         mirror N (N >= 1; id 0 is reserved for
+                         non-FLR layouts and is rejected)
 
 -N [K] --ec D+P          add K new data+parity mirror pairs
                          (K defaults to 1)
 
---ec D+P                 auto mode: attach a parity mirror to the
-                         file's lone data mirror. Resolved per file:
-                         files with exactly one mirror succeed; 2+
-                         mirrors error with a disambiguation message.
-                         Covers the non-FLR case where the user just
-                         wants to add EC protection to a plain file.
+--ec D+P                 attach a parity mirror to the file's lone
+                         data mirror, for the non-FLR case where the
+                         user just wants EC protection on a plain
+                         file; a file with 2+ mirrors errors out
+                         asking for --mirror-id or -N
 
-The new mirrors are in sync when the command returns, matching the
-regular extend behavior of never leaving a new mirror stale: new data
-mirrors are populated by a copy before the layout merge, and new
-parity mirrors are computed in place with the same client-side
-machinery 'lfs mirror resync' uses.
+As a regular extend never leaves a new mirror stale, the new mirrors
+are in sync when the command returns: data mirrors are populated by a
+copy before the layout merge, parity mirrors are computed in place
+with the machinery 'lfs mirror resync' uses. A partial extend resyncs
+the parity mirrors it did attach before reporting the error, and one
+that was merged but could not be marked stale is reported with the
+command that removes it, since resync finds mirrors by LCME_FL_STALE
+and so cannot repair that one.
 
 A parity mirror is attached by merging a layout that holds only the
 new parity components, while the data mirror they protect stays where
-it is. Splitting the pair across two files this way needs two changes
-in lod.
-
-lod_qos_prep_create() sizes a parity component from the data component
-it protects and rejects a parity component that has none. The data
-component of an extend is not in the volatile file being created, so
-the client sends that component's stripe count as the parity
-component's own stripe count, and lod derives the raidset count from
-it when there is no local data component to pair with. A transient
-link id is still required to resolve within one layout.
-
-lod_declare_layout_merge() copies the incoming entries verbatim, so
-only the parity -> data half of the link would be stored. It now also
-stamps the matching data component with the mirror id assigned to the
-parity component, so an EC pair created by 'lfs mirror extend' is
-linked in both directions like one created by 'lfs setstripe --ec'.
-Without this 'lfs mirror split' cannot see the pair from the data
-side and leaves the parity mirror behind when the data mirror it
-protects is split out.
-
-The new llapi_layout_comp_add_parity_only() builds the parity-only
-layout. llapi_layout_comp_add_ec() cannot serve that case: it derives
-the parity extent, stripe size and pool by searching for the data
-component in the same buffer, and pairs the two with a transient link
-id that is resolved during creation. The two functions share their EC
-stripe-count validation, and check the counts that do not depend on a
-layout before touching one, so a rejected call leaves the caller's
-layout as it found it. Client-side layout sanity likewise had to stop
+it is. The new llapi_layout_comp_add_parity_only() builds that layout;
+llapi_layout_comp_add_ec() cannot, as it derives the parity extent,
+stripe size and pool by searching for the data component in the same
+buffer, and pairs the two with a transient link id that is resolved
+during creation. Client-side layout sanity likewise had to stop
 requiring a data component for every parity component.
+
+Splitting the pair across two files needs two changes in lod.
+lod_qos_prep_create() sizes a parity component from the data component
+it protects and rejects one that has none; the data component of an
+extend is not in the volatile file being created, so the client sends
+its stripe count as the parity component's own and lod derives the
+raidset count from that. lod_declare_layout_merge() copies the
+incoming entries verbatim, so only the parity -> data half of the link
+would be stored; it now also stamps the matching data component with
+the mirror id assigned to the parity component, without which 'lfs
+mirror split' cannot see the pair from the data side and leaves the
+parity mirror behind.
 
 Attaching a second parity mirror of a different geometry to one data
 mirror, which would let a file's EC protection change without
-rewriting its data, is not implemented: the merge ioctl takes one
-mirror at a time and lod_qos_prep_create() resolves a parity component
-to a single data component. It is rejected for now, and no test
-asserts that rejection.
+rewriting its data, is not implemented. It is rejected for now, and no
+test asserts that rejection.
 
-'--mirror-id 0' is rejected by the parser; id 0 is reserved for
-non-FLR layouts and is not a valid target. Use auto mode instead.
+An MDS that predates this change refuses a parity-only create buffer
+outright, so the new sanity-ec subtests are gated on the server
+version and an interop run skips them instead of failing.
 
-Because an MDS that predates this change refuses a parity-only create
-buffer outright, the new sanity-ec subtests are gated on the server
-version so an interop run skips them instead of failing.
-
-The failure paths are brought in line with that. A partial extend
-resyncs the parity mirrors it did attach before reporting the error,
-instead of returning with them stale and unmentioned. A parity mirror
-that was merged but could not be marked stale is reported with the
-command that removes it: resync finds mirrors by LCME_FL_STALE, so it
-cannot repair that one, and a degraded read would reconstruct from
-parity that was never computed. A second --ec on one command line
-printed a usage error but still returned 0, so a script took the
-extend for done.
-
-A target mirror built from components EC cannot be sized for is named
-rather than left to a bare errno. A Data-on-MDT component has no OST
-stripes to spread a raidset over, and a parity component is paired
-with its data component by matching extents, which a self-extending
-component's do not keep as the file grows into the extension space
-after it. Both are refused with a message naming the component, as
-'lfs setstripe --ec' refuses both. The llapi getters in
-build_parity_layout_for_mirror() report only through errno, and one of
-them rejects a self-extending component, so such a file used to exit
-non-zero with nothing printed at all; those paths now carry an error
-string that is reported on the way out.
-
---ec is refused with -f as the man page says it is. A mirror taken
-from a victim file gets its content and its layout from that file, so
-mirror_extend() took the -f path and dropped the EC parameters,
-reporting success for a mirror with no parity.
+Components EC cannot be sized for are named rather than left to a bare
+errno: a Data-on-MDT component has no OST stripes to spread a raidset
+over, and a self-extending component's extent does not stay matched to
+its parity component, both as 'lfs setstripe --ec' refuses them. --ec
+is refused with -f as the man page says it is, and a second --ec on
+one command line no longer reports success after printing a usage
+error.
 
 struct collect_ids_data moves ahead of the new EC-extend helpers,
 which reuse it and collect_mirror_id() to gather a file's distinct
 mirror ids.
 
 Test-Parameters: testlist=sanity-ec ostcount=8
-Test-Parameters: testlist=sanity-ec ostcount=8 serverversion=2.17.52
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Assisted-by: ClaudeCode:Fable-5 llm_code_and_review_tools
 Change-Id: I8d670f0558521063af425e2c75a56b00cdd294d7
@@ -2791,3 +2758,60 @@ Patch Set 11:
 Patch Set 11:
 
 (11 comments)
+
+--- Message (Maximilian Dilger, 2026-08-13 22:32:51.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 22:36:03.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Maximilian Dilger, 2026-08-13 22:36:16.000000000) ---
+Patch Set 12:
+
+(13 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 22:37:58.000000000) ---
+Patch Set 12:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67860/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-13 22:42:48.000000000) ---
+Patch Set 12:
+
+(12 comments)
+
+13 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 23:30:36.000000000) ---
+Patch Set 12:
+
+Initial testing failed:
+
+> sanity-ec@zfs Failure(1058s)
+- 5b(mirror resync failed) 
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67860/results.html
+
+--- Message (jenkins, 2026-08-14 01:01:54.000000000) ---
+Patch Set 12: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129304/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 07:12:28.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful

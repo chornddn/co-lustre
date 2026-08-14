@@ -47,12 +47,12 @@ sanity-lfsck test_5 - (13) Fail to generate linkEA: &lt;span class="error"&gt;&a
                         <labels>
                     </labels>
                 <created>Tue, 21 Jul 2026 13:44:36 +0000</created>
-                <updated>Thu, 30 Jul 2026 16:28:44 +0000</updated>
+                <updated>Fri, 14 Aug 2026 00:07:58 +0000</updated>
                                             <version>Lustre 2.18.0</version>
                                     <fixVersion>Lustre 2.18.0</fixVersion>
                                         <due />
                             <votes>0</votes>
-                                    <watches>2</watches>
+                                    <watches>3</watches>
                                                                             <comments>
                             <comment id="498298" author="adilger" created="Tue, 21 Jul 2026 21:24:56 +0000">&lt;p&gt;This may be a duplicate of &lt;a href="https://jira.whamcloud.com/browse/LU-20308" title="sanity-lfsck test_0: el10.1: FAIL: (10) Expect nothing to be repaired, but got: 98" class="issue-link" data-issue-key="LU-20308"&gt;&lt;del&gt;LU-20308&lt;/del&gt;&lt;/a&gt; and &lt;a href="https://jira.whamcloud.com/browse/LU-20424" title="osd_fid_unpack() unexpected packed fid size: 0" class="issue-link" data-issue-key="LU-20424"&gt;LU-20424&lt;/a&gt; with a different symptom.  It is only failing this way on newer kernels (optional test sessions), and most of the time sanity-lfsck test_0 is failing with "&lt;tt&gt;Error:  '(10) Expect nothing to be repaired, but got: 97'&lt;/tt&gt;" and then all of the subtests fail until test_5 fails with "&lt;tt&gt;Fail to cleanup the env!&lt;/tt&gt;".&lt;/p&gt;
 
@@ -63,6 +63,45 @@ Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
 Commit: 418c401fd8cfe9da0df249e2b5ee0960afdb0988&lt;/p&gt;</comment>
+                            <comment id="499602" author="JIRAUSER19464" created="Fri, 14 Aug 2026 00:07:58 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=adilger" class="user-hover" rel="adilger"&gt;adilger&lt;/a&gt;  the real reason for this failure is that&lt;/p&gt;
+
+&lt;p&gt;"The real reason for the failure is that in test-5, &lt;tt&gt;OBD_FAIL_FID_IGIF&lt;/tt&gt; only suppressed LinkEA and FID-in-dirent, but still wrote the Normal FID into &lt;tt&gt;trusted.lma&lt;/tt&gt;. Consequently, when LFSCK ran after the backup/restore reformat, it detected the existing &lt;tt&gt;trusted.lma&lt;/tt&gt; and reconstructed the LinkEA and dirent using the Normal FID instead of upgrading the file to an IGIF FID. Because the file remained a Normal FID object and the MDT was started without OI scrub, the OI table lacked an entry for this Normal FID, causing subsequent FID-to-path lookups (&lt;tt&gt;lfs fid2path&lt;/tt&gt;) to fail."&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;(The test occasionally passed previously because if the inode mapping happened to remain in OSD's in-memory OI cache (&lt;tt&gt;oti_cache&lt;/tt&gt;), it bypassed the on-disk OI table check; once evicted from cache, subsequent &lt;tt&gt;lfs fid2path&lt;/tt&gt; lookups failed with error 13).&lt;/p&gt;
+
+&lt;p&gt;So the patch suppress writing the FID to trusted.lma as well.  But after this fix, it failed with &lt;/p&gt;
+
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;== sanity-lfsck test 5: LFSCK can handle IGIF object upgrading ========================================================== 12:09:54 (1786118994)
+preparing... 1 * 1 files will be created Fri Aug  7 12:09:57 EDT 2026.
+fail_loc=0x1504
+total: 1 mkdir in 0.01 seconds: 182.78 ops/second
+total: 1 create in 0.01 seconds: 137.88 ops/second
+ sanity-lfsck test_5: @@@@@@ FAIL: createmany 1
+  Trace dump:
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7496:error()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:94:lfsck_prep()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:656:test_5()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7873:run_one()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7936:run_one_logged()
+  = /home/green/git/lustre-release/lustre/tests/test-framework.sh:7750:run_test()
+  = /home/green/git/lustre-release/lustre/tests/sanity-lfsck.sh:715:main()&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The root cause in lfsck_prep 1 1 1 (analyze by gemini, and looks correct to me)&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;When &lt;tt&gt;createmany -d $DIR/$tdir/d 1&lt;/tt&gt; creates directory &lt;tt&gt;d0&lt;/tt&gt;, &lt;tt&gt;osd_create()&lt;/tt&gt; creates the backend inode on disk without &lt;tt&gt;trusted.lma&lt;/tt&gt;. However, the MDT still replies to the client with the &lt;b&gt;Normal FID&lt;/b&gt; allocated for the &lt;tt&gt;mkdir&lt;/tt&gt; RPC. The client VFS instantiates and caches the dentry &lt;tt&gt;"d0"&lt;/tt&gt; bound to this Normal FID.&lt;/li&gt;
+	&lt;li&gt;Immediately on the next step, &lt;tt&gt;createmany -m $DIR/$tdir/d0/f 1&lt;/tt&gt; tries to create file &lt;tt&gt;f0&lt;/tt&gt; inside &lt;tt&gt;d0&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;The client VFS path walk traverses into &lt;tt&gt;d0&lt;/tt&gt; and issues an &lt;tt&gt;IT_LOOKUP "d0"&lt;/tt&gt; RPC to the MDT.&lt;/li&gt;
+	&lt;li&gt;When the MDT looks up &lt;tt&gt;d0&lt;/tt&gt; on disk, it finds no &lt;tt&gt;trusted.lma&lt;/tt&gt;, so &lt;tt&gt;osd_iget_fid()&lt;/tt&gt; dynamically constructs an &lt;b&gt;IGIF FID&lt;/b&gt; &lt;tt&gt;&lt;span class="error"&gt;&amp;#91;0x0:ino_d0:gen_d0&amp;#93;&lt;/span&gt;&lt;/tt&gt; and returns it in the lookup reply.&lt;/li&gt;
+	&lt;li&gt;The client receives the &lt;b&gt;IGIF FID&lt;/b&gt; from the MDT, which collides with the cached dentry in client dcache (already bound to the &lt;b&gt;Normal FID&lt;/b&gt; inode). This dentry alias mismatch causes the lookup to fail with &lt;tt&gt;-ENOENT&lt;/tt&gt; (&lt;tt&gt;rc = -2&lt;/tt&gt;).&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;To make MDT reply igif FID with this fail_loc will need some efforts.  So I wonder do we still support IGIF now? otherwise can we skip this test? It seems not worth the efforts.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

@@ -1,0 +1,559 @@
+Change:     67969
+Subject:    LU-18298 pcc: recover a PCC file handle degraded at open
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67969
+Change-Id:  Ibdad3f0825f118525c3bee44e359ba3998c2d235
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-13 17:15:30.000000000
+Updated:    2026-08-14 12:31:04.000000000
+Patch Set:  2
+Insertions: +348
+Deletions:  -42
+Comments:   2 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+  REVIEWER: Oleg Drokin
+
+--- Commit Message ---
+LU-18298 pcc: recover a PCC file handle degraded at open
+
+A file descriptor that misses the PCC cache when it is opened never uses
+PCC again, because pcc_file_read_iter() and pcc_file_write_iter() bail
+out on a NULL pccf_file before reaching pcc_io_init(), and so does
+pcc_file_splice_read(). The only reset of that state is
+pcc_file_release().
+
+Open time is easy to miss. pcc_try_auto_attach() refuses to attach at
+PIT_OPEN whenever the client holds no valid layout, and the client loses
+its layout generation on any layout blocking AST, not just on an HSM
+restore, as the comment there claimed; correct that comment too. A
+conflicting open on the MDT is enough: vvp_conf_set() sets
+CL_LAYOUT_GEN_NONE and detaches the PCC inode while the racing open is
+still in flight.
+
+For a PCC-RW file the consequence is not just a lost cache hit. The
+O_TRUNC of the same open() re-attaches the inode through
+pcc_inode_setattr(), which truncates the PCC copy, but the write that
+follows still bypasses PCC, so it lands on the HSM released layout,
+forces a restore and detaches the cache again. The PCC copy is left at
+the size the truncate gave it. That is the sanity-pcc test_1c/test_1d
+failure "expected <pcc copy> size: 7654321 got: 0".
+
+Open the PCC copy for such a descriptor on its first read, write or
+splice, once the inode is attached again. This only ever uses an already
+attached PCC inode, so it takes no layout lock and issues no Lustre RPC.
+Refreshing the layout at open time instead does not work: pcc_file_open()
+is reached by the HSM copytool opening the very file it is restoring, and
+cdt_restore_handle_add() holds MDS_INODELOCK_LAYOUT EX for the whole
+restore, so the copytool deadlocks against its own restore. That was
+measured, not deduced - every restore hung with three copytool threads
+in ll_layout_refresh() under pcc_file_open().
+
+An encrypted file is deliberately left out, even though pcc_file_open()
+takes its copy for PCC-RO when the key is available. pcc_file_splice_read()
+hands the copy to the VFS without the llcrypt decryption that
+pcc_file_read_iter() does, so it returns whatever a previous read left in
+the copy's page cache. Gating only the splice would not help, as a
+descriptor that read first and spliced afterwards would still reach it.
+
+This does not restore auto attach for such a descriptor. It only picks
+up a PCC inode that something else has already attached, so a descriptor
+that is never re-attached between open and I/O still bypasses PCC.
+
+A descriptor whose VMA maps Lustre pages must keep using Lustre for all
+of its I/O, so record that in pccf_mmap_fallback and never reopen those.
+pccf_fallback cannot serve here: every descriptor this can reopen took
+one at open, so it does not single out the ones holding a Lustre VMA.
+Without the new bit such a descriptor would read and write its PCC copy
+while its own VMA still faults on Lustre, two page caches for one file,
+and for PCC-RW the restore would orphan what went through the copy.
+Reopening can install the handle before the mmap() as easily as after
+it, so the I/O path tests the bit ahead of the handle rather than only
+where the handle is installed. The bit shares a word with pccf_fallback,
+so once the descriptor is reachable by other threads both are only
+written under the PCC inode lock, which is why pcc_file_mmap() takes it
+earlier than before.
+
+Checking the bit in pcc_file_mmap() also stops a descriptor that mmapped
+while the inode was detached from taking a PCC VMA once it is attached
+again, which would rehost the mapping out from under its live Lustre
+VMA. That one is a pre-existing bug, fixed here because this patch pays
+for the machinery anyway. It is fixed only per descriptor: the same race
+across two descriptors of one inode is the inode-wide gap below.
+
+Barring the copy for the whole descriptor also covers one that got its
+handle at open() and only later fell back at mmap(), which until now
+kept reading and writing the copy under a Lustre VMA. Such a descriptor
+loses PCC for the rest of its life, and for PCC-RW its next write
+restores and detaches the file, so it takes the lli_pcc_mapneg vote at
+that point too, as it now does Lustre I/O like any other fallback.
+
+The descriptor keeps its lli_pcc_mapneg vote until close, as before.
+Returning it once the handle is installed would let another descriptor
+PCC mmap the inode while a Lustre I/O is still in flight on this one,
+because pcc_mmap_mapping_set() only waits for PCC I/O. The inode-wide
+gap this leaves - a Lustre VMA created without a vote when the inode is
+detached - is pre-existing and deliberately left alone here.
+
+Publishing the handle from the I/O path also makes its order matter:
+pcc_fsync() reads pccf_file and pccf_type without the PCC inode lock, so
+the type has to be visible first or a concurrent fsync could miss the
+PCC-RO bail. Hence the smp_store_release()/smp_load_acquire() pair.
+
+pcc_fsync() deliberately keeps its old bail: moving the PCC-RO test
+after pcc_io_init() would let a reopened read-only descriptor skip
+cl_sync_file_range() and lose dirty Lustre pages. It also has to report
+not cached once the descriptor maps Lustre pages, since from then on its
+writes go to Lustre while the copy still holds what it wrote before
+that, so both need flushing. ll_fsync() no longer drops the copy's error
+when it goes on to flush Lustre, and reports that one in preference to
+the OST error when both fail.
+
+Do not pick up a copy that has been unlinked behind the client's back
+either, as that would keep a doomed backend inode alive until the
+descriptor is closed. This makes the reopen stricter than
+pcc_file_open(), which still takes such a copy for a newly opened
+descriptor.
+
+New sanity-pcc test_1h reproduces this: it drops the cached layout lock
+and uses OBD_FAIL_MDS_NO_LL_OPEN so the write open gets no layout lock
+back, then checks that the file is still HSM released afterwards.
+
+Fixes: f172b1168857 ("LU-10092 llite: Add persistent cache on client")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ibdad3f0825f118525c3bee44e359ba3998c2d235
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-13 17:15:30.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-13 17:19:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 17:23:30.000000000) ---
+Patch Set 1:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67826/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc@ldiskfs+DNE sanity-pcc-special1@ldiskfs+DNE sanity-pcc-special1@ldiskfs sanity-pcc-special2@ldiskfs+DNE sanity-pcc-special2@ldiskfs sanity-pcc-special3@ldiskfs+DNE sanity-pcc-special3@ldiskfs sanity-pcc-special4@ldiskfs+DNE sanity-pcc-special4@ldiskfs sanity-pcc-special5@ldiskfs+DNE sanity-pcc-special5@ldiskfs sanity-pcc-special6@ldiskfs+DNE sanity-pcc-special6@ldiskfs sanity-pcc-special7@ldiskfs+DNE sanity-pcc-special7@ldiskfs sanity-pcc-special8@ldiskfs+DNE sanity-pcc-special8@ldiskfs sanity-pcc-special9@ldiskfs+DNE sanity-pcc-special9@ldiskfs sanity-pcc-special10@ldiskfs+DNE sanity-pcc-special10@ldiskfs sanity-pcc@zfs sanity-pcc-special1@zfs sanity-pcc-special1@zfs+DNE sanity-pcc-special2@zfs sanity-pcc-special2@zfs+DNE sanity-pcc-special3@zfs sanity-pcc-special3@zfs+DNE sanity-pcc-special4@zfs sanity-pcc-special4@zfs+DNE sanity-pcc-special5@zfs sanity-pcc-special5@zfs+DNE sanity-pcc-special6@zfs sanity-pcc-special6@zfs+DNE sanity-pcc-special7@zfs sanity-pcc-special7@zfs+DNE sanity-pcc-special8@zfs sanity-pcc-special8@zfs+DNE sanity-pcc-special9@zfs sanity-pcc-special9@zfs+DNE sanity-pcc-special10@zfs sanity-pcc-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-13 17:32:39.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-13 17:35:35.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-13 17:59:48.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129263/ : SUCCESS
+
+--- Message (Maloo, 2026-08-13 18:01:25.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 129263 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129263&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129263#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-13 18:45:16.000000000) ---
+Patch Set 1:
+
+Initial testing failed:
+
+> sanity-pcc@ldiskfs+DNE Failure(4262s)
+- 1c(request on 0x200000bd1:0x4:0x0 is not SUCCEED on mds1) 
+> sanity-pcc@zfs Failure(3770s)
+- 1d(request on 0x2000013a1:0x4:0x0 is not SUCCEED on mds1) 
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc-special1@ldiskfs+DNE sanity-pcc-special1@ldiskfs sanity-pcc-special2@ldiskfs+DNE sanity-pcc-special2@ldiskfs sanity-pcc-special3@ldiskfs+DNE sanity-pcc-special3@ldiskfs sanity-pcc-special4@ldiskfs+DNE sanity-pcc-special4@ldiskfs sanity-pcc-special5@ldiskfs+DNE sanity-pcc-special5@ldiskfs sanity-pcc-special6@ldiskfs+DNE sanity-pcc-special6@ldiskfs sanity-pcc-special7@ldiskfs+DNE sanity-pcc-special7@ldiskfs sanity-pcc-special8@ldiskfs+DNE sanity-pcc-special8@ldiskfs sanity-pcc-special9@ldiskfs+DNE sanity-pcc-special9@ldiskfs sanity-pcc-special10@ldiskfs+DNE sanity-pcc-special10@ldiskfs sanity-pcc-special1@zfs sanity-pcc-special1@zfs+DNE sanity-pcc-special2@zfs sanity-pcc-special2@zfs+DNE sanity-pcc-special3@zfs sanity-pcc-special3@zfs+DNE sanity-pcc-special4@zfs sanity-pcc-special4@zfs+DNE sanity-pcc-special5@zfs sanity-pcc-special5@zfs+DNE sanity-pcc-special6@zfs sanity-pcc-special6@zfs+DNE sanity-pcc-special7@zfs sanity-pcc-special7@zfs+DNE sanity-pcc-special8@zfs sanity-pcc-special8@zfs+DNE sanity-pcc-special9@zfs sanity-pcc-special9@zfs+DNE sanity-pcc-special10@zfs sanity-pcc-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67826/results.html
+
+--- Message (Oleg Drokin, 2026-08-13 19:06:37.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Oleg Drokin, 2026-08-14 02:34:13.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-14 02:35:11.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 02:38:32.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 02:39:19.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67878/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc@ldiskfs+DNE sanity-pcc-special1@ldiskfs+DNE sanity-pcc-special1@ldiskfs sanity-pcc-special2@ldiskfs+DNE sanity-pcc-special2@ldiskfs sanity-pcc-special3@ldiskfs+DNE sanity-pcc-special3@ldiskfs sanity-pcc-special4@ldiskfs+DNE sanity-pcc-special4@ldiskfs sanity-pcc-special5@ldiskfs+DNE sanity-pcc-special5@ldiskfs sanity-pcc-special6@ldiskfs+DNE sanity-pcc-special6@ldiskfs sanity-pcc-special7@ldiskfs+DNE sanity-pcc-special7@ldiskfs sanity-pcc-special8@ldiskfs+DNE sanity-pcc-special8@ldiskfs sanity-pcc-special9@ldiskfs+DNE sanity-pcc-special9@ldiskfs sanity-pcc-special10@ldiskfs+DNE sanity-pcc-special10@ldiskfs sanity-pcc@zfs sanity-pcc-special1@zfs sanity-pcc-special1@zfs+DNE sanity-pcc-special2@zfs sanity-pcc-special2@zfs+DNE sanity-pcc-special3@zfs sanity-pcc-special3@zfs+DNE sanity-pcc-special4@zfs sanity-pcc-special4@zfs+DNE sanity-pcc-special5@zfs sanity-pcc-special5@zfs+DNE sanity-pcc-special6@zfs sanity-pcc-special6@zfs+DNE sanity-pcc-special7@zfs sanity-pcc-special7@zfs+DNE sanity-pcc-special8@zfs sanity-pcc-special8@zfs+DNE sanity-pcc-special9@zfs sanity-pcc-special9@zfs+DNE sanity-pcc-special10@zfs sanity-pcc-special10@zfs+DNE
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 04:27:04.000000000) ---
+Patch Set 2:
+
+Initial testing failed:
+
+> sanity-pcc@ldiskfs+DNE Failure(4045s)
+- 1d(request on 0x2000013a1:0x4:0x0 is not SUCCEED on mds1) 
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc-special1@ldiskfs+DNE sanity-pcc-special1@ldiskfs sanity-pcc-special2@ldiskfs+DNE sanity-pcc-special2@ldiskfs sanity-pcc-special3@ldiskfs+DNE sanity-pcc-special3@ldiskfs sanity-pcc-special4@ldiskfs+DNE sanity-pcc-special4@ldiskfs sanity-pcc-special5@ldiskfs+DNE sanity-pcc-special5@ldiskfs sanity-pcc-special6@ldiskfs+DNE sanity-pcc-special6@ldiskfs sanity-pcc-special7@ldiskfs+DNE sanity-pcc-special7@ldiskfs sanity-pcc-special8@ldiskfs+DNE sanity-pcc-special8@ldiskfs sanity-pcc-special9@ldiskfs+DNE sanity-pcc-special9@ldiskfs sanity-pcc-special10@ldiskfs+DNE sanity-pcc-special10@ldiskfs sanity-pcc@zfs sanity-pcc-special1@zfs sanity-pcc-special1@zfs+DNE sanity-pcc-special2@zfs sanity-pcc-special2@zfs+DNE sanity-pcc-special3@zfs sanity-pcc-special3@zfs+DNE sanity-pcc-special4@zfs sanity-pcc-special4@zfs+DNE sanity-pcc-special5@zfs sanity-pcc-special5@zfs+DNE sanity-pcc-special6@zfs sanity-pcc-special6@zfs+DNE sanity-pcc-special7@zfs sanity-pcc-special7@zfs+DNE sanity-pcc-special8@zfs sanity-pcc-special8@zfs+DNE sanity-pcc-special9@zfs sanity-pcc-special9@zfs+DNE sanity-pcc-special10@zfs sanity-pcc-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67878/results.html
+
+--- Message (Maloo, 2026-08-14 04:42:27.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-157vm74: https://testing.whamcloud.com/test_sessions/b4f59237-0ac5-45dd-b41b-67fbdc782991 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (jenkins, 2026-08-14 04:44:53.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129325/ : SUCCESS
+
+--- Message (Autotest, 2026-08-14 04:46:08.000000000) ---
+Patch Set 1:
+
+Trevis Autotest is abandoning the following sessions because: later build 129325 found
+- Enforced review-dne-part-3 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2026-08-14 04:46:52.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 129325 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129325&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129325#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 04:54:26.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-14 09:55:20.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-159vm75: https://testing.whamcloud.com/test_sessions/b077bbf5-fc32-4288-9660-2100fb7fd87c ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-14 12:31:04.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm27: https://testing.whamcloud.com/test_sessions/c13a4f9c-4881-4474-923a-7980df464c6d ran 6 tests.  1 tests failed: sanity.

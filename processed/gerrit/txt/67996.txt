@@ -1,0 +1,90 @@
+Change:     67996
+Subject:    LU-20590 llite: pin the layout lock for a starving IO
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67996
+Change-Id:  I94a96d0c1216acce674a47ade170c6de0b1474c3
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Chris Horn
+Created:    2026-08-14 04:20:45.000000000
+Updated:    2026-08-14 09:48:12.000000000
+Patch Set:  1
+Insertions: +125
+Deletions:  -0
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20590 llite: pin the layout lock for a starving IO
+
+can_populate_pages() asks ll_file_io_generic() to restart the IO.
+The restart happens when the cached layout generation of the inode is
+the invalid sentinel.  Local reclaim of the MDC ibits lock which
+carries the layout produces that sentinel.  With the lock cache under
+pressure a reader or a writer then goes round the restart loop.  The
+loop can run until the budget is gone, and move no data at all.
+
+Count consecutive restarts which moved no bytes and found no cached
+generation.  After LL_LAYOUT_PIN_RESTARTS of them, hold the layout
+lock out of voluntary LRU reclaim for the rest of the syscall.  The
+pin takes no mode reference.  The server can still revoke the layout
+at once, and the existing generation checks stay in force.
+
+The counter is a heuristic.  The count does not prove that a layout
+drop caused the restart.  All it records is that the try moved no
+bytes, and that the generation read the sentinel at that instant.
+This test is a correlation.  A mirror failover retry which moves
+nothing and races a concurrent cancel advances the counter too.  The
+cost of a wrong guess is one spare pin, which the syscall drops on
+the way out.  A restart which a real layout change caused leaves a
+valid generation behind, or has already moved data.  Such a restart
+resets the counter.  The threshold only has to clear the one-shot
+paths, where a single restart is enough.
+
+A try at the pin can fail.  A layout which no thread can pin now is
+no more likely to be pinnable on the next restart.  The counter
+therefore restarts after each try, and one syscall makes no more
+than LL_LAYOUT_PIN_TRIES tries.  That bounds the added MDS intent
+RPCs at four, instead of one for every remaining restart.  One try
+which succeeds is all it takes to end the starvation.  A failed try
+never aborts the IO, because the restart budget already bounds it.
+
+While a thread starves on a file, cancel_lru_locks and an
+lru_size=clear no longer drop that file's layout lock.
+
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Chris Horn <chorn@ddn.com>
+Change-Id: I94a96d0c1216acce674a47ade170c6de0b1474c3
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-08-14 04:20:45.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-14 04:22:54.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 04:30:12.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-14 06:05:09.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129338/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 09:48:12.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
