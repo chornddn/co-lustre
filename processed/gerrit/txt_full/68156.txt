@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-08-24 02:32:50.000000000
-Patch Set:  6
-Insertions: +2353
-Deletions:  -11
-Comments:   37 (4 unresolved)
+Updated:    2026-08-24 17:02:41.000000000
+Patch Set:  7
+Insertions: +2389
+Deletions:  -10
+Comments:   41 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,97 +24,24 @@ Comments:   37 (4 unresolved)
 LU-20606 llapi: scan an ldiskfs target directly
 
 Add llapi_scan_device(), which reads an MDT's or OST's objects
-straight off the device with libext2fs and delivers the same
-per-object records llapi_scan_namespace() does.  No kernel change, no
-server change, no mount: it runs against existing servers, and against
-a snapshot or a passive failover partner.  The device is opened
-read-only and there is no write path -- LFU reads, LFSCK and OI scrub
-repair.
+straight off the device with libext2fs and delivers the same records
+llapi_scan_namespace() does.  No mount, no MDS, no kernel change: it
+runs against a stopped target, a snapshot or a failover partner's LUN,
+read-only and with no write path.
 
 libext2fs stays off liblustreapi.  The backend builds as
-scan_ldiskfs.so and is dlopen'ed on the first scan, the shape
-mount.lustre already uses for mount_osd_ldiskfs.so, so a client build
-has no plugin and the call answers -ENOTSUP.  Only a --disable-plugins
-server build links it in, and that build already links libext2fs into
-mount.lustre.  What the backend knows is ext4; what an LMA means, what
-an object is and what belongs in a record stays in liblustreapi, on
-the other side of struct llapi_scan_sink, so that a second backend is
-a second reader and not a second copy of that.
+scan_ldiskfs.so and is dlopen'ed on first use, the shape mount.lustre
+already uses for mount_osd_ldiskfs.so, so a client build has no plugin
+and the call answers ENOTSUP. A device that is not a Lustre target is
+refused with EINVAL instead, and the difference matters: ENOTSUP is
+what a build without a backend says, and a caller keys off it.
 
-The record grows what a device answers for and a namespace walk does
-not: the object id, the LMA flags, the raw linkea with its first
-parent FID and name, and a class.  sr_path stays NULL, because a
-device holds names and parent FIDs and turning those into a path is a
-walk of its own.  A regular file with a layout reports no
-LLAPI_SCAN_SIZE -- the object's own size is not the file's -- and
-trusted.som answers as LLAPI_SCAN_LAZY_SIZE, which is what that bit
-already meant.
-
-Only namespace-visible objects are delivered unless
-LLAPI_SCAN_F_INTERNAL asks for the rest, so a consumer that deletes
-what it is given does not have to recognise an OI file to avoid eating
-one.  A scan takes no locks and replays no journal: on a target in
-service it also finds objects caught mid-update, and skips them rather
-than reporting them wrong.  sp_stats is how the caller learns how
-many, because a scan that drops objects silently is not one a
-space-accounting consumer can build on.
-
-What a scan delivers by default is the target's own subject matter,
-and which that is comes from the target's label: the
-namespace-visible objects on an MDT, the data objects on an OST,
-where there is no namespace at all.  A scan of an OST that delivered
-only the visible class would deliver nothing and look like success.
-
-A build without shared libraries needs the backend compiled into
-liblustreapi, not linked beside it: adding a plain .a to a libtool
-library's LIBADD leaves its objects out of the static liblustreapi.a,
-and every program linking that archive is then short the backend's
-five symbols. The separate archive now exists only where it is
-turned into the plugin.
-
-HSM state comes from trusted.hsm, which a device answers for from the
-object itself where a namespace scan pays an ioctl per file.
-
-A device whose label names neither an MDT nor an OST is refused.  What
-the target is decides which class is its subject matter, and on a
-filesystem that is not a Lustre target nothing carries an LMA, so the
-scan would deliver no object and return success.  EINVAL and not
-ENOTSUP: the latter is what a build with no backend answers, and a
-caller keys off the difference.
-
-Timestamps are decoded as ldiskfs writes them -- signed seconds plus
-the two epoch bits in i_*time_extra -- so a pre-1970 mtime does not
-come back as a 2106 one and the same object reads the same here as
-through llapi_scan_namespace().
-
-i_dtime is not consulted.  ldiskfs aliases it as NEXT_ORPHAN and
-ext4_orphan_add() stores the next orphan's inode number there, so a
-file mid-truncate, or every orphan after an unclean shutdown this
-read-only scan replays no journal for, has it set with links intact;
-skipping on it dropped those objects from the scan and from both
-counters.  A freed inode is caught by the bitmap and by i_links_count,
-which is what osd_iit_next() itself relies on.
-
-LAST_ID is classed as the target's own object.  It has f_oid 0 and its
-sequence's f_seq, so it otherwise reaches the tests below looking like
-an ordinary object of that sequence, exactly as
-fid_is_namespace_visible() excludes it.
-
-ss_seen counts what the backend rejected before the pre-filter too, so
-that emitted, filtered and skipped stay parts of it rather than a
-separate tally.
-
-run_tests() splits: run_test_tbl() runs a table for a subject that is
-not a mountpoint, since a target scan has a device and not one.
-
-llapi_scan_device_test exercises the contract against a target, and
-conf-sanity test_165 runs it against a real MDT with the filesystem
-stopped and diffs its FID set against what the client saw: every FID
-the namespace has must come back off the device.  It skips rather than
-fails where the build has no backend for the target: the plugin is
-optional by construction, and a build whose configure found no headers
-for it installs no scan_<name>.so, so llapi_scan_device() answers
-ENOTSUP from a library that is working as designed.
+The record grows what a device answers for and a walk does not: the
+object id, the inode generation, the LMA flags, the raw linkea and a
+class.  The label is read the four ways mkfs.lustre writes it -- '-',
+':', '=' and the '+' that tunefs.lustre --nolocallogs leaves on disk
+while the target is stopped, which is exactly when this is what there
+is to read it with.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -926,3 +853,27 @@ Patch Set 6:
 AI code review results below, please doublecheck
 
 Mostly good, comments inline. The label parse is the one that looks like it can refuse a working target.
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:11.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:55.000000000) ---
+Patch Set 7:
+
+(4 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-24 16:59:16.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68653/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-24 17:02:41.000000000) ---
+Patch Set 7:
+
+Looks good to me.

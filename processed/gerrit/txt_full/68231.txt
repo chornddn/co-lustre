@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-23 13:18:48.000000000
-Updated:    2026-08-24 03:04:56.000000000
-Patch Set:  1
-Insertions: +12
-Deletions:  -2
-Comments:   5 (5 unresolved)
+Updated:    2026-08-24 17:03:57.000000000
+Patch Set:  2
+Insertions: +14
+Deletions:  -4
+Comments:   9 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -23,41 +23,26 @@ Comments:   5 (5 unresolved)
 --- Commit Message ---
 LU-20624 utils: fix stale fd in cb_get_dirstripe
 
-cb_get_dirstripe() closes the descriptor it was given and stores an
-O_NOFOLLOW reopen through its argument when LL_IOC_LMV_GETSTRIPE
-answers ENOTTY, which it does for the fake symlink a foreign file or
-directory presents and for any directory that is not on Lustre at all.
-cb_find_init() and cb_getstripe() pass the address of a local copy, so
-llapi_semantic_traverse() keeps the number that was closed: it
-fdopendir()s a closed descriptor and skips every object below that
-directory in silence, closes the number a second time on the way out,
-and leaks the one that was opened.  The second close is the dangerous
-one, since by then the walk may have handed that number to another
-thread.
+cb_get_dirstripe() closed the descriptor it was given and stored an
+O_NOFOLLOW reopen through its argument on the ENOTTY retry, which
+fires for a foreign file or directory and for any directory not on
+Lustre.  cb_find_init() and cb_getstripe() pass the address of a local
+copy, so llapi_semantic_traverse() kept a number that had been closed:
+it closed that number a second time on the way out and leaked the
+reopen.  The second close is the dangerous one, since with lfs find
+--threads the number may by then belong to another worker.
 
-lfs find loses the subtree under any predicate that needs the
-directory stripe: --printf, --links, --mdt-count, --mdt-hash and
---foreign.  lfs getdirstripe and lfs getstripe -D reach the same call
-through cb_getstripe(), but they stop at the ENOTTY in any case, so
-what the descriptor costs them is the double close rather than a lost
-walk.
+Keep the reopen on the descriptor the caller already holds, with
+dup2(), rather than asking every caller to notice that its copy was
+replaced.
 
-Reproduced with a tmpfs mounted inside a Lustre mount point.  lfs find
---printf over it prints one error line where it should print four
-paths.  strace of lfs getdirstripe -r shows the descriptor half, the
-two runs identical until the last close: the number cb_get_dirstripe()
-closed is handed straight back by the next open, and the close that
-follows fails EBADF here, or lands on a descriptor another worker
-holds once lfs find is given --threads.
+Not fixed here: for a directory off Lustre the retried ioctl answers
+ENOTTY as well and cb_find_init() returns that error, so the subtree
+is lost to the error return rather than to the descriptor.  Measured
+with strace on the main process: lfs getdirstripe -r goes from one
+EBADF close to none.
 
-lfs find also reports the wrong errno for it.  cb_get_dirstripe()
-returns the ioctl's -1 rather than a negative errno and cb_find_init()
-passes that out unchanged, so the walk fails with "Operation not
-permitted" where the error was ENOTTY.  That is left alone here.
-
-The third caller, in the dangling-symlink arm of cb_getstripe(), opens
-a descriptor it closes itself, and is correct as it stands.
-
+Fixes: 15d44e787e17 ("LU-12682 llite: fake symlink type of foreign file/dir")
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I19a3d62d231e9a932fba12a4d56fbbe691912cc9
@@ -288,3 +273,32 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Mostly good - the descriptor propagation itself is correct and fixes a real double close. Two things to look at: the commit message claims a user-visible symptom that this patch does not actually fix, and there is no Fixes: tag. Since this is a data-visibility bug in `lfs find`, would it be worth adding a sanity test that walks a non-Lustre directory (or a tmpfs mounted under $DIR) with `lfs find --printf` so the behaviour is pinned down?
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:50:11.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:51:24.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+--- Message (Hiroshi Nishida, 2026-08-24 16:51:24.000000000) ---
+Patch Set 2:
+
+liblustreapi.c:3572 (cb_getstripe): Done -- that hunk is gone entirely. Taking the dup2() suggestion kept the reopen on the caller's descriptor, so neither cb_getstripe() nor cb_find_init() needs a change and this patchset touches only liblustreapi_pfind.c. Replying here because the file is no longer in the change, so the thread cannot be answered inline.
+
+--- Message (wc-checkpatch, 2026-08-24 17:03:26.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-24 17:03:57.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68647/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
