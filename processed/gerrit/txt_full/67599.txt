@@ -1,5 +1,5 @@
 Change:     67599
-Subject:    LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+Subject:    LU-20531 mdc: skip close when import is not connected
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67599
 Change-Id:  I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 Project:    fs/lustre-release
@@ -7,144 +7,39 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-08-05 03:47:05.000000000
-Patch Set:  5
-Insertions: +129
-Deletions:  -3
-Comments:   32 (8 unresolved)
+Updated:    2026-08-15 15:53:12.000000000
+Patch Set:  13
+Insertions: +74
+Deletions:  -0
+Comments:   49 (20 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: kg.xu, Lustre RISC-V Builder
+  CC: kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Timothy Day, Duncan Vogel, Keguang Xu
 
 --- Commit Message ---
-LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+LU-20531 mdc: skip close when import is not connected
 
-Problem
-=======
-On a DNE (multi-MDT) filesystem, a cascading deadlock can drain an
-MDS's ldlm_bl (LDLM blocking/cancel) thread pool and stall lock
-cancellation fleet-wide, requiring a full MDS reboot to clear.
+When an MDT peer crashes on a DNE filesystem, the reconnecting client
+must cancel OPEN-bit ibit locks held against the peer.  Each cancel
+calls ll_md_real_close() -> mdc_close() -> ptlrpc_get_mod_rpc_slot(),
+which blocks waiting for the single close mod-RPC slot.  Since the
+import is recovering (not FULL), the slot is never granted; the
+ldlm_bl thread parks permanently.  All other ldlm_bl threads then pile
+up on the same lock's l_bl_ast callback, draining the pool and
+deadlocking recovery.
 
-The trigger is entirely local to one MDS.  An ldlm_bl thread performs
-a routine LRU cancellation of a cross-MDT LDLM lock that happens to
-cover an open file.  Cancelling that lock drives the inode's final
-release (ll_md_blocking_ast -> ll_lock_cancel_bits -> iput -> evict ->
-ll_md_real_close), and releasing an open inode issues a synchronous
-MDS_CLOSE RPC to the remote MDT that owns the inode.
+Skip the close RPC when imp_state != LUSTRE_IMP_FULL.  The server will
+clean up open state on reconnect (replay) or eviction, so the close is
+redundant during recovery.
 
-If the MDC import to that remote MDT is not LUSTRE_IMP_FULL (the peer
-is failing over / in recovery), the close cannot be transmitted.  It
-parks in ptlrpc_import_delay_req() while holding the single "close"
-modify-RPC slot (cl_close_rpcs_in_flight == 1).  Every other ldlm_bl
-thread that subsequently reaches mdc_close() then blocks in
-obd_get_mod_rpc_slot(), because a close is only granted a slot when no
-other close is in flight.  Those waits are TASK_UNINTERRUPTIBLE with
-MAX_SCHEDULE_TIMEOUT and are woken only on RPC completion via
-cl_mod_rpcs_waitq -- there is no wakeup on import state change.
-
-With the whole pool parked, the MDS can no longer answer any lock
-cancellation, including the blocking ASTs its own server needs, so it
-evicts its internal client and customers while peers evict it.  The
-close needs the import FULL; the import needs the bl threads; the bl
-threads are all parked on the close slot.  The cycle cannot self-heal.
-
-This is proven from production logs (fs-0b0daf7d49224771a, 16-MDT DNE,
-Lustre 2.15): 10 ldlm_bl threads on the victim MDT blocked >122s in
-obd_get_mod_rpc_slot via mdc_close, the stuck lock holding bits 0x5
-(LOOKUP|OPEN), and the MDC import to the recovering peer never
-reaching FULL (the OSP import restored, the MDC did not).  Replayed
-cross-MDT LDLM_ENQUEUEs to the peer aborted with status 301
-(ELDLM_LOCK_ABORTED), so the peer's recovery never completed and the
-MDC was ultimately evicted and marked IMPF_INVALID.
-
-Fix
-===
-Two complementary changes are required.  The first lets a close that
-*can* complete proceed during the peer's recovery; the second makes a
-close that *cannot* complete fail fast instead of hanging forever.
-
-1) mdc_close(): allow the cross-MDT close during the target's recovery
-   (lustre/mdc/mdc_request.c)
-
-   When the MDS-internal client (OBD_CONNECT_MDS_MDS) closes a file on
-   a remote MDT while the local top device is recovering
-   (OBDF_RECOVERING on ld_site->ls_top_dev), set req->rq_allow_replay.
-   ptlrpc_import_delay_req() then transmits the close during the
-   import's REPLAY/REPLAY_LOCKS/REPLAY_WAIT/RECOVER sub-states instead
-   of parking it.  rq_allow_replay does not set MSG_REPLAY on the wire,
-   so this remains an ordinary MDS_CLOSE; the server already accepts
-   MDS_CLOSE during recovery via tgt_filter_recovery_request() ->
-   target_queue_recovery_request().  This mirrors the existing OSP
-   cross-MDT CANCEL handling (ldlm_cli_cancel_req) and the SEQ/FLD
-   during-recovery idioms.  It is scoped to OBD_CONNECT_MDS_MDS +
-   OBDF_RECOVERING, so a customer-client close is never affected.
-
-   This covers the pre-eviction window only: while the import is still
-   in a recovery sub-state, the close is allowed out and completes,
-   releasing the close slot.
-
-2) Abort the mod-RPC-slot wait on an invalid import
-   (lustre/obdclass/genops.c, lustre/ptlrpc/client.c,
-    lustre/ptlrpc/import.c, lustre/include/lustre_net.h,
-    lustre/mdc/mdc_request.c)
-
-   rq_allow_replay is not sufficient by itself.  Once the peer's
-   recovery aborts and the MDC import is evicted and marked
-   IMPF_INVALID, the close no longer parks in a recovery sub-state --
-   it hits -ESHUTDOWN in ptlrpc_import_delay_req() -- but any threads
-   already sleeping in obd_get_mod_rpc_slot() for the close slot are
-   never woken, because the slot is only released on RPC completion
-   and the RPC will never complete.  The slot wait needs to become
-   import-state aware:
-
-   - genops.c: add a bool "aborted" to struct mod_waiter.  In the
-     custom wake function claim_mod_rpc_function(), before evaluating
-     slot availability, check the import: if cli->cl_import is NULL or
-     IMPF_INVALID is set, mark the waiter aborted, wake it, and return.
-     The abort must live inside claim_mod_rpc_function() rather than at
-     a plain wake_up site: for a close waiter, the custom wake function
-     deliberately refuses to wake the thread while another close is in
-     flight, so an ordinary wakeup would not rouse the stuck thread.
-     obd_get_mod_rpc_slot() detects wait.aborted after
-     __remove_wait_queue(), drops the lock, and returns tag 0 (the
-     existing "no slot acquired" sentinel) without allocating a bitmap
-     tag.  The LU-18826 kthread/PF_MEMALLOC force-grant branch and the
-     LU-15947 wakeup precision are left unchanged.
-
-   - client.c / lustre_net.h: ptlrpc_get_mod_rpc_slot() now returns int
-     instead of void.  A returned tag of 0 is translated to -ENOTCONN;
-     the success path sets the tag, reassigns the xid, and returns 0.
-     The other callers (ldlm_request, mdc_reint, mdc_request open/
-     intent paths, osp_trans, ptlrpc batch) ignore the return value,
-     which is source-compatible.
-
-   - mdc_request.c: mdc_close() checks the return of
-     ptlrpc_get_mod_rpc_slot() and, on error, GOTO(out, rc) before
-     ptlrpc_queue_wait().  Because the abort path never claimed a slot
-     and the close bails before ptlrpc_put_mod_rpc_slot(), the
-     cl_close_rpcs_in_flight accounting stays balanced.
-
-   - import.c: ptlrpc_deactivate_import_nolock() -- the single point
-     that sets IMPF_INVALID -- calls
-     wake_up_all(&imp->imp_obd->u.cli.cl_mod_rpcs_waitq) immediately
-     after ptlrpc_abort_inflight().  This is the event that drives the
-     parked waiters to re-run claim_mod_rpc_function(), observe
-     IMPF_INVALID, and abort.  Both invalidation entry points
-     (ptlrpc_deactivate_import and ptlrpc_invalidate_import) funnel
-     through the nolock form, so both are covered.
-
-Together the parked close is woken, returns -ENOTCONN, releases the
-close slot, and the next waiter is woken to the same fast-fail; the bl
-pool drains and lock cancellation resumes without a reboot.
-
-Test-Parameters: trivial
-Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
+Test-Parameters: testlist=recovery-small env=ONLY=171,MDSCOUNT=3
 Signed-off-by: Vandana Rungta <vrungta@amazon.com>
+Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 
 --- Review History ---
 
@@ -469,3 +364,1079 @@ Succeeded:
 Patch Set 5:
 
 (1 comment)
+
+--- Message (Vandana Rungta, 2026-08-14 15:48:23.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-08-14 15:49:20.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 15:51:28.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-08-14 15:52:23.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Vandana Rungta, 2026-08-14 15:54:47.000000000) ---
+Patch Set 7: Commit message was updated.
+
+--- Message (Vandana Rungta, 2026-08-14 15:55:22.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 15:56:04.000000000) ---
+Patch Set 6:
+
+Newer revision detected, aborting all work on revision 6
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 15:57:31.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67934/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-14 15:58:24.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 16:00:56.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-14 17:18:40.000000000) ---
+Patch Set 6: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 7 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129382/ : SUCCESS
+
+--- Message (Maloo, 2026-08-14 17:21:08.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 129382 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129382&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129382#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 17:44:24.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Vandana Rungta, 2026-08-14 20:55:22.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 20:59:32.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 21:00:56.000000000) ---
+Patch Set 8:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67973/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Vandana Rungta, 2026-08-14 21:01:10.000000000) ---
+Patch Set 9: Commit message was updated.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 21:07:12.000000000) ---
+Patch Set 9:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67977/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 21:08:56.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-14 21:09:53.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 22:43:56.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 23:46:28.000000000) ---
+Patch Set 9:
+
+Initial testing failed:
+
+> recovery-small@ldiskfs+DNE Timeout(5552s)
+> recovery-small@zfs Timeout(5572s)
+
+Tests with NEW Warning messages:
+- recovery-small@ldiskfs+DNE(Server (test_27): Spinlock badness) recovery-small@zfs(Server (test_27): Spinlock badness,Server (test_27): RCU stall) 
+
+Succeeded:
+- recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67977/results.html
+
+--- Message (jenkins, 2026-08-14 23:50:59.000000000) ---
+Patch Set 8: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 9 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129422/ : SUCCESS
+
+--- Message (Autotest, 2026-08-14 23:51:49.000000000) ---
+Patch Set 6:
+
+Onyx Autotest is abandoning the following sessions because: later build 129422 found
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-2 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-6 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.5-aarch64/ldiskfs clients
+
+--- Message (Autotest, 2026-08-14 23:52:03.000000000) ---
+Patch Set 6:
+
+Trevis Autotest is abandoning the following sessions because: later build 129422 found
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-7 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-5 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-7 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.7-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2026-08-14 23:52:14.000000000) ---
+Patch Set 8:
+
+#### The following sessions will be run for Build 129422 (patch #8):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129422&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129422#redirect
+
+--- Message (Maloo, 2026-08-15 00:48:51.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-154vm1: https://testing.whamcloud.com/test_sessions/94292661-7f54-4025-96c8-00774ba31191 ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-08-15 00:56:27.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-131vm1: https://testing.whamcloud.com/test_sessions/4be8b15a-8352-4c75-8ba4-ae4f5cc039b2 ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (Vandana Rungta, 2026-08-15 01:06:58.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-08-15 01:08:29.000000000) ---
+Uploaded patch set 11.
+
+--- Message (jenkins, 2026-08-15 01:08:30.000000000) ---
+Patch Set 10:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:10:32.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 01:11:13.000000000) ---
+Patch Set 10:
+
+Newer revision detected, aborting all work on revision 10
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 01:13:19.000000000) ---
+Patch Set 11:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67984/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-15 01:13:49.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:15:15.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-15 02:45:41.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129436/ : SUCCESS
+
+--- Message (Autotest, 2026-08-15 02:46:00.000000000) ---
+Patch Set 8:
+
+Trevis Autotest is abandoning the following sessions because: later build 129436 found
+- Enforced review-dne-part-7 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-5 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-7 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.7-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Autotest, 2026-08-15 02:46:28.000000000) ---
+Patch Set 8:
+
+Onyx Autotest is abandoning the following sessions because: later build 129436 found
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-2 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.5-aarch64/ldiskfs clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+
+--- Message (Maloo, 2026-08-15 02:46:43.000000000) ---
+Patch Set 11:
+
+#### The following sessions will be run for Build 129436 (patch #11):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129436&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129436#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 03:03:35.000000000) ---
+Patch Set 11:
+
+Initial testing failed:
+
+> recovery-small@ldiskfs+DNE Timeout(5414s)
+> recovery-small@zfs Timeout(5609s)
+
+Tests with NEW Warning messages:
+- recovery-small@ldiskfs+DNE(Server (test_27): Spinlock badness) recovery-small@zfs(Server (test_27): Spinlock badness) 
+
+Succeeded:
+- recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67984/results.html
+
+--- Message (Maloo, 2026-08-15 03:33:46.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-154vm18: https://testing.whamcloud.com/test_sessions/afd6cf06-aeee-4eb3-af72-ff0e68e32b56 ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (Vandana Rungta, 2026-08-15 03:39:36.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 03:41:36.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 03:43:30.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-08-15 03:43:31.000000000) ---
+Uploaded patch set 13.
+
+--- Message (jenkins, 2026-08-15 03:43:51.000000000) ---
+Patch Set 12: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129442/ : ABORTED
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 03:44:34.000000000) ---
+Patch Set 12:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67991/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-15 03:46:41.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 03:48:13.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 03:50:07.000000000) ---
+Patch Set 13:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67993/results.html
+
+ Commencing initial testing: recovery-small@ldiskfs+DNE recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small@zfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Maloo, 2026-08-15 03:55:51.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm138: https://testing.whamcloud.com/test_sessions/57ebcce0-af33-42a2-a35d-f40010e1f634 ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (jenkins, 2026-08-15 04:06:34.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129443/ : SUCCESS
+
+--- Message (Autotest, 2026-08-15 04:07:03.000000000) ---
+Patch Set 11:
+
+Trevis Autotest is abandoning the following sessions because: later build 129443 found
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-6 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+
+--- Message (Autotest, 2026-08-15 04:07:29.000000000) ---
+Patch Set 11:
+
+Onyx Autotest is abandoning the following sessions because: later build 129443 found
+- Enforced review-dne-part-4 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-7 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-5 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-7 on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el10.1-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.5-aarch64/ldiskfs clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.7-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2026-08-15 04:07:51.000000000) ---
+Patch Set 13:
+
+#### The following sessions will be run for Build 129443 (patch #13):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129443&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129443#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 04:39:53.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-15 07:35:57.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm53: https://testing.whamcloud.com/test_sessions/ed49420f-915f-4b1f-900c-51e4111ff193 ran 7 tests.  2 tests failed: sanityn, recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-15 08:09:57.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm216: https://testing.whamcloud.com/test_sessions/8c73fa99-b372-43b6-99e7-82dfc69b8489 ran 7 tests.  1 tests failed: recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-15 08:22:51.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-80vm4: https://testing.whamcloud.com/test_sessions/4e0cd9ae-b37a-4453-894b-5324b8a3c617 ran 7 tests.  1 tests failed: recovery-small.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-08-15 09:54:26.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-144vm22: https://testing.whamcloud.com/test_sessions/cf602386-0ee9-4eac-95c3-ea921e643d18 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-08-15 10:52:44.000000000) ---
+Patch Set 13:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-156vm199: https://testing.whamcloud.com/test_sessions/48a4584b-1538-4d03-b5f2-ea7a8d301f52 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 15:01:56.000000000) ---
+Patch Set 13:
+
+Initial testing failed:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- runtests-ssk@ldiskfs+SharedKey:test_1(Seen in reviews: 68020 67825 67696 67662 67631 67617 67459 66912 66183 66095 65628 65064 65062 64955 64321 64320 64318 63511 62946 62689 62571 62135 55878 55818 54267 53359 52788 52722 52595 52488 52487 52382 52331 52268 52243 52242 52240 52235 52226 52224 52208 52206 52205 52188 52187 52182 52167 52160 52140 52113 52110 52107 52104 52102 52082 52080 52075 51850 51592 51126 51125 50966 50677 50493 50296 49989 49978 49517 49125 46360 46293 45616 45544 45532 45421 45407 45386 45322 45317 45271 45234 45211 45202 45181 45174 45160 45153 45143 45133 45069 45042 45023 45004 45000 44969 44957 44885 44855 44853 44846)
+
+
+> recovery-small@ldiskfs+DNE Timeout(5528s)
+> recovery-small@zfs Timeout(5547s)
+- (Crash processing failed with code 1 stdout: Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+ stderr: )(Usage: ./scripts/extract_crash_data.sh builddir corefile distro arch
+)
+> runtests-ssk@ldiskfs+SharedKey Failure(937s)
+- 1(can't cp /etc/hosts to /mnt/lustre/hosts.9198) 
+
+Tests with NEW Warning messages:
+- recovery-small@ldiskfs+DNE(Server (test_27): Spinlock badness) recovery-small@zfs(Server (test_27): Spinlock badness,Server (test_27): RCU stall) 
+
+Succeeded:
+- recovery-small-special1@ldiskfs+DNE recovery-small-special1@ldiskfs recovery-small-special2@ldiskfs+DNE recovery-small-special2@ldiskfs recovery-small-special3@ldiskfs+DNE recovery-small-special3@ldiskfs recovery-small-special4@ldiskfs+DNE recovery-small-special4@ldiskfs recovery-small-special5@ldiskfs+DNE recovery-small-special5@ldiskfs recovery-small-special6@ldiskfs+DNE recovery-small-special6@ldiskfs recovery-small-special7@ldiskfs+DNE recovery-small-special7@ldiskfs recovery-small-special8@ldiskfs+DNE recovery-small-special8@ldiskfs recovery-small-special9@ldiskfs+DNE recovery-small-special9@ldiskfs recovery-small-special10@ldiskfs+DNE recovery-small-special10@ldiskfs recovery-small-special1@zfs recovery-small-special1@zfs+DNE recovery-small-special2@zfs recovery-small-special2@zfs+DNE recovery-small-special3@zfs recovery-small-special3@zfs+DNE recovery-small-special4@zfs recovery-small-special4@zfs+DNE recovery-small-special5@zfs recovery-small-special5@zfs+DNE recovery-small-special6@zfs recovery-small-special6@zfs+DNE recovery-small-special7@zfs recovery-small-special7@zfs+DNE recovery-small-special8@zfs recovery-small-special8@zfs+DNE recovery-small-special9@zfs recovery-small-special9@zfs+DNE recovery-small-special10@zfs recovery-small-special10@zfs+DNE runtests@ldiskfs+DNE runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/67993/results.html
+
+--- Message (Maloo, 2026-08-15 15:38:42.000000000) ---
+Patch Set 13: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-155vm41: https://testing.whamcloud.com/test_sessions/6eccb0ce-0396-4878-8e85-9d243901b9a2 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 15:53:12.000000000) ---
+Patch Set 13:
+
+(11 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The bigger question is the approach: this drops the close RPC rather than deferring it, so the open is lost on both the client and the server with no retry, and it hands a never-sent request back to a caller that then dereferences the reply. The underlying problem is a synchronous, slot-serialized MDS_CLOSE issued from the blocking-AST path; queuing the close (ptlrpcd/async) or letting only the AST path avoid the wait would fix the ldlm_bl pile-up without changing close semantics for every other caller.

@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Vandana Rungta
 Reporter:   Vandana Rungta
 Created:    Tue, 28 Jul 2026 15:26:36 +0000
-Updated:    Tue, 28 Jul 2026 17:49:45 +0000
+Updated:    Fri, 14 Aug 2026 16:03:00 +0000
 
 --- Environment ---
 16-MDT DNE filesystem, ~535 TiB, Lustre 2.15, EL9 kernel (5.14.x). Triggered during failover/recovery of a single MDT.
@@ -391,3 +391,61 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 4386bfa994a87b7047c81ef5a17df7a81f58dd9f
+
+--- Comment (gerrit, Fri, 14 Aug 2026 15:50:59 +0000) ---
+"Vandana Rungta " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/68014
+
+Subject: LU-20531 tests: add reproducer for cross-MDT close deadlock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: de501680a4ae77d8b101e863f339c3a7172d602d
+
+--- Comment (JIRAUSER19474, Fri, 14 Aug 2026 16:03:00 +0000) ---
+Here's how I reproduced and validated the fix using fail injection parameters
+
+Parameter Value Effect
+
+fail_loc 0x32e OBD_FAIL_LDLM_REPLAY_PAUSE — pauses inside ldlm_cancel_unused_locks_for_replay during reconnect
+
+fail_val 2 2-second pause duration
+
+The 2s pause widens the window where lock cancel callbacks (bl_ast) fire while the import is still in REPLAY_LOCKS state. This ensures enough bl threads enter mdc_close() simultaneously to drain the pool.
+
+Prerequisites: 3-MDT filesystem, client at $DIR
+1. Generate OPEN-bit locks
+
+lctl set_param llite.*.opencache_threshold_count=1
+
+lfs mkdir -c 3 $DIR/testdir
+
+for i in $(seq 0 99); do echo data > $DIR/testdir/f$i; done
+
+for i in $(seq 0 99); do cat $DIR/testdir/f$i > /dev/null; done
+
+2. Verify locks on MDT0001
+
+lctl get_param -n ldlm.namespaces.MDT0001mdc*.lock_count
+
+Should show > 50
+3. Arm fail_loc on client
+
+lctl set_param fail_val=2 fail_loc=0x32e
+
+4. Crash MDT0001 (force stop + restart the MDS instance)
+5. Wait 90s, then check:
+
+lctl get_param mdc.MDT0001.import | grep state:
+
+With fix: FULL
+Without fix: REPLAY_LOCKS (permanent deadlock)
+6. Try new activity:
+
+mkdir $DIR/newdir
+
+With fix: succeeds instantly
+Without fix: hangs forever (only reboot clears)

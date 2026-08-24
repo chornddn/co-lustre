@@ -1,5 +1,5 @@
 Change:     65219
-Subject:    LU-12668 llite: make AIO reads on EC file synchronous
+Subject:    LU-12669 llite: make AIO reads on EC file synchronous
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65219
 Change-Id:  I394a3610e33b29ead8f5adb52dfa21db6b721944
 Project:    fs/lustre-release
@@ -7,55 +7,60 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-04-10 15:35:34.000000000
-Updated:    2026-07-28 09:33:53.000000000
-Patch Set:  24
-Insertions: +32
-Deletions:  -14
-Comments:   23 (15 unresolved)
+Updated:    2026-08-20 23:00:59.000000000
+Patch Set:  30
+Insertions: +37
+Deletions:  -11
+Comments:   44 (2 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Marc Vef: +1
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell, Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Zhenyu Xu
+  CC: Andreas Dilger, Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Zhenyu Xu, Marc Vef
 
 --- Commit Message ---
-LU-12668 llite: make AIO reads on EC file synchronous
+LU-12669 llite: make AIO reads on EC file synchronous
 
 For sync DIO, EC recovery on read failure runs inline in
 ll_file_io_generic after cl_sync_io_wait_recycle.  AIO has
-the same recovery requirement but cannot run from the sub-DIO
-completion path -- ll_file_io_generic returns -EIOCBQUEUED to
-the VFS before the BRW completion fires.
+the same recovery requirement but cannot run recovery from
+the sub-DIO completion path -- ll_file_io_generic returns
+-EIOCBQUEUED to the VFS before the BRW completion fires, so
+the syscall context recovery needs (the lu_env, the user's
+iov_iter, the range lock) is gone by the time the read error
+is known.
 
 Rather than building a workqueue-based async recovery path,
-make AIO reads on EC files behave as sync DIO: after cl_io_loop
-runs cl_io_iter_init (which is where lov_io_mirror_select sets
-io->ci_cross_ec), if it is an AIO read on an EC layout that
-got -EIOCBQUEUED, set cda_no_aio_complete and cda_creator_free
-to disarm the async ki_complete path, then drop into the same
-wait + restart code sync DIO uses.  The VFS calls ki_complete
-itself when we return.
+make AIO reads on EC files behave as sync DIO: after
+cl_io_loop, if an AIO read on an EC layout (io->ci_cross_ec,
+set by lov_io_mirror_init during cl_io_rw_init) got
+-EIOCBQUEUED, set cda_no_aio_complete and cda_creator_free
+to disarm the async ki_complete path, then drop into the
+same wait + restart code sync DIO uses.  The VFS calls
+ki_complete itself when we return.
 
 The flag flip is race-free because the submission ref on
-cda_sync is still held -- end_io cannot fire until we drop it
-in cl_sync_io_wait_recycle.
+cda_sync is still held -- end_io cannot fire until we drop
+it in cl_sync_io_wait_recycle.
 
 This disables async semantics for every AIO read on an EC
 file, not only those that need recovery -- we cannot tell at
 submission time whether reconstruction will be needed, so the
 sync conversion fires unconditionally on -EIOCBQUEUED for an
-EC layout.  As a side effect, the range_lock held by
-ll_file_io_generic remains held across any EC restart, which
-is what we want.
-
-Generated with Claude Code + Tools
+EC layout.  As a side effect, the range_lock taken by
+ll_file_io_generic is now held until all sub-DIOs have
+drained, instead of being dropped while they are still in
+flight.
 
 Test-Parameters: testlist=sanity-ec
+Test-Parameters: testlist=sanity-ec fstype=zfs
+Assisted-by: Opus:4.8 llm_code_and_review_tools
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Signed-off-by: Marc Vef <mvef@whamcloud.com>
 Change-Id: I394a3610e33b29ead8f5adb52dfa21db6b721944
 
 --- Review History ---
@@ -568,3 +573,167 @@ AI code review results below, please doublecheck
 Some concerns, see inline comments. The mechanism itself (disarm ki_complete while the submission ref on cda_sync is still held, then drop into the sync wait) checks out, but several of the technical claims in the commit message and the new comment do not match the code, and the AIO path is now routed through a free site that leaves io->ci_dio_aio dangling.
 
 This also looks untested: sanity-ec.sh has no AIO coverage at all, so testlist=sanity-ec will not exercise the new path. Could this add a case that does an AIO O_DIRECT read of an EC file with a data OST deactivated, so the sync conversion plus the CIT_EC_RD restart is actually covered?
+
+--- Message (Marc Vef, 2026-08-17 13:15:37.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-17 13:18:12.000000000) ---
+Patch Set 25:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 13:19:41.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 13:27:30.000000000) ---
+Patch Set 25:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-17 13:40:43.000000000) ---
+Patch Set 25: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129570/ : FAILURE
+
+--- Message (Marc Vef, 2026-08-17 14:21:43.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Marc Vef, 2026-08-17 14:22:24.000000000) ---
+Uploaded patch set 27: Commit message was updated.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-17 14:24:13.000000000) ---
+Patch Set 26:
+
+Newer revision detected, aborting all work on revision 26
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 14:24:45.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 14:28:17.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-17 14:34:21.000000000) ---
+Patch Set 27:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 14:38:07.000000000) ---
+Patch Set 27:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-17 14:58:08.000000000) ---
+Uploaded patch set 28: Commit message was updated.
+
+Copied Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 15:01:02.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-17 15:04:51.000000000) ---
+Patch Set 28:
+
+Looks good to me.
+
+--- Message (Marc Vef, 2026-08-17 15:04:51.000000000) ---
+Patch Set 28:
+
+(15 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 15:10:44.000000000) ---
+Patch Set 28:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-17 15:35:19.000000000) ---
+Uploaded patch set 29: Commit message was updated.
+
+Copied Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (wc-checkpatch, 2026-08-17 15:37:56.000000000) ---
+Patch Set 29:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 15:38:12.000000000) ---
+Patch Set 29:
+
+Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-08-17 15:45:59.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 16:31:40.000000000) ---
+Patch Set 29:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Marc Vef, 2026-08-18 16:11:31.000000000) ---
+Patch Set 29: Code-Review+1
+
+(2 comments)
+
+--- Message (Maximilian Dilger, 2026-08-19 02:58:47.000000000) ---
+Uploaded patch set 30: Patch Set 29 was rebased.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 03:08:19.000000000) ---
+Patch Set 30:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 03:09:27.000000000) ---
+Patch Set 30:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 03:21:01.000000000) ---
+Patch Set 30:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-19 03:24:57.000000000) ---
+Patch Set 30: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129691/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-19 15:12:49.000000000) ---
+Patch Set 30:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good, one comment inline. The flag flip, the drain and the free path all check out. The new path looks untested though: sanity-ec test_40a only exercises the buffered recovery read, and nothing in sanity-ec does AIO at all, so an EC read with an OST deactivated never reaches the -EIOCBQUEUED conversion under test. aiocp is already built in lustre/tests and driven with '-f O_DIRECT' from sanity.sh test_398d, so a sanity-ec case that deactivates an OSC and reads the file back with aiocp would cover this end to end.
+
+--- Message (Marc Vef, 2026-08-19 20:04:04.000000000) ---
+Patch Set 30: Code-Review+1
+
+(2 comments)

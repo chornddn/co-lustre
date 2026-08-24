@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-22 16:30:13.000000000
-Updated:    2026-08-13 13:20:48.000000000
-Patch Set:  4
-Insertions: +165
-Deletions:  -8
-Comments:   17 (4 unresolved)
+Updated:    2026-08-20 21:49:22.000000000
+Patch Set:  7
+Insertions: +416
+Deletions:  -26
+Comments:   34 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Cyril Bordage: +1; Xinxia Qu: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -30,20 +30,18 @@ reconfigured or discovery re-elects a primary. Say the client's
 primary moves C1 -> C2 and the client stops advertising C1. At
 connect time the server keyed everything for that client on C1: the
 export connection, the target NID hash, and the reverse import used
-for lock callbacks. Two things then break:
+for lock callbacks.
 
-  - The obd NID hash stays keyed on C1, so NID-keyed lookups such as
-    evict_client and the nodemap walks no longer find this client.
-
-  - Blocking and completion ASTs are sent on the reverse import, also
-    keyed on C1. Once the client drops C1 the callback targets a dead
-    NID, is never delivered, times out, and the server evicts the
-    client.
+Blocking and completion ASTs are sent on the reverse import, keyed on
+C1. Once the client drops C1 the callback targets a dead NID, is
+never delivered, times out, and the server evicts the client. The
+target NID hash also keeps listing the export under C1, so a lookup
+by the client's current NID misses.
 
 The client-side import refresh cannot cover this. It detects a
 migration by looking up the primary of the NID its own connection
 holds, but the server's reverse import holds C1, and once discovery
-prunes C1 LNetPeerPrimaryNID() can no longer find it and reports it
+prunes C1 LNetPrimaryNIDNoWait() can no longer find it and reports it
 unchanged. The reverse import is blind to its own peer's migration
 and has no path from C1 to C2.
 
@@ -57,6 +55,20 @@ ptlrpc_refresh_export_primary(), which re-keys the export connection
 on the new primary, mirroring the connect-time swap
 (obd_nid_del/obd_nid_add) so the target NID hash stays consistent.
 
+Requests are not handled in arrival order. The high priority queue is
+drained first, NRS policies reorder within a queue, and service
+threads run in parallel. A migration does not increase exp_conn_cnt,
+so ptlrpc_check_req() does not drop a request that arrived before it,
+and rq_peer only records the primary as it stood at parse time. The
+refresh therefore asks LNet again for the primary of that NID and
+acts only if the answer still agrees. A request whose NID LNet has
+since demoted or dropped is stale and is ignored, so it cannot put
+the export back on the NID a newer request moved it off. Re-reading
+the answer, rather than ordering the requests, also keeps a request
+that predates a reconnect from undoing the connect-time key. This
+defense assumes that the LNet primary of a peer does not move back to
+a NID it left. LNet keeps no generation number for a migration.
+
 The same refresh moves the reverse import, the only place it can
 learn of the migration. exp_imp_reverse is stable under exp_lock, and
 the import paths that hold imp_lock do not take exp_lock, so the
@@ -66,17 +78,40 @@ refresh.
 
 A reverse import owns no DLM export of its own: the server's DLM
 export for that client is the obd_export the reverse import hangs off,
-and it is refreshed directly. import_switch_connection() therefore
-skips the DLM export step for IMPF_DLM_FAKE imports rather than
-reporting -EINVAL, and is no longer static so the export refresh can
-reach it.
+and it is refreshed directly. ptlrpc_import_switch_connection()
+therefore skips the DLM export step for IMPF_DLM_FAKE imports rather
+than reporting -EINVAL, and is no longer static so the export refresh
+can reach it.
 
-Extend conf-sanity test_73g to also migrate the client's own primary
-NID, so the servers detect the change on the next request and refresh
-both the export and its reverse import, exercising the server-side
-refresh.
+Move the setup of conf-sanity test_73g into setup_73gh(), so the new
+tests share it. Add one assertion to test_73g. A client holds no
+target export. A client must therefore never re-key a DLM export of
+one of its own imports.
+
+Add test_73h. It moves the client back to the servers' original net,
+so the client primary migrates while the connections stay up. The
+test checks that traffic keeps flowing over the refreshed export. It
+also asserts the server side. An unmigrated client must not cause a
+re-key. The client's old NID must stop resolving under the target's
+exports. The server must log the refresh.
+
+Add test_73i for the out-of-order case. It parks one OST_WRITE in the
+server request path with OBD_FAIL_PTLRPC_PAUSE_EXP_REFRESH, migrates
+the client, lets a later request re-key the export, then releases the
+parked request and checks that it does not move the export back.
+
+Only an export with a reverse import is refreshed. Every request
+resolves an export from the handle it carries, so on a server that
+is also a client an incoming callback resolves the local DLM export
+of one of its own imports. That export belongs to
+ptlrpc_import_switch_connection(), which re-keys it under imp_lock,
+while this path holds only exp_lock, so both could put the same
+connection reference. rev_import_init() gives a reverse import to
+every export a client connects to, and does so before exp_connection
+is set, so no target export is ever skipped.
 
 Assisted-by: Claude:claude-opus-4.8
+Fixes: b38eb0b6c483 ("LU-7734 lnet: set primary NID in ptlrpc_connection_get()")
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: I094d25c1d2c9b9e72ebbef9feef9430ba721f2e4
 
@@ -283,3 +318,124 @@ Patch Set 4:
 
 --- Message (Marc Vef, 2026-08-13 13:20:48.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Chris Horn, 2026-08-14 15:10:42.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-14 15:10:57.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Chris Horn, 2026-08-14 15:12:32.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 15:18:22.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 15:26:24.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-14 16:19:34.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129374/ : SUCCESS
+
+--- Message (Chris Horn, 2026-08-14 21:47:18.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 21:50:34.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-14 21:56:07.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-15 01:24:19.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129428/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 04:08:25.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 13:22:43.000000000) ---
+Patch Set 6:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The locking and refcounting in ptlrpc_refresh_export_primary() hold up: the exp_lock -> imp_lock nesting has no counterpart anywhere in the tree, every exit path balances the connection references, and storing exp_connection before taking imp_lock is what keeps a concurrent rev_import_reconnect() from re-installing a stale connection on the reverse import.
+
+--- Message (Chris Horn, 2026-08-16 19:18:40.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-16 19:19:42.000000000) ---
+Patch Set 7:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-16 19:24:28.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-16 19:24:49.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-08-16 19:37:12.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-16 19:49:44.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129509/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-17 06:50:03.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The re-key mechanics are well covered, but the part of the fix that actually stops the eviction - moving exp_imp_reverse->imp_connection onto the new primary - is not observed by any of the new tests. 73h/73i only assert the obd NID hash and the D_HA log line. Could one of them force a server-originated callback across the migration (a second client taking a conflicting lock, or a check of the reverse import connection) so a regression in the revimp half would be caught?
+
+--- Message (Autotest, 2026-08-20 15:40:11.000000000) ---
+Patch Set 7:
+
+Trevis Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 129509 patch 7. Requested by Chris Horn because of LU-17891.

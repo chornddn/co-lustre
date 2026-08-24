@@ -1,53 +1,76 @@
 Change:     66535
-Subject:    LU-20342 lnet/selftest: fix deadlocks during module unload
+Subject:    LU-20342 lnet: fix deadlocks during module unload
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66535
 Change-Id:  I8511103709c29f991d02aaef93b5f639047cd36e
 Project:    fs/lustre-release
 Branch:     master
-Status:     NEW
+Status:     MERGED
 Owner:      Jinshan Xiong
 Created:    2026-06-08 19:43:18.000000000
-Updated:    2026-08-14 08:31:30.000000000
-Patch Set:  8
-Insertions: +34
-Deletions:  -9
-Comments:   55 (5 unresolved)
-Hashtags:   master-next
+Updated:    2026-08-24 08:08:30.000000000
+Patch Set:  12
+Insertions: +100
+Deletions:  -19
+Comments:   72 (4 unresolved)
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Robert Read: +1; Chris Horn: +1; Timothy Day: +1
+  Code-Review: James Simmons: +1; Andreas Dilger: +1; Oleg Drokin: +2
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, James Simmons, Chris Horn, Gerrit Gatekeeper, Serguei Smirnov, Timothy Day, Robert Read
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Oleg Drokin, Andreas Dilger, James Simmons, Chris Horn, Gerrit Gatekeeper, Serguei Smirnov, Timothy Day, Robert Read
 
 --- Commit Message ---
-LU-20342 lnet/selftest: fix deadlocks during module unload
+LU-20342 lnet: fix deadlocks during module unload
 
 Resolve two critical hangs and a use-after-free during module unload:
 
-1. Fix initiator workqueue self-deadlock by checking current_work()
-   in swi_cancel_workitem() before calling cancel_work_sync().
+1. Fix client-side use-after-free: destroying a session frees its
+   client RPCs, but sfw_test_unit_done() -- reached from inside a
+   client RPC's own workqueue handler via srpc_send_rpc() ->
+   srpc_client_rpc_done() -> sfw_test_rpc_done() -- could reach that
+   destruction synchronously. cancel_work_sync() on the
+   currently-running work item would deadlock, and skipping the
+   wait left a racing re-arm free to run against already-freed
+   memory. Defer the destruction to a new fw_reap_wi work item
+   instead, so it never runs from within the work item it is
+   tearing down.
 
-2. Fix server-side logical deadlock where aborted RPCs remained in
+2. Pin the session (sn_busy) across the window in
+   sfw_deactivate_session() where fw_lock is dropped to call
+   srpc_abort_service(): the reaper now sweeps every zombie session
+   on each run, so without the pin it could free the session out
+   from under sfw_deactivate_session() before it comes back to walk
+   sn->sn_batches.
+
+3. Fix server-side logical deadlock where aborted RPCs remained in
    the active list forever. Intercept the final UNLINK event in
-   srpc_handle_server_rpc() even if state is SWI_STATE_DONE,
-   ensuring srpc_server_rpc_done() is called.
+   srpc_handle_rpc() even if state is SWI_STATE_DONE, ensuring
+   srpc_server_rpc_done() is called. A new srpc_completed sentinel
+   on struct srpc_server_rpc guards against running that completion
+   twice.
 
-3. Prevent use-after-free by calling swi_cancel_workitem() in
-   srpc_service_fini() to sync with running workitems before freeing.
+4. Prevent use-after-free by calling swi_cancel_workitem() in
+   srpc_service_fini() to sync with running workitems before
+   freeing; srpc_completed also guards this path against completing
+   an already-completed RPC a second time.
 
-4. Split srpc_init_server_rpc() and moving swi_init_workitem() into srpc_service_init() via srpc_init_server_rpc_workitem().
+5. Split srpc_init_server_rpc() so swi_init_workitem() runs once
+   from srpc_service_init(), via srpc_init_server_rpc_workitem().
 
-5. Bump the log-level in srpc_finish_service() to CWARN().
+6. Bump the log-level in srpc_finish_service() to CWARN().
 
 Test-Parameters: trivial testlist=lnet-selftest,sanity-lnet
-
 Fixes: 51dd6269c9 ("LU-9859 lnet: convert selftest to use workqueues")
-
 Change-Id: I8511103709c29f991d02aaef93b5f639047cd36e
 Signed-off-by: Jinshan Xiong <jinshanx@google.com>
+Reviewed-on: https://review.whamcloud.com/c/fs/lustre-release/+/66535
+Reviewed-by: Andreas Dilger <adilger@thelustrecollective.com>
+Tested-by: jenkins <devops@whamcloud.com>
+Reviewed-by: James Simmons <jsimmons@infradead.org>
+Reviewed-by: Oleg Drokin <green@whamcloud.com>
+Tested-by: Maloo <maloo@whamcloud.com>
 
 --- Review History ---
 
@@ -434,3 +457,161 @@ https://build.whamcloud.com/job/lustre-reviews/129240/ : SUCCESS
 Patch Set 8:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Jinshan Xiong, 2026-08-19 23:02:30.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Jinshan Xiong, 2026-08-19 23:03:10.000000000) ---
+Patch Set 9:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 23:05:46.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 23:14:47.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 23:26:27.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129772/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 23:42:30.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-20 15:33:53.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The deferral to fw_reap_wi is the right shape for the client-RPC self-cancel deadlock, but sfw_deactivate_session() still publishes the session on fw_zombie_sessions before it drops fw_lock, and the new reaper is a second, asynchronous consumer of that list.
+
+--- Message (Autotest, 2026-08-20 18:24:17.000000000) ---
+Patch Set 9:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 129772 patch 9. Requested by Andreas Dilger because of LU-20477.
+
+--- Message (Jinshan Xiong, 2026-08-20 22:20:55.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-20 22:26:24.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 22:36:09.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-21 00:41:49.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129870/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-21 04:48:06.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-21 15:57:24.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two style comments inline. I traced the new reaper wake-up path (both queue_work() sites vs. every way a session lands on fw_zombie_sessions), the sn_busy pin across the fw_lock drop in sfw_deactivate_session(), and the srpc_completed sentinel against a second srpc_server_rpc_done(), and could not find a lost wake-up, a use-after-free or a double completion; the design looks sound.
+
+One coverage thought: lnet-selftest.sh always tears the session down cleanly (lst_cleanup_all) before the modules go away, so nothing in the suite unloads lnet_selftest with a live session or in-flight test RPCs, which is exactly the state all three hangs need. Would a small subtest that starts a batch and then unloads without ending the session be worth adding?
+
+--- Message (Jinshan Xiong, 2026-08-21 16:36:51.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+--- Message (Jinshan Xiong, 2026-08-21 16:38:31.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (James Simmons, 2026-08-21 22:59:37.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Autotest, 2026-08-21 23:20:08.000000000) ---
+Patch Set 10:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 129870 patch 10. Requested by James Simmons because of LU-20535.
+
+--- Message (Andreas Dilger, 2026-08-22 04:20:11.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Oleg Drokin, 2026-08-22 07:09:23.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (James Simmons, 2026-08-22 18:04:32.000000000) ---
+Uploaded patch set 11: Patch Set 10 was rebased. Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (James Simmons, 2026-08-22 18:05:24.000000000) ---
+Patch Set 11: Code-Review+1
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-08-22 18:06:38.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 18:07:17.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-22 18:24:47.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-22 18:39:15.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129980/ : SUCCESS
+
+--- Message (Oleg Drokin, 2026-08-23 03:36:32.000000000) ---
+Patch Set 11: Code-Review+2
+
+--- Message (Oleg Drokin, 2026-08-23 03:36:36.000000000) ---
+Change has been successfully cherry-picked as d72c2d3f91fd5238e69f970c74f705184a33d7e3
+
+--- Message (Marc Vef, 2026-08-24 08:08:30.000000000) ---
+Hashtag removed: master-next

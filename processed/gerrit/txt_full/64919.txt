@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-26 17:09:22.000000000
-Updated:    2026-08-06 17:41:20.000000000
-Patch Set:  46
-Insertions: +1537
-Deletions:  -21
-Comments:   94 (14 unresolved)
+Updated:    2026-08-20 00:58:57.000000000
+Patch Set:  47
+Insertions: +167
+Deletions:  -9
+Comments:   111 (1 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Patrick Farrell, Marc Vef, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -41,23 +41,6 @@ route to the EC recovery path.
   recovery loop reconstructs them instead of building a sub-IO that
   cl_io_iter_init() or the lock enqueue would reject.
 
-Two reconstruction fixes to code added by "LU-12669 ec: recover data
-from parity" are needed as well, or the tests below return corrupted
-data with no error:
-
-- lov_ec_read_parity_stripe() wrapped the parity sub-object index on
-  lsme_cstripe_count, the per-raid-set code count.  lod_qos_prep_
-  create() gives a parity component cstripe_count objects per raid
-  set, so every raid set past the first folded back onto raid set 0's
-  parity objects.  Wrap on lsme_stripe_count, the component's total
-  object count.
-- lov_io_ec_rd_start() clamped the recovery-group end at the end of
-  the read request.  eoff is the zero-fill cutoff used by lov_ec_read_
-  stripe_pages(), so a request ending mid-recovery-group zero-stamped
-  live survivor bytes that had participated in parity and fed those
-  zeros to the decode.  Clamp at the data component extent end; the
-  i_size bound stays in vvp_io_ec_rd_start()/vvp_io_ec_rd_end().
-
 lov_io_set_range() rounded the CIT_EC_RD range end up to a raid-set
 boundary using the geometry of the component holding the read end, but
 that rounded value can land past the component.  The next component
@@ -69,28 +52,22 @@ LBUGged ("uncovered page!") from brw_queue_work and panicked the
 client.  Clamp the rounded end at the component boundary; the read
 cannot need data past it, since the request itself ended inside that
 component and each component is erasure coded independently.
-Reproduced by test 57a (-E 4M -c 3 --ec 2+1, -E -1 -c 5 --ec 4+1).
+Reproduced with a -E 4M -c 3 --ec 2+1, -E -1 -c 5 --ec 4+1 layout.
 
-ll_readahead_handle_work() dropped its ra_cur_pages reservation when
+ll_readahead_handle_work() leaked its ra_cur_pages reservation when
 cl_io_rw_init() failed.  That exit is rare today but becomes routine
 once a dead import can fail an EC read at init, and ll_ra_count_put()
 is the counter's only decrement, so readahead would stop for the whole
-mount and never recover.
+mount and never recover.  Release the reservation from a single exit
+label that every path past ll_ra_count_get() reaches, and call
+cl_io_fini() on the failed init, which cl_io_init() requires no matter
+what it returned.
 
-Add the sanity-ec recovery tests that only pass with the two
-reconstruction fixes: 51b, 53b-53e, 54a-54c, 55b-55d, 56a-56b,
-57a-57c, 58c-58d and 59b-59d.  They cover EOF at RAID set and PFL
-component boundaries, sub-stripe and multi-RAID-set reads, cached and
-partially cached reads, non-aligned file sizes, varied stripe
-geometries, and sparse files with holes.  The dead-import detection
-itself is covered by tests 40a, 40e and 40f -- the only tests that
-mark an import inactive; the rest inject BRW read faults on the OSS,
-which leaves the import active and never reaches these paths.
-
-Assisted-by: ClaudeCode:opus llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Test-Parameters: testlist=sanity-ec ostcount=8
 Test-Parameters: testlist=sanity-ec ostcount=8 fstype=zfs
 Test-Parameters: testlist=sanity ostcount=8
+Fixes: c2791674260b ("LU-12043 llite: improve single-thread read performance")
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
 Change-Id: I0913e1ee977c9850193c92835edb185b0aedc6d4
@@ -6120,3 +6097,270 @@ Some concerns, see inline comments. The ll_readahead_handle_work() reservation f
 Patch Set 46:
 
 (1 comment)
+
+--- Message (Maximilian Dilger, 2026-08-19 02:58:47.000000000) ---
+Uploaded patch set 47.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-08-19 03:08:16.000000000) ---
+Patch Set 47:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68195/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-ec@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 03:09:20.000000000) ---
+Patch Set 47:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 03:09:50.000000000) ---
+Patch Set 47:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 03:46:15.000000000) ---
+Patch Set 47: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129693/ : SUCCESS
+
+--- Message (Maloo, 2026-08-19 03:47:49.000000000) ---
+Patch Set 47:
+
+#### The following sessions will be run for Build 129693 (patch #47):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129693&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129693#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 03:48:24.000000000) ---
+Patch Set 47:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-19 09:12:53.000000000) ---
+Patch Set 47:
+
+Initial testing failed:
+
+> sanity1@zfs Failure(7932s)
+- 45(write wasn't cached) 
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-ec@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68195/results.html
+
+--- Message (Maloo, 2026-08-19 10:11:41.000000000) ---
+Patch Set 47:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm53: https://testing.whamcloud.com/test_sessions/e3e7ddff-4a44-474d-98ba-807068f2a4e9 ran 11 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-08-19 10:37:06.000000000) ---
+Patch Set 47:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm248: https://testing.whamcloud.com/test_sessions/173c80c0-a588-43a2-bc50-a8811ac834ff ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-08-19 11:52:05.000000000) ---
+Patch Set 47:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm147: https://testing.whamcloud.com/test_sessions/1ef7d988-c443-423f-94ed-937a536ac948 ran 6 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-08-19 15:13:14.000000000) ---
+Patch Set 47: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm242: https://testing.whamcloud.com/test_sessions/d68f1026-713d-4b50-b1bf-d6e089010207 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-19 15:33:26.000000000) ---
+Patch Set 47:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the three code changes trace correctly. Two whole-patch points. First, this bundles three independent concerns, and the ll_readahead_handle_work() reservation leak is the odd one out: it is a fix for landed code (c2791674260b), has nothing to do with erasure coding, and could review and land on its own Change-Id instead of waiting behind the EC series. Second, neither of the two bugs fixed here gets a test. The commit message even names a reproducer layout for the client panic (-E 4M -c 3 --ec 2+1, -E -1 -c 5 --ec 4+1); turning that into a sanity-ec case, plus one that deactivates an OST and reads a degraded EC file, would keep both from coming back.
+
+--- Message (Autotest, 2026-08-19 16:56:41.000000000) ---
+Patch Set 47:
+
+Trevis Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 129693 patch 47. Requested by Max Dilger because of TIMEOUT.
+
+--- Message (Autotest, 2026-08-19 16:57:21.000000000) ---
+Patch Set 47:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-ubuntu session on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients for build 129693 patch 47. Requested by Max Dilger because of LU-19605.
+
+--- Message (Autotest, 2026-08-19 16:57:51.000000000) ---
+Patch Set 47:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 129693 patch 47. Requested by Max Dilger because of LU-19730.
+
+--- Message (Maloo, 2026-08-19 22:55:39.000000000) ---
+Patch Set 47:
+
+Passed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm71: https://testing.whamcloud.com/test_sessions/e7effc46-c9b5-4c23-acc7-ad77756aa6d7 ran 11 tests.
+
+--- Message (Maloo, 2026-08-19 22:59:42.000000000) ---
+Patch Set 47:
+
+Passed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm20: https://testing.whamcloud.com/test_sessions/d4d32265-8a69-40f1-a1c1-aa7ae6251174 ran 6 tests.
+
+--- Message (Maloo, 2026-08-19 23:21:33.000000000) ---
+Patch Set 47: Verified+1
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm63: https://testing.whamcloud.com/test_sessions/fa218d15-5322-4257-acfd-8b020f9b677d ran 11 tests.
+
+--- Message (Maximilian Dilger, 2026-08-20 00:10:17.000000000) ---
+Patch Set 47:
+
+(4 comments)
+
+--- Message (Maximilian Dilger, 2026-08-20 00:58:57.000000000) ---
+Patch Set 47:
+
+(11 comments)

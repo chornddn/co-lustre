@@ -1,5 +1,5 @@
 Change:     67599
-Subject:    LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+Subject:    LU-20531 mdc: skip close when import is not connected
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67599
 Change-Id:  I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 Project:    fs/lustre-release
@@ -7,144 +7,39 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-08-05 03:47:05.000000000
-Patch Set:  5
-Insertions: +129
-Deletions:  -3
-Comments:   32 (8 unresolved)
+Updated:    2026-08-15 15:53:12.000000000
+Patch Set:  13
+Insertions: +74
+Deletions:  -0
+Comments:   49 (20 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: kg.xu, Lustre RISC-V Builder
+  CC: kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Timothy Day, Duncan Vogel, Keguang Xu
 
 --- Commit Message ---
-LU-20531 mdc: fix cross-MDT close blocking-AST thread deadlock
+LU-20531 mdc: skip close when import is not connected
 
-Problem
-=======
-On a DNE (multi-MDT) filesystem, a cascading deadlock can drain an
-MDS's ldlm_bl (LDLM blocking/cancel) thread pool and stall lock
-cancellation fleet-wide, requiring a full MDS reboot to clear.
+When an MDT peer crashes on a DNE filesystem, the reconnecting client
+must cancel OPEN-bit ibit locks held against the peer.  Each cancel
+calls ll_md_real_close() -> mdc_close() -> ptlrpc_get_mod_rpc_slot(),
+which blocks waiting for the single close mod-RPC slot.  Since the
+import is recovering (not FULL), the slot is never granted; the
+ldlm_bl thread parks permanently.  All other ldlm_bl threads then pile
+up on the same lock's l_bl_ast callback, draining the pool and
+deadlocking recovery.
 
-The trigger is entirely local to one MDS.  An ldlm_bl thread performs
-a routine LRU cancellation of a cross-MDT LDLM lock that happens to
-cover an open file.  Cancelling that lock drives the inode's final
-release (ll_md_blocking_ast -> ll_lock_cancel_bits -> iput -> evict ->
-ll_md_real_close), and releasing an open inode issues a synchronous
-MDS_CLOSE RPC to the remote MDT that owns the inode.
+Skip the close RPC when imp_state != LUSTRE_IMP_FULL.  The server will
+clean up open state on reconnect (replay) or eviction, so the close is
+redundant during recovery.
 
-If the MDC import to that remote MDT is not LUSTRE_IMP_FULL (the peer
-is failing over / in recovery), the close cannot be transmitted.  It
-parks in ptlrpc_import_delay_req() while holding the single "close"
-modify-RPC slot (cl_close_rpcs_in_flight == 1).  Every other ldlm_bl
-thread that subsequently reaches mdc_close() then blocks in
-obd_get_mod_rpc_slot(), because a close is only granted a slot when no
-other close is in flight.  Those waits are TASK_UNINTERRUPTIBLE with
-MAX_SCHEDULE_TIMEOUT and are woken only on RPC completion via
-cl_mod_rpcs_waitq -- there is no wakeup on import state change.
-
-With the whole pool parked, the MDS can no longer answer any lock
-cancellation, including the blocking ASTs its own server needs, so it
-evicts its internal client and customers while peers evict it.  The
-close needs the import FULL; the import needs the bl threads; the bl
-threads are all parked on the close slot.  The cycle cannot self-heal.
-
-This is proven from production logs (fs-0b0daf7d49224771a, 16-MDT DNE,
-Lustre 2.15): 10 ldlm_bl threads on the victim MDT blocked >122s in
-obd_get_mod_rpc_slot via mdc_close, the stuck lock holding bits 0x5
-(LOOKUP|OPEN), and the MDC import to the recovering peer never
-reaching FULL (the OSP import restored, the MDC did not).  Replayed
-cross-MDT LDLM_ENQUEUEs to the peer aborted with status 301
-(ELDLM_LOCK_ABORTED), so the peer's recovery never completed and the
-MDC was ultimately evicted and marked IMPF_INVALID.
-
-Fix
-===
-Two complementary changes are required.  The first lets a close that
-*can* complete proceed during the peer's recovery; the second makes a
-close that *cannot* complete fail fast instead of hanging forever.
-
-1) mdc_close(): allow the cross-MDT close during the target's recovery
-   (lustre/mdc/mdc_request.c)
-
-   When the MDS-internal client (OBD_CONNECT_MDS_MDS) closes a file on
-   a remote MDT while the local top device is recovering
-   (OBDF_RECOVERING on ld_site->ls_top_dev), set req->rq_allow_replay.
-   ptlrpc_import_delay_req() then transmits the close during the
-   import's REPLAY/REPLAY_LOCKS/REPLAY_WAIT/RECOVER sub-states instead
-   of parking it.  rq_allow_replay does not set MSG_REPLAY on the wire,
-   so this remains an ordinary MDS_CLOSE; the server already accepts
-   MDS_CLOSE during recovery via tgt_filter_recovery_request() ->
-   target_queue_recovery_request().  This mirrors the existing OSP
-   cross-MDT CANCEL handling (ldlm_cli_cancel_req) and the SEQ/FLD
-   during-recovery idioms.  It is scoped to OBD_CONNECT_MDS_MDS +
-   OBDF_RECOVERING, so a customer-client close is never affected.
-
-   This covers the pre-eviction window only: while the import is still
-   in a recovery sub-state, the close is allowed out and completes,
-   releasing the close slot.
-
-2) Abort the mod-RPC-slot wait on an invalid import
-   (lustre/obdclass/genops.c, lustre/ptlrpc/client.c,
-    lustre/ptlrpc/import.c, lustre/include/lustre_net.h,
-    lustre/mdc/mdc_request.c)
-
-   rq_allow_replay is not sufficient by itself.  Once the peer's
-   recovery aborts and the MDC import is evicted and marked
-   IMPF_INVALID, the close no longer parks in a recovery sub-state --
-   it hits -ESHUTDOWN in ptlrpc_import_delay_req() -- but any threads
-   already sleeping in obd_get_mod_rpc_slot() for the close slot are
-   never woken, because the slot is only released on RPC completion
-   and the RPC will never complete.  The slot wait needs to become
-   import-state aware:
-
-   - genops.c: add a bool "aborted" to struct mod_waiter.  In the
-     custom wake function claim_mod_rpc_function(), before evaluating
-     slot availability, check the import: if cli->cl_import is NULL or
-     IMPF_INVALID is set, mark the waiter aborted, wake it, and return.
-     The abort must live inside claim_mod_rpc_function() rather than at
-     a plain wake_up site: for a close waiter, the custom wake function
-     deliberately refuses to wake the thread while another close is in
-     flight, so an ordinary wakeup would not rouse the stuck thread.
-     obd_get_mod_rpc_slot() detects wait.aborted after
-     __remove_wait_queue(), drops the lock, and returns tag 0 (the
-     existing "no slot acquired" sentinel) without allocating a bitmap
-     tag.  The LU-18826 kthread/PF_MEMALLOC force-grant branch and the
-     LU-15947 wakeup precision are left unchanged.
-
-   - client.c / lustre_net.h: ptlrpc_get_mod_rpc_slot() now returns int
-     instead of void.  A returned tag of 0 is translated to -ENOTCONN;
-     the success path sets the tag, reassigns the xid, and returns 0.
-     The other callers (ldlm_request, mdc_reint, mdc_request open/
-     intent paths, osp_trans, ptlrpc batch) ignore the return value,
-     which is source-compatible.
-
-   - mdc_request.c: mdc_close() checks the return of
-     ptlrpc_get_mod_rpc_slot() and, on error, GOTO(out, rc) before
-     ptlrpc_queue_wait().  Because the abort path never claimed a slot
-     and the close bails before ptlrpc_put_mod_rpc_slot(), the
-     cl_close_rpcs_in_flight accounting stays balanced.
-
-   - import.c: ptlrpc_deactivate_import_nolock() -- the single point
-     that sets IMPF_INVALID -- calls
-     wake_up_all(&imp->imp_obd->u.cli.cl_mod_rpcs_waitq) immediately
-     after ptlrpc_abort_inflight().  This is the event that drives the
-     parked waiters to re-run claim_mod_rpc_function(), observe
-     IMPF_INVALID, and abort.  Both invalidation entry points
-     (ptlrpc_deactivate_import and ptlrpc_invalidate_import) funnel
-     through the nolock form, so both are covered.
-
-Together the parked close is woken, returns -ENOTCONN, releases the
-close slot, and the next waiter is woken to the same fast-fail; the bl
-pool drains and lock cancellation resumes without a reboot.
-
-Test-Parameters: trivial
-Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
+Test-Parameters: testlist=recovery-small env=ONLY=171,MDSCOUNT=3
 Signed-off-by: Vandana Rungta <vrungta@amazon.com>
+Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 
 --- Review History ---
 
@@ -321,3 +216,185 @@ Patch Set 5:
 Patch Set 5:
 
 (1 comment)
+
+--- Message (Vandana Rungta, 2026-08-14 15:48:23.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-08-14 15:49:20.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 15:51:28.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-08-14 15:52:23.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Vandana Rungta, 2026-08-14 15:54:47.000000000) ---
+Patch Set 7: Commit message was updated.
+
+--- Message (Vandana Rungta, 2026-08-14 15:55:22.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 15:56:04.000000000) ---
+Patch Set 6:
+
+Newer revision detected, aborting all work on revision 6
+
+--- Message (wc-checkpatch, 2026-08-14 15:58:24.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 16:00:56.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 17:44:24.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Vandana Rungta, 2026-08-14 20:55:22.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 20:59:32.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-08-14 21:01:10.000000000) ---
+Patch Set 9: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 21:08:56.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-14 21:09:53.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 22:43:56.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Vandana Rungta, 2026-08-15 01:06:58.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-08-15 01:08:29.000000000) ---
+Uploaded patch set 11.
+
+--- Message (jenkins, 2026-08-15 01:08:30.000000000) ---
+Patch Set 10:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:10:32.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 01:11:13.000000000) ---
+Patch Set 10:
+
+Newer revision detected, aborting all work on revision 10
+
+--- Message (wc-checkpatch, 2026-08-15 01:13:49.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 01:15:15.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-15 02:45:41.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129436/ : SUCCESS
+
+--- Message (Vandana Rungta, 2026-08-15 03:39:36.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 03:41:36.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 03:43:30.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-08-15 03:43:31.000000000) ---
+Uploaded patch set 13.
+
+--- Message (jenkins, 2026-08-15 03:43:51.000000000) ---
+Patch Set 12: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129442/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-08-15 03:46:41.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 03:48:13.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-15 04:06:34.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129443/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 04:39:53.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 15:53:12.000000000) ---
+Patch Set 13:
+
+(11 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The bigger question is the approach: this drops the close RPC rather than deferring it, so the open is lost on both the client and the server with no retry, and it hands a never-sent request back to a caller that then dereferences the reply. The underlying problem is a synchronous, slot-serialized MDS_CLOSE issued from the blocking-AST path; queuing the close (ptlrpcd/async) or letting only the AST path avoid the wait would fix the ldlm_bl pile-up without changing close semantics for every other caller.

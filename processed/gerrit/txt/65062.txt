@@ -1,5 +1,5 @@
 Change:     65062
-Subject:    LU-19921 sec: add target verification for nodemap
+Subject:    LU-19921 sec: add GSSIAM nodemap integration and export setup
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65062
 Change-Id:  I6b16504892da86e9026f4e0a4792fac7a6728b91
 Project:    fs/lustre-release
@@ -7,77 +7,62 @@ Branch:     master
 Status:     NEW
 Owner:      wangdi
 Created:    2026-04-03 01:30:16.000000000
-Updated:    2026-08-14 12:38:33.000000000
-Patch Set:  62
-Insertions: +809
-Deletions:  -37
-Comments:   769 (0 unresolved)
+Updated:    2026-08-24 12:07:13.000000000
+Patch Set:  74
+Insertions: +776
+Deletions:  -34
+Comments:   970 (0 unresolved)
 
 --- Labels ---
   Code-Review: Sebastien Buisson: +1
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Lai Siyao, Andreas Dilger, Sebastien Buisson
 
 --- Commit Message ---
-LU-19921 sec: add target verification for nodemap
+LU-19921 sec: add GSSIAM nodemap integration and export setup
 
-This patch adds gssiam_get_nodemap(), gssiam_install_ctx(),
-updates gssiam_handle_init(), and introduces other nodemap
-changes, preparing the target side for GSSIAM verification
-and security context setup.
+This patch introduces the target-side GSSIAM security context setup,
+nodemap integration, and export binding:
 
-GSSIAM introduces a novel identity-based authentication model using
-a Hybrid RPC Model. Since the data RPCs (after the initial context
-establishment) use standard Null framing to avoid signing overhead,
-we need a way to enforce fine-grained access control (UID/GID mapping,
-fileset restrictions, etc.) on these Null-framed RPCs.
+- GSSIAM Nodemap Integration:
+  GSSIAM uses a Hybrid RPC Model where Data RPCs use Null framing for
+  performance. To enforce fine-grained access control (UID/GID
+  squashing, project IDs, and fileset/subdirectory boundaries) on
+  these Null-framed RPCs, a dynamic child nodemap is created for each
+  unique GSSIAM identity (inheriting from a parent "gssiam" nodemap)
+  and pinned to the export. The dynamic nodemap is automatically
+  cleaned up when the export is closed or expires.
 
-Lustre's nodemap framework is already the established, optimized
-engine for enforcing UID/GID squashing, project IDs, and fileset
-(subdirectory) boundaries. If we only attached the security context
-directly to the export, we would have to implement a parallel,
-redundant access control mechanism within the RPC or GSS layers
-just for GSSIAM.
+- GSSIAM Nodemap Naming & Hashing:
+  Introduces gssiam_nodemap_name() and lustre_gssiam_hash_key() to
+  generate a unique 64-bit FNV-1a hash for each identity based on its
+  token, token length, subdirectory, project ID, and auth
+  permissions, preventing boundary collisions between different
+  identities.
 
-Instead, by creating a dynamic child nodemap for each unique
-GSSIAM identity (inheriting from a parent "gssiam" nodemap) and
-pinning it to the export, GSSIAM seamlessly integrates with
-Lustre's native policy enforcement. The target applies its standard
-nodemap rules to the incoming Null-framed RPCs effortlessly.
-The dynamic nodemap is automatically cleaned up when the export
-is closed or expires. And gssiam nodemap is only allowed to be
-deleted by resetting cli2mdt or cli2ost security failover to null.
+- Upcall Cache Deferred Free Rework (Load-Bearing):
+  Introduces gss_cleanup_wq workqueue and switches
+  rsc_upcall_cache_ops to .free_delay (rsc_entry_free_delay() +
+  rsc_entry_free_work()) to move __rsc_free() out from under
+  write_lock(&cache->uc_lock) into workqueue (process) context for all
+  GSS flavors. This is a load-bearing prerequisite for GSSIAM: it
+  allows gssiam_delete_sec_context() to call nodemap_putref(), which
+  may invoke nodemap_destroy() and acquire active_config_lock (a
+  mutex) without violating atomic context.
 
-This patch also includes the following auxiliary changes:
-- ptlrpc_module.c: swap nodemap_mod_exit() and tgt_mod_exit() order
-  so target modules clean up before nodemaps.
-- sec.c: restructure sptlrpc_sec_put() to an early return format.
-- nodemap_member.c: add NULL check on exp->exp_connection in
-  nm_member_exp_revoke().
-- lustre_idl.h: add lustre_hash_fnv_1a_64_continue() incremental
-  hashing helper.
-- tgt_gssiam.c: add initial target framework stubs (full verification
-  and Makefile wiring are added in the subsequent commit).
-
-Additionally, address several robustness and cleanup items:
-- Move lustre_gssiam_hash_key() to lustre_gssiam.h and hash 3
-  elements (token, len, subdir) to prevent boundary collisions.
-- Use disjoint bitfield mask (auth_options & 0xffff) in
-  gssiam_nodemap_name() to avoid 32-bit overlapping.
-- Check gss_pack_err_notify() return value in gssiam_check_nodemap().
-- In gssiam_verify_target() stub, return -EOPNOTSUPP and set
-  *major = GSS_S_FAILURE to prevent NULL dereferences before the
-  full target upcall verification lands.
-- In nodemap_export_refresh(), hold an explicit reference on
-  old_nm and copy its name to a stack buffer before unlocking to
-  safely call nodemap_del_internal().
-- Make nodemap_del_internal() static and update its kernel-doc.
-- Move nodemap_del_force("gssiam", NULL) in sec_config.c out of
-  __sptlrpc_process_config() into sptlrpc_process_config() after
-  sptlrpc_conf_lock is released, preventing mutex deadlock.
+- Target & Security Infrastructure:
+  - Add sptlrpc_target_export_sec_install() to install the security
+    context into the export during connection establishment.
+  - Update sptlrpc_wireflavor2policy() to demand-load ptlrpc_gss for
+    SPTLRPC_POLICY_GSSIAM as well as SPTLRPC_POLICY_GSS.
+  - Export lustre_free_reply_state() for use by GSSIAM.
+  - Add lustre_hash_fnv_1a_64_continue() incremental hashing helper.
+  - In sptlrpc_process_config(), clean up the "gssiam" nodemap when no
+    GSSIAM rules remain, outside of sptlrpc_conf_lock to prevent
+    mutex deadlock.
 
 Signed-off-by: Di Wang <ddiwang@google.com>
 Change-Id: I6b16504892da86e9026f4e0a4792fac7a6728b91
@@ -2109,3 +2094,547 @@ https://build.whamcloud.com/job/lustre-reviews/129324/ : SUCCESS
 
 --- Message (Sebastien Buisson, 2026-08-14 12:38:33.000000000) ---
 Patch Set 62: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-08-14 16:51:36.000000000) ---
+Patch Set 62:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The new nodemap lifecycle surface here is user-visible - nodemap_del_force(), and nodemap_del() now returning -EPERM for a GSSIAM-managed nodemap - but nothing in lustre/tests exercises it. Is sanity-sec coverage for that planned elsewhere in this series?
+
+--- Message (wangdi, 2026-08-14 20:01:59.000000000) ---
+Uploaded patch set 63.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-14 20:06:28.000000000) ---
+Patch Set 63:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 20:18:42.000000000) ---
+Patch Set 63:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-14 21:34:09.000000000) ---
+Patch Set 63: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129407/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 00:06:29.000000000) ---
+Patch Set 63:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wangdi, 2026-08-15 04:25:11.000000000) ---
+Uploaded patch set 64.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-15 04:33:06.000000000) ---
+Patch Set 64:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 04:34:35.000000000) ---
+Patch Set 64:
+
+Code-wise looks good to me.
+
+--- Message (wangdi, 2026-08-15 04:41:00.000000000) ---
+Patch Set 64:
+
+(4 comments)
+
+--- Message (jenkins, 2026-08-15 04:51:42.000000000) ---
+Patch Set 64: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129445/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 06:44:47.000000000) ---
+Patch Set 64:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 16:31:50.000000000) ---
+Patch Set 64:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Worth flagging up front that none of the new nodemap code added here can execute yet: gssiam_verify_target() unconditionally returns -EOPNOTSUPP, so gssiam_handle_init() now bails out before it ever reaches gssiam_get_nodemap(), and a GSSIAM handshake that completed on the parent commit now fails (with a CERROR per attempt) until the follow-on patch lands. The stub itself is described in the message, but the side effect is that gssiam_get_nodemap(), gssiam_install_ctx() and nodemap_export_refresh() land untested and unbisectable. It would help to say so explicitly, or to order the series so the verification lands first. Related: there is no test in this change - is a sanity-sec case that creates a GSSIAM identity, checks the dynamic nodemap appears, and checks it disappears again on disconnect planned for a later patch?
+
+--- Message (wangdi, 2026-08-16 02:24:39.000000000) ---
+Uploaded patch set 65.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-16 02:38:03.000000000) ---
+Patch Set 65:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-16 02:43:33.000000000) ---
+Patch Set 65:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-16 03:24:59.000000000) ---
+Patch Set 65: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129476/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-16 03:28:54.000000000) ---
+Patch Set 65:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wangdi, 2026-08-16 04:16:10.000000000) ---
+Patch Set 65:
+
+(8 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-08-16 14:37:43.000000000) ---
+Patch Set 65:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The biggest one is that gssiam_verify_target() is a stub that always returns -EOPNOTSUPP, so gssiam_handle_init() now fails every SEC_CTX_INIT and none of the nodemap machinery this patch adds can run or be tested at this commit. Separately, nothing in the GSSIAM series so far adds test coverage - a sanity-sec case that establishes a GSSIAM context and then checks the resulting dynamic nodemap (fileset, projid, ro) would make the feature reviewable and guard the cleanup paths.
+
+--- Message (wangdi, 2026-08-17 06:12:05.000000000) ---
+Uploaded patch set 66.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-17 06:24:05.000000000) ---
+Patch Set 66:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 06:34:04.000000000) ---
+Patch Set 66:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-17 07:15:41.000000000) ---
+Patch Set 66: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129539/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 09:22:31.000000000) ---
+Patch Set 66:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Sebastien Buisson, 2026-08-17 12:39:49.000000000) ---
+Patch Set 66: Code-Review+1
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-17 13:02:05.000000000) ---
+Patch Set 66:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129567/ : FAILURE
+
+--- Message (jenkins, 2026-08-18 01:48:02.000000000) ---
+Patch Set 66: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129609/ : SUCCESS
+
+--- Message (wangdi, 2026-08-18 01:55:50.000000000) ---
+Uploaded patch set 67.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-08-18 02:02:16.000000000) ---
+Patch Set 67:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-08-18 02:03:59.000000000) ---
+Patch Set 67:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-18 02:13:54.000000000) ---
+Patch Set 67:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-18 03:00:35.000000000) ---
+Patch Set 67:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-18 03:25:24.000000000) ---
+Patch Set 67: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129624/ : SUCCESS
+
+--- Message (Sebastien Buisson, 2026-08-18 07:20:23.000000000) ---
+Patch Set 67: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-08-18 16:05:12.000000000) ---
+Patch Set 67:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The nodemap policy derived from lii_auth_permission and the reclaim of the per-identity dynamic nodemaps both look like they can end up more permissive than intended.
+
+--- Message (wangdi, 2026-08-19 03:29:29.000000000) ---
+Uploaded patch set 68.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-19 03:41:06.000000000) ---
+Patch Set 68:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 03:47:56.000000000) ---
+Patch Set 68:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-19 04:23:23.000000000) ---
+Patch Set 68: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129701/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 05:05:35.000000000) ---
+Patch Set 68:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Sebastien Buisson, 2026-08-19 07:29:46.000000000) ---
+Patch Set 68: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-08-19 20:03:28.000000000) ---
+Patch Set 68:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The access-control policy this patch establishes for the new "gssiam" parent nodemap looks weaker than intended, and several of the new nodemap lifecycle paths act on state that was validated under a lock that has since been dropped.
+
+Nothing in this series adds test coverage: there is no gssiam case anywhere under lustre/tests/, so nodemap creation/inheritance, the fileset and read-only enforcement, and the force-delete path all land untested. Would a sanity-sec case exercising a GSSIAM identity (dynamic nodemap created, fileset enforced, nodemap removed on disconnect) be feasible here or in the follow-on patch?
+
+--- Message (wangdi, 2026-08-20 00:07:58.000000000) ---
+Uploaded patch set 69.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-20 00:16:22.000000000) ---
+Patch Set 69:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 00:26:14.000000000) ---
+Patch Set 69:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-20 01:11:34.000000000) ---
+Patch Set 69: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129777/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 01:39:18.000000000) ---
+Patch Set 69:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wangdi, 2026-08-20 03:21:18.000000000) ---
+Patch Set 69:
+
+(3 comments)
+
+--- Message (Sebastien Buisson, 2026-08-20 09:56:47.000000000) ---
+Patch Set 69: Code-Review+1
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-08-20 18:02:00.000000000) ---
+Patch Set 69:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The nm_member_exp_revoke() change is a fix to pre-existing code rather than part of the GSSIAM work: exp->exp_connection is swapped and ptlrpc_connection_put() is called under exp_lock in target_handle_connect(), so the old unlocked read could dereference a freed connection. Would that be better as its own patch with a Fixes: tag, so it can land independently of the feature? Separately, nothing in this series exercises the new nodemap path yet - is a sanity-sec case planned once the target upcall lands?
+
+--- Message (wangdi, 2026-08-20 19:55:52.000000000) ---
+Patch Set 69:
+
+(8 comments)
+
+--- Message (wangdi, 2026-08-21 00:58:38.000000000) ---
+Uploaded patch set 70.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-21 00:59:48.000000000) ---
+Patch Set 70:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-21 01:17:11.000000000) ---
+Patch Set 70:
+
+Code-wise looks good to me.
+
+--- Message (wangdi, 2026-08-21 02:02:18.000000000) ---
+Patch Set 70:
+
+(11 comments)
+
+--- Message (jenkins, 2026-08-21 02:15:51.000000000) ---
+Patch Set 70: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129887/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-21 02:56:39.000000000) ---
+Patch Set 70:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Sebastien Buisson, 2026-08-21 08:06:54.000000000) ---
+Patch Set 70: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-08-21 20:15:53.000000000) ---
+Patch Set 70:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.
+
+The whole-patch worry is reachability: gssiam_verify_target() is a stub that always fails, and gssiam_handle_init() now treats that as fatal, so at this commit no GSSIAM SEC_CTX_INIT can succeed and none of the nodemap creation/installation code added here can ever run. That also means none of it is exercisable by a test, which is presumably why the patch adds none. Would it be cleaner to land the stub together with the implementation, or to keep gssiam_handle_init() working until the real verification exists?
+
+--- Message (wangdi, 2026-08-22 18:16:05.000000000) ---
+Uploaded patch set 71.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-08-22 18:17:08.000000000) ---
+Patch Set 71:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-22 18:22:46.000000000) ---
+Patch Set 71:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-22 18:23:48.000000000) ---
+Patch Set 71:
+
+(2 comments)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68490/results.html
+
+--- Message (jenkins, 2026-08-22 18:52:01.000000000) ---
+Patch Set 71: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129985/ : FAILURE
+
+--- Message (wangdi, 2026-08-22 20:58:01.000000000) ---
+Uploaded patch set 72: Patch Set 71 was rebased.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre RISC-V Builder, 2026-08-22 20:58:06.000000000) ---
+Patch Set 71:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-22 21:05:18.000000000) ---
+Patch Set 72:
+
+(2 comments)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68504/results.html
+
+--- Message (wc-checkpatch, 2026-08-22 21:13:47.000000000) ---
+Patch Set 72:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-22 21:37:18.000000000) ---
+Patch Set 72: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129999/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-22 21:55:45.000000000) ---
+Patch Set 72:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wangdi, 2026-08-22 22:06:37.000000000) ---
+Uploaded patch set 73.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-22 22:15:13.000000000) ---
+Patch Set 73:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 22:15:58.000000000) ---
+Patch Set 73:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-22 22:32:30.000000000) ---
+Patch Set 73: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130006/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 01:10:41.000000000) ---
+Patch Set 73:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 11:22:47.000000000) ---
+Patch Set 73:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good, one comment inline. The nodemap-lifecycle behavior this adds is user-visible and has no test coverage: `lctl nodemap_del` now refuses a GSSIAM-managed nodemap with -EPERM, and the per-identity dynamic nodemaps are created and torn down implicitly by connect/disconnect. Would a sanity-sec case covering the create/attach/auto-delete cycle and the new -EPERM on `nodemap_del` be worth adding here, or is the whole feature meant to be tested only once the follow-on target-verification patch lands?
+
+--- Message (wangdi, 2026-08-23 22:50:53.000000000) ---
+Uploaded patch set 74: Patch Set 73 was rebased. Commit message was updated.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-08-23 22:51:41.000000000) ---
+Patch Set 74:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-08-23 22:57:47.000000000) ---
+Patch Set 74:
+
+(9 comments)
+
+9 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-23 23:00:37.000000000) ---
+Patch Set 74:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-23 23:47:13.000000000) ---
+Patch Set 74: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130060/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-24 00:22:19.000000000) ---
+Patch Set 74:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Sebastien Buisson, 2026-08-24 09:48:04.000000000) ---
+Patch Set 74: Code-Review+1

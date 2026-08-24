@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-05-16 02:27:33.000000000
-Updated:    2026-08-14 07:12:28.000000000
-Patch Set:  12
-Insertions: +1716
-Deletions:  -79
-Comments:   369 (1 unresolved)
+Updated:    2026-08-22 23:53:03.000000000
+Patch Set:  14
+Insertions: +1849
+Deletions:  -83
+Comments:   404 (5 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: -1
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -35,62 +35,40 @@ Add three EC modes to 'lfs mirror extend':
                          (K defaults to 1)
 
 --ec D+P                 attach a parity mirror to the file's lone
-                         data mirror, for the non-FLR case where the
-                         user just wants EC protection on a plain
-                         file; a file with 2+ mirrors errors out
-                         asking for --mirror-id or -N
+                         data mirror; a file with 2+ mirrors errors
+                         out asking for --mirror-id or -N
 
 As a regular extend never leaves a new mirror stale, the new mirrors
 are in sync when the command returns: data mirrors are populated by a
 copy before the layout merge, parity mirrors are computed in place
-with the machinery 'lfs mirror resync' uses. A partial extend resyncs
-the parity mirrors it did attach before reporting the error, and one
-that was merged but could not be marked stale is reported with the
-command that removes it, since resync finds mirrors by LCME_FL_STALE
-and so cannot repair that one.
+with the machinery 'lfs mirror resync' uses.
 
-A parity mirror is attached by merging a layout that holds only the
-new parity components, while the data mirror they protect stays where
-it is. The new llapi_layout_comp_add_parity_only() builds that layout;
-llapi_layout_comp_add_ec() cannot, as it derives the parity extent,
-stripe size and pool by searching for the data component in the same
-buffer, and pairs the two with a transient link id that is resolved
-during creation. Client-side layout sanity likewise had to stop
-requiring a data component for every parity component.
+A parity mirror is attached by merging a layout of parity components
+only, leaving the data mirror they protect in place. The new
+llapi_layout_comp_add_parity_only() builds that layout, and
+client-side layout sanity no longer requires a data component for
+every parity component.
 
-Splitting the pair across two files needs two changes in lod.
-lod_qos_prep_create() sizes a parity component from the data component
-it protects and rejects one that has none; the data component of an
-extend is not in the volatile file being created, so the client sends
-its stripe count as the parity component's own and lod derives the
-raidset count from that. lod_declare_layout_merge() copies the
-incoming entries verbatim, so only the parity -> data half of the link
-would be stored; it now also stamps the matching data component with
-the mirror id assigned to the parity component, without which 'lfs
-mirror split' cannot see the pair from the data side and leaves the
-parity mirror behind.
+Two lod changes support that split pair. lod_qos_prep_create() takes
+the parity stripe count from the client, as the data component it
+would size from is not in the volatile file being created.
+lod_declare_layout_merge() stamps the data component with the parity
+mirror id, without which 'lfs mirror split' cannot see the pair, and
+refuses a dangling or already-used link.
 
-Attaching a second parity mirror of a different geometry to one data
-mirror, which would let a file's EC protection change without
-rewriting its data, is not implemented. It is rejected for now, and no
-test asserts that rejection.
+A stale data mirror is refused, as parity computed from superseded
+data is never re-staled by a later resync. A 'nosync' data mirror is
+refused for now, as is a second parity mirror of a different geometry
+on one data mirror; neither refusal is asserted by a test.
 
-An MDS that predates this change refuses a parity-only create buffer
-outright, so the new sanity-ec subtests are gated on the server
-version and an interop run skips them instead of failing.
+A rider in lod_qos_prep_create() rejects an EC data stripe count of
+zero: lod_verify_striping() bounds only k + m, so a k == 0 layout
+reaches ec_split_stripes() and divides by zero in the kernel.
 
-Components EC cannot be sized for are named rather than left to a bare
-errno: a Data-on-MDT component has no OST stripes to spread a raidset
-over, and a self-extending component's extent does not stay matched to
-its parity component, both as 'lfs setstripe --ec' refuses them. --ec
-is refused with -f as the man page says it is, and a second --ec on
-one command line no longer reports success after printing a usage
-error.
+An older MDS refuses a parity-only create buffer, so the new sanity-ec
+subtests are gated on the server version and skip on an interop run.
 
-struct collect_ids_data moves ahead of the new EC-extend helpers,
-which reuse it and collect_mirror_id() to gather a file's distinct
-mirror ids.
-
+Fixes: 8c5f5d3ec9b1 ("LU-12668 lod: bind ec mirror to data mirror during creation")
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Assisted-by: ClaudeCode:Fable-5 llm_code_and_review_tools
@@ -536,3 +514,143 @@ https://build.whamcloud.com/job/lustre-reviews/129304/ : FAILURE
 Patch Set 12:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Maximilian Dilger, 2026-08-14 16:45:39.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-14 18:19:05.000000000) ---
+Patch Set 12:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129388/ : FAILURE
+
+--- Message (Maximilian Dilger, 2026-08-14 21:47:24.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-15 01:29:35.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129429/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 13:36:15.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new public entry point llapi_layout_comp_add_parity_only() has no coverage in lustre/tests/llapi_layout_test.c, while its sibling llapi_layout_comp_add_ec() is exercised there quite thoroughly (bad k/p, k+p over the limit, extents that do not match, NULL layout). Should this patch add the equivalent cases for the new call, so the argument validation is tested without needing a live filesystem?
+
+--- Message (Maximilian Dilger, 2026-08-17 20:20:50.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Maximilian Dilger, 2026-08-17 20:21:34.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-17 20:24:04.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-17 20:29:37.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-17 20:39:10.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-17 21:00:41.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129596/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-18 10:20:11.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the new link fix-up in lod_declare_layout_merge() validates only half of the invariant it exists for: a link that resolves to nothing is refused, but a link that resolves to a data component which is already bound to another parity mirror is accepted and silently re-stamped. Since the commit message says a second parity mirror on one data mirror is rejected for now, and no test asserts that rejection, a sanity-ec case for it would be useful once the server-side check is in place.
+
+--- Message (Andreas Dilger, 2026-08-20 01:17:23.000000000) ---
+Patch Set 13:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-08-20 19:42:07.000000000) ---
+Patch Set 13:
+
+(6 comments)
+
+--- Message (Maximilian Dilger, 2026-08-21 20:36:37.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Maximilian Dilger, 2026-08-21 20:36:48.000000000) ---
+Patch Set 14:
+
+(7 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-21 20:41:03.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-21 20:46:48.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-21 21:08:50.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129958/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-21 21:17:56.000000000) ---
+Patch Set 14:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-08-22 06:06:45.000000000) ---
+Patch Set 14: Code-Review+1
+
+--- Message (Autotest, 2026-08-22 17:48:53.000000000) ---
+Patch Set 14:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 129958 patch 14. Requested by Max Dilger because of LU-17077.
+
+--- Message (Autotest, 2026-08-22 17:49:13.000000000) ---
+Patch Set 14:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-7 session on el9.7-x86_64/zfs servers and clients for build 129958 patch 14. Requested by Max Dilger because of LU-20620.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-22 20:54:22.000000000) ---
+Patch Set 14:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the new k == 0 rider in lod_qos_prep_create() leaves the mirror-image m == 0 case open, and that one ends on an LASSERT rather than a divide. The commit message notes the 'nosync' and already-EC-protected refusals are not asserted by a test - sanity-ec test_8d already collects the rejection cases, so could they be added there?

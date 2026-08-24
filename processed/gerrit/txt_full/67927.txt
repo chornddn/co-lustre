@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-08-11 19:57:16.000000000
-Updated:    2026-08-12 23:42:01.000000000
-Patch Set:  2
-Insertions: +20
-Deletions:  -10
-Comments:   7 (3 unresolved)
+Updated:    2026-08-22 00:11:50.000000000
+Patch Set:  4
+Insertions: +25
+Deletions:  -8
+Comments:   16 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -19,42 +19,53 @@ Comments:   7 (3 unresolved)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: James Simmons, Timothy Day
+  REVIEWER: James Simmons, Serguei Smirnov, Cyril Bordage, Timothy Day
 
 --- Commit Message ---
 LU-20580 o2iblnd: don't sleep in atomic in kiblnd_startup()
 
-kiblnd_startup() queried the net device from inside the
-write_lock_irqsave(&kiblnd_data.kib_global_lock) section.
-lnet_get_link_status() takes rtnl_lock(), which is a mutex and
-can sleep, so the query ran with preemption disabled and
-interrupts off.
+kiblnd_startup() queried the net device inside the
+kib_global_lock write section. lnet_get_link_status() takes
+rtnl_lock(), which is a mutex and can sleep. The query therefore
+ran with preemption disabled and interrupts off.
 
-While rtnl_mutex is free the mutex fast path does not schedule
-and nothing is reported. When another task holds rtnl_mutex,
+On a kernel without CONFIG_DEBUG_ATOMIC_SLEEP, the uncontended
+mutex fast path does not schedule and reports nothing. With that
+option set, might_sleep() reports every call. When another task
+holds rtnl_mutex,
 __mutex_lock_slowpath() calls schedule_preempt_disabled() and
-the kernel reports "BUG: scheduling while atomic". This is
-reached at boot, when the network subsystem holds rtnl_mutex
-while LNet is configured, and the node does not boot.
+the kernel reports "BUG: scheduling while atomic". The system
+reaches this path at boot, when the network subsystem holds
+rtnl_mutex while LNet starts. The node then does not boot.
 
 schedule_debug() then calls preempt_count_set(PREEMPT_DISABLED),
 which leaves the count unbalanced.
 
-Take kib_global_lock only to link the net, then query the
-interface after the lock is dropped. The net is on ibd_nets
-before the query, so a link event that arrives during the query
-is seen by the netdev notifier, which walks that list. A second
-short lock section applies the result, because
-kiblnd_set_ni_fatal_on() also walks ibd_nets.
+Drop kib_global_lock before the query, and hold rtnl_lock()
+across the query and the update instead. The net is on ibd_nets
+before the query. The netdev notifier walks that list, and also
+runs under rtnl_lock(). The notifier therefore cannot make the
+query result stale before the update applies it.
+kiblnd_set_ni_fatal_on() walks ibd_nets, so it still takes
+kib_global_lock. The lock order is rtnl_lock() first.
 
-The query result is now used only when the device is found. The
-old code called dev_put() even when dev_get_by_name() returned
-NULL, which faults on kernels where dev_put() has no NULL check.
+The query now calls __dev_get_by_name() and
+lnet_get_link_status_locked(). These functions expect the caller
+to hold rtnl_lock(). __dev_get_by_name() takes no reference, so
+the code no longer calls dev_put(). The old
+code called dev_put() even when the lookup returned NULL. Before
+v5.17, dev_put() has no NULL check and faults.
 
-The query was already inside the lock before the Fixes commit,
-but did not sleep until that commit added rtnl_lock() to
-lnet_get_link_status(). The RCU read section that once wrapped
-the query was removed later, which left the sleep in place.
+kiblnd_dev_failover() clears the fatal flag from the same query.
+There, rtnl_lock() covered only lnet_get_link_status(), so the
+lock did not span the update. The flag also changed without
+kib_global_lock. That branch takes the same two locks now, in
+the same order.
+
+Before the Fixes commit, the query was already inside the lock.
+That commit added rtnl_lock() to lnet_get_link_status(), which
+made the query sleep. A later commit removed the RCU read
+section that once wrapped the query. The sleep stayed in place.
 
 Fixes: aebedbe75007 ("LU-19707 lnet: fix RTNL assert in LNet on v6.15")
 Test-Parameters: trivial
@@ -218,3 +229,189 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. Moving the query out of the write_lock_irqsave() section is the right fix for the sleep-in-atomic, but applying the sampled result in a second lock section can now clobber a state update that landed in the gap.
+
+--- Message (Chris Horn, 2026-08-14 17:40:59.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-14 17:41:06.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 17:44:16.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-14 17:45:15.000000000) ---
+Patch Set 3:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/67945/results.html
+
+ This was detected as a build-only change, no further testing would be performed by this bot.
+
+--- Message (wc-checkpatch, 2026-08-14 17:47:04.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-14 20:16:38.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129396/ : FAILURE
+
+--- Message (Chris Horn, 2026-08-14 20:17:29.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 20:33:05.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-14 22:18:49.000000000) ---
+Patch Set 3:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129414/ : FAILURE
+
+--- Message (Chris Horn, 2026-08-14 22:22:15.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (jenkins, 2026-08-15 02:07:56.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129433/ : SUCCESS
+
+--- Message (Maloo, 2026-08-15 02:09:42.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 129433 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129433&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129433#redirect
+
+--- Message (Maloo, 2026-08-15 09:48:35.000000000) ---
+Patch Set 3: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm19: https://testing.whamcloud.com/test_sessions/d4e0f580-2719-47a0-98e0-11f520085d99 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 09:59:16.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comment.
+
+--- Message (Chris Horn, 2026-08-15 17:17:12.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-15 17:20:36.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Chris Horn, 2026-08-15 17:20:49.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-08-15 17:24:11.000000000) ---
+Patch Set 4:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68017/results.html
+
+ This was detected as a build-only change, no further testing would be performed by this bot.
+
+--- Message (wc-checkpatch, 2026-08-15 17:29:36.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-15 17:45:06.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129464/ : SUCCESS
+
+--- Message (Maloo, 2026-08-15 17:46:20.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 129464 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=129464&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=129464#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-08-15 17:56:47.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-15 23:18:19.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-180vm17: https://testing.whamcloud.com/test_sessions/1ee43587-141d-4e66-9b98-947e5f6b1f51 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 23:32:08.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, one comment inline. The restructured locking looks right, but the two new call sites take only rtnl_lock() where the lnet_get_link_status() wrapper takes rtnl_lock() plus netdev_lock_ops().
+
+--- Message (James Simmons, 2026-08-22 00:11:07.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (James Simmons, 2026-08-22 00:11:50.000000000) ---
+Patch Set 4: -Code-Review

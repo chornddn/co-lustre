@@ -5,10 +5,11 @@ Type:       Bug
 Priority:   Medium
 Status:     Open
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Xiyang Wang
 Reporter:   Maloo
 Created:    Sun, 9 Aug 2026 08:06:02 +0000
-Updated:    Sun, 9 Aug 2026 08:06:02 +0000
+Updated:    Mon, 17 Aug 2026 07:31:03 +0000
+Links:      Related: is related to LU-20325; Related: is related to LU-20599
 
 --- Description ---
 This issue was created by maloo for wangxiyang 
@@ -22,3 +23,28 @@ clients: https://build.whamcloud.com/job/lustre-b_es-reviews/29602 - 5.14.0-503.
 servers: https://build.whamcloud.com/job/lustre-b_es-reviews/29602 - 6.12.0-124.56.1.el10_1_lustre.ddn1.x86_64
 
 >
+
+--- Comment (JIRAUSER22000, Mon, 17 Aug 2026 07:17:16 +0000) ---
+LU-20571 and LU-20325 share the same root cause: a deadlock on the shrinker_rwsem lock, because the upstream fix has not been backported to the RHEL 8 (4.18) and RHEL 9 (5.14) kernels.
+
+The upstream fix is Qi Zheng's patch series converting shrinker_rwsem to shrinker_mutex (main commit 8a0e8bb112af, "mm: shrinker: convert shrinker_rwsem to mutex", first landed in kernel 6.7).
+
+Neither RHEL 8 nor RHEL 9 has backported it. This is confirmed in the centos-stream-8 source (shrinker_rwsem is still there, no shrinker_mutex at all) and on the running kernel (kallsyms on 5.14.0-687 still shows the shrinker_rwsem symbol).
+
+The difference is in how the deadlock is triggered:
+
+LU-20325 (sanity-compr test_2030 timeout) hits it via unregister_shrinker, i.e. the shrinker teardown path, for
+
+example during filesystem unmount or module teardown.
+
+LU-20571 (sanity-compr timeout) hits it via alloc_shrinker, i.e. the shrinker registration path, while the test is generating memory pressure.
+
+LU-20325 can be worked around with drop_caches or umount -l style tricks that reduce shrinker activity (mitigation patch 67884 on b_es7_0), which lets the test finish.
+
+LU-20571 cannot be worked around this way, because generating memory pressure is exactly the purpose of the test. sanity-compr exercises compression, which deliberately drives memory pressure and shrinker allocation. Any mitigation of that kind would defeat the purpose of the test, so there is no practical test-side workaround.
+
+The only proper fix is to backport the upstream kernel change (Qi Zheng's shrinker_rwsem to shrinker_mutex conversion, commit 8a0e8bb112af and the related series) to the RHEL 8 / RHEL 9 kernels used on the test farm clients.
+
+Besides, maloo shows that RHEL 10 (6.12) clients are not affected, since they have the native mutex (the change landed in 6.7). 
+
+Also the x86_64 clients are not affected, the bug only happens on aarch64 clients.

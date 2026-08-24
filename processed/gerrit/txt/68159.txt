@@ -1,0 +1,321 @@
+Change:     68159
+Subject:    LU-20611 llapi: run find over a device scan
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68159
+Change-Id:  Ibf2dcf71e5444914f306ad37a551262cddd8e1de
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-08-19 19:55:28.000000000
+Updated:    2026-08-24 02:45:13.000000000
+Patch Set:  6
+Insertions: +657
+Deletions:  -57
+Comments:   32 (8 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20611 llapi: run find over a device scan
+
+Add llapi_find_device(), which puts llapi_scan_device()'s records
+through the same checks llapi_find() applies to a namespace walk.
+The checks are not reimplemented: the record is presented as the
+lov_user_mds_data every find_check_* helper already reads, and
+find_decide() does the rest.
+
+Three things the presentation has to get right.  A field the scan
+could not answer for is left out of stx_mask, exactly as llite leaves
+it out when the MDT's answer is not authoritative, so the checks that
+consult the mask behave the same either way.  The layout arrives as
+it is on disk and is byte-swapped in place, lov_mds_md and
+lov_user_md being the same bytes.  The directory stripe does not: on
+disk it is an lmv_mds_md_v1 and the checks read an lmv_user_md, which
+the kernel converts for the ioctl and nothing converts for a scan, so
+this does, for the three fields the predicates read.
+
+Both buffers live for the whole scan, so an object without a layout
+or a stripe has to say so rather than inherit the last one's: every
+object after a 60-stripe file matched --stripe-count 60, a directory
+with no layout at all included.
+
+There is no OST to refer a question to, so the MDT's own record
+decides a time outright rather than deferring, and -links reads the
+directory stripe, which is where a striped directory's link count
+comes from.
+
+A scan cannot glimpse, so --size and --blocks are size-on-MDT's
+answer or none: fp_lazy is set for the scan, since refusing
+trusted.som unless --lazy was typed would leave --size matching
+nothing on every striped file.  An object whose size nothing can
+settle is counted as undecided and reported at the end, not silently
+dropped.  --ost, --mdt, --xattr and -printf need the mounted
+filesystem or a path and are refused before the scan starts, because
+afterwards "no matches" and "could not answer" look alike.
+
+Documented in llapi_find_device.3.
+
+scan_linkea() is rebuilt around an indexed scan_linkea_entry(), so
+that
+find_device_prefilter() can run --name against every name in the link
+xattr rather than only the first.  That is a decision and not a
+refactor: a walk meets a hardlinked file once per link and a scan
+meets
+it once, so matching one name would answer differently depending on
+which link the search was looking for.
+
+A layout read off the target is checked against the buffer it arrived
+in before anything walks it.  These bytes come from a device that may
+be in service, so an object can be caught mid-update; the consumers
+below index by lcm_entry_count and lcme_offset, and a torn composite
+EA
+claiming a large entry count would be read well past the buffer.  An
+EA
+that does not describe itself is treated as no layout at all.
+
+fp_get_lmv is set from what the search needs rather than from what the
+object turned out to have, which is what the walk does.  Taking it
+from
+find_rec_to_lmv() skipped find_decide()'s stripe block entirely for an
+unstriped directory, so --foreign, --mdt-count and --hash-type never
+compared anything and the directory printed as a match.
+
+--maxdepth, --mindepth and --threads join the refused list.  Depth
+describes a walk and the thread count is the scanner's own, so they
+were being accepted and ignored, which is the quiet mismatch the rest
+of that check exists to prevent.
+
+A project id the target cannot answer for is undecided rather than an
+error: an inode whose i_extra_isize does not reach i_projid has none
+to
+give, and failing the object there ended the whole scan after matches
+had already been printed.  ss_skipped is reported at the end for the
+same reason the undecided count is.
+
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Ibf2dcf71e5444914f306ad37a551262cddd8e1de
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-08-19 19:55:28.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-19 20:02:45.000000000) ---
+Patch Set 1:
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/68256/results.html
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 20:09:11.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 20:10:29.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-19 20:14:11.000000000) ---
+Uploaded patch set 2: Patch Set 1 was rebased.
+
+--- Message (jenkins, 2026-08-19 20:14:13.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 20:24:09.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 20:26:00.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 21:32:48.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129765/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 22:42:33.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-20 13:07:15.000000000) ---
+Patch Set 2:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. The two buffer resets and forcing fp_lazy look correct, and the stale-stripe-count bug they fix is real.
+
+That bug was introduced by the immediately preceding, unlanded patch in this series, 55c88e1300 ("LU-20611 lfs: share find's predicate parsing"), which is where llapi_find_device() and all its helpers actually arrive. Folding the two resets, the flags argument and the lustreapi.h declaration back into that patch would keep each step self-contained; as things stand the series has one commit where lfs find over a scan matches the wrong objects for --stripe-count and a second that repairs it.
+
+Nothing exercises llapi_find_device(). lustre/tests/llapi_scan_device_test.c already exists for the scanner side, and a case that scans a target holding a striped file followed by an unstriped one and a plain directory would have caught this bug directly.
+
+--- Message (Hiroshi Nishida, 2026-08-20 13:58:41.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-20 14:10:28.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 14:14:11.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 15:50:05.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-20 15:56:38.000000000) ---
+Uploaded patch set 4.
+
+--- Message (wc-checkpatch, 2026-08-20 16:00:10.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-20 16:08:52.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 16:11:39.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-20 17:29:21.000000000) ---
+Uploaded patch set 5: Patch Set 4 was rebased.
+
+--- Message (wc-checkpatch, 2026-08-20 17:33:41.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-20 17:44:13.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 19:24:00.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-20 20:33:23.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129831/ : SUCCESS
+
+--- Message (jenkins, 2026-08-20 21:37:58.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129842/ : FAILURE
+
+--- Message (jenkins, 2026-08-20 22:43:46.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/129853/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-20 22:52:44.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-08-21 13:03:45.000000000) ---
+Patch Set 5:
+
+BUILD
+
+--- Message (jenkins, 2026-08-21 14:19:34.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129929/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-22 14:57:40.000000000) ---
+Patch Set 5:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The directory-stripe predicates look like they change answer between a walk and a scan, and the on-disk layout reaches the find_check_* helpers unvalidated. Also: llapi_find_device() has no in-tree caller and no test - should this come with a sanity/sanity-scan case that runs a few predicates over a formatted MDT image and compares against the same search on a mount?
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:18:48.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-23 13:33:40.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:35:49.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-08-23 13:35:50.000000000) ---
+Patch Set 5:
+
+(6 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-23 13:36:11.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-23 14:22:46.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130048/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 15:47:34.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-24 02:45:13.000000000) ---
+Patch Set 6:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, comments inline. One functional concern: --btime still ends the whole scan the way --projid used to. Also, llapi_scan_device() landed with lustre/tests/llapi_scan_device_test.c in this same series; should llapi_find_device() get an equivalent (a target with a known object, one predicate that matches and one that does not, plus the refused-predicate returns)?

@@ -1,5 +1,5 @@
 Change:     67346
-Subject:    LU-12571 llite: drain pinned dcache before cl_sb_fini at umount
+Subject:    LU-12571 llite: drain straggling cl_objects before cl_sb_fini
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67346
 Change-Id:  Ib2360e9a9427af31115902d57bd4b6fb91916eb9
 Project:    fs/lustre-release
@@ -7,15 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-18 15:25:24.000000000
-Updated:    2026-08-13 13:19:09.000000000
-Patch Set:  4
-Insertions: +14
-Deletions:  -0
-Comments:   47 (11 unresolved)
-Hashtags:   master-next
+Updated:    2026-08-23 12:29:55.000000000
+Patch Set:  5
+Insertions: +60
+Deletions:  -1
+Comments:   50 (13 unresolved)
 
 --- Labels ---
-  Code-Review: Sebastien Buisson: +1; Andreas Dilger: +1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -23,39 +22,99 @@ Hashtags:   master-next
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Sebastien Buisson
 
 --- Commit Message ---
-LU-12571 llite: drain pinned dcache before cl_sb_fini at umount
+LU-12571 llite: drain straggling cl_objects before cl_sb_fini
 
-On a subdir (fileset) mount, a lookup of /.fscrypt is redirected to the
-.fscrypt directory at the real filesystem root (LU-15176).  This
-instantiates a cross-tree dcache subtree under the mount root whose
-regular-file inodes (the fscrypt protector/policy metadata) carry
-cl_objects.  At umount such a subtree can still be pinned by a transient
-asynchronous reference at the moment the VFS runs
-shrink_dcache_for_umount()/evict_inodes() (before ->put_super), so it is
-not reclaimed.  Its inodes then survive into client_common_put_super()
-and their live cl_objects trip:
+The VFS runs shrink_dcache_for_umount() and evict_inodes() before
+->put_super, but either can leave an inode behind: a dentry that is still
+referenced at that moment is not reclaimed, and evict_inodes() skips any
+inode whose i_count is non-zero.  Such inodes reach
+client_common_put_super() with their cl_objects alive, and lu_stack_fini()
+cannot purge a referenced object, so cl_sb_fini() trips:
 
   lu_device_fini() ASSERTION( atomic_read(&d->ld_ref) == 0 ) Refcount
     lovsub_device_free() -> cl_sb_fini() -> ll_put_super()
 
-The straggling reference is released asynchronously moments later, but by
-then the teardown has already reached cl_sb_fini().  The window is narrow,
-so the failure is intermittent; it is seen most often as sanity-sec
-test_54 crashing the fscrypt client on umount.
+The straggling reference is released moments later, but by then the
+teardown has already reached cl_sb_fini(), so the failure is
+intermittent.  It is seen most often on a subdir (fileset) mount, where a
+lookup of /.fscrypt is redirected to the .fscrypt directory at the real
+filesystem root (LU-15176): that instantiates a cross-tree dcache subtree
+under the mount root whose regular-file inodes carry cl_objects, and it
+crashes the fscrypt client in sanity-sec test_54.
 
-Before tearing down the cl object stack in client_common_put_super(),
-give any straggling references a bounded window to drain, reclaiming the
-now-unused dentries with shrink_dcache_sb() -- which evicts their inodes,
-SB_ACTIVE being clear -- so the cl_objects are destroyed first.  The loop
-is a no-op on a clean umount, where s_inodes is already empty.
+Before tearing down the cl object stack, reclaim what has since become
+unused with shrink_dcache_sb() -- which evicts the inodes too, SB_ACTIVE
+being clear -- purge the site, and give the remaining references a window
+to drain.
 
-A deterministic reproducer and a sanity-sec test_54b regression test are
-provided as a separate change.
+The wait is on ls_obj_alive, so it ends only once no object is left on the
+site and therefore every lu_device_put() one owes has been made -- which is
+what lu_device_fini() asserts on.  Two counts that are nearer to hand both
+reach their final value too early:
 
-Test-Parameters: trivial testlist=sanity-sec
-Fixes: c12378fba7f0 ("LU-15176 sec: present .fscrypt in subdir mount")
+ - sb->s_inodes.  evict() calls inode_sb_list_del() at its top, before
+   ->evict_inode(), so a thread that drops the last reference to an inode
+   empties s_inodes while it is still inside ll_delete_inode(), which has
+   yet to reach cl_inode_fini() and can spend a long time before it does
+   -- cl_sync_file_range() issues OST RPCs there.  That thread need not be
+   the umounting one: ll_lock_cancel_bits() takes the inode with igrab()
+   via ll_inode_from_resource_lock() and iput()s it from the ldlm callback
+   thread.
+
+ - the site object hash.  A dying cl object is unhashed by
+   lu_object_put() while the bucket lock is held, and only then, outside
+   it, does lu_object_free() run each layer's lu_object_fini() to release
+   the device reference.
+
+The loop keeps its lu_site_purge() call for a different reason: a cl
+object whose last reference goes away while it is not dying is parked on
+the site LRU and stays hashed, still holding its device references, so it
+has to be purged rather than waited for.
+
+ls_obj_alive is per-site, and the client cl stack has two sites:
+sbi->ll_site carries the vvp and lov slices, while the lovsub and osc ones
+-- including those of the lovsub device that asserts in the trace above --
+live on the LOV device's own site.  Polling sbi->ll_site covers them
+because lov_object_delete() runs lov_subobject_kill() for every stripe
+before any layer of the lov object is freed, and that waits for the
+sub-object to be destroyed.  Its wait is on lovsub_object_free() clearing
+r0->lo_sub[], which until now it did before lu_object_fini() gave the
+lovsub device reference back, so the wait could end while the sub-object
+still held one; do the fini first so the slot really is the "done" signal.
+
+Measured against the reproducers in "LU-12571 llite: deterministic
+reproducers for the umount LBUG" (change 67547, which this one does not
+depend on), which pin inodes from a foreign thread and stall that thread
+in both windows: with no drain the umount asserts "Refcount is 5", with an
+s_inodes-based drain it asserts "Refcount is 1", and with ls_obj_alive it
+completes.  On a clean umount the count is already zero and the loop exits
+on its first test.
+
+Because the final reference is usually dropped by an eviction that flushes
+the inode's dirty pages first, the wait is bounded by obd_timeout rather
+than by a fixed value, so it tracks the RPCs actually being waited on -- a
+forced umount is not waiting on RPCs that are still coming, so it gets the
+5s floor instead.  The budget is wall-clock rather than a poll count,
+because a poll costs a dcache shrink and a site purge on top of its sleep.
+It stays bounded either way: a genuinely leaked reference gets a console
+warning naming the count and the time spent, and then the same LBUG as
+before.
+
+This is not a re-instatement of the obd_zombie_barrier() that LU-2543
+added here in 2013 and LU-6173 removed in 2015.  That barrier ran after
+cl_sb_fini(), waited for the OSC devices themselves rather than for
+cl_objects, and existed only to keep sbi->ll_cache alive; LU-6173 made
+that cache refcounted, which retired it properly.  Reverting it would not
+help here -- it fires long after the assertion.
+
+No Fixes: tag: the assertion is not the product of one commit.  LU-12571
+was filed in 2019 against sanity-dom test_150, with neither fscrypt nor a
+subdir mount involved, two and a half years before commit c12378fba7f0
+("LU-15176 sec: present .fscrypt in subdir mount") made one instance of it
+much easier to hit.
+
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: Ib2360e9a9427af31115902d57bd4b6fb91916eb9
 
 --- Review History ---
@@ -518,3 +577,242 @@ Patch Set 4:
 
 --- Message (Marc Vef, 2026-08-13 13:19:09.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Marc Vef, 2026-08-20 09:42:52.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-08-20 09:42:52.000000000) ---
+Patch Set 4:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-08-20 09:42:53.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-08-22 23:05:20.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-22 23:10:56.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-22 23:11:41.000000000) ---
+Patch Set 5:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68521/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (wc-checkpatch, 2026-08-22 23:17:00.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-22 23:46:09.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130011/ : SUCCESS
+
+--- Message (Maloo, 2026-08-22 23:47:40.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 130011 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130011&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130011#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-08-23 00:09:23.000000000) ---
+Patch Set 5:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68521/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-08-23 00:44:10.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-23 10:54:31.000000000) ---
+Patch Set 5:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(9071s)
+- 155(ls1 != ls2) 
+> replay-dual@ldiskfs+DNE Timeout(347s)
+> sanity3@ldiskfs+DNE Timeout(10595s)
+> sanity-pcc@ldiskfs+DNE Failure(3927s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3520s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68521/results.html
+
+--- Message (Maloo, 2026-08-23 12:10:35.000000000) ---
+Patch Set 5: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm84: https://testing.whamcloud.com/test_sessions/87c26044-a3b1-4ae2-a379-a1e75fce30f9 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-23 12:29:55.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline.

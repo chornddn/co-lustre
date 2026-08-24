@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-01 22:02:45.000000000
-Updated:    2026-08-13 13:20:31.000000000
-Patch Set:  11
-Insertions: +288
-Deletions:  -30
-Comments:   74 (7 unresolved)
+Updated:    2026-08-17 07:27:06.000000000
+Patch Set:  13
+Insertions: +366
+Deletions:  -40
+Comments:   94 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Cyril Bordage: +1; Manish Regmi: +1; Xinxia Qu: +1; Mikhail Pershin: +1
-  Verified: jenkins: +1; Oleg Drokin: -1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -25,38 +25,52 @@ Comments:   74 (7 unresolved)
 LU-20403 ptlrpc: refresh import conn on primary migration
 
 ptlrpc caches a connection keyed on the peer's primary NID and then
-freezes it: ptlrpc_connection_get() resolves the primary once,
-reconnect reuses the connection, and it is never re-resolved. The
-client import reply ME (ptl_send_rpc) is keyed on that frozen NID.
-When LNet's primary for the peer later migrates, which can happen for
-any unlocked peer, the reply is stamped with the new primary and no
-longer matches. It then takes the costly lnet_try_match_md() same-peer
-fallback or is dropped, which leaves the import stuck in CONNECTING.
+freezes it. The function ptlrpc_connection_get() resolves the primary
+once. A reconnect reuses that connection, and nothing re-resolves it.
+The client import reply ME (ptl_send_rpc) keys on that frozen NID.
+LNet's primary for the peer can later migrate, which happens for any
+unlocked peer. The reply then carries the new primary and no longer
+matches. It takes the costly lnet_try_match_md() same-peer fallback,
+or LNet drops it, and the import stays stuck in CONNECTING.
 
-Add LNetPeerPrimaryNID(), a non-blocking primary lookup that neither
-discovers nor allocates, and detect a migration on every send.
+Add LNetPrimaryNIDNoWait(), a non-blocking primary lookup that
+neither discovers nor allocates, and detect a migration on every
+send. It wraps lnet_peer_primary_nid_locked(), the helper that
+lnet_parse() uses to stamp msg_initiator, so detection and stamping
+stay in step. It returns -ENOENT when no peer owns the NID. A NID
+that is already primary and a NID that no peer owns both come back
+unchanged. A caller that must not act on an unverified NID therefore
+needs the return code.
 
-ptl_send_rpc() calls ptlrpc_refresh_import_primary() before posting
+ptl_send_rpc() calls ptlrpc_refresh_import_primary() before it posts
 the reply ME. On a change it installs a connection keyed on the
-current primary through import_switch_connection(), the single place
-that swaps imp_connection so a forward import's DLM export connection
-always moves with it, and re-keys the current imp_conn_list entry so a
-later reconnect cannot restore the stale connection. The replacement
-is resolved with ptlrpc_connection_get_primary(), a variant that skips
-the internal blocking primary lookup, so the send never blocks on
-discovery.
+current primary. It uses import_switch_connection(), which moves a
+forward import's DLM export connection with it. It also re-keys the
+current imp_conn_list entry, so a later reconnect cannot restore the
+stale connection. The function ptlrpc_connection_get_primary()
+resolves the replacement. This variant skips the internal blocking
+primary lookup, so the send never blocks on discovery.
+
+A lock callback sends on a reverse import. The refresh therefore
+makes ptl_send_rpc() a second writer of imp_connection for that
+import. The function rev_import_reconnect() swaps the same field.
+It now takes imp_lock around the swap. Without that lock both paths
+can put the same connection reference and make c_refcount underflow.
 
 The lookup takes a per-CPT lnet_net_lock and does one peer-table
-lookup, the same work lnet_select_pathway() already performs for the
-send that immediately follows. ptlrpc_connection_put() does not free a
-connection at runtime (connections are cached in the hash until module
-unload), so the connection swaps are safe.
+lookup. This lookup is the same work that lnet_select_pathway()
+already does for the send that immediately follows. The function
+ptlrpc_connection_put() does not free a connection at runtime.
+Connections stay in the hash until module unload, so the connection
+swaps are safe.
 
 Add conf-sanity test_73g. It migrates the servers' primary NIDs under
-a live client and checks the client imports recover, exercising the
-client-side refresh.
+a live client. It then checks that the client imports recover. It
+also checks that the OSC connection is re-keyed on the server's
+current primary NID.
 
 Assisted-by: Claude:claude-opus-4.8
+Fixes: b38eb0b6c483 ("LU-7734 lnet: set primary NID in ptlrpc_connection_get()")
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Change-Id: Iafad7c6674e9aa93b64016d46434d9273026ad9a
 
@@ -645,3 +659,99 @@ Patch Set 11:
 
 --- Message (Marc Vef, 2026-08-13 13:20:31.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Chris Horn, 2026-08-14 15:10:42.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-14 15:11:08.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-08-14 15:11:43.000000000) ---
+Patch Set 12:
+
+(6 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-14 15:18:16.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-14 15:39:23.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-14 16:07:20.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129372/ : SUCCESS
+
+--- Message (Chris Horn, 2026-08-14 19:28:43.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-08-15 08:22:24.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The core mechanism (detect the migration on the send path, swap imp_connection, the DLM export and the current failover entry together under imp_lock) traces cleanly, and the connection refcounts balance against obd_zombie_import_free().
+
+--- Message (Chris Horn, 2026-08-16 19:18:40.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-08-16 19:19:25.000000000) ---
+Patch Set 13:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-16 19:24:23.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-16 19:25:00.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-16 19:44:04.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129507/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-16 19:49:44.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-17 06:27:03.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Mostly good. The connection swap, the imp_lock coverage of the reverse-import path and the LNet helper all trace cleanly; one shell-style nit inline.

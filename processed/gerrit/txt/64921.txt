@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-26 17:29:37.000000000
-Updated:    2026-08-07 09:33:58.000000000
-Patch Set:  12
-Insertions: +4072
+Updated:    2026-08-19 18:18:35.000000000
+Patch Set:  13
+Insertions: +4102
 Deletions:  -2
-Comments:   63 (24 unresolved)
+Comments:   76 (27 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -30,25 +30,31 @@ for erasure-coded files, plus the sanity-ec tests that drive it.
 The tool arms OBD_FAIL_OST_BRW_READ_BULK on the OSS owning each target
 OST, so a read really has to reconstruct from parity rather than being
 served from cache or a healthy stripe.  Every fault is read back from
-the owning OSS before the read is issued, so a fault that failed to
-arm is reported instead of passing as a successful reconstruction.
+the owning OSS, so a fault that failed to arm is reported instead of
+passing as a successful reconstruction.
 Reads are compared against an md5 of the bytes as they were written,
 captured via tee at write time, rather than against an earlier read of
 the same file that may already be wrong.
 
-Four non-interactive modes, each returning its verdict as an exit
+Five non-interactive modes, each returning its verdict as an exit
 code:
 
 - --soak: randomized layout, geometry and size per iteration, with a
   fault injected mid-I/O.  Records MB/s and the degraded-vs-baseline
   slowdown per iteration, and gates on a kernel-health check (the
-  catastrophe flag on every OSS plus the dmesg corruption markers
-  test-framework.sh already curates).
+  catastrophe flag on every server node it knows of plus the dmesg
+  corruption markers test-framework.sh already curates).
 - --matrix: on a single-RAID-set file, faults every combination of
   1..P stripes and requires reconstruction, then P+1 and requires the
-  read to fail.  Bounded by --matrix-budget and --matrix-read-timeout:
-  combinations left unrun when the budget expires are reported as a
-  failure naming the count, never silently dropped.
+  read to fail with an error.  A P+1 read that hangs instead is scored
+  a failure, not the expected outcome -- that hang is the regression
+  this mode looks for.  Bounded by --matrix-budget and
+  --matrix-read-timeout: combinations left unrun when the budget
+  expires are reported as a failure naming the count, never silently
+  dropped.
+- --cli: one pass over the same machinery -- create the file, take
+  baseline benchmarks, then deactivate each data OST in turn and read
+  it degraded.  A hand-driven check that needs no terminal.
 - --write-verify: the write/resync/verify behaviors -- parity goes
   stale on write while data stays init, resync restores init with the
   md5 unchanged, one resync clears a stale plain mirror and stale
@@ -68,8 +74,10 @@ failure) so a run that crashes the node leaves evidence behind.
 
 Server-side actions are routed to the OSS owning each OST through an
 --ost-host map, so the tool works multi-node; sanity-ec builds that
-map from facet_host.  On a single node the hosts resolve local and no
-ssh is issued.
+map from facet_host.  --mds-host names the MDS nodes, which are never
+faulted but are still read for the latched catastrophe flag, so an
+LBUG there during a degraded read is not missed.  On a single node the
+hosts resolve local and no ssh is issued.
 
 Tests 76a (soak), 76b (matrix) and 76c (write-verify) wrap the modes.
 The geometry scales to the active OST count, so all three run on as
@@ -79,6 +87,7 @@ mask is a 16-bit field, and are gated behind SLOW since the soak and
 the matrix are long-running.  76c registers a stack_trap to put an OST
 back if the orchestrator is killed outright mid-corruption.
 
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Test-Parameters: testlist=sanity-ec ostcount=8 env=SLOW=yes
 Test-Parameters: testlist=sanity-ec ostcount=3
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
@@ -479,3 +488,47 @@ Patch Set 12:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The commit message describes four non-interactive modes, but only --soak, --matrix and --write-verify get a sanity-ec wrapper; --layout-audit (and --cli) ship with no test driving them, so a regression in the allocator audit would never be noticed. Could a 76d wrap --layout-audit? It is pure layout with no I/O, so it should be cheap enough to run ungated.
+
+--- Message (Maximilian Dilger, 2026-08-19 01:00:07.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+--- Message (Maximilian Dilger, 2026-08-19 02:58:47.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-19 03:09:31.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-19 03:10:01.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-19 03:48:18.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/129695/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-19 04:04:29.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-19 18:18:35.000000000) ---
+Patch Set 13:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The most serious is the unconditional osc.*.resend_count=0 write, which leaves a client tunable at a non-default value for the rest of the test session.
+
+Two of the five modes the commit message advertises, --cli and --layout-audit, get no sanity-ec wrapper. --layout-audit in particular is pure layout with no I/O, so it would be cheap to run ungated and would give the allocator checks real CI coverage instead of leaving them hand-driven only.
