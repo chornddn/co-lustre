@@ -1,0 +1,71 @@
+Change:     68308
+Subject:    LU-20641 ptlrpc: fix nodemap debugfs removal deadlock
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68308
+Change-Id:  I91699085351b504cca75776b34865cee188b4e8b
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sebastien Buisson
+Created:    2026-08-25 12:38:28.000000000
+Updated:    2026-08-25 12:58:22.000000000
+Patch Set:  1
+Insertions: +27
+Deletions:  -7
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: (no votes)
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-20641 ptlrpc: fix nodemap debugfs removal deadlock
+
+nodemap_del() holds active_config_lock across its call to
+lprocfs_nodemap_remove(), which ends up in
+debugfs_remove_recursive(). That helper waits until every reader
+currently executing one of the nodemap files has left.
+
+Such a reader is pinned by the debugfs full-proxy file operations
+for the whole duration of the ->show() callback, and every nodemap
+handler acquires active_config_lock: nodemap_ranges_show() and
+nodemap_ban_ranges_show() take it directly, while all the other
+handlers take it through nodemap_lookup_unlocked(), which locks and
+unlocks it internally.
+
+So a "lctl nodemap_del" racing with a reader of any file below
+/sys/kernel/debug/lustre/nodemap/<name>/ deadlocks: the reader blocks
+on the mutex the deleter holds, and the deleter blocks waiting for
+that reader to drop its file reference.
+
+What creates the cycle is acquiring the mutex inside ->show() at all,
+while the file reference is held. So fix this on the deleter side:
+detach nm_pde_data under active_config_lock, drop the mutex, and only
+then call lprocfs_nodemap_remove().
+
+Do this before the nodemap is removed from the hash, so that its name
+stays taken and a concurrent nodemap_add() for the same name still
+fails as it should. This is what the removed comment was guarding
+against.
+
+Test-Parameters: trivial testlist=sanity-sec
+Signed-off-by: Sebastien Buisson <sbuisson@ddn.com>
+Assisted-by: Claude:claude-opus-5
+Change-Id: I91699085351b504cca75776b34865cee188b4e8b
+
+--- Review History ---
+
+--- Message (Sebastien Buisson, 2026-08-25 12:38:28.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Lustre RISC-V Builder, 2026-08-25 12:51:41.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wc-checkpatch, 2026-08-25 12:58:22.000000000) ---
+Patch Set 1:
+
+Looks good to me.

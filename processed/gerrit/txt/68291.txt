@@ -1,0 +1,94 @@
+Change:     68291
+Subject:    LU-18298 utils: do not write open a file to detach it from PCC
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68291
+Change-Id:  If471625a63d6c514b0d5e56ef5cac552010795bc
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-25 01:00:21.000000000
+Updated:    2026-08-25 04:41:25.000000000
+Patch Set:  1
+Insertions: +44
+Deletions:  -7
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-18298 utils: do not write open a file to detach it from PCC
+
+lfs pcc detach opens the file O_RDWR only to issue LL_IOC_PCC_DETACH on
+the resulting descriptor. That write open takes a CW lock on
+MDS_INODELOCK_LOOKUP|OPEN, which conflicts on the LOOKUP bit with the
+client's own cached PR lock, and that lock usually also carries
+MDS_INODELOCK_LAYOUT. Cancelling it runs vvp_conf_set(), which sets
+CL_LAYOUT_GEN_NONE and detaches the PCC inode.
+
+The ioctl then finds no attached PCC inode, takes the
+"!pcci || !pcc_inode_has_layout(pcci)" path in pcc_ioctl_detach() and
+returns success with hsm_remove still false, so the HSM archive of a
+PCC-RW file is never removed. sanity-pcc test_1c, test_1d and test_13a
+then fail their following wait_request_state with "request on <fid> is
+not SUCCEED on mds1".
+
+Do not open the file at all instead. llapi_path2fid() resolves it with
+O_PATH, which does not call the file open method, and
+llapi_pcc_detach_fid() only opens the mount root and detaches by FID,
+which is what that ioctl exists for. Opening read-only would avoid the
+CW lock as well, but an O_RDONLY open is exactly what
+pcc_try_readonly_open_attach() acts on, so detaching a file that was not
+cached could attach it first, and for a file above the async threshold
+the attach then outlives the detach.
+
+The by-FID ioctl only detaches an inode that is still in the client
+cache, so keep the O_PATH descriptor open until it returns. Resolving
+the FID and then dropping the descriptor would leave a window in which
+the inode can be evicted, and the ioctl would again return success
+having detached nothing. Resolve the path first as well, since
+llapi_search_mounts() matches it against the mount table.
+
+LL_IOC_PCC_DETACH_BY_FID applies the same pcc_inode_permission() check
+as LL_IOC_PCC_DETACH, which tests the file mode against pccs_mode and
+inode_owner_or_capable() and never the mode a descriptor was opened
+with, so the permission semantics that sanity-pcc test_1g checks are
+unchanged. Neither path needs the encryption key, so the O_CIPHERTEXT
+open this replaces is no longer needed either.
+
+This does not close the window completely: any other write open of the
+file can still cancel the layout while the detach is in flight, and
+pcc_ioctl_detach() returning success without removing the archive in
+that case is a separate defect. It does remove the one trigger the
+detach inflicts on itself, which is the one these tests hit.
+
+Test-Parameters: trivial testlist=sanity-pcc
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: If471625a63d6c514b0d5e56ef5cac552010795bc
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-25 01:00:21.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-25 01:02:50.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-25 02:43:57.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130183/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-08-25 04:41:25.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
