@@ -1,5 +1,5 @@
 Change:     68030
-Subject:    LU-20597 utils: handle sparse OST indices in quota
+Subject:    LU-20597 utils: handle sparse target indices in quota
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68030
 Change-Id:  I8a921053b4a8eb71118fd523edc1fe5a5e73879d
 Project:    fs/lustre-release
@@ -7,65 +7,56 @@ Branch:     master
 Status:     NEW
 Owner:      Sergey Noskov
 Created:    2026-08-16 09:18:50.000000000
-Updated:    2026-08-25 11:38:08.000000000
-Patch Set:  8
-Insertions: +294
+Updated:    2026-08-26 11:33:02.000000000
+Patch Set:  9
+Insertions: +299
 Deletions:  -49
-Comments:   32 (0 unresolved)
+Comments:   39 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Sergey Cheremencev, Feng Lei 
 
 --- Commit Message ---
-LU-20597 utils: handle sparse OST indices in quota
+LU-20597 utils: handle sparse target indices in quota
 
 llapi_get_obd_count() returns different values for MDTs and OSTs.
 For MDTs, it returns the target array size, which covers sparse
 indices but also includes holes. For OSTs, it returns the number of
 configured targets.
 
-print_obd_quota() and lfs_reset_quota() treat this value as a dense
-upper bound. A filesystem with eight OSTs at indices 256 through 263
-is therefore queried at indices 0 through 7. print_obd_quota() omits
-the existing OSTs, while lfs_reset_quota() can return without checking
-whether grants on those OSTs have been reset.
+Therefore, a filesystem with eight OSTs at indices 256 through 263
+is queried at indices 0 through 7. print_obd_quota() omits the
+existing targets, and lfs_reset_quota() does not verify that their
+quota grants were reset.
 
-lfs_reset_quota() also retains wait_index when switching from MDTs to
-OSTs, which can skip the first OST entries after waiting for an MDT.
-Its shared wait counter can leave the OST phase without enough time to
-poll its targets.
+Obtain the actual MDT and OST indices with
+llapi_get_target_uuids() and use them for quota queries. Keep a UUID
+array to enable capacity checking when target_obd can be read from
+the parameter file. Allocate an extra zeroed index so the netlink
+parser's post-loop range check stays within bounds.
 
-Obtain the index-ordered target list with llapi_get_target_uuids() and
-use the actual indices for quota queries. Use the same list for MDTs
-to avoid probing holes. Reset both the array position and retry
-counter before checking OST grants, giving each phase its own bounded
-retry period.
+Build both target lists before issuing LUSTRE_Q_RESETQID so an
+allocation or enumeration failure aborts before quota limits are
+cleared.
 
-Clear ignored -ENODEV and -ENODATA results before continuing to the
-next target. Otherwise, an unavailable final OST can make a completed
-quota reset return an error.
+Reset wait_index when changing from MDTs to OSTs so the OST phase
+starts at its first target. Reset wait_count so each phase has its
+own 30-second retry period. Return -ETIMEDOUT when the retry budget
+is exhausted and report the target type and index in the diagnostic.
 
-When the quota reset retry budget is exhausted, return -ETIMEDOUT.
-Previously, lfs_reset_quota() printed an error but left rc as zero, so
-a successful restoration of the quota settings made lfs setquota -r
-return success.
+Clear rc when -ENODEV or -ENODATA is skipped. Otherwise, if the last
+target in the final phase is inactive, lfs_reset_quota() returns that
+error even though the reset completed.
 
-Extend sanity-quota test 16b to verify quota output with sparse MDT
-and OST indices. Create grants on MDT0064 and OST0064, block the
-OST0064 grant reset, and wait until the MDT0064 grant has drained
-before verifying that the reset is still waiting for OST0064. Use
-60-second timeouts for the MDT grant-drain and reset-completion waits
-so a failed reset cannot hang the test.
-
-Since fail_loc is node-global, run the reset verification only when
-OST0064 does not share its host with an earlier OST or any MDT.
-Request separate MDS and OSS hosts so the automated test exercises
-the fail-injection path.
+Extend sanity-quota test 16b to verify quota output and quota reset
+with sparse MDT and OST indices. Use observable quota grant state
+instead of a fixed delay, and skip the reset portion when fail_loc
+would affect multiple targets on the same host.
 
 Fixes: a2fd4d3aee97 ("LU-15880 quota: fix insane grant quota")
 Test-Parameters: testlist=sanity-quota mdtcount=3 mdscount=3 ostcount=2 osscount=2 env=ONLY=16b
@@ -2150,5 +2141,93 @@ Succeeded:
 - runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-quota@ldiskfs+DNE sanity-quota-special1@ldiskfs+DNE sanity-quota-special1@ldiskfs sanity-quota-special2@ldiskfs+DNE sanity-quota-special2@ldiskfs sanity-quota-special3@ldiskfs+DNE sanity-quota-special3@ldiskfs sanity-quota-special4@ldiskfs+DNE sanity-quota-special4@ldiskfs sanity-quota-special5@ldiskfs+DNE sanity-quota-special5@ldiskfs sanity-quota-special6@ldiskfs+DNE sanity-quota-special6@ldiskfs sanity-quota-special7@ldiskfs+DNE sanity-quota-special7@ldiskfs sanity-quota-special8@ldiskfs+DNE sanity-quota-special8@ldiskfs sanity-quota-special9@ldiskfs+DNE sanity-quota-special9@ldiskfs sanity-quota-special10@ldiskfs+DNE sanity-quota-special10@ldiskfs sanity-quota@zfs sanity-quota-special1@zfs sanity-quota-special1@zfs+DNE sanity-quota-special2@zfs sanity-quota-special2@zfs+DNE sanity-quota-special3@zfs sanity-quota-special3@zfs+DNE sanity-quota-special4@zfs sanity-quota-special4@zfs+DNE sanity-quota-special5@zfs sanity-quota-special5@zfs+DNE sanity-quota-special6@zfs sanity-quota-special6@zfs+DNE sanity-quota-special7@zfs sanity-quota-special7@zfs+DNE sanity-quota-special8@zfs sanity-quota-special8@zfs+DNE sanity-quota-special9@zfs sanity-quota-special9@zfs+DNE sanity-quota-special10@zfs sanity-quota-special10@zfs+DNE 
 
 (rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68710/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Maloo, 2026-08-25 13:57:26.000000000) ---
+Patch Set 8:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm52: https://testing.whamcloud.com/test_sessions/317e2033-4276-493f-a2da-396fbf12d7ae ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-08-25 19:48:21.000000000) ---
+Patch Set 8: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm9: https://testing.whamcloud.com/test_sessions/9b986ecb-c057-453b-b230-7a6df299bd35 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-08-25 20:07:07.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, a couple of small comments inline.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 05:08:03.000000000) ---
+Patch Set 8:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8155s)
+- 155(ls1 != ls2) 
+> replay-dual@ldiskfs+DNE Timeout(357s)
+> sanity-pcc@ldiskfs+DNE Failure(4234s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3214s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 100(test_100 returned 32) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68710/results.html
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 06:14:50.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Sergey Noskov, 2026-08-26 07:31:35.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+--- Message (Sergey Noskov, 2026-08-26 07:34:37.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 07:41:03.000000000) ---
+Patch Set 9:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68833/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-quota@ldiskfs+DNE sanity-quota-special1@ldiskfs+DNE sanity-quota-special1@ldiskfs sanity-quota-special2@ldiskfs+DNE sanity-quota-special2@ldiskfs sanity-quota-special3@ldiskfs+DNE sanity-quota-special3@ldiskfs sanity-quota-special4@ldiskfs+DNE sanity-quota-special4@ldiskfs sanity-quota-special5@ldiskfs+DNE sanity-quota-special5@ldiskfs sanity-quota-special6@ldiskfs+DNE sanity-quota-special6@ldiskfs sanity-quota-special7@ldiskfs+DNE sanity-quota-special7@ldiskfs sanity-quota-special8@ldiskfs+DNE sanity-quota-special8@ldiskfs sanity-quota-special9@ldiskfs+DNE sanity-quota-special9@ldiskfs sanity-quota-special10@ldiskfs+DNE sanity-quota-special10@ldiskfs sanity-quota@zfs sanity-quota-special1@zfs sanity-quota-special1@zfs+DNE sanity-quota-special2@zfs sanity-quota-special2@zfs+DNE sanity-quota-special3@zfs sanity-quota-special3@zfs+DNE sanity-quota-special4@zfs sanity-quota-special4@zfs+DNE sanity-quota-special5@zfs sanity-quota-special5@zfs+DNE sanity-quota-special6@zfs sanity-quota-special6@zfs+DNE sanity-quota-special7@zfs sanity-quota-special7@zfs+DNE sanity-quota-special8@zfs sanity-quota-special8@zfs+DNE sanity-quota-special9@zfs sanity-quota-special9@zfs+DNE sanity-quota-special10@zfs sanity-quota-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-08-26 07:48:13.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 09:42:33.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-26 09:51:43.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 11:33:02.000000000) ---
+Patch Set 9:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-quota@ldiskfs+DNE sanity-quota-special1@ldiskfs+DNE sanity-quota-special1@ldiskfs sanity-quota-special2@ldiskfs+DNE sanity-quota-special2@ldiskfs sanity-quota-special3@ldiskfs+DNE sanity-quota-special3@ldiskfs sanity-quota-special4@ldiskfs+DNE sanity-quota-special4@ldiskfs sanity-quota-special5@ldiskfs+DNE sanity-quota-special5@ldiskfs sanity-quota-special6@ldiskfs+DNE sanity-quota-special6@ldiskfs sanity-quota-special7@ldiskfs+DNE sanity-quota-special7@ldiskfs sanity-quota-special8@ldiskfs+DNE sanity-quota-special8@ldiskfs sanity-quota-special9@ldiskfs+DNE sanity-quota-special9@ldiskfs sanity-quota-special10@ldiskfs+DNE sanity-quota-special10@ldiskfs sanity-quota@zfs sanity-quota-special1@zfs sanity-quota-special1@zfs+DNE sanity-quota-special2@zfs sanity-quota-special2@zfs+DNE sanity-quota-special3@zfs sanity-quota-special3@zfs+DNE sanity-quota-special4@zfs sanity-quota-special4@zfs+DNE sanity-quota-special5@zfs sanity-quota-special5@zfs+DNE sanity-quota-special6@zfs sanity-quota-special6@zfs+DNE sanity-quota-special7@zfs sanity-quota-special7@zfs+DNE sanity-quota-special8@zfs sanity-quota-special8@zfs+DNE sanity-quota-special9@zfs sanity-quota-special9@zfs+DNE sanity-quota-special10@zfs sanity-quota-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68833/results.html
 Commencing standard testing: 
 - conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs

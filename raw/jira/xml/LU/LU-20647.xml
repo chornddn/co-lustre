@@ -1,0 +1,155 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20647] lfs changelog --user fails -ENOENT for a user registered without a mask or name</title>
+                <link>https://jira.whamcloud.com/browse/LU-20647</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;tt&gt;lfs changelog --user cl5 testfs-MDT0000&lt;/tt&gt; fails for a changelog user that was&lt;br/&gt;
+registered plainly. The same command works if the user was registered with a&lt;br/&gt;
+mask or a name.&lt;/p&gt;
+
+&lt;p&gt;Registration and lookup disagree about the record type.&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;mdd_changelog_user_reg()&lt;/tt&gt; deliberately writes the &lt;b&gt;old&lt;/b&gt; record type when the&lt;br/&gt;
+caller gave neither a mask nor a name, for compatibility&lt;br/&gt;
+(&lt;tt&gt;lustre/mdd/mdd_device.c:1785-1791&lt;/tt&gt;):&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        /* keep old record type for users without mask/name for
+         * compatibility needs
+         */
+        if (mask || (name &amp;amp;&amp;amp; name[0]))
+                rec-&amp;gt;cur_hdr.lrh_type = CHANGELOG_USER_REC2;
+        else
+                rec-&amp;gt;cur_hdr.lrh_type = CHANGELOG_USER_REC;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;tt&gt;mdd_changelog_user_lookup_cb()&lt;/tt&gt; accepts only the new one&lt;br/&gt;
+(&lt;tt&gt;lustre/mdd/mdd_changelog.c:46&lt;/tt&gt;):&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        if ((rec-&amp;gt;cur_hdr.lrh_type != CHANGELOG_USER_REC2) ||
+            (req-&amp;gt;cf_user_id != 0 &amp;amp;&amp;amp; rec-&amp;gt;cur_id != req-&amp;gt;cf_user_id) ||
+            (req-&amp;gt;cf_user_id == 0 &amp;amp;&amp;amp; strcmp(rec-&amp;gt;cur_name, req-&amp;gt;cf_username)))
+                RETURN(0);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;So the record is skipped, &lt;tt&gt;mcul_found&lt;/tt&gt; stays 0, and&lt;br/&gt;
+&lt;tt&gt;mdd_changelog_user_lookup()&lt;/tt&gt; turns that into &lt;tt&gt;-ENOENT&lt;/tt&gt;&lt;br/&gt;
+(&lt;tt&gt;lustre/mdd/mdd_changelog.c:100-103&lt;/tt&gt;).&lt;br/&gt;
+Userspace reports &lt;tt&gt;cannot set changelog filter&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;It is the only walker in MDD that does this. Every other one takes both types&lt;br/&gt;
+and guards the fields that exist in only one of them:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        mdd_device.c:248-249   changelog_user_init_cb()           accepts both, warns otherwise
+        mdd_device.c:333-334   changelog_user_detect_orphan_cb()  accepts both, warns otherwise
+        mdd_device.c:222       mdd_chlg_username()                reads cur_name only for REC2
+        mdd_device.c:233       mdd_chlg_usermask()                returns 0 for the old type
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The path is the shipped command, not only the library call:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        lfs changelog --user cl5 testfs-MDT0000
+          -&amp;gt; llapi_changelog_start_user()       liblustreapi_chlg.c:204
+          -&amp;gt; ioctl(OBD_IOC_CHANGELOG_FILTER)    liblustreapi_chlg.c:230
+          -&amp;gt; mdd_changelog_user_lookup()        mdd_changelog.c:76
+          -&amp;gt; mdd_changelog_user_lookup_cb()     mdd_changelog.c:29   -&amp;gt; ENOENT
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        lctl --device testfs-MDT0000 changelog_register        # -&amp;gt; cl5
+        lctl --device testfs-MDT0000 changelog_register -m all # -&amp;gt; cl6
+        lfs changelog --user cl6 testfs-MDT0000                # works
+        lfs changelog --user cl5 testfs-MDT0000                # ENOENT
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Note that deregistering the last changelog user purges the log, so a script&lt;br/&gt;
+that cleans up after itself reads an empty changelog on the next run. That is&lt;br/&gt;
+expected behaviour, not part of this bug.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Thefix"&gt;&lt;/a&gt;The fix&lt;/h3&gt;
+
+&lt;p&gt;Accept &lt;tt&gt;CHANGELOG_USER_REC&lt;/tt&gt; as well, and guard the two REC2-only fields&lt;br/&gt;
+rather than the whole record.&lt;/p&gt;
+
+&lt;p&gt;This is not a one-word change, because &lt;tt&gt;struct llog_changelog_user_rec&lt;/tt&gt; is&lt;br/&gt;
+half the size of &lt;tt&gt;struct llog_changelog_user_rec2&lt;/tt&gt; and has neither&lt;br/&gt;
+&lt;tt&gt;cur_mask&lt;/tt&gt; nor &lt;tt&gt;cur_name&lt;/tt&gt; (&lt;tt&gt;lustre_idl.h:3084-3104&lt;/tt&gt;). Today the &lt;tt&gt;||&lt;/tt&gt;&lt;br/&gt;
+short-circuits on the type test, so &lt;tt&gt;rec-&amp;gt;cur_name&lt;/tt&gt; is never reached for an&lt;br/&gt;
+old record; simply dropping that first clause would read past the end of the&lt;br/&gt;
+record into whatever the llog buffer holds next. So:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;a lookup &lt;b&gt;by ID&lt;/b&gt; must match an old record on &lt;tt&gt;cur_id&lt;/tt&gt; alone;&lt;/li&gt;
+	&lt;li&gt;a lookup &lt;b&gt;by name&lt;/b&gt; cannot match an old record at all, since it has no name, and should skip it rather than compare;&lt;/li&gt;
+	&lt;li&gt;the reply's mask comes from &lt;tt&gt;mdd_chlg_usermask()&lt;/tt&gt;, which already returns 0 for the old type, and the reply's username must stay empty for it.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Howitwasfound"&gt;&lt;/a&gt;How it was found&lt;/h3&gt;
+
+&lt;p&gt;On a lab run of the &lt;a href="https://jira.whamcloud.com/browse/LU-20462" title="Lustre Find Utility (LFU)" class="issue-link" data-issue-key="LU-20462"&gt;LU-20462&lt;/a&gt; changelog scanner on 2026-08-25, where a plainly&lt;br/&gt;
+registered &lt;tt&gt;cl5&lt;/tt&gt; failed and &lt;tt&gt;cl6&lt;/tt&gt;, registered with &lt;tt&gt;-m&lt;/tt&gt;, worked. That&lt;br/&gt;
+scanner reaches the changelog through the same ioctl, so it hit the same wall.&lt;/p&gt;
+
+&lt;p&gt;Introduced by &lt;tt&gt;5b85a4eb75&lt;/tt&gt; (&lt;a href="https://jira.whamcloud.com/browse/LU-19296" title="changelog processing should use per-user state" class="issue-link" data-issue-key="LU-19296"&gt;&lt;del&gt;LU-19296&lt;/del&gt;&lt;/a&gt;, "changelog: retrive changelog user info&lt;br/&gt;
+from MDT", October 2025), which added the lookup; the registration side was&lt;br/&gt;
+already writing both types.&lt;/p&gt;</description>
+                <environment />
+        <key id="99109">LU-20647</key>
+            <summary>lfs changelog --user fails -ENOENT for a user registered without a mask or name</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hnishida">Hiroshi Nishida</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 26 Aug 2026 13:41:43 +0000</created>
+                <updated>Wed, 26 Aug 2026 13:44:07 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06yxj:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

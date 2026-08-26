@@ -1,0 +1,127 @@
+Change:     68361
+Subject:    LU-00000 ec: use RAID10|PARITY (RAID10) so p may exceed k
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68361
+Change-Id:  I9574df44969ddd40776f028b3c326d150ea08eb5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Keguang Xu
+Created:    2026-08-26 09:56:30.000000000
+Updated:    2026-08-26 12:16:26.000000000
+Patch Set:  1
+Insertions: +740
+Deletions:  -201
+Comments:   5 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: (no votes)
+
+--- Commit Message ---
+LU-00000 ec: use RAID10|PARITY (RAID10) so p may exceed k
+
+The k >= p restriction is not a Cauchy/ISA-L limit. It comes from
+storing coding stripes as RAID0|PARITY: p objects are concatenated
+along the file offset, so nsets * p * stripe_size will not fit in a
+finite PFL extent when p > k (for example --ec 2+3 -E 2M).
+
+Write new EC parity as LOV_PATTERN_RAID10|PARITY with RAID10
+geometry: outer striping across raidsets (one stripe_size per
+raidset in the parity mirror row), and the p coding objects of
+a raidset share that same file offset. RAID10 keeps raidset
+structure in the file offset (outer RAID0 across raidsets) and
+treats the p coding objects of one raidset as a RAID1 mirror
+set at that offset. File extent still matches the data component:
+
+  ec_off(row, rs) =
+      e_start + row * (nsets * ss) + rs * ss
+
+object_off = row * ss. Within a raidset, resync/verify must pick a
+coding stripe via LL_IOC_FLR_SET_STRIPE /
+llapi_mirror_{read,write}_stripe(). Punch and truncate still hit
+all coding objects.
+
+Example: -E 128M -c 11 -S 1M --ec 4+2
+
+  data/parity extent [0, 128M)
+  raidsets [4,2], [4,2], [3,2] (nsets=3)
+  parity has 6 OST objects
+  one data stripe-set row = 11M
+  one parity row = 3M (not 1M flat, not 6M concat)
+
+  row rs   data_pos    RAID10   old RAID0  objs
+  --- ---- ----------- -------- ---------- ----
+  0   0    [0, 4M)     0        0          0,1
+  0   1    [4M, 8M)    1M       2M         2,3
+  0   2    [8M, 11M)   2M       4M         4,5
+  1   0    [11M, 15M)  3M       6M         0,1
+  1   1    [15M, 19M)  4M       8M         2,3
+  1   2    [19M, 22M)  5M       10M        4,5
+
+When nsets == 1 (e.g. --ec 2+3), RAID10 degenerates to a single
+leg and still fits p > k in a finite PFL extent. With --ec 1+N,
+parity offsets align with each data stripe.
+
+Existing RAID0|PARITY files keep the concatenated mapping.
+lov_pattern_available() accepts the new combination; old clients
+skip the unknown pattern and leave the parity component inert.
+Finite-extent stripe-count shrinking is skipped for parity
+components. The p <= k checks in lfs and llapi are removed;
+k+p <= 256 and p <= 15 remain.
+
+Tests: sanity-ec 4a/10 accept 2+3; test_300 covers PFL -E 2M
+--ec 2+3 create/resync/verify; 12c/34c cover holes and multi-leg
+offsets (34c asserts leg striping into raidset 1);
+llapi_layout_test T47 allows 3+4.
+
+Test-Parameters: fortestonly
+Test-Parameters: trivial
+Assisted-by: Cursor:Fable5/auto llm_code_and_review_tools
+Signed-off-by: Keguang Xu <kxu@ddn.com>
+Change-Id: I9574df44969ddd40776f028b3c326d150ea08eb5
+
+--- Review History ---
+
+--- Message (Keguang Xu, 2026-08-26 09:56:30.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Keguang Xu, 2026-08-26 09:57:07.000000000) ---
+Set Work In Progress
+
+--- Message (wc-checkpatch, 2026-08-26 10:11:22.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 10:12:35.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68860/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 10:41:04.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 12:16:26.000000000) ---
+Patch Set 1:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68860/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs

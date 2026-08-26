@@ -1,0 +1,139 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20648] lfs changelog --mask is silently ignored for a user registered without a mask</title>
+                <link>https://jira.whamcloud.com/browse/LU-20648</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;tt&gt;lfs changelog --user NAME --mask creat&lt;/tt&gt; returns every record type, not just&lt;br/&gt;
+CREAT, when NAME was registered without a mask. No error is reported. The&lt;br/&gt;
+request is a wrong answer rather than a failure, which is what makes it worth&lt;br/&gt;
+filing.&lt;/p&gt;
+
+&lt;p&gt;A zero &lt;tt&gt;cf_mask&lt;/tt&gt; means two different things, and the client composes them as&lt;br/&gt;
+if it meant one.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Meaning one, on the server:&lt;/b&gt; "this user registered no mask of their own".&lt;br/&gt;
+&lt;tt&gt;mdd_chlg_usermask()&lt;/tt&gt; returns &lt;tt&gt;cur_mask&lt;/tt&gt; for a &lt;tt&gt;CHANGELOG_USER_REC2&lt;/tt&gt; and&lt;br/&gt;
+0 for the older record (&lt;tt&gt;lustre/mdd/mdd_device.c:233&lt;/tt&gt;), and the lookup puts&lt;br/&gt;
+that in the reply (&lt;tt&gt;lustre/mdd/mdd_changelog.c:53&lt;/tt&gt;).&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Meaning two, on the client:&lt;/b&gt; "do not filter". A zero&lt;br/&gt;
+&lt;tt&gt;crs_user_mask&lt;/tt&gt; disables the test altogether&lt;br/&gt;
+(&lt;tt&gt;lustre/mdc/mdc_changelog.c:222-224&lt;/tt&gt;):&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        /* Check if this record type matches the user's mask */
+        if (crs-&amp;gt;crs_user_mask &amp;amp;&amp;amp;
+            !(crs-&amp;gt;crs_user_mask &amp;amp; BIT(rec-&amp;gt;cr.cr_type)))
+                RETURN(0);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The two meanings meet in &lt;tt&gt;chlg_ioctl()&lt;/tt&gt;&lt;br/&gt;
+(&lt;tt&gt;lustre/mdc/mdc_changelog.c:811-814&lt;/tt&gt;), where &lt;tt&gt;in&lt;/tt&gt; is the mask the caller&lt;br/&gt;
+asked for and &lt;tt&gt;out&lt;/tt&gt; is the mask the user registered:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        if (in.cf_mask == 0)
+                crs-&amp;gt;crs_user_mask = out.cf_mask;
+        else
+                crs-&amp;gt;crs_user_mask = in.cf_mask &amp;amp; out.cf_mask;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;So when the caller passes a mask and the user has none, the result is&lt;br/&gt;
+&lt;tt&gt;in.cf_mask &amp;amp; 0&lt;/tt&gt;, which is 0, which the record test then reads as *do not&lt;br/&gt;
+filter*. The caller's mask is dropped and everything comes back.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Whichusershavenomask"&gt;&lt;/a&gt;Which users have no mask&lt;/h3&gt;
+
+&lt;p&gt;Registration writes a &lt;tt&gt;rec2&lt;/tt&gt; when &lt;b&gt;either&lt;/b&gt; a mask or a name was given&lt;br/&gt;
+(&lt;tt&gt;lustre/mdd/mdd_device.c:1789&lt;/tt&gt;), but &lt;tt&gt;cur_mask&lt;/tt&gt; is only assigned inside&lt;br/&gt;
+&lt;tt&gt;if (mask)&lt;/tt&gt; (&lt;tt&gt;lustre/mdd/mdd_device.c:1817-1826&lt;/tt&gt;). So a registration with a&lt;br/&gt;
+name and no mask produces a &lt;tt&gt;rec2&lt;/tt&gt; whose &lt;tt&gt;cur_mask&lt;/tt&gt; is 0, and that user&lt;br/&gt;
+hits this today:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        lctl --device testfs-MDT0000 changelog register --user foo
+        touch /mnt/testfs/a ; mkdir /mnt/testfs/d
+        lfs changelog --user foo --mask creat testfs-MDT0000
+          -&amp;gt; the MKDIR record is listed too
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;A user registered with neither a mask nor a name gets the older record type,&lt;br/&gt;
+whose mask is 0 by definition, so every such user is affected as well. Those&lt;br/&gt;
+users cannot be looked up at all until &lt;a href="https://jira.whamcloud.com/browse/LU-20647" title="lfs changelog --user fails -ENOENT for a user registered without a mask or name" class="issue-link" data-issue-key="LU-20647"&gt;LU-20647&lt;/a&gt; is fixed, which is the only&lt;br/&gt;
+reason this is not visible for them yet.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Thefix"&gt;&lt;/a&gt;The fix&lt;/h3&gt;
+
+&lt;p&gt;Either give "no per-user mask" a value that is not zero, or stop treating the&lt;br/&gt;
+two zeros as the same thing when composing. The smaller change is a third arm:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;        if (in.cf_mask == 0)
+                crs-&amp;gt;crs_user_mask = out.cf_mask;
+        else if (out.cf_mask == 0)
+                crs-&amp;gt;crs_user_mask = in.cf_mask;
+        else
+                crs-&amp;gt;crs_user_mask = in.cf_mask &amp;amp; out.cf_mask;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;A user with no registered mask is not restricted to nothing; they are&lt;br/&gt;
+unrestricted, so intersecting with them should leave the caller's mask alone.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Howitwasfound"&gt;&lt;/a&gt;How it was found&lt;/h3&gt;
+
+&lt;p&gt;Reading the reply path while fixing &lt;a href="https://jira.whamcloud.com/browse/LU-20647" title="lfs changelog --user fails -ENOENT for a user registered without a mask or name" class="issue-link" data-issue-key="LU-20647"&gt;LU-20647&lt;/a&gt;, which makes a plainly registered&lt;br/&gt;
+user reachable by lookup for the first time and so would have exposed this to&lt;br/&gt;
+every such user.&lt;/p&gt;</description>
+                <environment />
+        <key id="99110">LU-20648</key>
+            <summary>lfs changelog --mask is silently ignored for a user registered without a mask</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hnishida">Hiroshi Nishida</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 26 Aug 2026 13:53:19 +0000</created>
+                <updated>Wed, 26 Aug 2026 13:53:47 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06yxr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

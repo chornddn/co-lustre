@@ -8,7 +8,7 @@ Resolution: Fixed
 Assignee:   Andreas Dilger
 Reporter:   Andreas Dilger
 Created:    Tue, 28 Jan 2025 21:17:42 +0000
-Updated:    Tue, 25 Aug 2026 00:56:39 +0000
+Updated:    Wed, 26 Aug 2026 05:19:15 +0000
 Resolved:   Wed, 19 Aug 2026 13:14:50 +0000
 Labels:     debug, fast_recovery, medium
 Links:      Related: is related to  LU-19199; Related: is related to  LU-14834; Related: is related to LU-20135
@@ -90,3 +90,89 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 6a0655ed312722c80c55ff889d1b80dff4d06d34
+
+--- Comment (JIRAUSER19463, Tue, 25 Aug 2026 17:48:35 +0000) ---
+I'm trying to extend the functionality to include RPC and Lock replay time.
+
+ 
+
+obdfilter.lustre-OST0000.recovery_histogram=
+recovery_start:    1787636301
+req_replay_start:  1787636418
+lock_replay_start: 1787636424
+recovery_finish:   1787636424
+recovery_time:     123
+reconnect_delay_seconds_samples: 8
+client_reconnect_histogram:
+- { phase_sec:   2, clients:    3, pct:  37, cum_pct:  37 }
+- { phase_sec:  16, clients:    1, pct:  12, cum_pct:  50 }
+- { phase_sec:  64, clients:    1, pct:  12, cum_pct:  62 }
+- { phase_sec: 128, clients:    3, pct:  37, cum_pct: 100 }
+req_replay_delay_seconds_samples: 8
+client_req_replay_histogram:
+- { phase_sec:   1, clients:    4, pct:  50, cum_pct:  50 }
+- { phase_sec:   8, clients:    4, pct:  50, cum_pct: 100 }
+lock_replay_delay_seconds_samples: 8
+client_lock_replay_histogram:
+- { phase_sec:   1, clients:    8, pct: 100, cum_pct: 100 }
+
+From the testing result above, the client reconnecting time dominated the overall recovery. IR is working properly. The root cause is that the clients had to wait for bulk transfer timeout before they could initiate new connections to the server.
+
+Is there any parameters to tune so that we can reduce the bulk transfer timeout.
+
+--- Comment (adilger, Tue, 25 Aug 2026 18:55:52 +0000) ---
+Per discussion in Slack, the bulk_timeout tunable can be set on the server to reduce this timeout.  IMHO it would be better in the long run if the bulk timeout were based on the LND timeout and AT timeout estimates rather than just being "long enough", but that is a separate change.
+
+--- Comment (JIRAUSER19463, Wed, 26 Aug 2026 00:57:56 +0000) ---
+It turned out to be 2 issues that led to this lengthy client reconnection issue:
+
+	right now the default msg timeout SOCKNAL_TIMEOUT_DEFAULT is set to 50 seconds, the same values applies to KIBLND_TIMEOUT_DEFAULT as well.
+
+	By default, the peer_credits by default is set to 8, as defined by DEFAULT_PEER_CREDITS.
+
+Therefore, in my test, the bulk transfer messages occupied all the sending credits so that the reconnecting RPC is sitting in the line, until all the bulk messages time out, which is pretty much 50s * retry_count ~= 100s.
+
+After I set the sock_timeout to 10 and tuned up peer_credits to 128, the result came back to normal:
+
+obdfilter.lustre-OST0000.recovery_histogram=
+recovery_start:    1787705258
+req_replay_start:  1787705261
+lock_replay_start: 1787705261
+recovery_finish:   1787705261
+recovery_time:     3
+reconnect_delay_seconds_samples: 9
+client_reconnect_histogram:
+- { phase_sec:   2, clients:    8, pct:  88, cum_pct:  88 }
+- { phase_sec:   4, clients:    1, pct:  11, cum_pct: 100 }
+req_replay_delay_seconds_samples: 9
+client_req_replay_histogram:
+- { phase_sec:   1, clients:    9, pct: 100, cum_pct: 100 }
+lock_replay_delay_seconds_samples: 9
+client_lock_replay_histogram:
+- { phase_sec:   1, clients:    9, pct: 100, cum_pct: 100 }
+
+This matches my expectation and it's consistent.
+
+hornc there is something that needs your attention, the `lnetctl peer show -v` returns invalid result:
+
+-     primary nid: 10.128.0.100@tcp
+      Multi-Rail: false
+      peer ni:
+      -     nid: 10.128.0.100@tcp
+            state: NA
+            max_ni_tx_credits: 8 
+            available_tx_credits: 8
+            min_tx_credits: 4294967154 
+
+I think it accidentally displayed a negative number to unsigned in `min_tx_credits`.
+
+--- Comment (adilger, Wed, 26 Aug 2026 03:48:00 +0000) ---
+I wonder if the control connection should always have one (extra) peer credit, that can never be used for bulk?  That would avoid the reconnect being stuck behind bulk transfers.
+
+--- Comment (JIRAUSER16704, Wed, 26 Aug 2026 04:12:51 +0000) ---
+Would it be possible to also dump more info into CDEBUG (standard mask that most people are running) about the recovery times, even per client? if you have say 10k clients ... that's 10k extra lines one time? 
+
+I am thinking about scenarios where if there was potentially a "longer" failover, how could one easily debug this via normal means and just look at "lctl dk > ..." after recovery finished.
+
+--- Comment (JIRAUSER19463, Wed, 26 Aug 2026 05:19:15 +0000) ---
+crusan I'm not sure I understand the question. Can you point the code out for me?
