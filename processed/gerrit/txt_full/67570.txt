@@ -1,5 +1,5 @@
 Change:     67570
-Subject:    LU-20443 llite: use atomic state machine for statahead threads
+Subject:    LU-20443 llite: fix statahead race conditions
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67570
 Change-Id:  I3e4ffc991795029057326982513b7a270f1238ad
 Project:    fs/lustre-release
@@ -7,55 +7,54 @@ Branch:     master
 Status:     NEW
 Owner:      Etienne AUJAMES
 Created:    2026-07-27 13:57:57.000000000
-Updated:    2026-08-22 16:19:12.000000000
-Patch Set:  15
-Insertions: +476
-Deletions:  -474
-Comments:   161 (24 unresolved)
+Updated:    2026-08-27 09:45:06.000000000
+Patch Set:  16
+Insertions: +562
+Deletions:  -521
+Comments:   166 (24 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Oleg Drokin, Andreas Dilger, James Simmons, Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20443 llite: use atomic state machine for statahead threads
+LU-20443 llite: fix statahead race conditions
 
-Replace smp barrier based synchronization on sai_task and unsafe
-access to lli_sa_enabled with atomic state machine to fix race
-conditions between start_statahead_thread() and
-ll_deauthorize_statahead().
+Replace smp barrier-based synchronization on sai_task and unsafe
+access to lli_sa_enabled with an atomic state machine (sai_task_state
+with SA_THR_STOPPED/RUNNING/STOPPING states).
 
-This introduces sai_task_st atomic state field and new helper
-functions (ll_sa_thread_should_stop, ll_sa_thread_stop,
-ll_sa_thread_stopall_locked, ll_sa_thread_wait_event,
-ll_sa_thread_wait_stop) to centralize thread state management,
-improving code maintainability.
+Introduce centralized thread state management helpers:
+- ll_sa_thread_should_stop(): check if thread should stop
+- ll_sa_thread_stop(): transition thread to STOPPING state
+- ll_sa_thread_stopall_locked(): stop all threads for a directory
+- ll_sa_thread_wait_stop(): wait for thread to reach STOPPING state
+- ll_sa_thread_wait_consumer(): wait for stat process to consume
+  entries
 
-This cleanups the way to handle lli_sax references.
-ll_sai_put() now automatically puts a sax reference: a sax reference
-is taken for each sai allocated, so it makes sense to put a reference
-when a sai is freed. It avoids to handle sax references independently
-in ll_deauthorize_statahead() or ll_statahead_thread().
+Clean up reference counting:
+- ll_sai_put() now automatically releases sax reference
+- Remove lli_sai field, using lli_sax->sax_sai_list for all cases
+- Add ll_sai_get() to obtain a ref on the sai of the current process
+- Add ll_sax_install() for atomic context installation
 
-Fixes a possible use-after-free in revalidate_statahead_dentry() on
-@info when sa_get returns -EINVAL.
+Fix race conditions:
+- Between start_statahead_thread() and ll_deauthorize_statahead()
+- Add lfd_sa_started flag to prevent duplicate statahead hints
+- Stale state prevention via ll_sa_reset_locked()
+- Use-after-free in revalidate_statahead_dentry() when sa_get()
+  returns -EINVAL
 
-lli_sai field is removed to use lli_sax->sax_sai_list for all the
-cases. A sai reference can be obtained via ll_sai_get(dir).
-
-lli_sa_pattern is now reset on context release to avoid races in
-stataheads threads.
-
-Fix race conditions in start_statahead_thread()/ll_ioctl_ahead() on
-lli->lli_sa_pattern.
+The @sai struct is revalidated via sa_revalidate_sai() before thread
+start to ensure the parent directory hasn't been closed or reopened by
+another thread.
 
 Fixes: b977caa2dc7d ("LU-15660 statahead: statahead thread doesn't stop")
 Test-Parameters: optional testlist=racer
 Test-Parameters: optional testlist=racer
-Test-Parameters: testlist=sanity env=ONLY=123
 Test-Parameters: testlist=sanity env=ONLY=123
 Signed-off-by: Etienne AUJAMES <eaujames@ddn.com>
 Change-Id: I3e4ffc991795029057326982513b7a270f1238ad
@@ -3534,3 +3533,218 @@ Patch Set 15:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The state-machine rework itself looks sound and the start_statahead_thread()/ll_deauthorize_statahead() race does look closed, but two behavioural details changed along the way: the prepare-to-wait ordering in the new wait helper, and a field that ll_deauthorize_statahead() used to reset and ll_sa_reset_locked() no longer does.
+
+--- Message (Etienne AUJAMES, 2026-08-26 15:02:47.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 15:05:57.000000000) ---
+Patch Set 16:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/68920/results.html
+
+ Commencing initial testing: racer@ldiskfs+DNE racer@ldiskfs+DNE racer@zfs racer@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-26 15:06:03.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-26 15:11:12.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-08-26 19:18:05.000000000) ---
+Patch Set 16:
+
+Initial testing failed:
+
+> sanity1@ldiskfs+DNE Timeout(8858s)
+> sanity2@ldiskfs+DNE Timeout(7822s)
+> sanity1@zfs Timeout(7990s)
+> sanity2@zfs Timeout(5609s)
+> sanity3@zfs Timeout(8075s)
+> sanity-slow@zfs Timeout(3908s)
+
+Succeeded:
+- racer@ldiskfs+DNE racer@ldiskfs+DNE racer@zfs racer@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/68920/results.html
+
+--- Message (jenkins, 2026-08-27 02:51:14.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130394/ : SUCCESS
+
+--- Message (Maloo, 2026-08-27 02:53:38.000000000) ---
+Patch Set 16:
+
+#### The following sessions will be run for Build 130394 (patch #16):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.7-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130394&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130394#redirect
+
+--- Message (Maloo, 2026-08-27 07:28:16.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-152vm153: https://testing.whamcloud.com/test_sessions/07559c2e-be21-4587-84ed-19a07a5aae29 ran 6 tests.  1 tests failed: sanity-ec.
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 09:37:17.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-08-27 09:45:06.000000000) ---
+Patch Set 16:
+
+Failed enforced test review-dne-part-1 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-152vm94: https://testing.whamcloud.com/test_sessions/4cbfb410-80f4-4fe4-81e6-5b2924c58110 ran 3 tests.  1 tests failed: sanity.

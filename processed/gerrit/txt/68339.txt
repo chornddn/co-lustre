@@ -7,46 +7,52 @@ Branch:     master
 Status:     NEW
 Owner:      Zhenyu Xu
 Created:    2026-08-25 16:01:43.000000000
-Updated:    2026-08-26 07:11:05.000000000
-Patch Set:  1
-Insertions: +75
-Deletions:  -12
-Comments:   2 (0 unresolved)
+Updated:    2026-08-27 13:49:19.000000000
+Patch Set:  2
+Insertions: +158
+Deletions:  -37
+Comments:   16 (0 unresolved)
+Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-12669 ec: fix reader deadlock, stale cache, EAGAIN leak
 
-Serialize concurrent CIT_EC_RD readers on the same page with a
-cp_in_ec_recovery flag on struct cl_page: a second reader finding
-the flag set drops the vmpage lock, yields via cond_resched(), and
-retries the grab until the recovery owner clears the flag in
-vvp_io_ec_rd_end.  This avoids both the cp_owner assert crash and
-the AB-BA deadlock that a blocking wait would cause (a reader holds
-locked vmpages across loop iterations and cannot sleep on a flag
-while the recovery owner's generic_file_read_iter needs one of those
-pages).
+Add a CP_EC_RECOVERY flag to cl_page::cp_flags to serialize concurrent
+CIT_EC_RD readers on the same page.  A second reader finding the flag
+set drops the vmpage lock, sleeps via schedule_timeout_interruptible()
+up to EC_RECOVERY_RETRY_MAX times, then bails with -EAGAIN/-EINTR,
+which triggers vvp_io_ec_rd_end() to release all held locks and clear
+the flag before ll_file_io_generic() restarts.  This avoids both the
+cp_owner assert crash and the AB-BA deadlock (a reader holding locked
+vmpages cannot block on a flag the recovery owner clears only after
+its generic_file_read_iter faults in a page the spinner holds).
+
+cp_flags is an unsigned long with set_bit()/clear_bit()/test_bit() so
+the clear after cl_page_disown() does not race with readahead
+modifying the cp_defer_uptodate bitfield word.
 
 Clear PageUptodate on reconstructed pages instead of discarding them,
-forcing the next read through ll_readpage() for a fresh DLM lock and
-in-place refresh.  The page is removed from ec_page_list and
-cp_in_ec_recovery is cleared so a concurrent retrying reader can
-proceed.
+forcing the next read through ll_readpage() for a fresh DLM lock.
 
 Convert -EAGAIN from generic_file_read_iter() in vvp_io_ec_rd_end()
-into an IO restart, since cl_io_loop() folds ci_result after its
--EAGAIN->restart conversion and the error would otherwise escape to
-userspace.
+into an IO restart, gated by !ci_iocb_nowait so RWF_NOWAIT reads still
+receive -EAGAIN instead of looping up to RETRY_ATTEMPTS times.
 
-Improve concurrent-reader test diagnostics: capture the real child
-exit code and dump reader output on failure.
+Carry ci_switch_ec_io into a local before vvp_env_new_io() memsets the
+io struct on restart.  Set ci_continue = 0 in the beyond-EOF readahead
+path.  Make cl_io_set_range() static and fix its doc comment.
 
+Improve concurrent-reader test diagnostics in sanity-ec.sh.
+
+Assisted-by: Augment Agent:GLM 5.2
+Fixes: 42b4ceebccc0 ("LU-12669 ec: recover data from parity")
 Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
 Change-Id: Ib124e31cd92b9ed24396b4b9ea63e268195f2816
 
@@ -79,3 +85,56 @@ https://build.whamcloud.com/job/lustre-reviews/130234/ : SUCCESS
 Patch Set 1:
 
 Code-wise looks good to me.
+
+--- Message (Autotest, 2026-08-26 16:36:04.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-part-4 session on el10.1-x86_64/ldiskfs servers and clients for build 130234 patch 1. Requested by Andreas Dilger because of ATM-4012.
+
+--- Message (Andreas Dilger, 2026-08-26 16:51:56.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-08-26 18:19:16.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The serialization added here still lets a retrying reader spin while holding page-cache locks, and the flag itself is updated outside the lock that protects the rest of that bitfield word.
+
+--- Message (Zhenyu Xu, 2026-08-27 12:47:20.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+--- Message (Zhenyu Xu, 2026-08-27 12:47:34.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-27 12:50:41.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-27 12:50:58.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-08-27 13:12:00.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130449/ : SUCCESS
+
+--- Message (Marc Vef, 2026-08-27 13:49:19.000000000) ---
+Hashtag added: pt_ecro
