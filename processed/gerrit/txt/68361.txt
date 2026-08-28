@@ -1,5 +1,5 @@
 Change:     68361
-Subject:    LU-00000 ec: use RAID10|PARITY (RAID10) so p may exceed k
+Subject:    LU-00000 ec: store parity as RAID10|PARITY so p may exceed k
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68361
 Change-Id:  I9574df44969ddd40776f028b3c326d150ea08eb5
 Project:    fs/lustre-release
@@ -7,80 +7,77 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-08-26 09:56:30.000000000
-Updated:    2026-08-27 12:46:08.000000000
-Patch Set:  2
-Insertions: +800
-Deletions:  -238
-Comments:   10 (2 unresolved)
+Updated:    2026-08-28 12:45:44.000000000
+Patch Set:  4
+Insertions: +758
+Deletions:  -254
+Comments:   14 (3 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder
 
 --- Commit Message ---
-LU-00000 ec: use RAID10|PARITY (RAID10) so p may exceed k
+LU-00000 ec: store parity as RAID10|PARITY so p may exceed k
 
 The k >= p restriction is not a Cauchy/ISA-L limit. It comes from
 storing coding stripes as RAID0|PARITY: p objects are concatenated
 along the file offset, so nsets * p * stripe_size will not fit in a
 finite PFL extent when p > k (for example --ec 2+3 -E 2M).
 
-Write new EC parity as LOV_PATTERN_RAID10|PARITY with RAID10
-geometry: outer striping across raidsets (one stripe_size per
-raidset in the parity mirror row), and the p coding objects of
-a raidset share that same file offset. RAID10 keeps raidset
-structure in the file offset (outer RAID0 across raidsets) and
-treats the p coding objects of one raidset as a RAID1 mirror
-set at that offset. File extent still matches the data component:
+Write EC parity as LOV_PATTERN_RAID10|PARITY. Raidset is an EC
+split of the stripe-set; EC chose RAID10 so the p coding objects
+of a raidset share one file offset (object_off = stripeset * ss)
+instead of concatenating them. File extent still matches the data
+component:
 
-  ec_off(row, rs) =
-      e_start + row * (nsets * ss) + rs * ss
+  ec_off(stripeset, raidset) =
+      e_start + stripeset * (nsets * ss) + raidset * ss
 
-object_off = row * ss. Within a raidset, resync/verify must pick a
-coding stripe via LL_IOC_FLR_SET_STRIPE /
-llapi_mirror_{read,write}_stripe(). Punch and truncate still hit
-all coding objects.
+I/O mapping keys off LCME_FL_PARITY, not the RAID10 bit. Within a
+raidset, resync/verify must pick a coding stripe via
+LL_IOC_FLR_SET_STRIPE / llapi_mirror_{read,write}_stripe():
+coding stripes differ, so a RAID10-style fan-out would be wrong.
+Punch and truncate still hit all coding objects.
 
 Example: -E 128M -c 11 -S 1M --ec 4+2
 
   data/parity extent [0, 128M)
   raidsets [4,2], [4,2], [3,2] (nsets=3)
   parity has 6 OST objects
-  one data stripe-set row = 11M
-  one parity row = 3M (not 1M flat, not 6M concat)
+  one data stripe-set = 11M
+  one parity stripe-set = 3M (not 1M flat, not 6M concat)
 
-  row rs   data_pos    RAID10   old RAID0  objs
-  --- ---- ----------- -------- ---------- ----
-  0   0    [0, 4M)     0        0          0,1
-  0   1    [4M, 8M)    1M       2M         2,3
-  0   2    [8M, 11M)   2M       4M         4,5
-  1   0    [11M, 15M)  3M       6M         0,1
-  1   1    [15M, 19M)  4M       8M         2,3
-  1   2    [19M, 22M)  5M       10M        4,5
+  sset rs  data_pos    EC       old concat objs
+  ---- --- ----------- -------- ---------- ----
+  0    0   [0, 4M)     0        0          0,1
+  0    1   [4M, 8M)    1M       2M         2,3
+  0    2   [8M, 11M)   2M       4M         4,5
+  1    0   [11M, 15M)  3M       6M         0,1
+  1    1   [15M, 19M)  4M       8M         2,3
+  1    2   [19M, 22M)  5M       10M        4,5
 
-When nsets == 1 (e.g. --ec 2+3), RAID10 degenerates to a single
-leg and still fits p > k in a finite PFL extent. With --ec 1+N,
-parity offsets align with each data stripe.
+When nsets == 1 (e.g. --ec 2+3), one raidset still fits p > k in
+a finite PFL extent. With --ec 1+N, parity offsets align with
+each data stripe.
 
-Existing RAID0|PARITY files keep the concatenated mapping.
-lov_pattern_available() accepts the new combination; old clients
-skip the unknown pattern and leave the parity component inert.
+lov_pattern_available() accepts RAID10|PARITY; old clients skip
+the unknown pattern and leave the parity component inert.
 Finite-extent stripe-count shrinking is skipped for parity
 components. The p <= k checks in lfs and llapi are removed;
 k+p <= 256 and p <= 15 remain.
 
 Tests: sanity-ec 4a/10 accept 2+3; test_300 covers PFL -E 2M
---ec 2+3 create/resync/verify; 12c/34c cover holes and multi-leg
-offsets (34c asserts leg striping into raidset 1);
+--ec 2+3 create/resync/verify; 12c/34c cover holes and
+multi-raidset offsets (34c asserts striping into raidset 1);
 llapi_layout_test T47 allows 3+4.
 
-Test-Parameters: fortestonly
 Test-Parameters: trivial
-Assisted-by: Cursor:Fable5/auto llm_code_and_review_tools
+Assisted-by: Cursor:Fable5/Grok-4.6 llm_code_and_review_tools
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: I9574df44969ddd40776f028b3c326d150ea08eb5
 
@@ -151,3 +148,69 @@ Patch Set 2: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/130448/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-27 23:55:02.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Keguang Xu, 2026-08-28 09:17:42.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-08-28 09:20:36.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69047/results.html
+
+--- Message (wc-checkpatch, 2026-08-28 09:27:25.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-28 09:54:13.000000000) ---
+Patch Set 3: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130528/ : FAILURE
+
+--- Message (Keguang Xu, 2026-08-28 10:05:39.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-28 10:08:11.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-08-28 10:15:40.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-08-28 11:15:52.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130533/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-28 12:45:44.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
