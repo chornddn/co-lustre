@@ -53,16 +53,6 @@
         "username": "vandanarungta"
       }
     },
-    "1130": {
-      "account": {
-        "_account_id": 1130,
-        "name": "Vandana Rungta",
-        "email": "vrungta@amazon.com",
-        "username": "vandanarungta"
-      },
-      "last_update": "2026-08-15 15:53:12.000000000",
-      "reason": "Someone else replied on the change"
-    },
     "117": {
       "account": {
         "_account_id": 117,
@@ -72,6 +62,22 @@
       },
       "last_update": "2026-08-04 23:06:01.000000000",
       "reason": "Vote got outdated and was removed: Code-Review+1"
+    },
+    "119": {
+      "account": {
+        "_account_id": 119,
+        "name": "Alex Zhuravlev",
+        "email": "bzzz@whamcloud.com",
+        "username": "bzzz"
+      },
+      "last_update": "2026-08-29 06:08:30.000000000",
+      "reason": "<GERRIT_ACCOUNT_1130> mentioned you in a comment",
+      "reason_account": {
+        "_account_id": 1130,
+        "name": "Vandana Rungta",
+        "email": "vrungta@amazon.com",
+        "username": "vandanarungta"
+      }
     },
     "1138": {
       "account": {
@@ -118,21 +124,15 @@
       "last_update": "2026-08-15 04:39:53.000000000",
       "reason": "removed on reply"
     },
-    "119": {
+    "1130": {
       "account": {
-        "_account_id": 119,
-        "name": "Alex Zhuravlev",
-        "email": "bzzz@whamcloud.com",
-        "username": "bzzz"
+        "_account_id": 1130,
+        "name": "Vandana Rungta",
+        "email": "vrungta@amazon.com",
+        "username": "vandanarungta"
       },
-      "last_update": "2026-08-25 09:34:07.000000000",
-      "reason": "<GERRIT_ACCOUNT_119> replied on the change",
-      "reason_account": {
-        "_account_id": 119,
-        "name": "Alex Zhuravlev",
-        "email": "bzzz@whamcloud.com",
-        "username": "bzzz"
-      }
+      "last_update": "2026-08-28 22:16:42.000000000",
+      "reason": "removed on reply"
     }
   },
   "hashtags": [],
@@ -140,14 +140,14 @@
   "subject": "LU-20531 mdc: skip close when import is not connected",
   "status": "NEW",
   "created": "2026-07-28 17:49:43.000000000",
-  "updated": "2026-08-25 09:36:23.000000000",
+  "updated": "2026-08-29 06:08:30.000000000",
   "submit_type": "CHERRY_PICK",
   "insertions": 74,
   "deletions": 0,
-  "total_comment_count": 51,
-  "unresolved_comment_count": 19,
+  "total_comment_count": 56,
+  "unresolved_comment_count": 16,
   "has_review_started": true,
-  "meta_rev_id": "c3e5a6aa66739023a1d430421b78f659236cf3bf",
+  "meta_rev_id": "2c2c75b5955f060e1f1cac19f18e72c7383379b6",
   "_number": 67599,
   "virtual_id_number": 67599,
   "owner": {
@@ -2184,6 +2184,32 @@
       },
       "date": "2026-08-25 09:36:23.000000000",
       "message": "Patch Set 13:\n\n(1 comment)",
+      "accounts_in_message": [],
+      "_revision_number": 13
+    },
+    {
+      "id": "6d2e1f6a6ba7b2bff27a95042e6f68fcf5b741de",
+      "author": {
+        "_account_id": 1130,
+        "name": "Vandana Rungta",
+        "email": "vrungta@amazon.com",
+        "username": "vandanarungta"
+      },
+      "date": "2026-08-28 22:16:42.000000000",
+      "message": "Patch Set 13:\n\nYou're right on both counts, and I'm abandoning the \"skip the close\" approach.\nBelow is what I found when I went looking for a replacement, including the\nchecks I ran to convince myself the alternatives actually work before putting\nthem in front of you.\n\n== Conceding the current patch ==\n\nThe atime point is correct, and it's broader than atime. mdc_close_pack()\n(mdc_lib.c:663) packs a full mdt_rec_setattr via mdc_setattr_pack_rec() -\nsa_atime/mtime/ctime, sa_size, sa_blocks, sa_uid/gid/projid, sa_attr_flags -\nplus the ioepoch and the close intents (HSM release, layout swap,\nresync-done), and the LSOM lazysize/lazyblocks update. Dropping the RPC\ndiscards all of it silently. That atime rides on close clearly isn't\nincidental either, given the LU-8041 workaround sitting in that same\nfunction.\n\nThere is also a defect I should own that's worse than the atime loss. The\nearly return in PS13 lands *after* the mod fixup block, which has already\ndone mod->mod_open_req->rq_replay = 0 (mdc_request.c:968). So the patch\nsuppresses replay of the open and then skips the close. The commit message's\nclaim that \"the server will clean up open state on reconnect (replay)\" is\nfalse - this path is precisely what disabled that replay. The handle leaks\nuntil eviction or unmount, and mod_close_req is left holding an extra\nreference on a request that was never sent (mdc_request.c:1015). Not\nsalvageable.\n\n== Corrected root cause ==\n\nI also had the mechanism described imprecisely - it isn't primarily ldlm_bl\npool exhaustion, it's a single-thread circular wait:\n\n  1. ldlm_replay_locks() raises imp_replay_inflight to 1 and spawns the\n     \"ldlm_lock_replay\" kthread (ldlm_request.c:2988-2994).\n  2. That kthread runs __ldlm_replay_locks() ->\n     ldlm_cancel_unused_locks_for_replay() (ldlm_request.c:2933) ->\n     ldlm_cancel_lru_local().\n  3. ldlm_cancel_callback() invokes the blocking AST *synchronously in that\n     kthread* (ldlm_lock.c:2464-2468).\n  4. For an ibit lock holding MDS_INODELOCK_OPEN: ll_md_blocking_ast() ->\n     ll_lock_cancel_bits() (llite/namei.c:264-288) -> ll_md_real_close() ->\n     mdc_close().\n  5. mdc_close() -> ptlrpc_queue_wait(), and ptlrpc_import_delay_req()\n     defers it: rq_send_state is FULL, imp_state is REPLAY_LOCKS, so it\n     takes the delay = 1 branch (ptlrpc/client.c:1416-1433).\n  6. imp_replay_inflight therefore never drops to 0, so\n     ptlrpc_import_recovery_state_machine() can never advance\n     REPLAY_LOCKS -> REPLAY_WAIT (import.c:1712-1714) and on to FULL.\n     But the deferred close is only released once the import is FULL.\n\nThe ldlm_bl pile-up we measured is secondary: other threads touching the same\nlock land in the uninterruptible wait_event_idle(lock->l_waitq,\nis_bl_done(lock)) at ldlm_lock.c:2476-2480, and further closes serialize\nbehind the one above-max close slot (cl_close_rpcs_in_flight == 0,\ngenops.c:2330-2331).\n\n== On the extra reply_data slot ==\n\nI don't think more slots resolves this one, and I'd like to check that\nreasoning with you. The blocking wait isn't slot acquisition - it's the\nimport-state gate in ptlrpc_import_delay_req() above. Granting more slots\njust moves threads from the queue in obd_get_mod_rpc_slot() into\nptlrpc_queue_wait(); the ldlm_lock_replay kthread is still parked and\nimp_replay_inflight still never reaches 0. So it changes the shape but not\nthe outcome.\n\n== Option A (preferred): send the close during recovery ==\n\nSet rq_allow_replay on the MDS_CLOSE once the import has passed\nLUSTRE_IMP_REPLAY, so ptlrpc_import_delay_req() lets it through during\nREPLAY_LOCKS/REPLAY_WAIT/RECOVER instead of deferring it:\n\n\tif (imp->imp_state >= LUSTRE_IMP_REPLAY_LOCKS &&\n\t    imp->imp_state < LUSTRE_IMP_FULL)\n\t\treq->rq_allow_replay = 1;\n\natime and every other attribute survive, the slot turns over, the replay\nkthread makes progress, and nothing changes on the server - no extra\nreply_data slot needed.\n\nFour things had to hold for this to work, so I checked each against master\nrather than assuming:\n\n  1. rq_allow_replay lifts exactly the gate that is deferring us -\n     client.c:1425-1430 covers REPLAY, REPLAY_LOCKS, REPLAY_WAIT, RECOVER.\n  2. The MDT will actually *process* the close rather than queue it while\n     it is itself recovering. This was the one that could have killed the\n     idea. tgt_filter_recovery_request() routes MDS_CLOSE to\n     target_queue_recovery_request() (tgt_handler.c:509-531), which returns\n     1 - \"continue request processing\" - when transno == 0\n     (ldlm_lib.c:3237-3241). A fresh close has transno 0: the client only\n     stamps transno into rq_reqmsg in after_reply(), for the benefit of a\n     later replay (client.c:1727-1730). So it is handled immediately, not\n     parked on obd_req_replay_queue.\n  3. The server has the open handle back by then. import.c:1700-1705 only\n     transitions REPLAY -> REPLAY_LOCKS when inflight == 0 &&\n     imp_replay_inflight == 0, i.e. every request replay has completed and\n     been replied to. Hence gating on >= REPLAY_LOCKS rather than just\n     \"not FULL\" - during REPLAY the handle may not exist yet.\n  4. If ordering ever did slip, mdc_close() already maps -ESTALE on a\n     committed open to success (mdc_request.c:996-1007).\n\nPrecedent for the same deadlock class: ldlm_cli_cancel_req() already sets\nrq_allow_replay = 1 so a cross-MDT cancel isn't blocked in recovery\n(ldlm_request.c:1565-1580). That is also the code whose OBD_CONNECT_MDS_MDS\ngate I copied in PS2 - which is what your \"just a regular lustre client\"\ncomment was getting at. I understand that now. And close is already\nspecial-cased twice for deadlock avoidance: the MDS_READPAGE_PORTAL redirect\n(bug 7034, mdc_request.c:934-938) and the one-above-max close slot\n(Bugzilla 3462, genops.c:2302-2303).\n\n== Option C: don't cancel OPEN-bit locks before replay ==\n\nSkip locks with MDS_INODELOCK_OPEN in ldlm_cancel_unused_locks_for_replay()\nso they are replayed instead of canceled, keeping close out of the recovery\npath entirely. Costs more locks to replay.\n\nWhat convinced me this is sound rather than speculative: \"replay instead of\ncancel\" is already a shipped, supported path. The whole cancel pass is\nbehind ldlm_cancel_unused_locks_before_replay (ldlm_request.c:2933), a\nwritable sysfs attribute defaulting to 1 (LUSTRE_RW_ATTR,\nldlm_lockd.c:3225). Setting it to 0 skips the pass wholesale. Option C is\njust doing that selectively for the one lock class whose cancel has an RPC\nside effect.\n\nThat tunable is also useful independently of the fix: it should be an\nimmediate client-side workaround for affected sites, and it's a zero-build\nway to confirm the diagnosis on an unpatched client. I'll run that\nexperiment either way.\n\n== Option B: get the RPC out of the AST context (direction, not a proposal) ==\n\nStop calling ll_md_real_close() inline from the AST and queue it instead, so\nno RPC is ever issued from AST context. Structurally the nicest of the three\nand it would help beyond this bug, but it's a larger llite change - och and\ninode references have to be held across the handoff, and the lock ends up\ncanceled before the close is sent. I have not convinced myself of the\nlifetime rules yet, so I'm flagging it as a direction rather than putting a\npatch behind it.\n\n== Question ==\n\nMy preference is A now, with B as a follow-on cleanup if you think the AST\ncontext should be RPC-free on principle. Do you have a preference, or an\nobjection to A's assumption that a transno-0 close is safe to let the MDT\nprocess mid-recovery? I'd rather respin once against whichever you'd\nactually take.\n\nIndependent of the choice, the reproducer stands: on an unpatched client\nrecovery-small test_171 leaves the MDT0001 import wedged at REPLAY_LOCKS\n(3/3 runs), and it reached FULL (3/3) with the PS13 code. I'll re-verify it\nagainst whichever fix we settle on. It's also posted standalone as change\n68014 (not for merge) so the failure is reproducible without any fix\napplied.",
+      "accounts_in_message": [],
+      "_revision_number": 13
+    },
+    {
+      "id": "2c2c75b5955f060e1f1cac19f18e72c7383379b6",
+      "author": {
+        "_account_id": 1130,
+        "name": "Vandana Rungta",
+        "email": "vrungta@amazon.com",
+        "username": "vandanarungta"
+      },
+      "date": "2026-08-29 06:08:30.000000000",
+      "message": "Patch Set 13:\n\n(5 comments)",
       "accounts_in_message": [],
       "_revision_number": 13
     }

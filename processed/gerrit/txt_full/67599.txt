@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-08-25 09:36:23.000000000
+Updated:    2026-08-29 06:08:30.000000000
 Patch Set:  13
 Insertions: +74
 Deletions:  -0
-Comments:   51 (19 unresolved)
+Comments:   56 (16 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -1450,3 +1450,165 @@ Patch Set 13:
 Patch Set 13:
 
 (1 comment)
+
+--- Message (Vandana Rungta, 2026-08-28 22:16:42.000000000) ---
+Patch Set 13:
+
+You're right on both counts, and I'm abandoning the "skip the close" approach.
+Below is what I found when I went looking for a replacement, including the
+checks I ran to convince myself the alternatives actually work before putting
+them in front of you.
+
+== Conceding the current patch ==
+
+The atime point is correct, and it's broader than atime. mdc_close_pack()
+(mdc_lib.c:663) packs a full mdt_rec_setattr via mdc_setattr_pack_rec() -
+sa_atime/mtime/ctime, sa_size, sa_blocks, sa_uid/gid/projid, sa_attr_flags -
+plus the ioepoch and the close intents (HSM release, layout swap,
+resync-done), and the LSOM lazysize/lazyblocks update. Dropping the RPC
+discards all of it silently. That atime rides on close clearly isn't
+incidental either, given the LU-8041 workaround sitting in that same
+function.
+
+There is also a defect I should own that's worse than the atime loss. The
+early return in PS13 lands *after* the mod fixup block, which has already
+done mod->mod_open_req->rq_replay = 0 (mdc_request.c:968). So the patch
+suppresses replay of the open and then skips the close. The commit message's
+claim that "the server will clean up open state on reconnect (replay)" is
+false - this path is precisely what disabled that replay. The handle leaks
+until eviction or unmount, and mod_close_req is left holding an extra
+reference on a request that was never sent (mdc_request.c:1015). Not
+salvageable.
+
+== Corrected root cause ==
+
+I also had the mechanism described imprecisely - it isn't primarily ldlm_bl
+pool exhaustion, it's a single-thread circular wait:
+
+  1. ldlm_replay_locks() raises imp_replay_inflight to 1 and spawns the
+     "ldlm_lock_replay" kthread (ldlm_request.c:2988-2994).
+  2. That kthread runs __ldlm_replay_locks() ->
+     ldlm_cancel_unused_locks_for_replay() (ldlm_request.c:2933) ->
+     ldlm_cancel_lru_local().
+  3. ldlm_cancel_callback() invokes the blocking AST *synchronously in that
+     kthread* (ldlm_lock.c:2464-2468).
+  4. For an ibit lock holding MDS_INODELOCK_OPEN: ll_md_blocking_ast() ->
+     ll_lock_cancel_bits() (llite/namei.c:264-288) -> ll_md_real_close() ->
+     mdc_close().
+  5. mdc_close() -> ptlrpc_queue_wait(), and ptlrpc_import_delay_req()
+     defers it: rq_send_state is FULL, imp_state is REPLAY_LOCKS, so it
+     takes the delay = 1 branch (ptlrpc/client.c:1416-1433).
+  6. imp_replay_inflight therefore never drops to 0, so
+     ptlrpc_import_recovery_state_machine() can never advance
+     REPLAY_LOCKS -> REPLAY_WAIT (import.c:1712-1714) and on to FULL.
+     But the deferred close is only released once the import is FULL.
+
+The ldlm_bl pile-up we measured is secondary: other threads touching the same
+lock land in the uninterruptible wait_event_idle(lock->l_waitq,
+is_bl_done(lock)) at ldlm_lock.c:2476-2480, and further closes serialize
+behind the one above-max close slot (cl_close_rpcs_in_flight == 0,
+genops.c:2330-2331).
+
+== On the extra reply_data slot ==
+
+I don't think more slots resolves this one, and I'd like to check that
+reasoning with you. The blocking wait isn't slot acquisition - it's the
+import-state gate in ptlrpc_import_delay_req() above. Granting more slots
+just moves threads from the queue in obd_get_mod_rpc_slot() into
+ptlrpc_queue_wait(); the ldlm_lock_replay kthread is still parked and
+imp_replay_inflight still never reaches 0. So it changes the shape but not
+the outcome.
+
+== Option A (preferred): send the close during recovery ==
+
+Set rq_allow_replay on the MDS_CLOSE once the import has passed
+LUSTRE_IMP_REPLAY, so ptlrpc_import_delay_req() lets it through during
+REPLAY_LOCKS/REPLAY_WAIT/RECOVER instead of deferring it:
+
+	if (imp->imp_state >= LUSTRE_IMP_REPLAY_LOCKS &&
+	    imp->imp_state < LUSTRE_IMP_FULL)
+		req->rq_allow_replay = 1;
+
+atime and every other attribute survive, the slot turns over, the replay
+kthread makes progress, and nothing changes on the server - no extra
+reply_data slot needed.
+
+Four things had to hold for this to work, so I checked each against master
+rather than assuming:
+
+  1. rq_allow_replay lifts exactly the gate that is deferring us -
+     client.c:1425-1430 covers REPLAY, REPLAY_LOCKS, REPLAY_WAIT, RECOVER.
+  2. The MDT will actually *process* the close rather than queue it while
+     it is itself recovering. This was the one that could have killed the
+     idea. tgt_filter_recovery_request() routes MDS_CLOSE to
+     target_queue_recovery_request() (tgt_handler.c:509-531), which returns
+     1 - "continue request processing" - when transno == 0
+     (ldlm_lib.c:3237-3241). A fresh close has transno 0: the client only
+     stamps transno into rq_reqmsg in after_reply(), for the benefit of a
+     later replay (client.c:1727-1730). So it is handled immediately, not
+     parked on obd_req_replay_queue.
+  3. The server has the open handle back by then. import.c:1700-1705 only
+     transitions REPLAY -> REPLAY_LOCKS when inflight == 0 &&
+     imp_replay_inflight == 0, i.e. every request replay has completed and
+     been replied to. Hence gating on >= REPLAY_LOCKS rather than just
+     "not FULL" - during REPLAY the handle may not exist yet.
+  4. If ordering ever did slip, mdc_close() already maps -ESTALE on a
+     committed open to success (mdc_request.c:996-1007).
+
+Precedent for the same deadlock class: ldlm_cli_cancel_req() already sets
+rq_allow_replay = 1 so a cross-MDT cancel isn't blocked in recovery
+(ldlm_request.c:1565-1580). That is also the code whose OBD_CONNECT_MDS_MDS
+gate I copied in PS2 - which is what your "just a regular lustre client"
+comment was getting at. I understand that now. And close is already
+special-cased twice for deadlock avoidance: the MDS_READPAGE_PORTAL redirect
+(bug 7034, mdc_request.c:934-938) and the one-above-max close slot
+(Bugzilla 3462, genops.c:2302-2303).
+
+== Option C: don't cancel OPEN-bit locks before replay ==
+
+Skip locks with MDS_INODELOCK_OPEN in ldlm_cancel_unused_locks_for_replay()
+so they are replayed instead of canceled, keeping close out of the recovery
+path entirely. Costs more locks to replay.
+
+What convinced me this is sound rather than speculative: "replay instead of
+cancel" is already a shipped, supported path. The whole cancel pass is
+behind ldlm_cancel_unused_locks_before_replay (ldlm_request.c:2933), a
+writable sysfs attribute defaulting to 1 (LUSTRE_RW_ATTR,
+ldlm_lockd.c:3225). Setting it to 0 skips the pass wholesale. Option C is
+just doing that selectively for the one lock class whose cancel has an RPC
+side effect.
+
+That tunable is also useful independently of the fix: it should be an
+immediate client-side workaround for affected sites, and it's a zero-build
+way to confirm the diagnosis on an unpatched client. I'll run that
+experiment either way.
+
+== Option B: get the RPC out of the AST context (direction, not a proposal) ==
+
+Stop calling ll_md_real_close() inline from the AST and queue it instead, so
+no RPC is ever issued from AST context. Structurally the nicest of the three
+and it would help beyond this bug, but it's a larger llite change - och and
+inode references have to be held across the handoff, and the lock ends up
+canceled before the close is sent. I have not convinced myself of the
+lifetime rules yet, so I'm flagging it as a direction rather than putting a
+patch behind it.
+
+== Question ==
+
+My preference is A now, with B as a follow-on cleanup if you think the AST
+context should be RPC-free on principle. Do you have a preference, or an
+objection to A's assumption that a transno-0 close is safe to let the MDT
+process mid-recovery? I'd rather respin once against whichever you'd
+actually take.
+
+Independent of the choice, the reproducer stands: on an unpatched client
+recovery-small test_171 leaves the MDT0001 import wedged at REPLAY_LOCKS
+(3/3 runs), and it reached FULL (3/3) with the PS13 code. I'll re-verify it
+against whichever fix we settle on. It's also posted standalone as change
+68014 (not for merge) so the failure is reproducible without any fix
+applied.
+
+--- Message (Vandana Rungta, 2026-08-29 06:08:30.000000000) ---
+Patch Set 13:
+
+(5 comments)

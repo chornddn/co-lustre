@@ -1,0 +1,105 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20664] rustreapi: lsp_pool is set from an unterminated Rust String</title>
+                <link>https://jira.whamcloud.com/browse/LU-20664</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;rustreapi passes an unterminated Rust string to liblustreapi as the pool name.&lt;/p&gt;
+
+&lt;p&gt;OpenOptions::get_stripe_param() (rustreapi/rustreapi/src/lib.rs:229) fills&lt;br/&gt;
+llapi_stripe_param.lsp_pool from the bytes of a Rust String:&lt;/p&gt;
+
+&lt;p&gt;    let pool = if let Some(pool) = self.pool.as_ref() &lt;/p&gt;
+{
+            pool.as_bytes().as_ptr() as *mut c_char
+    }
+&lt;p&gt; else &lt;/p&gt;
+{
+            ptr::null_mut::&amp;lt;c_char&amp;gt;()
+    }
+&lt;p&gt;;&lt;br/&gt;
+    ...&lt;br/&gt;
+    addr_of_mut!((*param).lsp_pool).write(pool);&lt;/p&gt;
+
+&lt;p&gt;`pool` is Option&amp;lt;String&amp;gt; (line 97). A Rust String stores exactly its bytes with&lt;br/&gt;
+no trailing NUL, but liblustreapi treats lsp_pool as a C string:&lt;/p&gt;
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;liblustreapi.c:478   const char *pool_name = param-&amp;gt;lsp_pool;&lt;br/&gt;
+                         then lov_pool_is_ignored(pool_name)&lt;/li&gt;
+	&lt;li&gt;llapi_stripe_param_verify(), which strlen()s it against LOV_MAXPOOLNAME&lt;/li&gt;
+	&lt;li&gt;liblustreapi.c:881   snprintf(lmu-&amp;gt;lum_pool_name, sizeof(...), "%s",&lt;br/&gt;
+                                  param-&amp;gt;lsp_pool)&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Each of those reads past the end of the String's heap allocation until it&lt;br/&gt;
+happens to find a zero byte. Depending on what follows in memory the effects&lt;br/&gt;
+are: garbage appended to the pool name so a valid pool fails with EINVAL or&lt;br/&gt;
+ENOENT, a length that trips the LOV_MAXPOOLNAME check, or a heap over-read&lt;br/&gt;
+fault when no zero byte precedes the end of the mapping.&lt;/p&gt;
+
+&lt;p&gt;Reproducer:&lt;/p&gt;
+
+&lt;p&gt;    OpenOptions::new().pool(Some("mypool".to_string())).open(path)&lt;/p&gt;
+
+&lt;p&gt;Note this is not a dangling pointer: self.pool is owned by the OpenOptions,&lt;br/&gt;
+which outlives the llapi_* call, so the memory is valid. Only the terminator&lt;br/&gt;
+is missing. That shapes the fix &amp;#8211; a CString built inside get_stripe_param()&lt;br/&gt;
+would be dropped at return and &lt;b&gt;would&lt;/b&gt; dangle, because open() calls&lt;br/&gt;
+assume_init() and then passes &amp;amp;param to llapi_file_open_param() after&lt;br/&gt;
+get_stripe_param() has returned. The terminator has to be owned by something&lt;br/&gt;
+that outlives the call; storing pool as a CString rather than a String is the&lt;br/&gt;
+straightforward option, since self already has the right lifetime.&lt;/p&gt;
+
+&lt;p&gt;The same class of bug in OpenOptions::volatile(), which passed&lt;br/&gt;
+dir.as_os_str().as_encoded_bytes().as_ptr() as the directory argument, is&lt;br/&gt;
+fixed in &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/58514" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/58514&lt;/a&gt; (&lt;a href="https://jira.whamcloud.com/browse/LU-18842" title="lustreapi: add a volatile function that supports layouts" class="issue-link" data-issue-key="LU-18842"&gt;LU-18842&lt;/a&gt;).&lt;/p&gt;</description>
+                <environment />
+        <key id="99130">LU-20664</key>
+            <summary>rustreapi: lsp_pool is set from an unterminated Rust String</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="rread">Robert Read</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 29 Aug 2026 00:00:43 +0000</created>
+                <updated>Sat, 29 Aug 2026 00:00:43 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06z27:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
