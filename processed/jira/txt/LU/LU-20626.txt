@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Vadakkumuri Valappil Abooback
 Created:    Sat, 22 Aug 2026 21:45:29 +0000
-Updated:    Sun, 23 Aug 2026 20:48:05 +0000
+Updated:    Sun, 30 Aug 2026 16:00:46 +0000
 
 --- Environment ---
 2.15.5 servers with some patches
@@ -237,3 +237,233 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 0dc0d481c2209333b85ad9b59734f537dd523256
+
+--- Comment (JIRAUSER19323, Sat, 29 Aug 2026 20:30:36 +0000) ---
+This note is prepared for manual addition to LU-20626. It documents three complementary validations of the discovery-Ping cancellation change:
+
+	a real OST failover with the patched client;
+
+	the in-tree sanity-lnet regression test; and
+
+	a controlled manual A/B test that reproduces the original failure without the patch and passes with it.
+
+The client used temporary IRDBG messages together with the proposed code to make the new path observable. Those messages are test instrumentation only; they are not part of the functional fix proposed for upstream.
+
+1. Successful real OST failover
+
+The following is a representative client trace from /home/ubuntu/-dk-2.log on client 10.131.0.131@tcp. It shows the service NID 10.131.100.78@tcp for lustrefs-OST000c during an OST failover. This client had the proposed change and the temporary IRDBG instrumentation.
+
+The MGC first applies the imperative-recovery log and a discovery Ping is sent to the service NID:
+
+{{18:43:24.642631 configuration from log 'lustrefs-cliir' succeeded (0)
+18:43:24.642624 LNetGet -> 12345-10.131.100.78@tcp
+18:43:24.642644 IRDBG: published Ping MD for peer 10.131.100.78@tcp
+18:43:24.642691 Ping Send to 10.131.100.78@tcp: 0}} 
+
+About 2.303 seconds later, SockLND detects the reset associated with the service-NID move. The relevant peer-down notification, cancellation, and MD unlink are contiguous:
+
+{{18:43:26.945371 A connection with 12345-10.131.100.78@tcp
+(10.131.100.78:988) was reset; it may have rebooted.
+18:43:26.945383 10.131.0.131@tcp notifying 10.131.100.78@tcp: down
+18:43:26.945388 IRDBG: LND down 10.131.100.78@tcp: queue Ping cancellation
+18:43:26.945391 IRDBG: cancel Ping for peer 10.131.100.78@tcp
+18:43:26.945393 Unlinking md ...
+18:43:26.945397 Ping Unlink for message to peer 10.131.100.78@tcp
+18:43:26.945426 peer 10.131.100.78@tcp:-110
+18:43:26.945428 Discovery complete. Dequeue peer 10.131.100.78@tcp}} 
+
+Thus the known reset reaches the new cancellation path and unlinks the outstanding discovery response MD within 26 microseconds of the reset log. The cancelled discovery completes with -ETIMEDOUT (-110), which is the intentional result of unlinking that response MD; it is not a wait for the normal LNet response-expiry deadline.
+
+The normal recovery worker begins the next recovery attempt 3.328 seconds after the reset. It immediately performs a fresh discovery, creates a new TCP connection, receives the reply, and releases the delayed message:
+
+ 
+
+{{18:43:30.273287 lustrefs-OST000c_UUID: starting recovery
+18:43:30.274078 LNetGet -> 12345-10.131.100.78@tcp
+18:43:30.274528 New conn ... 10.131.0.131 -> 10.131.100.78:988
+18:43:30.274705 ... for me
+18:43:30.274760 Discovery complete. Dequeue peer 10.131.100.78@tcp
+18:43:30.274762 sending pending message PUT to target 12345-10.131.100.78@tcp}} 
+
+The OSC then moves from CONNECTING to REPLAY at 18:43:30.275324 and eventually reaches FULL at 18:46:16.739646. The important point is narrow: the patch removes the discovery-Ping stall after the transport reset. It does not claim that the complete replay and server recovery window take only a few milliseconds.
+
+2. Regression test added to sanity-lnet.sh
+
+test_252a, Peer-down cancels an outstanding discovery Ping, was added to lustre/tests/sanity-lnet.sh in the LU-20626 change. It automates the same causal sequence as the manual test while preventing an ordinary transaction timeout from producing a false pass.
+
+The test:
+
+	Requires single-rail IPv4 TCP LNet and establishes an initial Ping to form the actual SockLND port-988 connection.
+
+	Sets the client LNet transaction timeout to 90 seconds, then allows only 30 seconds for the peer-down cancellation assertion.
+
+	Adds a one-shot GET drop rule on the remote node for the client-to-peer discovery GET. Because the rule runs in the remote LNet receive path, the GET has traversed SockLND before it is dropped.
+
+	Starts lnetctl discover --force, verifies the peer state contains LNET_PEER_PING_SENT, and confirms the remote drop-rule count shows that the GET was received.
+
+	Verifies the exact remote port-988 TCP socket is still established, then resets only that socket using ss -K.
+
+	Requires LNET_PEER_PING_SENT to clear within 30 seconds. The first, intentionally cancelled discovery may return an error.
+
+	Requires a new forced discovery to complete successfully after the reset.
+
+This layout tests the desired LND-originated path: a real SocketLND connection reset causes lnet_notify(..., alive = false), which must cancel the specific outstanding discovery Ping and permit rediscovery. The 90-second LNet timeout is deliberately longer than the 30-second assertion, so a response-MD expiry cannot satisfy the test.
+
+3. Controlled manual test and A/B result
+
+The manual test uses the same client and service NID. It establishes a live port-988 connection, uses a one-shot remote receive-side rule to drop the next discovery GET, confirms the GET was dropped, and resets that exact TCP connection from the peer. This leaves a valid outstanding discovery response MD at the instant the client sees the real SockLND peer-down event.
+
+Patched result (dk.txt)
+
+The patched run begins its forced discovery at 19:55:23.292 and detects the server-side TCP reset at 19:55:59.073373:
+
+ 
+
+{{19:55:59.073373 A connection with 12345-10.131.100.78@tcp
+(10.131.100.78:988) was reset; it may have rebooted.
+19:55:59.073402 10.131.0.131@tcp notifying 10.131.100.78@tcp: down
+19:55:59.073407 IRDBG: LND down 10.131.100.78@tcp: queue Ping cancellation
+19:55:59.073411 IRDBG: cancel Ping for peer 10.131.100.78@tcp
+19:55:59.073418 Ping Unlink for message to peer 10.131.100.78@tcp
+19:55:59.073492 peer 10.131.100.78@tcp ... -110. discovery complete}} 
+
+The test observed PING_SENT clear at 19:55:59.120, about 47 milliseconds after the actual unlink. A new discovery was queued at 19:55:59.124106, sent at 19:55:59.124117, received its reply at 19:55:59.124861, and completed at 19:55:59.124918.
+
+There was an EADDRNOTAVAIL attempt on source port 1023 during reconnection, but it did not block recovery: the health-check GET and reply completed immediately afterward. A second patched manual run (dk1.txt) repeated the same reset, notification, unlink, and successful rediscovery sequence.
+
+Unpatched control (dk-unpatched.txt)
+
+After rebuilding without the change, the same manual procedure failed as expected:
+
+{{20:10:30.914066 Ping Send to 10.131.100.78@tcp: 0
+20:10:51.361194 A connection with 12345-10.131.100.78@tcp
+(10.131.100.78:988) was reset; it may have rebooted.
+20:10:51.361211 10.131.0.131@tcp notifying 10.131.100.78@tcp: down}} 
+
+The unpatched trace has the real SocketLND reset and the LNet peer-down notification, but no Ping-MD unlink and no Ping Unlink event. The client script still found LNET_PEER_PING_SENT set at 20:11:15.038, 30 seconds after the reset confirmation, and failed the assertion.
+
+The final discovery complete with -4 in that buffer is not a normal LNet timeout: the manual test script exited after its assertion failed and terminated its background lnetctl discover process. Without that script cleanup, the outstanding discovery response MD would continue to wait for its ordinary expiry.
+
+ 
+
+The real failover trace shows the new code activating on an actual service-NID move. The manual A/B test isolates the behavior: both builds receive the same SockLND reset and lnet_notify(... down), but only the patched build promptly unlinks the outstanding discovery Ping and permits rediscovery. The added sanity-lnet test turns that sequence into regular regression coverage.
+
+--- Comment (JIRAUSER19323, Sun, 30 Aug 2026 15:59:17 +0000) ---
+The newly created regression test for this specific bug fix keep failing on whamcloud test environment for some reason. 
+
+The instrumented sanity-lnet.sh test 252a passes in the in-house auster environment. It exercises the intended sequence: a discovery GET is dropped at the remote peer, the client remains PING_SENT, a server-side ss -K resets the matching SockLND TCP streams, SockLND notifies LNet that the peer is down, and discovery is cancelled promptly.
+
+The earlier Whamcloud run failed at the ss -K step. Its old test logging did not record the pre-reset socket list, the ss -K stderr, or its actual exit status. It therefore cannot establish whether no socket matched, the socket was not ESTABLISHED, or the kernel-side socket-destroy operation failed.
+
+In-house auster result
+
+Environment: six-node regression cluster, run with normal auster setup from client1.
+
+ 
+
+{{auster sanity-lnet --only 252a
+
+test_252a: PASS, 21s
+
+sanity-lnet: PASS, 172s
+
+auster lifecycle: PASS, 183s}}
+
+Result file:
+
+ 
+
+/tmp/test_logs/2026-08-30/154758/results.yml
+
+The trace recorded:
+
+	No pre-existing drop rules (found total 0).
+
+	The exact discovery GET-drop rule was installed.
+
+	The remote rule counter advanced from GET 0 to GET 1.
+
+	The forced client discovery remained active with PING_SENT=1.
+
+	ss -K listed and reset the matching remote SockLND streams:
+
+{{192.168.100.55:988 -> 192.168.100.198:1021
+
+192.168.100.55:988 -> 192.168.100.198:1022
+
+192.168.100.55:988 -> 192.168.100.198:1023}}
+
+	ss -K returned 0.
+
+	The client observed the SockLND peer-down notification after 3 seconds.
+
+	PING_SENT cleared and forced discovery exited with its accepted cancellation error (rc=255).
+
+	A fresh discovery succeeded.
+
+The test now records pre-existing and installed drop rules, forced-discovery PID/output, peer state, both TCP socket views, ss -K output/status, and client peer-down evidence.
+
+Earlier Whamcloud result
+
+Whamcloud test: sanity-lnet-special7@zfs, Rocky 8.10, kernel 4.18.0rh8.10-debug.
+
+ 
+
+FAIL: ss -K did not reset a SockLND connection for 192.168.204.156@tcp
+
+The old client debug independently shows that the forced discovery did not finish early:
+
+Time
+Evidence
+
+1788094914.692942
+Forced discovery of 192.168.204.156@tcp starts.
+
+1788094914.703166
+LNetGet is issued.
+
+1788094914.703238
+SockLND queues the GET to 192.168.204.156:988.
+
+1788094914.703252
+Peer state is 0x4251, including PING_SENT.
+
+1788094914.703336
+Discovery GET send completion reports success.
+
+1788094916.119460
+The test fails at the ss -K stage.
+
+The test could only reach that stage after its internal checks had observed:
+
+	successful drop-rule installation;
+
+	a nonzero remote GET drop counter;
+
+	client PING_SENT=1; and
+
+	a still-running forced discovery process.
+
+The previous reset command was:
+
+ 
+
+{{ss -HtnK state established src  sport = :988 dst  |
+
+grep -q .}}
+
+It discarded the socket list, ss stderr, and the ss status. Therefore, the failure proves only that the pipeline produced no matching stdout. It does not distinguish a missing matching socket from an unsupported or failed socket-destroy operation.
+
+Relevant artifacts:
+
+	Whamcloud test log
+
+	Whamcloud client LNet debug
+
+ 
+
+The in-house result validates the intended test flow and the peer-down/PING cancellation behavior. The Whamcloud failure remains an ss -K test-environment or test-observability issue, not evidence that the LU-20626 cancellation path failed.
+
+The instrumented test should be rerun in the Whamcloud environment. It will show whether an ESTABLISHED .156:988 -> .56: socket exists immediately before ss -K, and retain ss -K output, stderr, and return code.
+
+Note: the expanded trace is a test-script-only instrumentation change; it does not modify the LNet functional code under review.

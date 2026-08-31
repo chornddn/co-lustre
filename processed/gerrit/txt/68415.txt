@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-08-29 18:38:11.000000000
-Patch Set:  4
-Insertions: +1452
+Updated:    2026-08-31 14:52:36.000000000
+Patch Set:  6
+Insertions: +1616
 Deletions:  -0
-Comments:   11 (11 unresolved)
+Comments:   37 (11 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -30,8 +30,15 @@ or llapi_scan_device() can be fed by a delta without being rewritten.
 
 A changelog record carries the FID, the parent FID, the name, the
 event and its time, and -- where the server recorded them -- the uid
-and gid. It carries no size, mode, times, layout or HSM state at any
-setting, so those arrive absent with their sr_valid bit clear.  With
+and gid of whoever caused it.  That pair is sr_event_uid and
+sr_event_gid, not sr_uid: mdd_changelog_ns_store() fills the uidgid
+extension from lu_ucred(env), the acting client's credentials, so it
+says who acted and not who owns the object, which is what sr_uid
+means in every scanner that fills it and what lfs find -uid matches.
+Delivering it as sr_uid would have answered "-uid alice" from the
+identity of whoever last touched her file.  The record carries no
+size, mode, owner, times, layout or HSM state at any setting, so
+those arrive absent with their sr_valid bit clear.  With
 LLAPI_SCAN_CL_F_RESOLVE they are filled by opening the object through
 a client mount, which is one open and one stat each; the demand mask
 decides whether that happens at all, so a consumer reading only what
@@ -93,10 +100,45 @@ then stopping the scan loses B entirely -- no callback saw it, and a
 restart from sc_startrec cannot read it back, because the record is
 gone.
 
+An event with no target object is delivered per event even in object
+mode.  mdd_changelog_ns_store() zeroes cr_tfid when its target is
+NULL, which mdd_rename() passes whenever the destination name did not
+already exist, and cr_markerflags -- a CL_MARK's union with the same
+bytes -- is not a FID either.  Coalescing keys on the FID, so all of
+them shared one cache entry and only the last survived: an ordinary
+`mv a b` was enough to lose the one before it, and with clearing on,
+the record it came from is gone as well.
+
+The parent FID is taken only from an event that carries one.  CL_CLOSE
+does not -- mdd_changelog_data_store() is called with pfid NULL -- so
+assigning it from every event while only ever OR-ing the bit in left
+create+write+close reporting LLAPI_SCAN_PARENT over a zero.  A name or
+job id whose copy failed leaves its bit clear for the same reason: a
+bit that promises a string must not be set over a NULL.
+
+A resolve is skipped only for a demand mask every event can answer, so
+LLAPI_SCAN_TYPE no longer counts: scan_cl_mode() answers it for the
+four record types that imply one, and a consumer asking for FID and
+type was getting no lookup and no type at all on a CL_CLOSE.
+
+Resolution opens O_PATH and takes a real open only for the regular
+file whose size it came for.  llite gives a special file
+init_special_inode(), so opening every object for read opened the
+driver behind a device node stored in the filesystem; O_NONBLOCK holds
+off the wait, not the rest of what an open does.
+
 The uidgid extension is asked for when sc_want is 0.  Zero means
 "everything", and it is the caller that most needs the extension, but
 `0 & ~LLAPI_SCAN_EVENT` is 0, so the test skipped exactly that caller
-and LLAPI_SCAN_UID and LLAPI_SCAN_GID never reached sr_valid for it.
+and LLAPI_SCAN_EVENT_UID never reached sr_valid for it.
+
+A size is reported strict only where the OSTs were actually glimpsed.
+The second open runs for a regular file whose demand mask names a
+size and can still fail, so a consumer asking for an mtime alone
+reaches the fill on the O_PATH descriptor; that is the MDT's lazy
+answer, and LLAPI_SCAN_LAZY_SIZE and LLAPI_SCAN_LAZY_BLOCKS are what
+say so.  liblustreapi_pfind.c maps the two to OBD_MD_FLSIZE and
+OBD_MD_FLLAZYSIZE, so they are not interchangeable.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -209,5 +251,93 @@ Looks good to me.
 
 --- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-29 18:38:11.000000000) ---
 Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-08-29 19:43:57.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130598/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 19:56:21.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 09:13:35.000000000) ---
+Patch Set 4:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments -- the object-mode cache in particular can drop events for changelog records that carry no target FID.
+
+The new binary is added to THETESTS but nothing runs it: llapi_scan_test is driven from sanity.sh and llapi_scan_device_test from conf-sanity.sh, while llapi_scan_changelog_test has no caller in any suite, so the new API gets no automated coverage. Should a sanity case register a changelog user, generate a workload and run it?
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:20.000000000) ---
+Patch Set 5:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:00:29.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:16:07.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 16:20:35.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-30 16:36:19.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130631/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 09:18:27.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments.
+
+The new llapi_scan_changelog_test is added to THETESTS but no suite ever runs it: llapi_scan_test is invoked from sanity.sh and llapi_scan_device_test from conf-sanity.sh, so those get exercised and this one never will. Should this patch add the sanity.sh (or conf-sanity.sh) case that registers a changelog user, enables the mask and runs the binary?
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:41.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:20:34.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:38:53.000000000) ---
+Patch Set 6:
 
 Code-wise looks good to me.

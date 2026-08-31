@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-08-29 18:38:27.000000000
-Patch Set:  4
-Insertions: +395
-Deletions:  -11
-Comments:   10 (9 unresolved)
+Updated:    2026-08-31 15:19:30.000000000
+Patch Set:  6
+Insertions: +520
+Deletions:  -19
+Comments:   30 (9 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -30,86 +30,62 @@ it was recorded.  That is why -name here matches the name in the event
 rather than the object's current one, and why an object unlinked since
 the event is in this answer and cannot be in --since's.
 
-Three rules keep the two apart, and each is a refusal rather than an
-approximation.  A predicate the changelog cannot answer -- -size,
--blocks, the layout options, -projid, -printf -- is refused naming
-itself, unless --resolve is given to look the object up.  An object
-time is refused outright, because a record carries an event time and
-the two are not the same question; the message says --since 1d is how
-to ask it.  --maxdepth and --mindepth describe a walk, and --ost and
---mdt need something a per-MDT log does not have.
+It takes an MDT name or "all", required rather than optional because
+getopt_long() accepts an optional argument only as --changelog=VALUE.
+One named MDT is also what makes a bare --since index unambiguous, the
+index being paired with the log it came from.
 
-The path argument means the filesystem rather than a subtree, since a
-changelog knows nothing about where an object sits, and a path below
-the mount is refused unless --resolve makes a pathname to match
-against.  Output is a pathname where the FID still resolves to one and
-the FID where it does not, which is the whole point of asking.  With
---resolve the subtree is tested the way --since tests it, over every
-name the object has rather than the one linkno 0 answered with.
+Every predicate a record cannot answer is refused naming itself,
+rather than answered from a zero.  Without --resolve that is -size,
+-blocks, -perm, -links, --attrs, --xattr, the layout options, -projid,
+-printf, --mdt-count and --mdt-hash; --xattr was the loud one,
+reaching llistxattr(NULL, ...) once per object, and the rest were
+quiet and worse, "--perm 644" matching nothing and its negation
+everything.  -uid and -gid are refused for a different reason and at
+every setting short of --resolve: a changelog records who caused an
+event, from the acting client's credentials, which is not who owns the
+object.  An object time is refused outright, a record carrying an
+event time and the two being different questions; the message says
+--since 1d is how to ask.  --maxdepth and --mindepth describe a walk,
+and --ost and --mdt need something a per-MDT log does not have.
 
-That fallback needs saying in the code and not only here.
-find_decide() resolves a FID through the mount for a target scan too,
-and there an object with no pathname is counted rather than printed --
-the target's own objects never had a name, and half a line is worse
-than none.  An object unlinked since its event did have one, and the
-record is the answer, so this source asks for the FID instead.
-Without it the case --changelog exists for -- the one --since cannot
-report -- came back silently missing, counted as "no pathname" while
-the man page said it would be named.
+-type is the one field with a third answer.  A record says what kind
+of object was created and only for four record types, so an object
+whose event does not carry one is counted undecided rather than
+compared against a mode of zero, which reads as "not a file" and "not
+a directory" at once.
 
-This is also the caller that hands find_prefilter() a record with no
-name at all: cr_namelen is 0 for a MARK, and for an event on a FID
-whose name the log never held.  fnmatch() would take that NULL, so the
-guard for it moves here, where the caller that needs it is.
+Output is a pathname where the FID still resolves to one and the FID
+where it does not, which is the whole point of asking: an object
+unlinked since its event is the case --changelog exists for, and
+counting it as "no pathname" the way a target scan counts its own
+objects would drop exactly that case in silence.  The count of those
+is reported at the end, so a caller knows some lines are FIDs.
 
---resolve fills what the stream lacks and never restates what it has,
-so the merge starts from the looked-up record and puts every field the
-event answered for back over it.  Only the type bits of the mode are
-taken from the event, because a record says what kind of object was
-created and never its permissions, so -perm still reads the live one.
+The path argument names the filesystem, not a subtree, a changelog
+knowing nothing about where an object sits; a path below the mount is
+refused unless --resolve makes a pathname to match against.
 
---changelog takes an MDT name or "all", required rather than optional
-because getopt_long() accepts an optional argument only as
---changelog=VALUE.  One named MDT is also what makes a bare --since
-index unambiguous, the index being paired with the log it came from.
+--resolve looks each object up through the mount and hands
+find_decide() what it found -- the path, the parent descriptor and the
+object's own -- so -size glimpses the OSTs, -projid opens through a
+descriptor of ours, and -printf gathers as a walk gathers.  It fills
+what the stream lacks and never restates what it has: the merge starts
+from the looked-up record and puts every field the event answered for
+back over it, taking only the type bits of the mode, so -perm reads
+the live one.  The subtree is tested on that pathname, over every name
+the object has rather than the one linkno 0 answered with.
 
---resolve now hands find_decide() what the lookup found.  The merged
-record carries sr_path, sr_parent_fd and sr_fd and they were dropped,
-so the decider ran with no path and no descriptor and -size, -blocks,
--projid and -printf were undecidable for every object -- the run exits
-0, reports nothing, and warns that the changelog had no answer, which
-is the opposite of what the man page promises --resolve is for.  A
-striped file's size lives on the OSTs and only a stat through the path
-glimpses it, so passing the path is what makes the promise true.
+An object that has gone between its event and the lookup keeps the
+answer honest in the other direction.  It is still in this answer --
+resolution fills and never removes -- but only where the record can
+carry the question: where the search asks something only a lookup
+supplies, or names a subtree the object can no longer be placed in, it
+is counted undecided instead.
 
-The subtree is applied on that path too.  A path argument below the
-mount is refused with "add --resolve to search below it", but nothing
-on the --resolve path consulted it, so the search answered for the
-whole filesystem and printed objects outside the subtree.  Only the
-lookup can say where an object is, so the test goes where the path
-arrives.
-
-Four more options are refused rather than answered from a record that
-cannot carry them.  --xattr was the loud one: it reached
-llistxattr(NULL, ...) and printed an error per object.  -perm, -links
-and --attrs were quieter and worse -- the record's fields are zero, so
-"--perm 644" matched nothing and its negation matched everything,
-which is the approximation the refusal exists to prevent.  All four
-are answerable once --resolve supplies the object, so they sit with
-the rest after that test.
-
---resolve on its own is refused at parse time.  lfs find only routes
-to llapi_find_since() when --since or --changelog is given, so the
-flag was parsed and never read, and lfind(1) shares this parser and
-never reads it at all.
-
-The demand mask names its fields instead of relying on 0.  Zero is
-"everything" to llapi_scan_changelog(), but the comment here read the
-other way, and a reader had to know which.
-
-A merged record no longer claims a parent it does not carry: sr_valid
-is OR'd from the event, so sr_parent_fid has to come with its bit or
-the record reports [0x0:0x0:0x0] as though it were an answer.
+The first resolve failure that is not "this object has no name"
+decides the exit status, as it already does for a target scan, so a
+run that could resolve nothing cannot report itself complete.
 
 Test-Parameters: testlist=sanity env=ONLY=56
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
@@ -226,3 +202,96 @@ Looks good to me.
 Patch Set 4:
 
 Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-29 18:54:12.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-29 19:47:54.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130601/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-30 10:57:28.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. --resolve is documented and implemented as the way to make the object-state predicates answerable, but -projid ends the whole search rather than answering, and -printf still answers from the MDT record alone. Separately, the refusal list in find_changelog_supported() misses the predicates that read the directory stripe, so they are accepted and never evaluated.
+
+The new --changelog and --resolve options look untested -- Test-Parameters names sanity ONLY=56 but no sanity test_56* case is added here or elsewhere in the series. Would it be worth a case that creates, renames and unlinks under a changelog user, then checks that --changelog reports the unlinked object by FID and that --resolve prints a path?
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:47:27.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-30 14:48:21.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-30 15:00:17.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-30 15:16:24.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-30 15:31:20.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-30 16:54:31.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130633/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 08:36:40.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that --resolve switches off the whole refusal list in find_changelog_supported(), including for the objects whose lookup fails -- which is the population --changelog exists to report.
+
+There is also no test here: --changelog and --resolve are new user-visible options and nothing under lustre/tests changes, though Test-Parameters names sanity ONLY=56. A sanity_56 case that creates, modifies and then unlinks a file, and checks that --changelog reports it by FID (and that --resolve makes -size answerable for the ones still present), would cover the behaviour the message describes.
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:07:31.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-08-31 14:08:43.000000000) ---
+Patch Set 5:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-08-31 14:20:57.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 14:39:09.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 15:19:30.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful

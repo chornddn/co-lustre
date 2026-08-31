@@ -1,0 +1,124 @@
+Change:     68521
+Subject:    LU-17000 obdclass: add class_name_validate() helper
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68521
+Change-Id:  Icdeb3063a136a2d0c3cc860d55456cf8d8f950c8
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-31 05:17:41.000000000
+Updated:    2026-08-31 14:31:34.000000000
+Patch Set:  1
+Insertions: +103
+Deletions:  -38
+Comments:   4 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder
+
+--- Commit Message ---
+LU-17000 obdclass: add class_name_validate() helper
+
+Six kernel sites open code the same "alphanumeric plus a few extra
+characters, within a length" name check, with four different accepted
+sets and four different ways of reporting a rejection, and each has
+picked up its own mistakes.  lqa_parse_args() in
+lustre/quota/qmt_handler.c names the offending character with
+"'%c'(0x%02x)" and passes a plain char, so on a signed char build a
+rejected byte above 0x7f is sign extended by the default promotion and
+reported as 0xffffffa1 rather than 0xa1.  The name comes straight out of
+the ioctl inline buffer, so any byte value is reachable, and the buffer
+is not required to hold a NUL, so printing the name with "%s" is not
+safe either.
+
+Add class_name_validate(), the kernel counterpart of the userspace
+llapi_name_validate() added by Gerrit 65994 on LU-19276, taking the
+same arguments
+and returning the same -ENXIO/-EINVAL/-ENAMETOOLONG codes, so that a name
+the utilities accept is always accepted by the server.  The kernel
+isalnum() is Latin-1 while the utilities run in the C locale where it is
+ASCII only, so the kernel stays the more permissive of the two on
+purpose: narrowing it would refuse names earlier versions have already
+written to the nodemap index, which would stop an MDT from mounting.
+
+class_name_verify() wraps it and reports which rule the name broke, so
+the converted sites have one place that prints an illegal name
+character: the byte is printed as unsigned there, the '%c' is guarded
+with isascii() as well, and the name is shown only as far as the
+character before the one that failed, so the rejected byte reaches the
+log through the guarded '%c' and its hex value rather than raw inside
+the name.
+
+This complements rather than competes with 65994: that change covers the
+utilities and replaces lfs_arg_insane() and lqa_name_insane(), this one
+covers the kernel.  They touch no file in common and can land in either
+order, since neither narrows the set of accepted names.
+
+Use them in lqa_parse_args(), nodemap_name_is_valid() and
+check_rule_name().  The names accepted do not change.  An empty LQA name
+returns -ENXIO now rather than -ENAMETOOLONG, which is what the
+userspace helper returns and is a better description than "larger than
+maximum"; the TBF rule name keeps -EINVAL, since that reaches an admin
+as the errno of a set_param write and "no such device" would point at
+the wrong thing.  For a name that is both too long and illegal, which of
+-EINVAL and -ENAMETOOLONG comes back now depends only on where the
+illegal character is: reported if it is within the first maxlen
+characters, too long if it is beyond them.  That moves in both
+directions - LQA used to check the length first, and the TBF rule check
+used to scan one character further than its own limit.
+
+class_name_validate() reads at most maxlen + 1 bytes, which the LQA
+ioctl caller cannot promise: the inline buffer is only ioc_inllen1
+bytes, of which obd_ioctl_packlen() reserves ALIGN(ioc_inllen1, 8), so a
+caller declaring a short buffer with no terminator made the strnlen()
+this replaces read past the end of the ioctl allocation.  Require the
+buffer to contain a terminator instead, which bounds the scan without
+changing which names are accepted; an unterminated buffer of
+LQA_NAME_MAX + 1 bytes comes back -EINVAL now rather than
+-ENAMETOOLONG.
+
+The other three sites, mdd_changelog_name_check(), mgs_extract_fs_pool()
+and job_xattr_store(), each apply a further rule of their own, so they
+are left for a follow-on rather than changing what they accept here, as
+is qmt_get_qc_args(), which checks only the length of the LQA and pool
+names arriving over the quotactl RPC.
+
+Fixes: bce5cb03fb3b ("LU-18222 quota: add lctl lqa commands")
+Fixes: 323f949a1552 ("LU-18222 quota: check lqa name for illegal characters")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: Icdeb3063a136a2d0c3cc860d55456cf8d8f950c8
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-31 05:17:41.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-08-31 05:21:35.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 05:22:33.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (jenkins, 2026-08-31 06:09:19.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130693/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 06:42:06.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful

@@ -1,5 +1,5 @@
 Change:     68361
-Subject:    LU-00000 ec: store parity as RAID10|PARITY so p may exceed k
+Subject:    LU-00000 ec: like-RAID10 parity layout so p may exceed k
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68361
 Change-Id:  I9574df44969ddd40776f028b3c326d150ea08eb5
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-08-26 09:56:30.000000000
-Updated:    2026-08-29 11:30:19.000000000
-Patch Set:  4
-Insertions: +758
-Deletions:  -254
-Comments:   14 (3 unresolved)
+Updated:    2026-08-31 14:47:35.000000000
+Patch Set:  5
+Insertions: +789
+Deletions:  -296
+Comments:   16 (4 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
@@ -22,59 +22,71 @@ Hashtags:   pt_ecro
   CC: Lustre RISC-V Builder
 
 --- Commit Message ---
-LU-00000 ec: store parity as RAID10|PARITY so p may exceed k
+LU-00000 ec: like-RAID10 parity layout so p may exceed k
 
 The k >= p restriction is not a Cauchy/ISA-L limit. It comes from
-storing coding stripes as RAID0|PARITY: p objects are concatenated
-along the file offset, so nsets * p * stripe_size will not fit in a
-finite PFL extent when p > k (for example --ec 2+3 -E 2M).
+storing parity as RAID0|PARITY: the p parity objects of a raidset are
+concatenated along the file offset, so raidset_count * p * stripe_size
+does not fit in a finite PFL extent when p > k (for example
+--ec 2+3 -E 2M).
 
-Write EC parity as LOV_PATTERN_RAID10|PARITY. Raidset is an EC
-split of the stripe-set; EC chose RAID10 so the p coding objects
-of a raidset share one file offset (object_off = stripeset * ss)
-instead of concatenating them. File extent still matches the data
-component:
+Store EC parity as LOV_PATTERN_PARITY instead. A raidset is an EC
+split of the stripe set, and the layout is like RAID10 in that it has
+the same two axes:
 
-  ec_off(stripeset, raidset) =
-      e_start + stripeset * (nsets * ss) + raidset * ss
+  - across the raidsets of one stripe set: like RAID0, one
+    stripe_size per raidset;
+  - within one raidset: like RAID1, the p parity stripes share one
+    file offset (the same object_off).
 
-I/O mapping keys off LCME_FL_PARITY, not the RAID10 bit. Within a
-raidset, resync/verify must pick a coding stripe via
-LL_IOC_FLR_SET_STRIPE / llapi_mirror_{read,write}_stripe():
-coding stripes differ, so a RAID10-style fan-out would be wrong.
-Punch and truncate still hit all coding objects.
+Unlike RAID1 the p parities are not replicas, each one holds a
+different parity. The file extent still matches the data component:
+
+  ec_off(stripeset, raidset) = e_start
+      + stripeset * (raidset_count * stripe_size)
+      + raidset * stripe_size
+
+I/O mapping keys off LCME_FL_PARITY, not the pattern. Within a
+raidset, resync/verify must pick one parity via LL_IOC_FLR_SET_STRIPE
+/ llapi_mirror_{read,write}_stripe(): the parities differ, so a
+RAID1-style fan-out would be wrong. Punch and truncate still hit
+every parity object.
 
 Example: -E 128M -c 11 -S 1M --ec 4+2
 
   data/parity extent [0, 128M)
-  raidsets [4,2], [4,2], [3,2] (nsets=3)
+  raidsets [4,2], [4,2], [3,2] (raidset_count=3)
   parity has 6 OST objects
-  one data stripe-set = 11M
-  one parity stripe-set = 3M (not 1M flat, not 6M concat)
+  one data stripe set = 11M
+  one parity stripe set = 3M (not 1M flat, not 6M concat)
 
-  sset rs  data_pos    EC       old concat objs
-  ---- --- ----------- -------- ---------- ----
-  0    0   [0, 4M)     0        0          0,1
-  0    1   [4M, 8M)    1M       2M         2,3
-  0    2   [8M, 11M)   2M       4M         4,5
-  1    0   [11M, 15M)  3M       6M         0,1
-  1    1   [15M, 19M)  4M       8M         2,3
-  1    2   [19M, 22M)  5M       10M        4,5
+  stripeset raidset data_pos    ec_off  concat  objects
+  --------- ------- ----------- ------- ------- -------
+  0         0       [0, 4M)     0       0       0,1
+  0         1       [4M, 8M)    1M      2M      2,3
+  0         2       [8M, 11M)   2M      4M      4,5
+  1         0       [11M, 15M)  3M      6M      0,1
+  1         1       [15M, 19M)  4M      8M      2,3
+  1         2       [19M, 22M)  5M      10M     4,5
 
-When nsets == 1 (e.g. --ec 2+3), one raidset still fits p > k in
-a finite PFL extent. With --ec 1+N, parity offsets align with
-each data stripe.
+The concat column is what RAID0|PARITY would have used, and is what
+overflows a finite extent. When raidset_count == 1 (e.g. --ec 2+3) a
+single raidset still fits p > k in a finite PFL extent. With
+--ec 1+N, parity offsets align with each data stripe.
 
-lov_pattern_available() accepts RAID10|PARITY; old clients skip
-the unknown pattern and leave the parity component inert.
-Finite-extent stripe-count shrinking is skipped for parity
-components. The p <= k checks in lfs and llapi are removed;
-k+p <= 256 and p <= 15 remain.
+This changes how a parity component is encoded, so
+lov_pattern_supported() and lov_pattern_available() now accept
+LOV_PATTERN_PARITY on its own in place of RAID0|PARITY, and
+lov_entry_type() dispatches on the PARITY bit. EC has not shipped, so
+the old combination is not kept. Finite-extent stripe-count shrinking
+is skipped for parity components. The p <= k checks in lfs and llapi
+are removed; k+p <= 256 and p <= 15 remain.
 
-Tests: sanity-ec 4a/10 accept 2+3; test_300 covers PFL -E 2M
---ec 2+3 create/resync/verify; 12c/34c cover holes and
-multi-raidset offsets (34c asserts striping into raidset 1);
-llapi_layout_test T47 allows 3+4.
+Tests: sanity-ec 4a and 10 accept p > k; test_300 covers PFL -E 2M
+--ec 2+3 create/resync/verify; 12c/34c cover holes and multi-raidset
+offsets (34c asserts striping into raidset 1); llapi_layout_test
+test47 allows 3+4 and asserts the component pattern is
+LOV_PATTERN_PARITY.
 
 Test-Parameters: trivial
 Assisted-by: Cursor:Fable5/Grok-4.6 llm_code_and_review_tools
@@ -212,5 +224,36 @@ https://build.whamcloud.com/job/lustre-reviews/130533/ : SUCCESS
 
 --- Message (Lustre RISC-V Builder, 2026-08-28 12:45:44.000000000) ---
 Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Keguang Xu, 2026-08-31 02:15:16.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-08-31 02:16:53.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 02:17:55.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-08-31 02:46:09.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130675/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 04:07:19.000000000) ---
+Patch Set 5:
 
 RISC-V Client Builder: build succesful

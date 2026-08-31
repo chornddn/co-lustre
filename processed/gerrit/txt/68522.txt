@@ -1,0 +1,87 @@
+Change:     68522
+Subject:    LU-17000 llite: pin fa_nr against a double fetch in ll_rmfid()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68522
+Change-Id:  I2e92f41fb8f3bff69764bfab2ff2c306671d5662
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Oleg Drokin
+Created:    2026-08-31 06:11:13.000000000
+Updated:    2026-08-31 14:57:25.000000000
+Patch Set:  1
+Insertions: +5
+Deletions:  -0
+Comments:   2 (1 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-17000 llite: pin fa_nr against a double fetch in ll_rmfid()
+
+ll_rmfid() reads the caller's fa_nr with get_user() and sizes both the
+lfa FID array and the rcs[] status array from that value, then
+copy_from_user()s the header again.  lfa->fa_nr is therefore a second,
+independent read of the same user field, and nothing downstream
+revalidates it against the size the buffers were allocated for.
+
+mdc_rmfid() sizes the RMF_FID_ARRAY and RMF_RCS request buffers from
+fa->fa_nr and memcpy()s fa->fa_fids into the RPC; mdc_rmfid_interpret()
+memcpy()s fa_nr ints from the reply back into rcs[]; lmv_rmfid() walks
+fa->fa_fids[] to the same count and sizes its per-target arrays from it.
+The second fetch never goes back through the nr > OBD_MAX_FIDS_IN_ARRAY
+test, so lfa->fa_nr is an arbitrary __u32, not a value capped at 4096.
+A caller that raises it between the two fetches makes the client copy
+FIDs out of a much smaller allocation into an outgoing RPC and write
+that many ints past the end of rcs[]: a heap overread onto the wire and
+a heap overflow.  mdc_rmfid() computes flen as an int, so a large enough
+value also truncates or goes negative before it reaches
+req_capsule_set_size() and memcpy().
+
+Pin lfa->fa_nr to the value every buffer was sized from.
+
+Test-Parameters: trivial
+Fixes: 1fd63fcb045c ("LU-12090 utils: lfs rmfid")
+Signed-off-by: Oleg Drokin <green@whamcloud.com>
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Change-Id: I2e92f41fb8f3bff69764bfab2ff2c306671d5662
+
+--- Review History ---
+
+--- Message (Oleg Drokin, 2026-08-31 06:11:13.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-08-31 06:14:03.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-08-31 06:23:16.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-08-31 06:29:29.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-08-31 06:42:07.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130696/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-08-31 14:57:25.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+The pin itself looks correct and matches what every buffer in this function was sized from. One suggestion inline about the neighbouring nr == 0 path, which is the other way a hostile fa_nr gets through here.
