@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chakshu Kansal
 Created:    2026-07-14 10:32:37.000000000
-Updated:    2026-08-27 04:54:55.000000000
-Patch Set:  4
-Insertions: +456
-Deletions:  -25
-Comments:   77 (16 unresolved)
+Updated:    2026-09-01 14:18:06.000000000
+Patch Set:  6
+Insertions: +1194
+Deletions:  -88
+Comments:   107 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Vitaly Oratovsky, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,48 +24,69 @@ Comments:   77 (16 unresolved)
 --- Commit Message ---
 LU-17957 mdd: POSIX interface for non-root immutable files
 
-Adds a POSIX-compatible interface for non-root users to set files
-as immutable.
-The interface allows non-root file owners to make files immutable by:
+Add a POSIX-compatible interface allowing non-root file owners to
+make their own files immutable, without requiring CAP_LINUX_IMMUTABLE
+or root, by:
 
-- Setting the file's access time (atime) to a future time
-- Removing all write permissions from the file
+  1. Setting the file's atime at least 24 hours into the future
+  2. Removing all write permissions from the file
 
-The access time must be set at least 60 seconds into the future.
-When both conditions are met, the file automatically gets the
-`LUSTRE_IMMUTABLE_FL` flag set.
+When both conditions are met and mdd.posix_immutable is enabled,
+the MDS automatically sets LUSTRE_IMMUTABLE_FL. A new LMA compat
+flag, LMAC_RETENTION (wire flag LUSTRE_RETENTION_FL), marks the
+file as under this auto-expiry scheme, distinguishing it from a
+plain chattr +i file, which must never auto-clear.
 
-Shared helpers lu_posix_immutable_expired() and
-lu_posix_immutable_owner_or_cap()  are used by the
-MDD and MDT to agree on what is an expired POSIX immutable file:
-a regular file with LUSTRE_IMMUTABLE_FL, no write bits and
-atime <= now. A chattr +i file (write bits present) never
-auto-expires.
+lu_posix_immutable_expired() and lu_posix_immutable_owner_or_cap()
+are shared inline helpers in md_object.h. They define the common
+expiry rule used by MDD: a regular file with both IMMUTABLE_FL and
+RETENTION_FL set, no write bits, and atime <= now.
+lu_posix_immutable_check() combines these into a single
+authorization rule used everywhere LUSTRE_IMMUTABLE_FL is enforced:
+setattr, unlink, rename, migrate, open for write/trunc/append,
+layout merge/split, layout swap, and mirror/component add. A
+caller with CAP_LINUX_IMMUTABLE is always allowed, at any time, so
+a long or mistaken retention period can never permanently lock an
+administrator out of a file. The owner without that capability is
+only allowed once the file has expired. A plain chattr +i file is
+always denied to the owner. Whoever acts on an expired file also
+persists the flag clear via mdd_clear_expired_posix_immutable() in
+its own transaction. mdd_attr_get() applies the same rule on
+getattr, so a stale flag is not returned to the owner or a cap
+holder.
 
-After the retention period expires, the immutable restriction is
-lifted for the owner or CAP_LINUX_IMMUTABLE:
-- MDD permission, setattr and delete paths allow the operation
-  and clear LUSTRE_IMMUTABLE_FL in the same transaction.
-- mdd_attr_get() drops an expired LUSTRE_IMMUTABLE_FL on disk,
-  and mdt_pack_attr2body() omits it from the getattr reply so
-  clients never observe a stale flag.
-- ll_refresh_posix_immutable(), called from ll_revalidate_dentry()
-  before the VFS IS_IMMUTABLE() check, re-fetches flags from the
-  MDS and drops S_IMMUTABLE when LUSTRE_IMMUTABLE_FL is gone.
+Note, a getattr from a non-owner, non-privileged caller may still
+see LUSTRE_IMMUTABLE_FL on an expired but not yet cleared file until
+the owner or a privileged caller next touches it. The flag is not
+filtered in mdt_pack_attr2body().
 
-Because the file remains a‑w, the write still fails with EACCES
-until write permission is restored; only the immutable restriction
-is lifted.
+osd-ldiskfs and osd-zfs osd_attr_set() are reworked from a one-way
+OR of LMA flags to a compute-and-diff set/clear update, since
+RETENTION_FL, unlike ORPHAN/ENCRYPT, must be clearable.
 
-ll_md_getattr_flags() is factored out of fileattr_get() so the
-client revalidation path issues the same MDS getattr used by
-lsattr.
+On the client, llite gains LLIF_POSIX_IMMUTABLE and
+ll_refresh_posix_immutable(), called from ll_revalidate_dentry()
+before the VFS IS_IMMUTABLE() check, to re-fetch flags from the MDS
+and drop S_IMMUTABLE once LUSTRE_IMMUTABLE_FL is gone. Since the
+file stays mode a-w, writes still fail with EACCES until write
+permission is restored. Only the immutable restriction is lifted.
+Refresh RPCs are rate-limited to 5 per second MDS-wide, and only
+triggered for files carrying LLIF_POSIX_IMMUTABLE, so plain
+chattr +i files never issue extra RPCs. fileattr_get() is refactored
+to share ll_md_getattr_flags() with the revalidation path, and hides
+LUSTRE_RETENTION_FL from userspace so chattr -i is not rejected as
+an unrecognized flag.
+
+Off by default, mdd.posix_immutable=0.
 
 test_106d in sanityn.sh covers flag set, retention expiry,
-mode-only failure after expiry and root delete after expiry.
+mode-only failure after expiry, root override before expiry, and
+owner delete after expiry.
+test_106e covers lfs migrate, layout swap, honoring the same
+owner-or-cap rule.
 
-Change-Id: Iab9c0f69dd8152a7eaa48e8454120af469ea4d63
 Signed-off-by: Chakshu Kansal <ckansal@ddn.com>
+Change-Id: Iab9c0f69dd8152a7eaa48e8454120af469ea4d63
 
 --- Review History ---
 
@@ -241,3 +262,68 @@ Patch Set 4:
 Patch Set 4:
 
 (2 comments)
+
+--- Message (Chakshu Kansal, 2026-09-01 10:25:28.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chakshu Kansal, 2026-09-01 10:25:59.000000000) ---
+Patch Set 5:
+
+(16 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 10:28:01.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-01 10:36:59.000000000) ---
+Patch Set 5:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 10:40:31.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chakshu Kansal, 2026-09-01 11:20:43.000000000) ---
+Uploaded patch set 6.
+
+--- Message (jenkins, 2026-09-01 11:20:57.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130771/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-09-01 11:23:01.000000000) ---
+Patch Set 6:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 11:23:25.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 11:33:25.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-01 12:29:49.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130774/ : SUCCESS

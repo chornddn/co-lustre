@@ -7,19 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Shaun Tancheff
 Created:    2026-04-04 14:40:09.000000000
-Updated:    2026-08-29 05:14:34.000000000
+Updated:    2026-08-31 17:16:42.000000000
 Patch Set:  30
 Insertions: +2359
 Deletions:  -1126
-Comments:   1339 (26 unresolved)
+Comments:   1340 (26 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Patrick Farrell: -1
   Verified: jenkins: -1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Nikitas Angelinas, Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Qian Yingjin, Shaun Tancheff
+  CC: Andreas Dilger, Nikitas Angelinas, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Qian Yingjin, Shaun Tancheff, Patrick Farrell
 
 --- Commit Message ---
 LU-19895 clio: enable multi-order folios for BIO writes
@@ -1007,3 +1007,26 @@ Patch Set 30:
 Patch Set 30:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-08-31 17:14:00.000000000) ---
+Patch Set 30:
+
+AI review of PS30 (Claude). Two issues found while reviewing a DIO change built on top of this patchset. Both look pre-existing rather than introduced here, so reporting rather than fixing.
+
+1. lov_page_init_empty() (lustre/lov/lov_page.c:191) zeroes only PAGE_SIZE of what may now be a multi-page folio, then marks it uptodate:
+
+        addr = cl_kmap_local(cl_page);
+        memset(addr, 0, PAGE_SIZE);
+        kunmap_local(addr);
+        folio_mark_uptodate(cl_page->cp_folio);
+
+cl_kmap_local() is kmap_local_folio(cp_folio, cl_page_pgno << PAGE_SHIFT), which maps the single page at that offset, so for a CPT_CACHEABLE cl_page spanning a large folio (cp_len == folio_size) only the first 4KiB is cleared. The remaining pages keep whatever they held and the folio is then marked uptodate, so a buffered read of a hole or of an uninstantiated PFL component on a large folio would return stale kernel memory to userspace. The line itself is unchanged, but this patchset is what makes cached cl_pages span whole folios, so the reachability is new. A per-page loop over cp_npgs would fix it; a wider memset would not, since kmap_local_folio only guarantees the one page.
+
+2. osc_dio_submit() (lustre/osc/osc_io.c:340): if osc_queue_dio_pages() fails mid-loop, the code breaks with queued > 0 and a list that the failed call has already emptied. The trailing 'if (queued > 0)' then calls osc_queue_dio_pages() again on that empty list, where the oe_dio branch does list_first_entry() and dereferences the list head as an osc_async_page. Entries after the failure point are also never completed while the function returns 0, which would leave the sync anchor waiting.
+
+Neither has been reproduced at runtime -- item 1 in particular is a code-reading result and worth confirming before acting on it.
+
+--- Message (Patrick Farrell, 2026-08-31 17:16:42.000000000) ---
+Patch Set 30: Code-Review-1
+
+(1 comment)
