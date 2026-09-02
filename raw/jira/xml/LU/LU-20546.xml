@@ -1,49 +1,121 @@
 <rss version="0.92"><channel><item>
-            <title>[LU-20546] ptlrpc: import reference leaked when idle reconnect fails</title>
+            <title>[LU-20546] ptlrpc: import reference leaked or double-released on setup failure</title>
                 <link>https://jira.whamcloud.com/browse/LU-20546</link>
                 <project id="10000" key="LU">Lustre</project>
-                    <description>&lt;p&gt;Similar to &lt;a href="https://jira.whamcloud.com/browse/LU-20050" title="ptlrpc: fix sepol error handling in ptlrpc_connect_import_locked" class="issue-link" data-issue-key="LU-20050"&gt;LU-20050&lt;/a&gt; (Gerrit 65026), the same import reference leak on a second path that patch doesn't touch.&lt;/p&gt;
+                    <description>&lt;p&gt;Two import reference bugs on the paths that set a request up before it is&lt;br/&gt;
+sent. Both come from the same thing: &lt;b&gt;ptlrpc_request_free()&lt;/b&gt; and&lt;br/&gt;
+&lt;b&gt;ptlrpc_req_put()&lt;/b&gt; are not interchangeable, and the setup paths disagree about&lt;br/&gt;
+which one is correct. Related to &lt;a href="https://jira.whamcloud.com/browse/LU-20050" title="ptlrpc: fix sepol error handling in ptlrpc_connect_import_locked" class="issue-link" data-issue-key="LU-20050"&gt;LU-20050&lt;/a&gt; (Gerrit 64945), which fixes the same&lt;br/&gt;
+kind of leak in &lt;b&gt;ptlrpc_connect_import_locked()&lt;/b&gt;.&lt;/p&gt;
 
-&lt;p&gt;In &lt;b&gt;ptlrpc_request_alloc_internal()&lt;/b&gt; the request gets allocated first, and  &lt;b&gt;__ptlrpc_request_alloc()&lt;/b&gt; takes an import reference for it:&lt;/p&gt;
+&lt;h2&gt;&lt;a name="1.Thereferenceisleakedwhenanidlereconnectfails"&gt;&lt;/a&gt;1. The reference is leaked when an idle reconnect fails&lt;/h2&gt;
+
+&lt;p&gt;In &lt;b&gt;ptlrpc_request_alloc_internal()&lt;/b&gt; the request gets allocated first, and&lt;br/&gt;
+&lt;b&gt;__ptlrpc_request_alloc()&lt;/b&gt; takes an import reference for it:&lt;/p&gt;
 &lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
-&lt;pre class="code-java"&gt;
-request-&amp;gt;rq_import = class_import_get(imp);
-atomic_inc(&amp;amp;imp-&amp;gt;imp_reqs);&lt;/pre&gt;
+&lt;pre class="code-java"&gt;&lt;/pre&gt;
 &lt;/div&gt;&lt;/div&gt;
-&lt;p&gt;If the import isn't FULL we try an idle reconnect, and the failure path looks like this:&lt;/p&gt;
+&lt;p&gt;request-&amp;gt;rq_import = class_import_get(imp);&lt;br/&gt;
+atomic_inc(&amp;amp;imp-&amp;gt;imp_reqs);{code}&lt;br/&gt;
+If the import isn't FULL we try an idle reconnect, and the failure path looks like this:&lt;/p&gt;
 &lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
-&lt;pre class="code-java"&gt;
-&lt;span class="code-keyword"&gt;if&lt;/span&gt; (ptlrpc_reconnect_if_idle(imp) &amp;lt; 0) {
+&lt;pre class="code-java"&gt;&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;if (ptlrpc_reconnect_if_idle(imp) &amp;lt; 0) &lt;/p&gt;
+{
         atomic_dec(&amp;amp;imp-&amp;gt;imp_reqs);
         ptlrpc_request_free(request);
-        &lt;span class="code-keyword"&gt;return&lt;/span&gt; NULL;
-}&lt;/pre&gt;
+        return NULL;
+}
+&lt;p&gt;{code}&lt;br/&gt;
+&lt;b&gt;ptlrpc_request_free()&lt;/b&gt; only puts the request back on the slab or into the&lt;br/&gt;
+pool. It never calls &lt;b&gt;class_import_put()&lt;/b&gt;, so the reference taken a few lines&lt;br/&gt;
+earlier is just lost. Every failed idle reconnect leaks one, the import is&lt;br/&gt;
+never freed, &lt;b&gt;client_obd_cleanup()&lt;/b&gt; never runs, and the LDLM namespace kobject&lt;br/&gt;
+is left behind in sysfs. The next mount of the same target then fails with&lt;br/&gt;
+-EEXIST.&lt;/p&gt;
+
+&lt;p&gt;The easiest way to see it is to set &lt;b&gt;sptlrpc.send_sepol=-1&lt;/b&gt; and break&lt;br/&gt;
+&lt;b&gt;l_getsepol&lt;/b&gt;: any client whose import has gone idle fails the reconnect, and&lt;br/&gt;
+leaks on every RPC that triggers one.&lt;/p&gt;
+
+&lt;p&gt;The fix is to call &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; instead — it goes through&lt;br/&gt;
+&lt;b&gt;__ptlrpc_free_req()&lt;/b&gt;, which already drops the import reference and decrements&lt;br/&gt;
+&lt;b&gt;imp_reqs&lt;/b&gt;. The open-coded &lt;b&gt;atomic_dec()&lt;/b&gt; has to go at the same time, otherwise&lt;br/&gt;
+the counter drops twice and the assertion in &lt;b&gt;__ptlrpc_free_req()&lt;/b&gt; trips.&lt;/p&gt;
+
+&lt;p&gt;This has been there since 93d20d171c20 ("&lt;a href="https://jira.whamcloud.com/browse/LU-11128" title="replay-single test timeout" class="issue-link" data-issue-key="LU-11128"&gt;&lt;del&gt;LU-11128&lt;/del&gt;&lt;/a&gt; ptlrpc: new request vs&lt;br/&gt;
+disconnect race"), which moved the allocation above the idle check.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="2.Thereferenceisreleasedtwicewhenpackingfails"&gt;&lt;/a&gt;2. The reference is released twice when packing fails&lt;/h2&gt;
+
+&lt;p&gt;&lt;b&gt;ptlrpc_request_bufs_pack()&lt;/b&gt; has the opposite problem. Its out_free label drops&lt;br/&gt;
+the reference, but leaves &lt;b&gt;rq_import&lt;/b&gt; pointing at the import:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;&lt;/pre&gt;
 &lt;/div&gt;&lt;/div&gt;
-&lt;p&gt;&lt;b&gt;ptlrpc_request_free()&lt;/b&gt; only puts the request back on the slab or into the pool. It  never calls &lt;b&gt;class_import_put()&lt;/b&gt;, so the reference taken a few lines earlier is just lost. Every failed idle reconnect leaks one, the import is never freed, &lt;b&gt;client_obd_cleanup()&lt;/b&gt; never runs, and the LDLM namespace kobject is left behind in sysfs. The next mount of the same target then fails with -EEXIST.&lt;/p&gt;
+&lt;p&gt;out_free:&lt;br/&gt;
+        atomic_dec(&amp;amp;imp-&amp;gt;imp_reqs);&lt;br/&gt;
+        class_import_put(imp);&lt;/p&gt;
 
-&lt;p&gt;The easiest way to see it is to set &lt;b&gt;sptlrpc.send_sepol=-1&lt;/b&gt; and break &lt;b&gt;l_getsepol&lt;/b&gt;: any client whose import has gone idle fails the reconnect, and leaks on every RPC that triggers one.&lt;/p&gt;
+&lt;p&gt;        return rc;{code}&lt;br/&gt;
+&lt;b&gt;__ptlrpc_free_req()&lt;/b&gt; releases the import whenever &lt;b&gt;rq_import&lt;/b&gt; is set. So a&lt;br/&gt;
+caller that disposes of the failed request with &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; releases the&lt;br/&gt;
+same reference a second time.&lt;/p&gt;
 
-&lt;p&gt;The fix is to call &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; instead — it goes through &lt;b&gt;_&lt;em&gt;ptlrpc_free_req()&lt;/b&gt;, which already drops the import reference and decrements &lt;b&gt;imp_reqs&lt;/b&gt;. The open-coded &lt;b&gt;atomic_dec()&lt;/b&gt; has to go at the same time, otherwise the counter drops twice and the LASSERT in &lt;b&gt;&lt;/em&gt;_ptlrpc_free_req()&lt;/b&gt; trips.&lt;/p&gt;
+&lt;p&gt;Two callers do exactly that today:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;gss_cli_ctx_fini_rpc()&lt;/b&gt; in gss_cli_upcall.c jumps to out_ref on a pack&lt;br/&gt;
+error, and out_ref calls &lt;b&gt;ptlrpc_req_put()&lt;/b&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;osp_sync_new_job()&lt;/b&gt; in osp_sync.c calls &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; on a pack error&lt;/li&gt;
+&lt;/ul&gt;
 
-&lt;p&gt;This has been there since 93d20d171c20 ("&lt;a href="https://jira.whamcloud.com/browse/LU-11128" title="replay-single test timeout" class="issue-link" data-issue-key="LU-11128"&gt;&lt;del&gt;LU-11128&lt;/del&gt;&lt;/a&gt; ptlrpc: new request vs disconnect race"), which moved the allocation above the idle check. &lt;a href="https://jira.whamcloud.com/browse/LU-20050" title="ptlrpc: fix sepol error handling in ptlrpc_connect_import_locked" class="issue-link" data-issue-key="LU-20050"&gt;LU-20050&lt;/a&gt; fixes the same kind of leak in &lt;b&gt;ptlrpc_connect_import_locked()&lt;/b&gt;.&lt;/p&gt;</description>
+
+&lt;p&gt;Both over-release the import and decrement &lt;b&gt;imp_reqs&lt;/b&gt; twice. The assertion on&lt;br/&gt;
+&lt;b&gt;imp_reqs&lt;/b&gt; in &lt;b&gt;__ptlrpc_free_req()&lt;/b&gt; can fire, and the import can be freed while&lt;br/&gt;
+it is still in use.&lt;/p&gt;
+
+&lt;p&gt;The fix is to clear &lt;b&gt;rq_import&lt;/b&gt; once the reference has been dropped.&lt;br/&gt;
+&lt;b&gt;__ptlrpc_free_req()&lt;/b&gt; already skips the release when &lt;b&gt;rq_import&lt;/b&gt; is NULL, so&lt;br/&gt;
+after this both &lt;b&gt;ptlrpc_request_free()&lt;/b&gt; and &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; are correct on a&lt;br/&gt;
+failed pack, and callers no longer have to know which one to use.&lt;/p&gt;
+
+&lt;p&gt;This one dates to 8e86156c34f3 ("&lt;a href="https://jira.whamcloud.com/browse/LU-10486" title="osp_sync_new_{unlink,unlink64}_job() leak req on error" class="issue-link" data-issue-key="LU-10486"&gt;&lt;del&gt;LU-10486&lt;/del&gt;&lt;/a&gt; osp: fix request leak on error in&lt;br/&gt;
+osp_sync") for the osp caller; the gss caller is older.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Whytheyarefixedtogether"&gt;&lt;/a&gt;Why they are fixed together&lt;/h2&gt;
+
+&lt;p&gt;The two fixes meet in the middle. The first makes a setup path start using&lt;br/&gt;
+&lt;b&gt;ptlrpc_req_put()&lt;/b&gt;; the second makes &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; safe on a setup path&lt;br/&gt;
+that has already failed. Together they make &lt;b&gt;ptlrpc_req_put()&lt;/b&gt; the one correct&lt;br/&gt;
+way to dispose of a request that failed before it was sent, which is what lets&lt;br/&gt;
+the callers in mdc drop their second error label (&lt;a href="https://jira.whamcloud.com/browse/LU-20050" title="ptlrpc: fix sepol error handling in ptlrpc_connect_import_locked" class="issue-link" data-issue-key="LU-20050"&gt;LU-20050&lt;/a&gt;, Gerrit 65026).&lt;/p&gt;</description>
                 <environment />
         <key id="98743">LU-20546</key>
-            <summary>ptlrpc: import reference leaked when idle reconnect fails</summary>
+            <summary>ptlrpc: import reference leaked or double-released on setup failure</summary>
                 <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
                                             <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
-                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
-                    <statusCategory id="2" key="new" colorName="default" />
+                        <status id="3" iconUrl="https://jira.whamcloud.com/images/icons/statuses/inprogress.png" description="This issue is being actively worked on at the moment by the assignee.">In Progress</status>
+                    <statusCategory id="4" key="indeterminate" colorName="inprogress" />
                                     <resolution id="-1">Unresolved</resolution>
                                         <assignee username="hnishida">Hiroshi Nishida</assignee>
                                     <reporter username="hnishida">Hiroshi Nishida</reporter>
                         <labels>
                     </labels>
                 <created>Fri, 31 Jul 2026 13:57:00 +0000</created>
-                <updated>Fri, 31 Jul 2026 13:57:00 +0000</updated>
+                <updated>Wed, 2 Sep 2026 14:21:42 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>1</watches>
-                                                                                    <attachments>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="500770" author="gerrit" created="Wed, 2 Sep 2026 13:54:00 +0000">&lt;p&gt;"Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/68582" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/68582&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20546" title="ptlrpc: import reference leaked or double-released on setup failure" class="issue-link" data-issue-key="LU-20546"&gt;LU-20546&lt;/a&gt; ptlrpc: fix import ref on request setup failures&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 134d3461b0dbc34377ae5349ecc8178e1b680dac&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
                     </attachments>
                 <subtasks>
                     </subtasks>

@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-22 16:30:13.000000000
-Updated:    2026-08-20 21:49:22.000000000
-Patch Set:  7
-Insertions: +416
-Deletions:  -26
-Comments:   34 (2 unresolved)
+Updated:    2026-09-02 17:36:55.000000000
+Patch Set:  8
+Insertions: +520
+Deletions:  -25
+Comments:   38 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -38,12 +38,9 @@ never delivered, times out, and the server evicts the client. The
 target NID hash also keeps listing the export under C1, so a lookup
 by the client's current NID misses.
 
-The client-side import refresh cannot cover this. It detects a
-migration by looking up the primary of the NID its own connection
-holds, but the server's reverse import holds C1, and once discovery
-prunes C1 LNetPrimaryNIDNoWait() can no longer find it and reports it
-unchanged. The reverse import is blind to its own peer's migration
-and has no path from C1 to C2.
+The client-side import refresh cannot cover this. The server's reverse
+import holds C1, and once discovery prunes C1 LNetPrimaryNIDNoWait()
+can no longer find it. The reverse import has no path from C1 to C2.
 
 The only place the server authoritatively learns C2 is an incoming
 request: rq_peer is the primary NID LNet resolved for the request at
@@ -58,16 +55,23 @@ on the new primary, mirroring the connect-time swap
 Requests are not handled in arrival order. The high priority queue is
 drained first, NRS policies reorder within a queue, and service
 threads run in parallel. A migration does not increase exp_conn_cnt,
-so ptlrpc_check_req() does not drop a request that arrived before it,
-and rq_peer only records the primary as it stood at parse time. The
-refresh therefore asks LNet again for the primary of that NID and
-acts only if the answer still agrees. A request whose NID LNet has
-since demoted or dropped is stale and is ignored, so it cannot put
-the export back on the NID a newer request moved it off. Re-reading
-the answer, rather than ordering the requests, also keeps a request
-that predates a reconnect from undoing the connect-time key. This
-defense assumes that the LNet primary of a peer does not move back to
-a NID it left. LNet keeps no generation number for a migration.
+so ptlrpc_check_req() still admits a request that predates one.
+
+The export must therefore move only forward in time. Add
+rq_arrival_mono, a CLOCK_MONOTONIC stamp that request_in_callback()
+writes beside rq_peer and rq_arrival_time. Record the newest stamp in
+the export, and ignore a request that arrived before it. Deadlines and
+adaptive timeouts keep rq_arrival_time.
+
+The export can still hold a NID that the peer left after the newest
+request arrived, because no request shows that the migration
+occurred. The next request corrects the export.
+
+The refresh does not move exp_nid_stats. The exports directory of the
+target keeps the name of the NID that the client used at connect time.
+A lookup by the current NID does not find the export, and neither does
+obd_export_evict_by_nid(). The counters stay correct, because every
+counter goes through exp->exp_nid_stats. LU-20674 covers the move.
 
 The same refresh moves the reverse import, the only place it can
 learn of the migration. exp_imp_reverse is stable under exp_lock, and
@@ -76,12 +80,10 @@ nesting order is exp_lock -> imp_lock. rev_import_reconnect() takes
 imp_lock around its own connection swap so it serializes with this
 refresh.
 
-A reverse import owns no DLM export of its own: the server's DLM
-export for that client is the obd_export the reverse import hangs off,
-and it is refreshed directly. ptlrpc_import_switch_connection()
-therefore skips the DLM export step for IMPF_DLM_FAKE imports rather
-than reporting -EINVAL, and is no longer static so the export refresh
-can reach it.
+The helper import_switch_connection() is no longer static, so the
+export refresh can reach it. Rename it to
+ptlrpc_import_switch_connection() to match the other exported ptlrpc
+symbols. It already skips the DLM export step for a reverse import.
 
 Move the setup of conf-sanity test_73g into setup_73gh(), so the new
 tests share it. Add one assertion to test_73g. A client holds no
@@ -100,15 +102,13 @@ server request path with OBD_FAIL_PTLRPC_PAUSE_EXP_REFRESH, migrates
 the client, lets a later request re-key the export, then releases the
 parked request and checks that it does not move the export back.
 
-Only an export with a reverse import is refreshed. Every request
-resolves an export from the handle it carries, so on a server that
-is also a client an incoming callback resolves the local DLM export
-of one of its own imports. That export belongs to
-ptlrpc_import_switch_connection(), which re-keys it under imp_lock,
-while this path holds only exp_lock, so both could put the same
-connection reference. rev_import_init() gives a reverse import to
-every export a client connects to, and does so before exp_connection
-is set, so no target export is ever skipped.
+Only an export with a reverse import is refreshed. A server that is
+also a client resolves an incoming callback to a local DLM export.
+That export belongs to one of its own imports, and to
+ptlrpc_import_switch_connection(), which re-keys it under imp_lock.
+This path holds only exp_lock. rev_import_init() gives a reverse
+import to every export a client connects to. No target export is
+therefore skipped.
 
 Assisted-by: Claude:claude-opus-4.8
 Fixes: b38eb0b6c483 ("LU-7734 lnet: set primary NID in ptlrpc_connection_get()")
@@ -1871,3 +1871,276 @@ Trevis Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/l
 Patch Set 7:
 
 Passed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm150: https://testing.whamcloud.com/test_sessions/84c1b9b5-c881-4bf3-809b-a0163aaff8ab ran 11 tests.
+
+--- Message (Chris Horn, 2026-09-01 20:30:07.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-09-01 20:32:46.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-09-01 20:35:17.000000000) ---
+Patch Set 8:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69340/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 20:36:05.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-01 20:38:24.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 21:59:28.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 01:40:22.000000000) ---
+Patch Set 8:
+
+Initial testing succeeded.
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69340/results.html
+Commencing standard testing: 
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 09:25:34.000000000) ---
+Patch Set 8:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8192s)
+- 155(ls1 != ls2) 
+> sanity-pcc@ldiskfs+DNE Failure(3785s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-pcc@zfs Failure(3724s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+
+Succeeded:
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69340/results.html
+
+--- Message (Chris Horn, 2026-09-02 16:36:11.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (jenkins, 2026-09-02 17:35:13.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130851/ : SUCCESS
+
+--- Message (Maloo, 2026-09-02 17:36:55.000000000) ---
+Patch Set 8:
+
+#### The following sessions will be run for Build 130851 (patch #8):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130851&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130851#redirect

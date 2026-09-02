@@ -7,95 +7,78 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-08-14 04:20:45.000000000
-Updated:    2026-08-31 09:44:40.000000000
-Patch Set:  4
-Insertions: +244
+Updated:    2026-09-02 16:38:36.000000000
+Patch Set:  5
+Insertions: +287
 Deletions:  -10
-Comments:   27 (2 unresolved)
+Comments:   30 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Zhenyu Xu, Qian Yingjin
 
 --- Commit Message ---
 LU-20590 llite: pin the layout lock for a starving IO
 
-can_populate_pages() asks ll_file_io_generic() to restart the IO.
-The restart happens when the cached layout generation of the inode is
-the invalid sentinel.  Local reclaim of the MDC ibits lock which
-carries the layout produces that sentinel.  With the lock cache under
-pressure a reader or a writer then goes round the restart loop.  The
-loop can run until the budget is gone, and move no data at all.
+can_populate_pages() asks ll_file_io_generic() to restart the IO when
+the cached layout generation of the inode is the invalid sentinel.
+Local reclaim of the MDC ibits lock which carries the layout produces
+that sentinel. With the lock cache under pressure, a reader or a
+writer then goes round the restart loop. The loop can run until the
+budget is gone, and move no data at all.
 
 Count consecutive restarts which moved no bytes and found no cached
-generation.  After LL_LAYOUT_PIN_RESTARTS of them, hold the layout
-lock out of voluntary LRU reclaim for the rest of the syscall.  The
-pin takes no mode reference.  The server can still revoke the layout
-at once, and the existing generation checks stay in force.
+generation. After LL_LAYOUT_PIN_RESTARTS of them, hold the layout lock
+out of voluntary LRU reclaim for the rest of the syscall. The pin
+takes no mode reference. The server can still revoke the layout at
+once, and the existing generation checks stay in force.
 
-The counter is a heuristic.  The count does not prove that a layout
-drop caused the restart.  All it records is that the try moved no
-bytes, and that the generation read the sentinel at that instant.
-This test is a correlation.  A mirror failover retry which moves
-nothing and races a concurrent cancel advances the counter too.  The
-cost of a wrong guess is one spare pin, which the syscall drops on
-the way out.
+The counter is a heuristic. A server revoke and a local reclaim both
+reach vvp_conf_set() through ll_layout_conf(OBJECT_CONF_INVALIDATE).
+The sentinel therefore does not name the cause. A mirror failover
+retry which moves nothing can advance the counter too. The cost of a
+wrong guess is one spare pin, which the syscall drops on the way out.
+A try which moves bytes, or which reads a valid generation, resets the
+counter. The threshold only has to clear the one-shot paths.
 
-A server revoke and a local reclaim both reach vvp_conf_set() through
-ll_layout_conf(OBJECT_CONF_INVALIDATE), so the sentinel does not name
-the cause.  vvp_io_fini() also skips its own layout refresh when
-ci_need_restart is already set.  A restart from can_populate_pages()
-therefore still reads the sentinel, whatever caused it.  The counter
-advances.  The next try resets the counter.  vvp_io_init() refreshes
-the layout first, and a valid generation ends the run.  A try which
-moves bytes resets the counter too.  The threshold only
-has to clear the one-shot paths, where a single restart is enough.
-
-A try at the pin can fail.  A layout which no thread can pin now is
-no more likely to be pinnable on the next restart.  The counter
-therefore restarts after each try, and one syscall makes no more
-than LL_LAYOUT_PIN_TRIES tries.  That bounds the added MDS intent
-RPCs at four, instead of one for every remaining restart.  One try
-which succeeds is all it takes to end the starvation.  A failed try
-never aborts the IO, because the restart budget already bounds it.  A
-try which returns -EALREADY ends the tries at once.
+A try at the pin can fail. A failure which says that no pin can help
+spends one of LL_LAYOUT_PIN_TRIES. One syscall makes at most four such
+tries. A failure with -ENOENT or -ESTALE says only that the reclaim
+won the race. That race is the condition the pin exists for, so it
+spends no try. The count of restarts still bounds the retries. Every
+restart already sends its own layout intent RPC from vvp_io_init(), so
+a try adds at most one RPC. A failed try never aborts the IO.
 
 While a thread starves on a file, cancel_lru_locks and an
 lru_size=clear no longer drop that file's layout lock.
 
 Add a fault injection which drops the unused locks of the MDC
-namespace inside the window the IO uses.  The restart then needs no
-memory pressure and no racing lru_size=clear.  The injection goes
-through the LRU cancel path, not a direct invalidation of the object.
-The condition under test is therefore the real one.  The injection
-fires only after the layout refresh succeeds.  A drop of the
-namespace LRU on the way out of a failed refresh does no good.
-The injection also gates on the IO
-type, because vvp_io_init() serves every llite cl_io.
+namespace inside the window the IO uses. The injection goes through
+the LRU cancel path, not a direct invalidation of the object. The
+condition under test is therefore the real one. The injection fires
+only after the layout refresh succeeds. The injection also gates on
+the IO type, because vvp_io_init() serves every llite cl_io. The
+reclaim is best effort, so the injection can bite fewer times than the
+test needs.
 
-The reclaim is best effort, so the injection can bite fewer times
-than the test needs.  Every injected restart moves no bytes, so the
-client owes a pin only from LL_LAYOUT_PIN_RESTARTS restarts on.  The
-count of locks queued goes to the debug log, together with the file
-identifier.  The test skips when the log holds fewer restarts than
-the threshold.  A test which did not run must not report a failure.
+Add sanity test_251d. The test checks that such an IO completes, and
+that the pin held the layout lock out of the LRU. The debug log names
+the resource, so the check accepts only a pin of the test file. The
+test skips when the log holds fewer restarts than the threshold. A
+test which did not run must not report a failure.
 
-Add sanity test_251d.  The test checks that such an IO completes.
-The test also checks that the pin held the layout lock out of the
-LRU.
+ldlm_cancel_lru() moves to a public header for the injection site. The
+llite module is separate, so the patch exports the symbol. The move
+also corrects the description of ldlm_cancel_lru(). The old text named
+LCF_ASYNC for both cases. The return section named a parameter which
+the function does not have. The section also gave one meaning to a
+return of 0 where the function has two.
 
-ldlm_cancel_lru() moves to a public header, and llite is a module of
-its own, so the patch exports the symbol.  The injection site needs
-it, and the correction itself does not.
-
-The move also corrects the description of ldlm_cancel_lru().  The old
-text named LCF_ASYNC for both cases.  The return section named a
-parameter which the function does not have.  It also gave one meaning
-to a return of 0 where the function has two.
-
+Fixes: 4af3ab1945fd ("LU-2017 mdc: add layout swap between 2 objects")
 Test-Parameters: testlist=sanity env=ONLY=251,ONLY_REPEAT=3
 Assisted-by: Claude:claude-opus-5
 Signed-off-by: Chris Horn <chorn@ddn.com>
@@ -281,3 +264,34 @@ Patch Set 4:
 AI code review results below, please doublecheck
 
 Mostly good, two comments inline. The pin mechanism itself reads correct: the pin is taken with the mode reference held so there is no LRU window, it is dropped on the single exit path after the restart loop, and the -ESTALE re-check closes the revoke race.
+
+--- Message (Chris Horn, 2026-09-01 19:44:40.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-09-01 19:45:29.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-01 19:52:04.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-01 19:52:33.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-01 22:53:02.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-09-02 16:38:36.000000000) ---
+Patch Set 5:
+
+(1 comment)

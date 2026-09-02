@@ -74,7 +74,7 @@ sanityn test_70b - trevis-156vm93 crashed during sanityn test_70b&lt;/p&gt;</des
                         <labels>
                     </labels>
                 <created>Mon, 18 May 2026 07:28:46 +0000</created>
-                <updated>Sun, 23 Aug 2026 11:27:39 +0000</updated>
+                <updated>Wed, 2 Sep 2026 17:01:07 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
                                     <watches>13</watches>
@@ -95,12 +95,28 @@ sanityn test_70b - trevis-156vm93 crashed during sanityn test_70b&lt;/p&gt;</des
                             <comment id="499087" author="ys" created="Mon, 3 Aug 2026 18:21:09 +0000">&lt;p&gt;+1 sanityn test_71d on master: &lt;a href="https://testing.whamcloud.com/test_sets/4575ef06-44b0-46c3-9bb1-182bd7fe71ad" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/4575ef06-44b0-46c3-9bb1-182bd7fe71ad&lt;/a&gt;&lt;/p&gt;</comment>
                             <comment id="499120" author="hongchao.zhang" created="Tue, 4 Aug 2026 09:54:40 +0000">&lt;p&gt;+1 sanity test_71c: &lt;a href="https://testing.whamcloud.com/test_sets/28826960-6826-4cef-aa20-806534a07d77" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/28826960-6826-4cef-aa20-806534a07d77&lt;/a&gt;&lt;/p&gt;</comment>
                             <comment id="500210" author="adilger" created="Sun, 23 Aug 2026 11:27:39 +0000">&lt;p&gt;+6 crashes of 70b, +6 of 71c in the past week&lt;/p&gt;</comment>
+                            <comment id="500758" author="emoly.liu" created="Wed, 2 Sep 2026 07:15:38 +0000">&lt;p&gt;More on master:&lt;br/&gt;
+70b &lt;a href="https://testing.whamcloud.com/test_sets/293b42a8-a534-43e3-875e-fd99ed9bdd96" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/293b42a8-a534-43e3-875e-fd99ed9bdd96&lt;/a&gt;&lt;br/&gt;
+71c &lt;a href="https://testing.whamcloud.com/test_sets/5c5d5001-4991-4b4b-8e03-9ec9c3066cc7" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/5c5d5001-4991-4b4b-8e03-9ec9c3066cc7&lt;/a&gt;&lt;/p&gt;</comment>
+                            <comment id="500767" author="emoly.liu" created="Wed, 2 Sep 2026 09:16:14 +0000">&lt;p&gt;Here is some AI's analysis of this OOM crash issue:&lt;/p&gt;
+&lt;blockquote&gt;&lt;p&gt;test_70b and test_71c are NOT the actual trigger — they're just innocent bystanders. The real culprit is test_56b (which runs earlier in the same sanityn.sh suite). test_56b creates a (16TB × OSTCOUNT) sparse, 2000-overstriped file via llverdev, writing 4KB chunks every 1GB offset (partial mode). When this massive sparse file is destroyed at test exit via stack_trap "rm -f", the client sends destroy RPCs and moves on quickly, but on the OSS the destroy is processed inline on the ptlrpc service thread: osd_trans_stop() → osd_unlinked_list_emptify() → osd_unlinked_object_free() → dmu_free_long_range(). This dirties the entire indirect block tree for each OST object, generating massive unreclaimable slab allocations (dbuf_dirty_record_t, dmu_buf_impl_t, zio_buf_comb_*, zfs_btree_leaf_cache, etc.) that silently exhaust free memory on the ~4GB test VM.&lt;/p&gt;
+
+&lt;p&gt;A userspace process (NetworkManager) does an ordinary page fault, finds no free pages, and invokes the OOM killer after ZFS consumed it all.&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;Reducing llverdev size in test_56b for ZFS would prevent this OOM crash, but we still need a thorough fix.&lt;/p&gt;</comment>
+                            <comment id="500779" author="adilger" created="Wed, 2 Sep 2026 17:01:07 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=emoly.liu" class="user-hover" rel="emoly.liu"&gt;emoly.liu&lt;/a&gt;, can you please push a patch that adds &lt;tt&gt;wait_delete_completed&lt;/tt&gt; after &lt;tt&gt;rm -f&lt;/tt&gt; in the &lt;tt&gt;stack_trap&lt;/tt&gt; in &lt;tt&gt;sanityn.sh::test_56b&lt;/tt&gt;.  That might help that test wait for the unlink to clean up a bit, but I'm not sure if that will free up the memory usage.  The test &lt;em&gt;shouldn't&lt;/em&gt; need to flush memory explicitly on the OSS for it to work properly (that should be handled by ZFS itself), but at least it can wait for the TXG commit before moving on to the next tests.  While it would seem like there is a big gap between test_56b and test_70b, it looks like this is only 4s (only test_60 and test_70a in between, 2s each), so the &lt;tt&gt;wait_delete_completed&lt;/tt&gt; call may be enough to allow this to pass consistently.&lt;/p&gt;
+
+&lt;p&gt;I don't think the &lt;tt&gt;llverdev&lt;/tt&gt; file size should be reduced.  The whole point of that subtest is to test a very large file (at the limits of ldiskfs, but it also shouldn't cause ZFS to fail).&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=behlendorf" class="user-hover" rel="behlendorf"&gt;behlendorf&lt;/a&gt; any chance you could look into the ZFS side of this?  It seems like a mistake for ZFS to dirty so many unrelated indirect blocks and then consume all the RAM.  There should be some kind of TXG flush and memory reclaim if the memory is getting low.  We are seeing very regular OOM crashes with ZFS testing since the upgrade to ZFS 2.4 and it seems that this is one of the causes.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">
                     <name>Related</name>
                                             <outwardlinks description="is related to ">
                                         <issuelink>
+            <issuekey id="70842">LU-15963</issuekey>
+        </issuelink>
+            <issuelink>
             <issuekey id="94631">LU-19761</issuekey>
         </issuelink>
                             </outwardlinks>

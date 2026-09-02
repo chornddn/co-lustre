@@ -1,5 +1,5 @@
 Change:     65026
-Subject:    LU-20050 ptlrpc: fix sepol_helper decode and import ref leak
+Subject:    LU-20050 ptlrpc: fix sepol_helper status decode
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/65026
 Change-Id:  If9312fce842fca133de21c4898cafd949ace6aa6
 Project:    fs/lustre-release
@@ -7,31 +7,30 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-01 17:00:15.000000000
-Updated:    2026-08-19 15:58:02.000000000
-Patch Set:  7
-Insertions: +226
-Deletions:  -23
-Comments:   73 (2 unresolved)
+Updated:    2026-09-02 14:49:47.000000000
+Patch Set:  10
+Insertions: +203
+Deletions:  -15
+Comments:   77 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Sebastien Buisson
 
 --- Commit Message ---
-LU-20050 ptlrpc: fix sepol_helper decode and import ref leak
+LU-20050 ptlrpc: fix sepol_helper status decode
 
 sepol_helper() declared ret as signed short while
-call_usermodehelper() returns int, and decoded with a single
+call_usermodehelper() returns int, and decoded it with a single
 "rc = ret>>8". That shift is only correct for a normal exit. A
-kernel-level launch failure returns a negative errno rather than
-a wait status, and shifting collapses it (-ENOMEM becomes
--EPERM; any errno in [-255, -1] becomes -1 or 0). A helper
-killed by a signal leaves the signal in the low 7 bits, so
-ret>>8 is 0 and the failure is reported as success.
+kernel launch failure returns a negative errno, not a wait
+status, and shifting collapses it (-ENOMEM becomes -EPERM). A
+helper killed by a signal leaves the signal in the low 7 bits,
+so ret>>8 is 0 and the failure is reported as success.
 
 Widen ret to int and decode the three cases separately, with raw
 bit tests since WIFEXITED/WEXITSTATUS are userspace macros:
@@ -43,68 +42,35 @@ bit tests since WIFEXITED/WEXITSTATUS are userspace macros:
 The exit code must be sign-extended, not negated: l_getsepol
 returns -errno whenever stdin is not a tty, always the case
 under call_usermodehelper(), and exit() keeps only the low byte.
-The old signed short truncation did that by accident.
+So -ENODEV arrives as exit byte 237, and (signed char)237 is
+-19. sptlrpc_sepol_get() special-cases -ENODEV as "SELinux is
+disabled, report nothing", so negating it made that branch
+unreachable and turned those mounts into "Unknown error 237".
+This extends 8a6788b508db.
 
-  -ENODEV  ->  exit byte 237  ->  (signed char)237 == -19
+A positive exit status is not an errno either, so negating it
+invented plausible but wrong errors: 127 became EKEYEXPIRED and
+126 ENOKEY, pointing at key management rather than a broken
+helper. Report -EPROTO and log the raw status. sepol_helper()
+can then no longer return a positive value, so drop the
+unreachable rc > 0 case in sptlrpc_sepol_get().
 
-sptlrpc_sepol_get() special-cases exactly -ENODEV as "SELinux is
-disabled, report nothing", so decoding 237 as -237 makes that
-branch unreachable and turns those mounts into "Unknown error
-237". This extends 8a6788b508db, which fixed a positive rc
-reaching ERR_PTR() undetected.
+The eight sptlrpc_sepol_get() error paths in mdc_locks.c,
+mdc_reint.c and mdc_request.c leaked the request's import
+reference and the LDLM locks gathered for early cancel: the
+sepol check runs before the prep call, so the request still owns
+both, but the error tail only called ptlrpc_request_free(). Keep
+one exit per function and make it correct on both sides of the
+prep call, through the new mdc_elc_req_put() helper, clearing
+@count once the prep call owns the locks. This needs LU-20546,
+which clears rq_import when packing fails so the reference is
+dropped exactly once.
 
-A positive exit status is not an errno at all, so negating it
-invented a plausible but wrong error: 127 from the dynamic
-loader became EKEYEXPIRED and 126 from a failed exec became
-ENOKEY, pointing at key management rather than a broken helper.
-Report -EPROTO for those, and log the raw wait status so the
-real exit code is still recoverable.
-
-Second, the IS_ERR() branch in ptlrpc_connect_import_locked()
-calls ptlrpc_request_free(), which returns the request slab but
-does not release the import reference taken by
-ptlrpc_request_alloc(). That keeps client_obd_cleanup() from
-running, strands the LDLM namespace kobject in sysfs, and the
-next mount fails with -EEXIST. Use ptlrpc_req_put() instead.
-
-The same leak exists at the eight other sptlrpc_sepol_get()
-error paths in mdc_locks.c, mdc_reint.c and mdc_request.c,
-reached by ordinary create/unlink/link/rename/open/setxattr
-syscalls rather than only by connect. They cannot simply call
-ptlrpc_req_put(): each shared an error tail with the failure
-path of mdc_prep_elc_req()/ldlm_prep_enqueue_req(), whose
-ptlrpc_request_bufs_pack() out_free label already drops the
-reference without clearing rq_import, so that would double-put.
-Give the sepol failure its own err_put_rq label, calling the new
-mdc_elc_req_put() helper. Those paths leak the queued LDLM locks
-too -- ownership passes to the prep helpers, but the sepol check
-runs before either is called -- so the helper releases them as
-well.
-
-sepol_helper() can no longer return a positive value, so drop the
-now unreachable rc > 0 case in sptlrpc_sepol_get().
-
-Add sanity-selinux test_21d, which stubs l_getsepol (overwriting
-in place so its SELinux label survives) and mounts with
-send_sepol=-1: exit 237 must sign-extend to -19 and the mount
-still succeed; exit 234 must fail with -EINVAL; removing the
-helper must fail with -ENOENT. Both failures are matched against
-the expected strerror() text, as the old decode also yielded a
-named errno and a check for "Unknown error" would pass either
-way. After each failure the helper is restored and the client
-mounted again -- that second mount catches the leaked reference.
-
-test_21c leaves a persistent sptlrpc.send_sepol=0 in the MGS
-config log, which every later mount replays over a local
-setting.  test_21d drops that entry before setting send_sepol
-itself, and checks the value survived the first mount: without
-that the helper is never consulted and each mount succeeds for
-the wrong reason.
-
-test_21d deliberately creates no nodemap: with
-nodemap.<nm>.sepol set, req_check_sepol() refuses any connect
-carrying no policy (test_21a covers that), which is exactly what
-the -ENODEV case produces, so the mount would fail for an
+Add sanity-selinux test_21d: stub l_getsepol, mount with
+send_sepol=-1, and check that exit 237 still mounts while 234
+and a missing helper fail with the expected errno text. It
+creates no nodemap on purpose -- with nodemap.<nm>.sepol set,
+req_check_sepol() would refuse the -ENODEV connect for an
 unrelated reason.
 
 Suggested-by: Sebastien Buisson <sbuisson@ddn.com>
@@ -112,8 +78,8 @@ Suggested-by: Sebastien Buisson <sbuisson@ddn.com>
 Test-Parameters: trivial testgroup=review-dne-selinux-ssk-part-1
 Test-Parameters: trivial testgroup=review-dne-selinux-ssk-part-2
 Fixes: c61168239eff ("LU-8955 sec: create new function sptlrpc_get_sepol()")
-Fixes: dd200e5530fd ("LU-8955 ptlrpc: manage SELinux policy info at connect time")
 Fixes: 0a773f04b288 ("LU-8955 ptlrpc: manage SELinux policy info for metadata ops")
+Assisted-by: Claude:Opus-5 claude-code
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Change-Id: If9312fce842fca133de21c4898cafd949ace6aa6
 
@@ -1281,3 +1247,127 @@ Succeeded:
 Patch Set 7:
 
 (2 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-02 14:09:45.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-02 14:10:17.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 14:12:48.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69369/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-selinux@ldiskfs+DNE sanity-selinux-special1@ldiskfs+DNE sanity-selinux-special1@ldiskfs sanity-selinux-special2@ldiskfs+DNE sanity-selinux-special2@ldiskfs sanity-selinux-special3@ldiskfs+DNE sanity-selinux-special3@ldiskfs sanity-selinux-special4@ldiskfs+DNE sanity-selinux-special4@ldiskfs sanity-selinux-special5@ldiskfs+DNE sanity-selinux-special5@ldiskfs sanity-selinux-special6@ldiskfs+DNE sanity-selinux-special6@ldiskfs sanity-selinux-special7@ldiskfs+DNE sanity-selinux-special7@ldiskfs sanity-selinux-special8@ldiskfs+DNE sanity-selinux-special8@ldiskfs sanity-selinux-special9@ldiskfs+DNE sanity-selinux-special9@ldiskfs sanity-selinux-special10@ldiskfs+DNE sanity-selinux-special10@ldiskfs sanity-selinux@zfs sanity-selinux-special1@zfs sanity-selinux-special1@zfs+DNE sanity-selinux-special2@zfs sanity-selinux-special2@zfs+DNE sanity-selinux-special3@zfs sanity-selinux-special3@zfs+DNE sanity-selinux-special4@zfs sanity-selinux-special4@zfs+DNE sanity-selinux-special5@zfs sanity-selinux-special5@zfs+DNE sanity-selinux-special6@zfs sanity-selinux-special6@zfs+DNE sanity-selinux-special7@zfs sanity-selinux-special7@zfs+DNE sanity-selinux-special8@zfs sanity-selinux-special8@zfs+DNE sanity-selinux-special9@zfs sanity-selinux-special9@zfs+DNE sanity-selinux-special10@zfs sanity-selinux-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-02 14:13:06.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-02 14:13:49.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-02 14:17:46.000000000) ---
+Patch Set 9: Commit message was updated.
+
+--- Message (Hiroshi Nishida, 2026-09-02 14:20:09.000000000) ---
+Patch Set 10: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-02 14:21:00.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 14:23:37.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69371/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-selinux@ldiskfs+DNE sanity-selinux-special1@ldiskfs+DNE sanity-selinux-special1@ldiskfs sanity-selinux-special2@ldiskfs+DNE sanity-selinux-special2@ldiskfs sanity-selinux-special3@ldiskfs+DNE sanity-selinux-special3@ldiskfs sanity-selinux-special4@ldiskfs+DNE sanity-selinux-special4@ldiskfs sanity-selinux-special5@ldiskfs+DNE sanity-selinux-special5@ldiskfs sanity-selinux-special6@ldiskfs+DNE sanity-selinux-special6@ldiskfs sanity-selinux-special7@ldiskfs+DNE sanity-selinux-special7@ldiskfs sanity-selinux-special8@ldiskfs+DNE sanity-selinux-special8@ldiskfs sanity-selinux-special9@ldiskfs+DNE sanity-selinux-special9@ldiskfs sanity-selinux-special10@ldiskfs+DNE sanity-selinux-special10@ldiskfs sanity-selinux@zfs sanity-selinux-special1@zfs sanity-selinux-special1@zfs+DNE sanity-selinux-special2@zfs sanity-selinux-special2@zfs+DNE sanity-selinux-special3@zfs sanity-selinux-special3@zfs+DNE sanity-selinux-special4@zfs sanity-selinux-special4@zfs+DNE sanity-selinux-special5@zfs sanity-selinux-special5@zfs+DNE sanity-selinux-special6@zfs sanity-selinux-special6@zfs+DNE sanity-selinux-special7@zfs sanity-selinux-special7@zfs+DNE sanity-selinux-special8@zfs sanity-selinux-special8@zfs+DNE sanity-selinux-special9@zfs sanity-selinux-special9@zfs+DNE sanity-selinux-special10@zfs sanity-selinux-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-02 14:24:32.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-02 14:29:09.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-09-02 14:45:00.000000000) ---
+Patch Set 8: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 9, 10 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130841/ : SUCCESS
+
+--- Message (Maloo, 2026-09-02 14:46:27.000000000) ---
+Patch Set 8:
+
+#### The following sessions will be run for Build 130841 (patch #8):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130841&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130841#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-02 14:49:42.000000000) ---
+Patch Set 10:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-selinux@ldiskfs+DNE sanity-selinux-special1@ldiskfs+DNE sanity-selinux-special1@ldiskfs sanity-selinux-special2@ldiskfs+DNE sanity-selinux-special2@ldiskfs sanity-selinux-special3@ldiskfs+DNE sanity-selinux-special3@ldiskfs sanity-selinux-special4@ldiskfs+DNE sanity-selinux-special4@ldiskfs sanity-selinux-special5@ldiskfs+DNE sanity-selinux-special5@ldiskfs sanity-selinux-special6@ldiskfs+DNE sanity-selinux-special6@ldiskfs sanity-selinux-special7@ldiskfs+DNE sanity-selinux-special7@ldiskfs sanity-selinux-special8@ldiskfs+DNE sanity-selinux-special8@ldiskfs sanity-selinux-special9@ldiskfs+DNE sanity-selinux-special9@ldiskfs sanity-selinux-special10@ldiskfs+DNE sanity-selinux-special10@ldiskfs sanity-selinux@zfs sanity-selinux-special1@zfs sanity-selinux-special1@zfs+DNE sanity-selinux-special2@zfs sanity-selinux-special2@zfs+DNE sanity-selinux-special3@zfs sanity-selinux-special3@zfs+DNE sanity-selinux-special4@zfs sanity-selinux-special4@zfs+DNE sanity-selinux-special5@zfs sanity-selinux-special5@zfs+DNE sanity-selinux-special6@zfs sanity-selinux-special6@zfs+DNE sanity-selinux-special7@zfs sanity-selinux-special7@zfs+DNE sanity-selinux-special8@zfs sanity-selinux-special8@zfs+DNE sanity-selinux-special9@zfs sanity-selinux-special9@zfs+DNE sanity-selinux-special10@zfs sanity-selinux-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69371/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre RISC-V Builder, 2026-09-02 14:49:47.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful

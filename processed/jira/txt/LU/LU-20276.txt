@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Maloo
 Created:    Mon, 18 May 2026 07:28:46 +0000
-Updated:    Sun, 23 Aug 2026 11:27:39 +0000
-Links:      Related: is related to  LU-19761; Related: is related to LU-20277
+Updated:    Wed, 2 Sep 2026 17:01:07 +0000
+Links:      Related: is related to  LU-15963; Related: is related to  LU-19761; Related: is related to LU-20277
 
 --- Description ---
 This issue was created by maloo for Andreas Dilger 
@@ -104,3 +104,26 @@ sanityn_71c, +1 on master: https://testing.whamcloud.com/test_sets/f5362865-b6ea
 
 --- Comment (adilger, Sun, 23 Aug 2026 11:27:39 +0000) ---
 +6 crashes of 70b, +6 of 71c in the past week
+
+--- Comment (emoly.liu, Wed, 2 Sep 2026 07:15:38 +0000) ---
+More on master:
+
+70b https://testing.whamcloud.com/test_sets/293b42a8-a534-43e3-875e-fd99ed9bdd96
+
+71c https://testing.whamcloud.com/test_sets/5c5d5001-4991-4b4b-8e03-9ec9c3066cc7
+
+--- Comment (emoly.liu, Wed, 2 Sep 2026 09:16:14 +0000) ---
+Here is some AI's analysis of this OOM crash issue:
+
+test_70b and test_71c are NOT the actual trigger — they're just innocent bystanders. The real culprit is test_56b (which runs earlier in the same sanityn.sh suite). test_56b creates a (16TB × OSTCOUNT) sparse, 2000-overstriped file via llverdev, writing 4KB chunks every 1GB offset (partial mode). When this massive sparse file is destroyed at test exit via stack_trap "rm -f", the client sends destroy RPCs and moves on quickly, but on the OSS the destroy is processed inline on the ptlrpc service thread: osd_trans_stop() → osd_unlinked_list_emptify() → osd_unlinked_object_free() → dmu_free_long_range(). This dirties the entire indirect block tree for each OST object, generating massive unreclaimable slab allocations (dbuf_dirty_record_t, dmu_buf_impl_t, zio_buf_comb_*, zfs_btree_leaf_cache, etc.) that silently exhaust free memory on the ~4GB test VM.
+
+A userspace process (NetworkManager) does an ordinary page fault, finds no free pages, and invokes the OOM killer after ZFS consumed it all.
+
+Reducing llverdev size in test_56b for ZFS would prevent this OOM crash, but we still need a thorough fix.
+
+--- Comment (adilger, Wed, 2 Sep 2026 17:01:07 +0000) ---
+emoly.liu, can you please push a patch that adds wait_delete_completed after rm -f in the stack_trap in sanityn.sh::test_56b.  That might help that test wait for the unlink to clean up a bit, but I'm not sure if that will free up the memory usage.  The test shouldn't need to flush memory explicitly on the OSS for it to work properly (that should be handled by ZFS itself), but at least it can wait for the TXG commit before moving on to the next tests.  While it would seem like there is a big gap between test_56b and test_70b, it looks like this is only 4s (only test_60 and test_70a in between, 2s each), so the wait_delete_completed call may be enough to allow this to pass consistently.
+
+I don't think the llverdev file size should be reduced.  The whole point of that subtest is to test a very large file (at the limits of ldiskfs, but it also shouldn't cause ZFS to fail).
+
+behlendorf any chance you could look into the ZFS side of this?  It seems like a mistake for ZFS to dirty so many unrelated indirect blocks and then consume all the RAM.  There should be some kind of TXG flush and memory reclaim if the memory is getting low.  We are seeing very regular OOM crashes with ZFS testing since the upgrade to ZFS 2.4 and it seems that this is one of the causes.
