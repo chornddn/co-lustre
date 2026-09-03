@@ -55,10 +55,10 @@ PID: 107101   TASK: ffff922a41bccec0  CPU: 3    COMMAND: &lt;span class="code-qu
                         <labels>
                     </labels>
                 <created>Thu, 7 Mar 2024 06:19:02 +0000</created>
-                <updated>Sun, 2 Aug 2026 04:52:08 +0000</updated>
+                <updated>Wed, 2 Sep 2026 18:01:40 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>5</watches>
+                                    <watches>6</watches>
                                                                             <comments>
                             <comment id="406657" author="gerrit" created="Thu, 7 Mar 2024 06:20:55 +0000">&lt;p&gt;"Alex Zhuravlev &amp;lt;bzzz@whamcloud.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/54310" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/54310&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-17620" title="Lustre client gets stuck in lov_layout_wait() awaiting for IO completion" class="issue-link" data-issue-key="LU-17620"&gt;LU-17620&lt;/a&gt; lov: debug activ IOs per-thread&lt;br/&gt;
@@ -88,6 +88,62 @@ Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: &lt;br/&gt;
 Commit: 751f6c50e2340216ca9347c9992400739c090d80&lt;/p&gt;</comment>
+                            <comment id="500780" author="JIRAUSER21604" created="Wed, 2 Sep 2026 17:58:23 +0000">&lt;p&gt;Group lock ioctl ignores O_NONBLOCK (same blocking site as this ticket)       &lt;br/&gt;
+                                                                                &lt;br/&gt;
+While reproducing this deadlock, I hit a separable defect: LL_IOC_GROUP_LOCK cannot honour O_NONBLOCK.&lt;br/&gt;
+ &lt;br/&gt;
+In cl_get_grouplock() the nonblock argument is only consumed at the enqueue:&lt;/p&gt;
+
+&lt;p&gt;enqflags = CEF_MUST | (nonblock ? CEF_NONBLOCK : 0);&lt;br/&gt;
+...&lt;br/&gt;
+rc = cl_lock_request(env, io, lock);&lt;br/&gt;
+  &lt;br/&gt;
+but cl_io_init(env, io, CIT_MISC, io-&amp;gt;ci_obj) runs earlier in the same function, and that is where vvp_io_init() &lt;del&gt;&amp;gt; ll_layout_refresh() blocks in lov_layout_wait(). The blocking step sits above the only line the flag affects, so ll_get_grouplock() passing (file&lt;/del&gt;&amp;gt;f_flags &amp;amp; O_NONBLOCK) cannot prevent it — a non-blocking group-lock request can block indefinitely.&lt;/p&gt;
+
+&lt;p&gt;Observed on 2.17.57: the ioctl on an O_NONBLOCK fd sat in lov_layout_wait() for 490s+ in TASK_IDLE (ps shows I, not D) and was not reapable — SIGKILL and timeout(1) both ineffective; only a reboot cleared it.&lt;br/&gt;
+  &lt;br/&gt;
+Same stack as this ticket, different caller:&lt;br/&gt;
+ &lt;br/&gt;
+lov_layout_wait &lt;del&gt;&amp;gt; lov_conf_set -&amp;gt; cl_conf_set -&amp;gt; ll_layout_conf -&amp;gt; ll_layout_lock_set -&amp;gt; ll_layout_refresh -&amp;gt; vvp_io_init &lt;/del&gt;&amp;gt; __cl_io_init -&amp;gt; cl_get_grouplock -&amp;gt; ll_get_grouplock -&amp;gt; ll_file_ioctl&lt;br/&gt;
+ &lt;br/&gt;
+This looks separable from the design question in the 2024-04-03 comment:&lt;br/&gt;
+whatever is decided about which layout changes are acceptable while a grouplock is held, a non-blocking request should arguably fail rather than wait.&lt;br/&gt;
+  &lt;/p&gt;</comment>
+                            <comment id="500781" author="JIRAUSER21604" created="Wed, 2 Sep 2026 18:01:40 +0000">&lt;p&gt;This deadlocks with a single process and no external layout change&lt;br/&gt;
+  &lt;br/&gt;
+  The reproducer on 54343 (sanity-flr.sh test_213) needs two mounts and a second&lt;br/&gt;
+  party: one process holds the grouplock, $MOUNT2 does setstripe &lt;br/&gt;
+  --component-add, then the holder is poked to refresh. The deadlock doesn't&lt;br/&gt;
+  need any of that — one process, two fds, one mount, nothing else touching the&lt;br/&gt;
+  file:&lt;/p&gt;
+
+&lt;p&gt;  lfs setstripe -N -c 1 -N -c 1 /mnt/lustre/f     /* any mirrored file */&lt;/p&gt;
+
+&lt;p&gt;  fd1 = open(f, O_RDWR|O_CREAT);    ioctl(fd1, LL_IOC_GROUP_LOCK, 1234);  /* ok &lt;br/&gt;
+  */&lt;br/&gt;
+  fd2 = open(f, O_RDWR);            ioctl(fd2, LL_IOC_GROUP_LOCK, 1234);  /* &lt;br/&gt;
+  never returns */&lt;br/&gt;
+ &lt;br/&gt;
+  The layout change is self-inflicted. ll_get_grouplock() raises&lt;br/&gt;
+  LAYOUT_INTENT_WRITE over 0..EOF before taking the lock; on a mirrored file&lt;br/&gt;
+  that hits the lov_flr_state(obj) == LCM_FL_RDONLY case in lov_io.c which sets&lt;br/&gt;
+  ci_need_write_intent, so the state flips ro -&amp;gt; wp — and that transition is a&lt;br/&gt;
+  layout change. Measured across the first ioctl on a freshly created file:&lt;br/&gt;
+  lcm_flags ro -&amp;gt; wp, lcm_layout_gen -&amp;gt; 4. The second acquisition then refreshes&lt;br/&gt;
+  into lov_layout_wait(), waiting on the lo_active_ios pin its own first group&lt;br/&gt;
+  lock holds.&lt;/p&gt;
+
+&lt;p&gt;  So the pre-instantiation that exists to keep layouts stable during a group&lt;br/&gt;
+  lock is, on a mirrored file, the thing that closes the cycle.&lt;/p&gt;
+
+&lt;p&gt;  Not claiming mirroring is required — test_213 shows a plain composite plus an&lt;br/&gt;
+  external change is enough, so mirroring is one way to supply the trigger, not&lt;br/&gt;
+  a precondition. The point is only that no second party is needed. A plain PFL&lt;br/&gt;
+  file with no layout changer present does not reproduce, which is consistent.&lt;br/&gt;
+ &lt;br/&gt;
+  Given this ticket is filed Minor: a single-process, single-mount reproducer&lt;br/&gt;
+  that wedges in about a second and leaves an unkillable TASK_IDLE task might be&lt;br/&gt;
+  worth re-rating.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

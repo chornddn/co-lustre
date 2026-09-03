@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Lai Siyao
 Created:    2026-02-24 03:41:41.000000000
-Updated:    2026-09-02 14:02:10.000000000
-Patch Set:  33
-Insertions: +768
-Deletions:  -146
-Comments:   398 (28 unresolved)
+Updated:    2026-09-03 10:58:51.000000000
+Patch Set:  34
+Insertions: +807
+Deletions:  -151
+Comments:   416 (33 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,8 +24,9 @@ Comments:   398 (28 unresolved)
 --- Commit Message ---
 LU-19916 mgs: start MGS follower on MDTs/OSTs
 
-Start an MGS follower on every MDT/OST, to serve configuration to
-clients; imperative recovery is wired up in the next patch.  MGS0 is
+Start an MGS follower on every MDT/OST, to serve the configuration it
+has a copy of - the params and sptlrpc logs - to the clients attached
+to it; imperative recovery is wired up in the next patch.  MGS0 is
 the leader; MDTs and OSTs still connect to it, and a follower rejects
 them with -ENODEV.  A combined MGS/MDT0 takes over from a follower
 another target on the host already started.  The follower is optional:
@@ -39,7 +40,10 @@ MGT".
 A follower is a readonly backup of MGS0: no ioctls, and no nodemap
 config file - it refuses a nodemap config read rather than serving one
 it does not have.  Replicating the nodemap configuration, so that it
-too survives the loss of MGS0, is left to a later patch.
+too survives the loss of MGS0, is left to a later patch, and so is
+replicating <fsname>-client, which a follower has no copy of and
+cannot serve, and _mgs-sptlrpc, without which a follower applies no
+mgs.srpc.flavor.* restriction to the clients it accepts.
 
 A follower writes no config log into CONFIGS/, which on a follower
 belongs to the MDT or OST it runs on and holds that target's local
@@ -60,14 +64,19 @@ afterwards: that left the live MDT/OST with a NULL top device,
 crashing the next mdt_object_find() or ofd_object_find().  Nothing
 there needs it - local storage resolves through ls_locate() and the
 root through dt_locate_at() - which is also why mgc_fs_setup() does
-the same work without it.
+the same work without it.  For the same reason mgs_fs_setup() and
+nidtbl_read_version() resolve their objects through the local storage
+device rather than through the MGS layer, which would leave an
+MGS-layer object pinned in a site only that target can purge.
 
 The follower registers as an observer of the MGC so it hears about
 config changes; obd_notify() takes a union obd_notify_data to carry
 the payload.  It is unregistered before it is freed, since the MGC is
 shared by every target on the node and outlives any one of them, and
-the MGC pins it across every notify because an unmount can free it in
-between.
+the MGC holds the observer link for read across every notify:
+unregistering takes it for write, so an unmount waits out a notify
+already inside the MGS rather than tearing its fsdbs down underneath
+it.
 
 OBD_CONNECT_FTM, set only by a client mount, is what a follower
 accepts a connection on.  The follow-on patch gives the server MGC its
@@ -76,14 +85,24 @@ connection's flags.
 
 server_mgs_lock() stays a separate call rather than being taken inside
 server_start_mgs_or_follower(), because server_fill_super() holds it
-across lustre_start_mgc(), which takes cld_lock; taking it the other
-way round in the MGC would invert that order.
+across the follower start and the obd_register_observer() that follows
+it, so the requeue thread cannot start a second one in between.  It
+nests outside cld_lock, which cld_start_mgs() takes under it.
 
 Add debugfs entry mgs/MGS/state, "leader" or "follower", which
 is_mgs() in liblustreapi checks because a follower handles no ioctl.
 
+conf-sanity test_5b starts its OST with "nomgs": it checks that a
+client cannot mount with no MGS, and an OST that starts a follower
+here has no MGS0 to feed it, so the OST's own MGC is refused by that
+follower for as long as the test runs.  replay-single test_61d drops
+CFS_FAIL_ONCE from its llog_setup failure, which a follower started
+on another target of that node would otherwise spend before the mount
+under test reaches it.
+
 Test-Parameters: mdtcount=4 testlist=conf-sanity serverversion=2.17
 Test-Parameters: mdtcount=4 testlist=conf-sanity clientversion=2.17
+Test-Parameters: mdtcount=4 testlist=replay-single env=ONLY=61,ONLY_REPEAT=20
 Signed-off-by: Lai Siyao <lai.siyao@whamcloud.com>
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -1319,3 +1338,50 @@ Patch Set 33:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The patch adds a lot of new user-visible behaviour - an MGS device now appears on every MDT/OST, `mgs.MGS.state` is new, and "nomgs"/"nosvc"/"rdonly_dev" now gate it - but no test exercises any of it. Should conf-sanity get a case that mounts a plain OST, checks `mgs.MGS.state` is "follower", verifies the MGS0 takeover and the requeue-thread restart after MGS0 stops, and confirms "-o nomgs" keeps the follower off? Also worth checking that suites which key off `lctl dl` output or `do_facet mgs` still behave now that every server node has an "MGS" device.
+
+--- Message (Andreas Dilger, 2026-09-02 22:26:48.000000000) ---
+Patch Set 33: Code-Review-1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-02 22:33:37.000000000) ---
+Patch Set 33:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-02 23:08:07.000000000) ---
+Patch Set 33:
+
+(5 comments)
+
+--- Message (Oleg Drokin, 2026-09-03 07:14:33.000000000) ---
+Uploaded patch set 34.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-03 07:23:20.000000000) ---
+Patch Set 34:
+
+(11 comments)
+
+11 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 07:26:24.000000000) ---
+Patch Set 34:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 08:10:42.000000000) ---
+Patch Set 34:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 10:58:51.000000000) ---
+Patch Set 34: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130905/ : FAILURE
