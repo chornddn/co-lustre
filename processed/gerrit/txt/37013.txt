@@ -7,20 +7,20 @@ Branch:     master
 Status:     NEW
 Owner:      James Simmons
 Created:    2019-12-13 18:28:00.000000000
-Updated:    2026-07-26 07:35:16.000000000
-Patch Set:  32
-Insertions: +63
-Deletions:  -30
-Comments:   62 (5 unresolved)
+Updated:    2026-09-06 15:06:56.000000000
+Patch Set:  33
+Insertions: +43
+Deletions:  -11
+Comments:   67 (10 unresolved)
 Topic:      upstream
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Alexander Zarochentsev, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Qian Yingjin, Neil Brown
+  CC: Alexander Zarochentsev, Neil Brown, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Qian Yingjin
 
 --- Commit Message ---
 LU-9868 llite: use d_splice_alias for directories.
@@ -32,25 +32,72 @@ IS_ROOT() or d_lustre_invalid().
 Separating out the directories from non-directories will allow us
 to simplify the non-directory code.
 
+A negative lookup (@inode NULL) takes the new branch as well, where it
+used to reach d_add(de, NULL): d_splice_alias(NULL, de) does the same
+__d_add(), with the BUG_ON(!d_unhashed(de)) it opens with. No caller
+passes a hashed dentry -- ll_atomic_open() either hands over a
+d_in_lookup() dentry or d_drop()s it first.
+
 Unlike the old ll_splice_alias() d_add() path, d_splice_alias() consumes
 the passed inode reference in every case (including on its error returns
 -ELOOP/-ESTALE) and can now return an error. Adjust the callers to the
 new contract:
 
- - ll_statahead_dentry() transferred the sa_entry inode reference to
-   the dentry (se_inode = NULL) only on the success path, so on the
-   d_splice_alias() error path the reference it already dropped was
-   iput() a second time when the sa_entry was freed, underflowing
-   i_count (WARNING at fs/inode.c ihold, hit under an rm workload with
-   statahead active). Transfer ownership away from the sa_entry before
-   inspecting the result.
+ - revalidate_statahead_dentry() transferred the sa_entry inode
+   reference to the dentry (se_inode = NULL) only on the success path,
+   so on the d_splice_alias() error path the reference it already
+   dropped was iput() a second time when the sa_entry was freed,
+   underflowing i_count (WARNING at fs/inode.c ihold, hit under an rm
+   workload with statahead active). Transfer ownership away from the
+   sa_entry before inspecting the result.
 
  - A by-FID (.lustre/fid/) directory lookup must not d_move the
-   directory's real (connected) dentry onto the fid path, or the normal
-   path to the directory breaks (LU-1777, sanity 233a/233b). Keep the
+   directory's real (connected) dentry onto the fid path.
+   d_splice_alias() does exactly that for an ordinary directory:
+   __d_find_any_alias() returns its connected dentry, which is neither
+   an ancestor of the new .lustre/fid/<FID> dentry nor IS_ROOT(), so
+   __d_unalias() moves it there and the normal path to the directory
+   stops working. ($MOUNT itself and .lustre are ancestors, so they come
+   back -ELOOP instead -- equally fatal to sanity 233a/233b.) Keep the
    legacy alias handling for OBF-parented directory lookups; use
    d_splice_alias() only for normal-namespace lookups, where it keeps a
    directory to a single dentry (LU-17536).
+
+   The test is on the immediate parent's FID, so it recognises the
+   entries directly under .lustre/fid/ and nothing else about the by-FID
+   namespace. Two cases are therefore left as d_splice_alias() handles
+   them, both of them consequences of the OBF namespace giving a
+   directory a second dentry in the first place:
+
+    * .lustre/fid/<dir-FID>/<name>: the parent is the duplicate dentry
+      this branch made for <dir-FID>, so the child takes the
+      d_splice_alias() path and __d_unalias() moves its real dentry into
+      the by-FID tree.
+    * $MOUNT/<path>/<dir> for a directory that already has a by-FID
+      dentry: __d_find_any_alias() hands that dentry back, and
+      __d_unalias() moves it into the normal namespace -- the useful
+      direction, but a direction the old d_add() never took.
+
+   In both, __d_unalias() takes its cross-parent path and can return
+   -ESTALE: it mutex_trylock()s s_vfs_rename_mutex, which any rename on
+   the filesystem holds, and inode_trylock_shared()es the alias's
+   parent, which any create, unlink, mkdir, rmdir or setattr in that
+   directory holds exclusively. The VFS retries once with LOOKUP_REVAL,
+   but a lookup that could not fail before now can, and under a
+   directory-churn workload it will meet those holders.
+   Covering these means recognising the whole by-FID subtree -- marking
+   the dentries this branch creates -- which is new dentry state and is
+   left for its own patch.
+
+The legacy branch is otherwise left exactly as it was: an alias that
+ll_find_alias() returns is still d_move()d onto the new dentry and
+reused, whether it is d_lustre_invalid() or not. d_lustre_invalid()
+only means the LOOKUP lock was dropped at some point, which is the
+common case, and reusing the dentry is the whole point of
+ll_find_alias(); discarding it instead would replace the dentry that
+open files and mounts are attached to on every lookup that races a
+lock cancellation. It would also be a behaviour change for regular
+files, which this patch is not about.
 
 Linux-commit: e9d4f0b9f55920821845b8e063ed593422c18d8a
 Linux-commit: 1d6e65bedf5878c8dd5b089d3f034b619bbb8a77
@@ -59,7 +106,7 @@ Test-Parameters: optional testlist=racer
 Signed-off-by: NeilBrown <neil@brown.name>
 Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: If80a02b77c4fc62cdb90e86cdb8a0f9eba21193b
 
 --- Review History ---
@@ -1372,3 +1419,43 @@ https://build.whamcloud.com/job/lustre-reviews/128107/ : FAILURE
 Patch Set 32:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Oleg Drokin, 2026-09-04 21:56:23.000000000) ---
+Uploaded patch set 33.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 22:11:06.000000000) ---
+Patch Set 33:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:14:01.000000000) ---
+Patch Set 33:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-09-05 00:43:16.000000000) ---
+Patch Set 33: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131086/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 06:20:20.000000000) ---
+Patch Set 33:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 15:06:56.000000000) ---
+Patch Set 33:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The d_splice_alias() inode-reference contract checks out on both callers, and the statahead ownership transfer closes the double-iput. Only optional nits inline, no need to re-spin for them.

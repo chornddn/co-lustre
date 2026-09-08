@@ -1,5 +1,5 @@
 Change:     67497
-Subject:    LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+Subject:    LU-6301 llite: clear rq_replay in ll_open_cleanup
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67497
 Change-Id:  Iea44872f5507d829c1baa791ed179ee0f13f09c1
 Project:    fs/lustre-release
@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-23 19:10:14.000000000
-Updated:    2026-07-28 15:41:49.000000000
-Patch Set:  4
-Insertions: +27
-Deletions:  -4
-Comments:   13 (7 unresolved)
+Updated:    2026-09-06 11:22:01.000000000
+Patch Set:  5
+Insertions: +85
+Deletions:  -7
+Comments:   14 (8 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -22,47 +22,77 @@ Comments:   13 (7 unresolved)
   REVIEWER: Andreas Dilger
 
 --- Commit Message ---
-LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+LU-6301 llite: clear rq_replay in ll_open_cleanup
 
-The first LU-6301 patch added ll_open_cleanup() to send a close RPC
-when the client hits an error after the MDT has granted an open,
-so the MDT-side open handle is not leaked. That fix only covers
-the server side: the original open request is replayable,
-so after_reply() left it on the import replay list with rq_replay
-set, and because a failed open has no close/commit callback
-(mdc_commit_open) nothing ever clears rq_replay.
-The request then stays on the committed-replay list until reconnect,
-pinning its reply buffer (sized to max_mds_easize, which can be hundreds
-of KB with wide/PFL/DoM layouts). Under an open-heavy workload that
-takes the open-error cleanup path frequently this accumulates without
-bound and can OOM the client.
+ll_open_cleanup() closes the MDT-side handle of an open the client
+abandoned after the MDT had granted it, but leaves the open request
+itself replayable. Nothing ever clears rq_replay for such a request:
+it has no och and therefore no mdc_commit_open() commit callback, so
+once the transaction commits ptlrpc_free_committed() moves it to
+imp_committed_list, where it stays -- pinning a reply buffer sized to
+max_mds_easize, hundreds of KB with wide/PFL/DoM layouts -- until the
+next reconnect. A workload that takes the open-error path often enough
+grows that list without bound and can OOM the client.
 
-This becomes easy to hit once ll_splice_alias() uses d_splice_alias()
-for directories (which, unlike the old d_add(), can return -ELOOP or
--ESTALE): a racing rename/create workload then drives ll_lookup_it_finish()
-into this error path thousands of times per run.
+Clear rq_replay before sending the close, exactly as mdc_close() does
+for a normal close, and drop the request from the replay list with
+ptlrpc_request_committed() afterwards, as mdc_free_open() does. Clearing
+it after md_close() would be too late: after_reply() for the close runs
+ptlrpc_free_committed() on the same import, and if the open has committed
+by then the request is moved to imp_committed_list with rq_replay still
+set -- and that list is only rescanned when the import generation changes.
+Both happen even if op_data cannot be allocated and no close goes out,
+since that is the low-memory case this is meant to help.
 
-Clear rq_replay in ll_open_cleanup() after the MDT open handle has been
-released, so ptlrpc_free_committed() can drop the request once its
-transaction commits. The server-side handle is already closed at this
-point, so dropping replay for this request is safe.
+Make ll_open_cleanup() self-guarding while here. It takes the
+lookup_intent instead of a req_capsule and does nothing unless
+DISP_OPEN_OPEN is set, i.e. the MDT granted an open and the reply holds a
+handle to release. Which reference on that reply it may use then depends
+on how the open ended. With DISP_ENQ_OPEN_REF set the intent still owns
+the reference mdc_finish_intent_lock() took, so it->it_request is safe.
+Without it, and with the open itself successful, ll_file_open() or
+ll_release_openhandle() has taken the handle over and cleared the bit; an
+och owns the handle (and with it rq_early_free_repbuf) and the request
+may already be freed -- on a non-replayable open, such as one against a
+read-only export, mdc_finish_enqueue() clears rq_replay, nothing retains
+the request, and their ptlrpc_req_put() was the last reference. Without
+it and with the open failed, the bit was never set at all, because
+mdc_finish_intent_lock() only sets it when it_open_error(DISP_OPEN_OPEN)
+is zero; the MDT can install the mfd in mdt_finish_open() and then fail
+the request in mdt_refetch_lovea(), and that handle still has to be
+released. Nothing retains the reply there either -- mdt_reint_open()
+zeroes the transno on error -- so the caller's own reference is the only
+one, and callers that have one pass it in. ll_lookup_it_finish() and
+ll_prep_inode() do; ll_atomic_open()'s out_release passes NULL, since
+ll_lookup_it() has already dropped it by then. DISP_OPEN_OPEN is cleared
+once the close has been issued, so a second cleanup of the same abandoned
+open is a no-op; DISP_ENQ_OPEN_REF must survive for ll_intent_release()
+to drop the reference.
 
-Make ll_open_cleanup() idempotent and self-guarding while here. It now
-takes the lookup_intent: it does nothing unless DISP_OPEN_OPEN is set
-(there is no granted open handle to release otherwise, which also stops
-it from md_close()ing a bogus handle), and it clears DISP_OPEN_OPEN once
-the handle is released. The same intent is shared across ll_prep_inode(),
-ll_lookup_it_finish() and ll_atomic_open()'s out_release, so a second
-cleanup of the same abandoned open now short-circuits at the guard rather
-than double-closing. Only DISP_OPEN_OPEN is cleared; DISP_ENQ_OPEN_REF
-must survive so ll_intent_release() still drops the request reference that
-mdc_finish_intent_lock() took for the open. The callers reduce to
-"DISP_OPEN_OPEN && it_request" and no longer reach into rq_replay /
-rq_commit_cb.
+ll_atomic_open() gains a cleanup call on out_release, which previously
+only released the intent. That label is reached both by the error exits
+and by the two finish_no_open() branches, which return 1 and leave the
+VFS to open the dentry itself; either way the handle granted for this
+intent is abandoned, and until now it leaked until umount or eviction.
+It passes no request of its own, since ll_lookup_it() has already
+dropped its reference by then, so it covers the intents that still carry
+DISP_ENQ_OPEN_REF and not an open the MDT granted and then failed --
+that one arrives here through ll_file_open()'s out_och_free with the bit
+already clear, and freeing it would need ll_lookup_it() to hand the
+reply reference back. As at the other two call sites, the intent lock is
+dropped first, since the close waits for a mod RPC slot and holding the
+lock across that wait can get the client evicted (LU-13101).
 
-Fixes: d2b203692e ("LU-6301 llite: cleanup open handle for client open failure")
+The leak is reachable today via ll_prep_inode() and
+llcrypt_prepare_readdir() failures. It becomes
+easy to hit with "LU-9868 llite: use d_splice_alias for directories",
+which lets ll_splice_alias() fail with -ELOOP or -ESTALE where the
+current d_add() cannot: a racing rename/create workload then drives
+ll_lookup_it_finish() into this error path thousands of times per run.
+
+Fixes: d2b203692e24 ("LU-6301 llite: cleanup open handle for client open failure")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: Iea44872f5507d829c1baa791ed179ee0f13f09c1
 
 --- Review History ---
@@ -209,3 +239,41 @@ Some concerns, see inline comments. The main one is the new ll_open_cleanup() ca
 Patch Set 4: Code-Review-1
 
 (1 comment)
+
+--- Message (Oleg Drokin, 2026-09-04 21:56:23.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 22:10:34.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:13:56.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 00:35:26.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131085/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 05:41:33.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 11:22:01.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; the guard and the ordering both hold up against the callers I traced. One optional inline note for whenever this is next refreshed -- no need to re-spin for it. It would also be nice to have a regression test that drives one of the abandoned-open paths (e.g. an ll_prep_inode() failure) and checks the reply buffers are not retained, though that needs a fault-injection point that does not exist today.

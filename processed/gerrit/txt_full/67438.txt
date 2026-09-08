@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-22 02:24:37.000000000
-Updated:    2026-08-31 18:05:44.000000000
-Patch Set:  6
+Updated:    2026-09-05 06:35:43.000000000
+Patch Set:  7
 Insertions: +138
 Deletions:  -2
 Comments:   13 (10 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -46,12 +46,30 @@ FIDs of unrelated objects.  That is how LU-20501 handed ll_get_name() a
 ".." entry whose FID matched the child being looked up.
 
 Report the OSD root.  It is the real parent -- ROOT and update_log_dir
-are entries in its ZAP -- and it is what osd-ldiskfs already reports for
-the same directories, since osd_iget_fid() maps an LMA-less root inode
-to lu_local_obj_fid(OSD_FS_ROOT_OID).  osd_scrub.c performs the same
-mapping.  That FID is in FID_SEQ_LOCAL_FILE, so
+are entries in its ZAP -- and it is what osd-ldiskfs answers for the same
+objects through dt_lookup(), where osd_ea_lookup_rec() falls through to
+osd_iget_fid() and that maps the LMA-less root inode to
+lu_local_obj_fid(OSD_FS_ROOT_OID).  That FID is in FID_SEQ_LOCAL_FILE, so
 lfsck_find_mdt_idx_by_fid() always resolves it to the local target and
 the LFSCK takes the idx == lfsck_dev_idx() path, where ".." is a no-op.
+
+osd-ldiskfs does not give one answer here, so there is no single
+behaviour to match: its iterator disagrees with its own lookup.
+do_osd_ldiskfs_filldir() substitutes the directory's own FID whenever a
+dirent points at the ldiskfs superblock root, so through readdir /ROOT's
+".." reads back as /ROOT itself, and osd_ea_fid_get() is never reached
+for it.  A client therefore sees a different ".." inode number at the
+mount root on zfs than on ldiskfs.  That divergence is accepted: the OSD
+root is where these objects actually live, and both values are local, so
+the LFSCK behaves identically either way.
+
+osd_dir_lookup() is left alone, so on zfs dt_lookup(dir, "..") still
+answers -ENODATA for these objects while the iterator now answers.  No
+current consumer hits that: mdd_is_parent() short-circuits on
+mdd_is_root(), and the LFSCK's dt_lookup_dir(child, dotdot) tolerates
+-ENODATA.  Making the lookup answer would feed the LFSCK a parent FID
+where it currently gets nothing, which wants its own patch and its own
+validation.
 
 Tracing every -ENOENT through a full sanity-lfsck run on a 2-MDT DNE
 filesystem finds exactly three objects reaching this branch, all direct
@@ -65,69 +83,65 @@ children of the OSD root:
 never opens it, since FID_SEQ_DOT_LUSTRE is below FID_SEQ_NORMAL and
 lfsck_master_oit_engine() drops objects that are neither norm nor igif.
 
-Gate that answer on the iterated object's own FID.  osd_find_parent_fid()
-returns -ENOENT for any object whose linkEA is unreadable and whose
-SA_ZPL_PARENT names an LMA-less dnode, and an object created with no
-local parent hint stores the OI ZAP there -- that covers DNE remote
-directories and striped shards.  The OSD root is not their parent, so
-only ROOT and update_log_dir take it.
+Gate that answer on the iterated object's own FID, not on the parent
+dnode: SA_ZPL_PARENT does not name the OSD root for these objects, it
+names the OI ZAP that indexes them, so testing the dnode against
+osd->od_root never matches.  osd_find_parent_fid() returns -ENOENT for
+any object whose linkEA is unreadable and whose SA_ZPL_PARENT names an
+LMA-less dnode, which also covers DNE remote directories and striped
+shards; the OSD root is not their parent, so only ROOT and
+update_log_dir take that arm.
 
 Everything else reaching this branch reports the object itself.  That is
 not a claim about the parent; it is the value that leaks nothing, asserts
 nothing false, and stays local, so lfsck_find_mdt_idx_by_fid() resolves
 to this target and the LFSCK dotdot check is a no-op.  It is marked
 LUDA_UNKNOWN to document that, the same way the sibling
-osd_get_fid_by_oid() failure below is marked; nothing in the tree tests
-that flag.  The absent LUDA_FID is what makes
-ll_get_name() skip the entry, via the companion llite patch; readdir does
-not gate on it at all -- ll_dir_read() builds the d_ino from lde_fid
-whatever the flags say, and mdd_dir_page_build() only consults LUDA_FID
-to spot .lustre and packs the entry either way.
-The LFSCK reads lde_fid regardless of any flag, which is why the value
-has to be sane and local rather than merely unmarked.
+osd_get_fid_by_oid() failure below is marked.  The flag is documentation
+only: readdir does not gate on it -- ll_dir_read() builds the d_ino from
+lde_fid whatever the flags say, and mdd_dir_page_build() only consults
+LUDA_FID to spot .lustre and packs the entry either way -- and the LFSCK
+reads lde_fid regardless of any flag, which is why the value has to be
+sane and local rather than merely unmarked.
 
 Zeroing lde_fid is not usable here.  A zero FID on ".." is a defined
 value: lfsck_namespace_assistant_handler_p1() reads it as "parent
 unknown" and flags LNTF_CHECK_PARENT.  The fs root is scanned by the
 namespace LFSCK -- lfsck_master_oit_engine() lets li_global_root_fid
 through the filter that drops purely local objects -- so a zeroing
-scheme would raise that flag on the root on every scan.  An earlier
-attempt to zero it did exactly that and regressed sanity-lfsck.
+scheme would raise that flag on the root on every scan.
 
-The gate keys on the iterated object's own FID rather than on the parent
-dnode: SA_ZPL_PARENT does not name the OSD root for these objects, it
-names the OI ZAP that indexes them, so testing the dnode against
-osd->od_root never matches.
+The sibling case is left alone: when osd_get_fid_by_oid() fails for an
+ordinary entry further down, lde_fid is likewise left unwritten under
+LUDA_UNKNOWN.  Neither a stale FID nor a zero one is benign for the
+LFSCK there -- it can misrepair either way, adding a link naming an
+unrelated object or taking the dangling path -- so choosing a value for
+it wants its own patch.  The companion llite patch covers that path from
+the client side, by ignoring any entry without LUDA_FID.  For the ".."
+entries this branch produces the same client guard is never reached:
+do_nfs_get_name_filldir() drops "." and ".." by name before it looks at
+the flags.
 
-osd_dir_lookup() still answers -ENODATA for these same objects, so
-dt_lookup(dir, "..") and the iterator disagree where osd-ldiskfs agrees.
-That is deliberate here: no current consumer hits the divergence
-(mdd_is_parent() short-circuits on mdd_is_root(), and the LFSCK's
-dt_lookup_dir(child, dotdot) tolerates -ENODATA), and changing the lookup
-would feed the LFSCK a parent FID where it currently gets nothing, which
-wants its own patch and its own validation.
-
-The sibling case is left alone here: when osd_get_fid_by_oid() fails for
-an ordinary entry further down, lde_fid is also left unwritten but the
-entry is marked LUDA_UNKNOWN.  A zero FID there would be worse than a
-stale one, because for a name other than ".." the LFSCK treats an insane
-FID as LNIT_BAD_DIRENT and removes the name entry.  The companion llite
-patch makes the client ignore any entry without LUDA_FID, which covers
-that path from the client side.
-
-sanity test_912 covers it: it reads the ".." d_ino of the mount root
+sanity test_913 covers it: it reads the ".." d_ino of the mount root
 through getdents64() ten times over dropped caches and requires a stable,
 non-zero value.  On zfs it also requires that value to differ from ".",
 so a gate that stopped matching the root and let it fall to the self-FID
-arm would be caught too; osd-ldiskfs reports the root as its own parent,
-which is the usual convention for a filesystem root, so that part is not
-checked there.  On an
-unpatched ZFS MDT that value is 0 half the time and
+arm would be caught too; that half is not checked on ldiskfs, where the
+filldir substitution above makes the root its own parent by design.  On
+an unpatched ZFS MDT the value is 0 half the time and
 5188147320583553024 the rest; with the patch it is 144115188092633101
 every time.  The new dirent_ino helper is needed because stat(2) -- and
 so ls(1), find(1) and $LFS path2fid -- resolves ".." through the VFS,
 which at a mount root answers with the mountpoint's parent instead of
 what the OSD put in the entry.
+
+Its version gate names 2.17.58, the newest tag: a build carrying this
+patch reports 2.17.58_N and runs the test, while every older MDS -- the
+2.17.55 and 2.17.56 ZFS servers where the value is 0 about half the time
+included -- skips it.  The gate cannot tell an unpatched 2.17.58_N server
+from a patched one, so an interop run pinned to an older build of this
+same branch would still run it; the release branches interop normally
+pins to are all below 2.17.58.
 
 Validated on a ZFS DNE cluster (2 MDT, 2 OST) with the companion llite
 patches, tracing both arms of the gate: the fs root and both
@@ -139,6 +153,7 @@ mismatch" (LU-15842), not an ESTALE.
 
 Fixes: 0780fde4d415 ("LU-3573 osd-zfs: Only advance zap cursor as needed")
 Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanityn env=ONLY=102a,ONLY_REPEAT=200
+Test-Parameters: mdsfilesystemtype=zfs mdtfilesystemtype=zfs ostfilesystemtype=zfs testlist=sanity,sanity-lfsck
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I0e999b877991e3c784d3f38a8d43ada0d99e7c44
@@ -1601,3 +1616,58 @@ Removed cc <GERRIT_ACCOUNT_1055>.
 
 --- Message (Oleg Drokin, 2026-08-31 18:05:44.000000000) ---
 Hashtag removed: testfix
+
+--- Message (Oleg Drokin, 2026-09-04 21:35:35.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 21:41:21.000000000) ---
+Patch Set 7:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69587/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-special1@ldiskfs+DNE sanity-special1@ldiskfs sanity-special2@ldiskfs+DNE sanity-special2@ldiskfs sanity-special3@ldiskfs+DNE sanity-special3@ldiskfs sanity-special4@ldiskfs+DNE sanity-special4@ldiskfs sanity-special5@ldiskfs+DNE sanity-special5@ldiskfs sanity-special6@ldiskfs+DNE sanity-special6@ldiskfs sanity-special7@ldiskfs+DNE sanity-special7@ldiskfs sanity-special8@ldiskfs+DNE sanity-special8@ldiskfs sanity-special9@ldiskfs+DNE sanity-special9@ldiskfs sanity-special10@ldiskfs+DNE sanity-special10@ldiskfs sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-special1@zfs sanity-special1@zfs+DNE sanity-special2@zfs sanity-special2@zfs+DNE sanity-special3@zfs sanity-special3@zfs+DNE sanity-special4@zfs sanity-special4@zfs+DNE sanity-special5@zfs sanity-special5@zfs+DNE sanity-special6@zfs sanity-special6@zfs+DNE sanity-special7@zfs sanity-special7@zfs+DNE sanity-special8@zfs sanity-special8@zfs+DNE sanity-special9@zfs sanity-special9@zfs+DNE sanity-special10@zfs sanity-special10@zfs+DNE sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (wc-checkpatch, 2026-09-04 21:49:35.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:50:37.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-04 23:42:44.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131078/ : SUCCESS
+
+--- Message (Maloo, 2026-09-04 23:43:51.000000000) ---
+Patch Set 7:
+
+#### Build 131078 (patch #7) will not be tested because: the Test-Parameters contain an error: Unknown parameter mdsfilesystemtype
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 03:37:24.000000000) ---
+Patch Set 7:
+
+Initial testing failed:
+
+> sanity2@ldiskfs+DNE Timeout(15521s)
+> sanity2@zfs Timeout(14050s)
+> sanityn@ldiskfs+DNE Timeout(16858s)
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity-special1@ldiskfs+DNE sanity-special1@ldiskfs sanity-special2@ldiskfs+DNE sanity-special2@ldiskfs sanity-special3@ldiskfs+DNE sanity-special3@ldiskfs sanity-special4@ldiskfs+DNE sanity-special4@ldiskfs sanity-special5@ldiskfs+DNE sanity-special5@ldiskfs sanity-special6@ldiskfs+DNE sanity-special6@ldiskfs sanity-special7@ldiskfs+DNE sanity-special7@ldiskfs sanity-special8@ldiskfs+DNE sanity-special8@ldiskfs sanity-special9@ldiskfs+DNE sanity-special9@ldiskfs sanity-special10@ldiskfs+DNE sanity-special10@ldiskfs sanity1@zfs sanity3@zfs sanity-slow@zfs sanity-special1@zfs sanity-special1@zfs+DNE sanity-special2@zfs sanity-special2@zfs+DNE sanity-special3@zfs sanity-special3@zfs+DNE sanity-special4@zfs sanity-special4@zfs+DNE sanity-special5@zfs sanity-special5@zfs+DNE sanity-special6@zfs sanity-special6@zfs+DNE sanity-special7@zfs sanity-special7@zfs+DNE sanity-special8@zfs sanity-special8@zfs+DNE sanity-special9@zfs sanity-special9@zfs+DNE sanity-special10@zfs sanity-special10@zfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69587/results.html
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 06:35:43.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful

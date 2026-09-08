@@ -7,20 +7,20 @@ Branch:     master
 Status:     NEW
 Owner:      James Simmons
 Created:    2019-12-13 18:28:00.000000000
-Updated:    2026-07-26 07:35:16.000000000
-Patch Set:  32
-Insertions: +63
-Deletions:  -30
-Comments:   62 (5 unresolved)
+Updated:    2026-09-06 15:06:56.000000000
+Patch Set:  33
+Insertions: +43
+Deletions:  -11
+Comments:   67 (10 unresolved)
 Topic:      upstream
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Alexander Zarochentsev, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Qian Yingjin, Neil Brown
+  CC: Alexander Zarochentsev, Neil Brown, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Qian Yingjin
 
 --- Commit Message ---
 LU-9868 llite: use d_splice_alias for directories.
@@ -32,25 +32,72 @@ IS_ROOT() or d_lustre_invalid().
 Separating out the directories from non-directories will allow us
 to simplify the non-directory code.
 
+A negative lookup (@inode NULL) takes the new branch as well, where it
+used to reach d_add(de, NULL): d_splice_alias(NULL, de) does the same
+__d_add(), with the BUG_ON(!d_unhashed(de)) it opens with. No caller
+passes a hashed dentry -- ll_atomic_open() either hands over a
+d_in_lookup() dentry or d_drop()s it first.
+
 Unlike the old ll_splice_alias() d_add() path, d_splice_alias() consumes
 the passed inode reference in every case (including on its error returns
 -ELOOP/-ESTALE) and can now return an error. Adjust the callers to the
 new contract:
 
- - ll_statahead_dentry() transferred the sa_entry inode reference to
-   the dentry (se_inode = NULL) only on the success path, so on the
-   d_splice_alias() error path the reference it already dropped was
-   iput() a second time when the sa_entry was freed, underflowing
-   i_count (WARNING at fs/inode.c ihold, hit under an rm workload with
-   statahead active). Transfer ownership away from the sa_entry before
-   inspecting the result.
+ - revalidate_statahead_dentry() transferred the sa_entry inode
+   reference to the dentry (se_inode = NULL) only on the success path,
+   so on the d_splice_alias() error path the reference it already
+   dropped was iput() a second time when the sa_entry was freed,
+   underflowing i_count (WARNING at fs/inode.c ihold, hit under an rm
+   workload with statahead active). Transfer ownership away from the
+   sa_entry before inspecting the result.
 
  - A by-FID (.lustre/fid/) directory lookup must not d_move the
-   directory's real (connected) dentry onto the fid path, or the normal
-   path to the directory breaks (LU-1777, sanity 233a/233b). Keep the
+   directory's real (connected) dentry onto the fid path.
+   d_splice_alias() does exactly that for an ordinary directory:
+   __d_find_any_alias() returns its connected dentry, which is neither
+   an ancestor of the new .lustre/fid/<FID> dentry nor IS_ROOT(), so
+   __d_unalias() moves it there and the normal path to the directory
+   stops working. ($MOUNT itself and .lustre are ancestors, so they come
+   back -ELOOP instead -- equally fatal to sanity 233a/233b.) Keep the
    legacy alias handling for OBF-parented directory lookups; use
    d_splice_alias() only for normal-namespace lookups, where it keeps a
    directory to a single dentry (LU-17536).
+
+   The test is on the immediate parent's FID, so it recognises the
+   entries directly under .lustre/fid/ and nothing else about the by-FID
+   namespace. Two cases are therefore left as d_splice_alias() handles
+   them, both of them consequences of the OBF namespace giving a
+   directory a second dentry in the first place:
+
+    * .lustre/fid/<dir-FID>/<name>: the parent is the duplicate dentry
+      this branch made for <dir-FID>, so the child takes the
+      d_splice_alias() path and __d_unalias() moves its real dentry into
+      the by-FID tree.
+    * $MOUNT/<path>/<dir> for a directory that already has a by-FID
+      dentry: __d_find_any_alias() hands that dentry back, and
+      __d_unalias() moves it into the normal namespace -- the useful
+      direction, but a direction the old d_add() never took.
+
+   In both, __d_unalias() takes its cross-parent path and can return
+   -ESTALE: it mutex_trylock()s s_vfs_rename_mutex, which any rename on
+   the filesystem holds, and inode_trylock_shared()es the alias's
+   parent, which any create, unlink, mkdir, rmdir or setattr in that
+   directory holds exclusively. The VFS retries once with LOOKUP_REVAL,
+   but a lookup that could not fail before now can, and under a
+   directory-churn workload it will meet those holders.
+   Covering these means recognising the whole by-FID subtree -- marking
+   the dentries this branch creates -- which is new dentry state and is
+   left for its own patch.
+
+The legacy branch is otherwise left exactly as it was: an alias that
+ll_find_alias() returns is still d_move()d onto the new dentry and
+reused, whether it is d_lustre_invalid() or not. d_lustre_invalid()
+only means the LOOKUP lock was dropped at some point, which is the
+common case, and reusing the dentry is the whole point of
+ll_find_alias(); discarding it instead would replace the dentry that
+open files and mounts are attached to on every lookup that races a
+lock cancellation. It would also be a behaviour change for regular
+files, which this patch is not about.
 
 Linux-commit: e9d4f0b9f55920821845b8e063ed593422c18d8a
 Linux-commit: 1d6e65bedf5878c8dd5b089d3f034b619bbb8a77
@@ -59,7 +106,7 @@ Test-Parameters: optional testlist=racer
 Signed-off-by: NeilBrown <neil@brown.name>
 Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: If80a02b77c4fc62cdb90e86cdb8a0f9eba21193b
 
 --- Review History ---
@@ -6168,3 +6215,281 @@ Succeeded:
 - conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
 
 (rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/66702/results.html
+
+--- Message (Oleg Drokin, 2026-09-04 21:56:23.000000000) ---
+Uploaded patch set 33.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 22:11:06.000000000) ---
+Patch Set 33:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:14:01.000000000) ---
+Patch Set 33:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 22:20:04.000000000) ---
+Patch Set 33:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69614/results.html
+
+ Commencing initial testing: racer@ldiskfs+DNE racer@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 00:12:05.000000000) ---
+Patch Set 33:
+
+Initial testing succeeded.
+
+Succeeded:
+- racer@ldiskfs+DNE racer@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69614/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-05 00:43:16.000000000) ---
+Patch Set 33: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131086/ : SUCCESS
+
+--- Message (Maloo, 2026-09-05 00:44:29.000000000) ---
+Patch Set 33:
+
+#### The following sessions will be run for Build 131086 (patch #33):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131086&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131086#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 06:20:20.000000000) ---
+Patch Set 33:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-06 03:42:53.000000000) ---
+Patch Set 33:
+
+Testing has completed with errors!
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity-slow@zfs:test_64b(Seen in reviews: 68392 60995 43786)
+
+
+> sanity-slow@zfs Failure(5719s)
+- 64b(oos.sh failed: 1) 
+> sanity-pcc@ldiskfs+DNE Failure(3721s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3339s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-quota@zfs Failure(15311s)
+- 86(succeed to create files, expect failed) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69614/results.html
+
+--- Message (Maloo, 2026-09-06 11:22:29.000000000) ---
+Patch Set 33:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-141vm25: https://testing.whamcloud.com/test_sessions/79abb194-c548-4232-af70-b1328d3f70c0 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-06 14:54:47.000000000) ---
+Patch Set 33: Verified-1
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-141vm3: https://testing.whamcloud.com/test_sessions/042fe79f-b661-4933-b41b-9f4782675df2 ran 9 tests.  1 tests failed: sanity-quota.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 15:06:56.000000000) ---
+Patch Set 33:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The d_splice_alias() inode-reference contract checks out on both callers, and the statahead ownership transfer closes the double-iput. Only optional nits inline, no need to re-spin for them.

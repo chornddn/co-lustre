@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-24 22:52:15.000000000
-Updated:    2026-09-02 23:49:42.000000000
-Patch Set:  9
-Insertions: +610
-Deletions:  -12
-Comments:   51 (10 unresolved)
+Updated:    2026-09-06 20:04:00.000000000
+Patch Set:  11
+Insertions: +1570
+Deletions:  -24
+Comments:   75 (0 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Lustre Gerrit Janitor: -1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -49,6 +49,73 @@ CAP_DAC_READ_SEARCH, which ll_fid2path() checks first -- is an error
 and not a missing name, so a broken search cannot read as a complete
 one.
 
+Neither half of the resolution asks anything of the target being
+scanned, which is what lets it name objects on a target that is out of
+service -- and a ZFS target can only be scanned out of service, its
+pool being exported.
+
+An OST data object is named by the file that owns it, read from the
+object's own trusted.fid.  Its own FID is an OST-sequence one, which
+__ll_fid2path() answers only by asking the OST holding it, through the
+OSC: exactly the target the scan is reading.  ff_parent is the owner's
+MDT FID, and the stripe index filter_fid keeps in its f_ver is
+dropped,
+that field being an index and not a version.  An object no file owns
+yet -- precreated and never written, of which a target holds many --
+carries no trusted.fid and is reported as having no name rather than
+being chased through the OSC.
+
+trusted.fid is not the only place that FID lives.  An OST whose inodes
+are 256 bytes or smaller has none at all: osd_xattr_set_pfid() packs
+the parent into the LMA as a struct lustre_ost_attrs and removes the
+separate xattr, saying so with LMAC_STRIPE_INFO.  Reading only
+trusted.fid there leaves every object on the target without an owner,
+so --fid2path prints nothing and reports them all unnamed -- measured
+on an OST formatted -I 256: 33 objects, no owner on any of them,
+against four files whose paths it should have printed.  mkfs.lustre
+defaults to -I 512 now, but -I 256 is still accepted and older OSTs
+carry it.  The LMA buffer is already in hand for the classification,
+so the fallback costs no second xattr, and ll_decode_filter_fid(8)
+reads the same two places.
+
+An MDT object is named from its trusted.link and a map of the target's
+directories, FID to parent and name, built by a pass over the target
+before the search.  A pass of its own because objects arrive in inode
+order, so an object is usually delivered before its ancestors are;
+resolving inline would mean holding every match until the scan ended.
+The pass asks for no layout, no SOM and no HSM, and a filesystem holds
+far fewer directories than files.  On an OST it stops at the first
+object and leaves the map empty.
+
+There is no fall back to the lookup once the map is in use.  The map
+is
+used precisely when the target cannot answer, so one object it could
+not place would stop the whole search there.  Two things are nameless
+in consequence and counted with the rest: an ownerless OST object, and
+on DNE an object whose ancestors live on another MDT, the map covering
+only the target scanned.
+
+--paths is the same composition with no mount at all.  --fid2path
+still needs one, not to resolve anything but as the filesystem the
+paths hang from and for the comparison below, and a filesystem whose
+only MDT is the target being scanned has none to give -- which for a
+single-MDT ZFS filesystem is every scan of its MDT, the pool having
+to be exported.  --paths prints filesystem-root-relative names
+instead, asks nothing of any running service, and is refused on an
+OST, whose objects are named by files that live on an MDT.
+
+A mount whose own filesystem cannot be read is refused rather than
+run unguarded: --fid2path was asked for explicitly, and the fallback
+was the very outcome the comparison exists to prevent, another
+filesystem's pathnames printed with a zero exit.
+
+llapi_scan_rec_path.3 says the same thing to a consumer pairing that
+call with llapi_scan_device() directly, because nothing in the
+library can make the check for them: the call is handed a descriptor
+and a record and never sees the target the record came from.  lfind
+compares the mount's fsname with the target's label; anyone else has
+to do that too, or know by construction that the two agree.
+
 A MOUNT of another filesystem is refused when the target is opened,
 its fsname compared with the one the target's label names.  The
 comparison sits inside the scan's own open rather than in a probe
@@ -63,16 +130,18 @@ therefore finds a range and __ll_fid2path() answers with a pathname
 from it, so the run would have printed another filesystem's paths as
 though they were the target's and exited 0.
 
---fid2path cannot be satisfied on a ZFS target at all, which lfind(8)
-now says.  Scanning one needs its pool exported, but an OST object's
-pathname resolves through the OSC to the file that owns it, which
-needs that OST reachable; a client still carrying it as active blocks
-on the lookup.  That is a property of the two requirements and not of
-this patch, but it was undocumented.
-
 The mount point is resolved before use: a bare fsname, a
 subdirectory and a trailing slash all open the same root, and none of
 them names a file when prefixed to what fid2path answers.
+
+conf-sanity test_167 stops an OST, exports its pool where the backend
+is
+ZFS, and compares the names a scan of it gives against what the client
+saw before it went down -- a scan that resolved nothing and one that
+resolved everything both exit 0, so the set is what is asserted.  Its
+files are written rather than merely created, a precreated object
+being
+rightly nameless.
 
 conf-sanity test_166 diffs the resolved paths against what the client
 sees, and checks that a hardlinked object is named once.  It mounts a
@@ -80,6 +149,120 @@ client on the MDS for the duration, because --fid2path resolves
 through a mount on the node running the scan and a server is not a
 client; a configuration that cannot mount one skips.  It is ldiskfs
 only: reading a target in service is what ZFS refuses.
+
+scan_device_run()'s comment says what a second open costs rather than
+calling it a deadlock, because it is not one: llapi_find_device()
+builds the directory map in a pass of its own, so every --fid2path and
+--paths
+run already opens and closes the target twice in one process, and
+conf-sanity test_167 does exactly that against a stopped OST with its
+pool exported and passes on conf-sanity4@zfs.  The reason to test the
+fsname inside the scan's own open is the cost of the second import and
+export, not a hang.  The wasted pass on an OST -- where
+scan_dirmap_cb() stops at the first object -- is left as it is;
+folding the map into the search's own open would serve both from one
+open and is worth doing separately.
+
+The resolve-failure message names the FID that was looked up and the
+mount only when there is one.  An OST object is resolved by its
+owner's FID rather than its own, so the message named the wrong one;
+and under --paths there is no mount at all, yet -ERANGE and -ELOOP
+still arrive here and reported a failure "through the mount given".
+
+lfind(8) says what --fid2path costs, which differs by target and is
+easy to state as one number and be wrong.
+One lookup per kept object is the OST's cost; on an MDT there is no
+lookup and a whole extra pass instead, to build the map the page
+describes four blocks further down -- the more expensive of the two,
+and paid before the search rather than per match.  Where a name cannot be
+composed the page points at lfs-fid2path(1), which is a tool that
+exists, rather than at a lookup-only mode of this one, which is not.
+
+--paths and --fid2path together goes through the same exit as every
+other error in that function.  Returning CMD_HELP from main() exits 4
+and prints no usage, where "ret = CMD_HELP; goto out" prints it and
+exits EXIT_FAILURE.
+
+fp_paths takes fp_unused_bit1.  struct find_param keeps those bits for
+exactly this, and a trailing byte would have cost 8 with padding.
+
+The directory map's names stay inline.  At NAME_MAX + 1 an entry is
+~288 bytes, so a million directories is ~288 MB and 1.5x that while
+scan_dirmap_grow() holds both tables, and interning them in an arena
+would cut it several-fold.  Left for now: it is a change to the map's
+memory layout for a case no measurement here has reached, and a
+calloc() failure already fails the search cleanly rather than
+corrupting it.  Worth revisiting when --paths is pointed at a target
+big enough to need it.
+
+conf-sanity test_168 covers --paths, where 166 and
+167 both exercise only --fid2path, so the composition --paths exists
+for was never run.  It scans an MDT in service with no mount given,
+which is the case a filesystem whose only MDT is the target has to be
+named in, and asserts the answer is the client's set: one path per
+object rather than one per name, the hardlinked object once, no FID
+where a path was asked for, and no mount point in the answer -- root-
+relative being what separates it from --fid2path, and a mounted prefix
+meaning the wrong composer ran.  It also asserts the two refusals:
+--paths on an OST, whose objects are named by files that live on an
+MDT, and --paths together with --fid2path.  ldiskfs only, an imported
+ZFS pool answering EBUSY by design.
+
+sp_fsname makes the check a public caller can ask for.
+llapi_scan_rec_path.3 tells one they must establish that the mount and
+the target are the same filesystem, and nothing in
+<lustre/lustreapi.h> let them: scan_device_run() is internal,
+llapi_scan_device() passed want_fsname NULL, and the target's label
+lives in a private header.  The field is the same machinery under a
+public name -- the scan refuses a target whose label names another
+filesystem with -EXDEV -- and it has to be the scan that does it,
+because only the scan reads the label and a lookup on the wrong mount
+succeeds and answers with that filesystem's pathname.
+
+The usage agrees with its own option list.  "The output is a
+FID because a target has no paths" sat two lines below --paths and
+--fid2path, both of which print pathnames; it now says the output is a
+FID unless one of them is given.
+
+test_166 and test_168 sync the MDS, not only the client.
+lustre_super_operations has no .sync_fs, so a client sync writes back
+page-cache data and leaves the MDT's ldiskfs to commit on its own
+schedule -- and both tests scan that ldiskfs directly while it is in
+service, so an object still only in memory is one the scan cannot see
+and the comparison against the client's answer is a race.  test_167
+needs none of this: its target is stopped, which flushes it.
+
+test_167 also tells the scan where the OST's pool devices are.  An
+exported pool is found by reading vdev labels under a search path,
+which defaults to /dev, and the test framework's ZFS vdevs are files
+in $TMP -- so without --search the pool is not found at all and the
+test failed on every ZFS configuration with ENOENT.  On ldiskfs the
+argument is empty and nothing changes.
+
+test_166's one bare lfs becomes $LFS, as every other call in the file
+is.  An interop run that points LFS at another binary would have used
+whatever PATH found.
+
+The EXAMPLES fragment in llapi_scan_rec_path.3 writes n rather than
+n.  troff reads the single form as a register reference, so the page
+rendered printf("%s0, path) -- llapi_fid_parse.3 already escapes it
+the other way.
+
+The three places that said a target scan needs no client now say what
+--fid2path changes.  lfind.c's file header and llapi_find_device()'s
+block comment both stated it flatly, and llapi_find_device.3
+documented neither fp_fid2path_mnt nor the -ENAMETOOLONG an over-long
+mount path answers with; its SEE ALSO gains llapi_scan_rec_path(3),
+which is the call that does the resolving.
+
+llapi_scan_rec_path.3's NOTES point a consumer at sp_fsname rather than
+telling it to compare the mount and the target itself.  sp_fsname is
+that comparison -- the scan refuses a target of another filesystem with
+-EXDEV -- and saying otherwise on the page that introduces it would
+send a caller to write what the library already does.
+
+test_168's one bare lfs becomes $LFS, as test_166's did.  It was added
+after that fix and reintroduced it.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -2040,3 +2223,862 @@ Patch Set 9:
 AI code review results below, please doublecheck
 
 Mostly good, a few comments inline. The wrong-filesystem guard added in this revision is the part worth a second look: it is only applied when the mount's fsname could be read, and the mechanism it relies on is not reachable from the public API that llapi_scan_rec_path(3) points an out-of-tree caller at.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 16:13:09.000000000) ---
+Patch Set 10:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69464/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 16:26:06.000000000) ---
+Patch Set 10:
+
+Test script conf-sanity subtest test_167 that was touched by this patch failed with 'lfind --fid2path on a stopped lustre-ost1/ost1 failed'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:32:28.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 17:45:07.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:09:57.000000000) ---
+Patch Set 9:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 18:39:47.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130959/ : SUCCESS
+
+--- Message (Maloo, 2026-09-03 18:43:08.000000000) ---
+Patch Set 10:
+
+#### The following sessions will be run for Build 130959 (patch #10):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+#### The following sessions were skipped because they are untestable:
+
+#### Untestable Optional:
+
+- Test Config #74: review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #75: review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #76: review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #77: review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #78: review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #79: review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #80: review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #81: review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #82: review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #83: review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #84: review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #85: review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #86: review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #87: review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #88: review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #89: review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #91: review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #100: review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+- Test Config #101: review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #130959
+
+#### Supported build configurations for lustre-reviews #130959:
+
+#### Clients
+
+  - rocky9.5   - aarch64 - inkernel
+
+  - el10.0     - x86_64  - inkernel
+
+  - el10.1     - x86_64  - inkernel
+
+  - el10.2     - x86_64  - inkernel
+
+  - el8.10     - x86_64  - inkernel
+
+  - el9.7      - x86_64  - inkernel
+
+  - el9.8      - x86_64  - inkernel
+
+  - rocky9.5   - x86_64  - inkernel
+
+  - sles15sp7  - x86_64  - inkernel
+
+  - ubuntu2404 - x86_64  - inkernel
+
+  - ubuntu2604 - x86_64  - inkernel
+
+#### Servers
+
+  - el10.0 - x86_64 - inkernel
+
+  - el10.1 - x86_64 - inkernel
+
+  - el8.10 - x86_64 - inkernel
+
+  - el9.7  - x86_64 - inkernel
+
+  - el9.8  - x86_64 - inkernel
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=130959&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=130959#redirect
+
+--- Message (wc-checkpatch, 2026-09-03 20:12:37.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-03 20:51:48.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 20:56:41.000000000) ---
+Patch Set 10: Code-Review-1
+
+Newly added or changed test failed in initial testing:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- conf-sanity4@zfs:test_167(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+
+
+> conf-sanity4@zfs Failure(3740s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special1@zfs Failure(602s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special1@zfs+DNE Failure(601s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special2@zfs Failure(586s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special2@zfs+DNE Failure(882s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special3@zfs Failure(671s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special3@zfs+DNE Failure(862s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special4@zfs Failure(596s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special4@zfs+DNE Failure(807s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special5@zfs Failure(661s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special5@zfs+DNE Failure(877s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special6@zfs Failure(641s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special6@zfs+DNE Failure(746s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special7@zfs Failure(686s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special7@zfs+DNE Failure(781s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special8@zfs Failure(666s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special8@zfs+DNE Failure(812s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special9@zfs Failure(691s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special9@zfs+DNE Failure(716s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special10@zfs Failure(596s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special10@zfs+DNE Failure(791s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69464/results.html
+
+--- Message (Maloo, 2026-09-04 02:53:13.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-153vm20: https://testing.whamcloud.com/test_sessions/07efda85-4a2a-474a-bd75-0da944973e8d ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-09-04 03:30:29.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-part-7 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-143vm14: https://testing.whamcloud.com/test_sessions/802ad765-018f-46a3-a59d-41d882ebe9b9 ran 6 tests.  1 tests failed: sanity-pcc.
+
+--- Message (Maloo, 2026-09-04 03:30:29.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-159vm101: https://testing.whamcloud.com/test_sessions/b0e4c89c-4631-40a0-8d31-652aca220cd7 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-09-04 03:52:28.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-158vm56: https://testing.whamcloud.com/test_sessions/d58ad123-009a-4ef4-a6ad-62346b25c96d ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-09-04 04:54:49.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-152vm52: https://testing.whamcloud.com/test_sessions/20563164-ab50-4707-abc8-63d8eef6b1c1 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-09-04 05:34:17.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-159vm118: https://testing.whamcloud.com/test_sessions/00d520aa-4a92-471d-aa18-b9c097b05fcd ran 5 tests.  2 tests failed: node-provisioning, sanity-sec.
+
+--- Message (Maloo, 2026-09-04 11:08:35.000000000) ---
+Patch Set 10: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-156vm184: https://testing.whamcloud.com/test_sessions/9e2dd36c-736d-4b2d-bfd9-96bae639ec8b ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 11:27:31.000000000) ---
+Patch Set 10:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The --paths refusal keys off an empty directory map rather than off what the target is, and that looks able to reject a legitimate MDT scan; the remaining points are documentation and commit-message items that can ride along on the same refresh.
+
+--- Message (Autotest, 2026-09-04 14:45:18.000000000) ---
+Patch Set 10:
+
+Trevis Autotest retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 130959 patch 10. Requested by Jin Gwoun because of ATM-4035.
+
+--- Message (Maloo, 2026-09-04 19:42:04.000000000) ---
+Patch Set 10:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-155vm58: https://testing.whamcloud.com/test_sessions/db24961b-c937-49cf-9bea-901270c56136 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 22:06:22.000000000) ---
+Patch Set 11:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69601/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:06:50.000000000) ---
+Patch Set 11:
+
+(11 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:09:12.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 22:19:46.000000000) ---
+Patch Set 11:
+
+Test script conf-sanity subtest test_167 that was touched by this patch failed with 'lfind --fid2path on a stopped lustre-ost1/ost1 failed'. This is just a heads up on first fatal failure and a full report would be posted on test completion. See the results link above if you want intermediate results.
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 22:33:48.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:50:08.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 01:49:15.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131100/ : SUCCESS
+
+--- Message (Maloo, 2026-09-05 01:50:42.000000000) ---
+Patch Set 11:
+
+#### The following sessions will be run for Build 131100 (patch #11):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+#### The following sessions were skipped because they are untestable:
+
+#### Untestable Optional:
+
+- Test Config #74: review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #75: review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #76: review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #77: review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #78: review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #79: review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #80: review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #81: review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #82: review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #83: review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #84: review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #85: review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #86: review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #87: review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #88: review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #89: review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #91: review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #100: review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+- Test Config #101: review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131100
+
+#### Supported build configurations for lustre-reviews #131100:
+
+#### Clients
+
+  - rocky9.5   - aarch64 - inkernel
+
+  - el10.0     - x86_64  - inkernel
+
+  - el10.1     - x86_64  - inkernel
+
+  - el10.2     - x86_64  - inkernel
+
+  - el8.10     - x86_64  - inkernel
+
+  - el9.7      - x86_64  - inkernel
+
+  - el9.8      - x86_64  - inkernel
+
+  - rocky9.5   - x86_64  - inkernel
+
+  - sles15sp7  - x86_64  - inkernel
+
+  - ubuntu2404 - x86_64  - inkernel
+
+  - ubuntu2604 - x86_64  - inkernel
+
+#### Servers
+
+  - el10.0 - x86_64 - inkernel
+
+  - el10.1 - x86_64 - inkernel
+
+  - el8.10 - x86_64 - inkernel
+
+  - el9.7  - x86_64 - inkernel
+
+  - el9.8  - x86_64 - inkernel
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131100&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131100#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 03:10:42.000000000) ---
+Patch Set 11: Code-Review-1
+
+Newly added or changed test failed in initial testing:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- conf-sanity4@zfs:test_167(Seen in reviews: 68416 68415)
+
+
+> conf-sanity4@zfs Failure(3352s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special1@zfs Failure(719s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special1@zfs+DNE Failure(855s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special2@zfs Failure(615s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special2@zfs+DNE Failure(897s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special3@zfs Failure(700s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special3@zfs+DNE Failure(832s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special4@zfs Failure(641s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special4@zfs+DNE Failure(755s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special5@zfs Failure(729s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special5@zfs+DNE Failure(797s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special6@zfs Failure(736s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special6@zfs+DNE Failure(761s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special7@zfs Failure(686s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special7@zfs+DNE Failure(812s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special8@zfs Failure(751s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special8@zfs+DNE Failure(932s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special9@zfs Failure(671s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special9@zfs+DNE Failure(982s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special10@zfs Failure(676s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+> conf-sanity-special10@zfs+DNE Failure(942s)
+- 167(lfind --fid2path on a stopped lustre-ost1/ost1 failed) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69601/results.html
+
+--- Message (Maloo, 2026-09-06 10:40:56.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Trevis Autotest from trevis-156vm58: https://testing.whamcloud.com/test_sessions/097d546b-3c2e-4926-9ed2-23b28aab3d87 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-06 10:50:34.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-141vm34: https://testing.whamcloud.com/test_sessions/a2e460d1-f224-48f7-94c4-3185030020a0 ran 6 tests.  1 tests failed: sanity-pcc.
+
+--- Message (Maloo, 2026-09-06 10:59:05.000000000) ---
+Patch Set 11:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-145vm22: https://testing.whamcloud.com/test_sessions/1dde2849-ed6d-45f5-afc1-12ed35627e5b ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-09-06 16:15:30.000000000) ---
+Patch Set 11: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-154vm96: https://testing.whamcloud.com/test_sessions/929f5956-36a9-440b-a925-606f30f485c4 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 16:35:53.000000000) ---
+Patch Set 11:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that a path composed from the directory map looks wrong, not merely missing, for any file under a striped directory - none of the three new subtests covers that shape, so an 'lfs setdirstripe' case alongside them would be worth adding.
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:43:04.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-06 19:47:10.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-06 20:04:00.000000000) ---
+Patch Set 10:
+
+(1 comment)

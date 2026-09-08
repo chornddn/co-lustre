@@ -1,5 +1,5 @@
 Change:     67956
-Subject:    LU-20522 obdclass: bound llog record length before using the tail
+Subject:    LU-20522 obdclass: keep llog record swabs inside the record
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67956
 Change-Id:  Ib3e5518947abe458a1be4c1e210ca2064b769322
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-13 05:55:40.000000000
-Updated:    2026-08-18 23:38:53.000000000
-Patch Set:  1
-Insertions: +168
-Deletions:  -40
-Comments:   6 (2 unresolved)
+Updated:    2026-09-06 10:25:27.000000000
+Patch Set:  2
+Insertions: +223
+Deletions:  -45
+Comments:   14 (5 unresolved)
 Hashtags:   testfix
 
 --- Labels ---
@@ -22,7 +22,7 @@ Hashtags:   testfix
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20522 obdclass: bound llog record length before using the tail
+LU-20522 obdclass: keep llog record swabs inside the record
 
 lustre_swab_llog_rec() has the same defect the previous patch fixed for
 the log header, still live for every other record type.  It swabs
@@ -55,9 +55,11 @@ tail inside them; every case is then bounded by the record's own extent,
 which that check has just proved lies within the buffer.  Each case also
 needs the length its fixed fields actually occupy, which is not always
 the size of the struct it casts to: llog_changelog_rec ends in a
-for_sizeof_only llog_rec_tail, so a legitimate 80 byte CL_MARK record is
-shorter than sizeof(*cr), and a v1 CHANGELOG_USER_REC is half the size
-of the v2 struct the case uses.
+for_sizeof_only llog_rec_tail and the fields swabbed there stop where
+that tail begins.  That also has to be the bound, because
+mdd_changelog_write_header() writes CL_MARK records with an lrh_len of
+80, short of the 88 byte struct.  A v1 CHANGELOG_USER_REC is likewise
+half the size of the v2 struct its case uses.
 
 MDS_SETATTR64_REC picked its v2 layout on lrh_len > sizeof(the v1
 struct), so an lrh_len between the two sizes put the tail at offset 80,
@@ -84,18 +86,63 @@ Two callers can hand the swabber a record that has already left the
 buffer, so they now bail out instead: llog_reverse_process() advances by
 an lrh_len it has not checked, and llog_osd_next_block() derives last_rec
 by subtracting an untrusted tail length from a pointer, which can land on
-either side of the block.  llog_reverse_process() also locates its own
-tail from that unchecked lrh_len, so bound it there too.
+either side of the block.  llog_reverse_process()'s own forward walk and
+tail lookup are equally unchecked, and a changelog log legitimately holds
+a record-sized hole of zeroes, left by a write that failed after
+mdd_changelog_write_rec() consumed the index: the walk used to assume
+lrh_len always advances across such a hole, which instead leaves rec in
+place while idx catches up to index, so it arrives at the hole with
+rec->lrh_len == 0 and, until now, located the tail at rec - sizeof(*tail)
+-- inside the previous record instead of the one being sought.  It now
+finds each record with llog_skip_gap(), the same helper
+llog_process_thread() already uses to step over exactly this shape of
+hole.  A hole found short of the target index leaves the loop's own index
+alone rather than adopting the found record's on-disk lrh_index: an
+earlier version of this fix resynced index to it, the same "gap in
+index" recovery llog_process_thread() does, but llog_prev_block() only
+checks that its target falls between a chunk's first and last record
+index and does not require a record at that exact index to exist, so a
+single corrupt-but-plausible lrh_index inside a chunk could get adopted,
+sent straight to llog_is_index_skipable() -> test_bit_le() against the
+header bitmap hundreds of MB past the header allocation, and then send
+this same walk right back over the same chunk on the next
+llog_prev_block() call, forever.  Left alone, index keeps the same
+strictly-decreasing property the walk already relied on to terminate, at
+the cost of a skip/cancel decision below occasionally keyed off the
+nominal target rather than the record a hole substituted for it -- a
+narrow policy imprecision, not a memory-safety or termination one, and
+strictly better than resyncing into either hazard.  The final tail lookup
+also now requires lrh_len to be at least
+LLOG_MIN_REC_SIZE rather than only checking where it places the tail,
+which keeps the located tail strictly inside the chunk: a first record
+whose lrh_len happened to equal sizeof(*tail) used to place the tail on
+buf itself, and the walk below only runs while the tail is above buf, so
+that record was silently skipped and the caller re-read the same chunk at
+the same index forever.
 
-There is no new test.  These swabbers only run when the data is in the
-opposite byte order, so a same-endian cluster reaches them solely through
-corruption that happens to set LLOG_REC_HDR_NEEDS_SWABBING(), and unlike
-the log header there is no point in recovery-small where a catalog holds
-both a valid header and a record to corrupt -- the update log catalog is
-still empty there, so processing stops on the header instead.  A test
-that plants a record anyway passes with or without this patch, which is
-worse than none.
+There is no new test for lustre_swab_llog_rec() itself.  Those swabbers
+only run when the data is in the opposite byte order, so a same-endian
+cluster reaches them solely through corruption that happens to set
+LLOG_REC_HDR_NEEDS_SWABBING().  The update log catalog this bound was
+written against is still empty in recovery-small, so processing there
+stops on the header before any UPDATE_REC gets corrupted and swabbed -- a
+test that plants one anyway passes with or without this patch, which is
+worse than none.  A changelog catalog, unlike the update log one, does
+hold both a valid header and live records by the time recovery-small
+runs, and corrupt_update_llog_hdr() already has the offline-edit plumbing
+to reach one; planting a byte-swapped CHANGELOG_REC there was not tried
+for this patch and is left as a follow-up rather than asserted here as
+untestable.
 
+The llog.c and llog_osd.c hunks are not endianness-gated the same way:
+llog_reverse_process()'s walk and llog_osd_next_block()'s last_rec bound
+both run on every cluster regardless of byte order, and existing
+recovery-small test_163 already exercises the llog_reverse_process() fix
+-- it induces exactly the record-sized zero hole this patch makes that
+walk tolerate, via OBD_FAIL_MDS_CHANGELOG_FAIL_WRITE, and an MDT remount
+afterward is what used to hang before this change.
+
+Fixes: cb1290768df9 ("LU-18218 mdd: changelog specific write function")
 Fixes: 4f53536d002c ("LU-3540 lod: update recovery thread")
 Fixes: a15eb4f13224 ("LU-13055 mdd: per-user changelog names and mask")
 Fixes: 97fbb61dbe26 ("LU-4017 quota: add project id support")
@@ -146,3 +193,43 @@ On testing: the argument that no useful test exists only covers the update log c
 
 --- Message (Andreas Dilger, 2026-08-18 23:38:53.000000000) ---
 Hashtag added: testfix
+
+--- Message (Oleg Drokin, 2026-09-04 21:50:26.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:55:21.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 22:07:41.000000000) ---
+Patch Set 2:
+
+(5 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 23:55:35.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131080/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 03:52:29.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 10:25:27.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the bounds all hold up and the reverse-process walk now terminates on the zero-hole and short-record cases it used to spin on. Only optional items inline, no need to re-spin for them.

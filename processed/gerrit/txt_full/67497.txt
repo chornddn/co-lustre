@@ -1,5 +1,5 @@
 Change:     67497
-Subject:    LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+Subject:    LU-6301 llite: clear rq_replay in ll_open_cleanup
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67497
 Change-Id:  Iea44872f5507d829c1baa791ed179ee0f13f09c1
 Project:    fs/lustre-release
@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-23 19:10:14.000000000
-Updated:    2026-07-28 15:41:49.000000000
-Patch Set:  4
-Insertions: +27
-Deletions:  -4
-Comments:   13 (7 unresolved)
+Updated:    2026-09-06 11:22:01.000000000
+Patch Set:  5
+Insertions: +85
+Deletions:  -7
+Comments:   14 (8 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -22,47 +22,77 @@ Comments:   13 (7 unresolved)
   REVIEWER: Andreas Dilger
 
 --- Commit Message ---
-LU-6301 llite: clear rq_replay for failed opens in ll_open_cleanup
+LU-6301 llite: clear rq_replay in ll_open_cleanup
 
-The first LU-6301 patch added ll_open_cleanup() to send a close RPC
-when the client hits an error after the MDT has granted an open,
-so the MDT-side open handle is not leaked. That fix only covers
-the server side: the original open request is replayable,
-so after_reply() left it on the import replay list with rq_replay
-set, and because a failed open has no close/commit callback
-(mdc_commit_open) nothing ever clears rq_replay.
-The request then stays on the committed-replay list until reconnect,
-pinning its reply buffer (sized to max_mds_easize, which can be hundreds
-of KB with wide/PFL/DoM layouts). Under an open-heavy workload that
-takes the open-error cleanup path frequently this accumulates without
-bound and can OOM the client.
+ll_open_cleanup() closes the MDT-side handle of an open the client
+abandoned after the MDT had granted it, but leaves the open request
+itself replayable. Nothing ever clears rq_replay for such a request:
+it has no och and therefore no mdc_commit_open() commit callback, so
+once the transaction commits ptlrpc_free_committed() moves it to
+imp_committed_list, where it stays -- pinning a reply buffer sized to
+max_mds_easize, hundreds of KB with wide/PFL/DoM layouts -- until the
+next reconnect. A workload that takes the open-error path often enough
+grows that list without bound and can OOM the client.
 
-This becomes easy to hit once ll_splice_alias() uses d_splice_alias()
-for directories (which, unlike the old d_add(), can return -ELOOP or
--ESTALE): a racing rename/create workload then drives ll_lookup_it_finish()
-into this error path thousands of times per run.
+Clear rq_replay before sending the close, exactly as mdc_close() does
+for a normal close, and drop the request from the replay list with
+ptlrpc_request_committed() afterwards, as mdc_free_open() does. Clearing
+it after md_close() would be too late: after_reply() for the close runs
+ptlrpc_free_committed() on the same import, and if the open has committed
+by then the request is moved to imp_committed_list with rq_replay still
+set -- and that list is only rescanned when the import generation changes.
+Both happen even if op_data cannot be allocated and no close goes out,
+since that is the low-memory case this is meant to help.
 
-Clear rq_replay in ll_open_cleanup() after the MDT open handle has been
-released, so ptlrpc_free_committed() can drop the request once its
-transaction commits. The server-side handle is already closed at this
-point, so dropping replay for this request is safe.
+Make ll_open_cleanup() self-guarding while here. It takes the
+lookup_intent instead of a req_capsule and does nothing unless
+DISP_OPEN_OPEN is set, i.e. the MDT granted an open and the reply holds a
+handle to release. Which reference on that reply it may use then depends
+on how the open ended. With DISP_ENQ_OPEN_REF set the intent still owns
+the reference mdc_finish_intent_lock() took, so it->it_request is safe.
+Without it, and with the open itself successful, ll_file_open() or
+ll_release_openhandle() has taken the handle over and cleared the bit; an
+och owns the handle (and with it rq_early_free_repbuf) and the request
+may already be freed -- on a non-replayable open, such as one against a
+read-only export, mdc_finish_enqueue() clears rq_replay, nothing retains
+the request, and their ptlrpc_req_put() was the last reference. Without
+it and with the open failed, the bit was never set at all, because
+mdc_finish_intent_lock() only sets it when it_open_error(DISP_OPEN_OPEN)
+is zero; the MDT can install the mfd in mdt_finish_open() and then fail
+the request in mdt_refetch_lovea(), and that handle still has to be
+released. Nothing retains the reply there either -- mdt_reint_open()
+zeroes the transno on error -- so the caller's own reference is the only
+one, and callers that have one pass it in. ll_lookup_it_finish() and
+ll_prep_inode() do; ll_atomic_open()'s out_release passes NULL, since
+ll_lookup_it() has already dropped it by then. DISP_OPEN_OPEN is cleared
+once the close has been issued, so a second cleanup of the same abandoned
+open is a no-op; DISP_ENQ_OPEN_REF must survive for ll_intent_release()
+to drop the reference.
 
-Make ll_open_cleanup() idempotent and self-guarding while here. It now
-takes the lookup_intent: it does nothing unless DISP_OPEN_OPEN is set
-(there is no granted open handle to release otherwise, which also stops
-it from md_close()ing a bogus handle), and it clears DISP_OPEN_OPEN once
-the handle is released. The same intent is shared across ll_prep_inode(),
-ll_lookup_it_finish() and ll_atomic_open()'s out_release, so a second
-cleanup of the same abandoned open now short-circuits at the guard rather
-than double-closing. Only DISP_OPEN_OPEN is cleared; DISP_ENQ_OPEN_REF
-must survive so ll_intent_release() still drops the request reference that
-mdc_finish_intent_lock() took for the open. The callers reduce to
-"DISP_OPEN_OPEN && it_request" and no longer reach into rq_replay /
-rq_commit_cb.
+ll_atomic_open() gains a cleanup call on out_release, which previously
+only released the intent. That label is reached both by the error exits
+and by the two finish_no_open() branches, which return 1 and leave the
+VFS to open the dentry itself; either way the handle granted for this
+intent is abandoned, and until now it leaked until umount or eviction.
+It passes no request of its own, since ll_lookup_it() has already
+dropped its reference by then, so it covers the intents that still carry
+DISP_ENQ_OPEN_REF and not an open the MDT granted and then failed --
+that one arrives here through ll_file_open()'s out_och_free with the bit
+already clear, and freeing it would need ll_lookup_it() to hand the
+reply reference back. As at the other two call sites, the intent lock is
+dropped first, since the close waits for a mod RPC slot and holding the
+lock across that wait can get the client evicted (LU-13101).
 
-Fixes: d2b203692e ("LU-6301 llite: cleanup open handle for client open failure")
+The leak is reachable today via ll_prep_inode() and
+llcrypt_prepare_readdir() failures. It becomes
+easy to hit with "LU-9868 llite: use d_splice_alias for directories",
+which lets ll_splice_alias() fail with -ELOOP or -ESTALE where the
+current d_add() cannot: a racing rename/create workload then drives
+ll_lookup_it_finish() into this error path thousands of times per run.
+
+Fixes: d2b203692e24 ("LU-6301 llite: cleanup open handle for client open failure")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-4.8 llm_code_and_review_tools
+Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: Iea44872f5507d829c1baa791ed179ee0f13f09c1
 
 --- Review History ---
@@ -1009,3 +1039,279 @@ Some concerns, see inline comments. The main one is the new ll_open_cleanup() ca
 Patch Set 4: Code-Review-1
 
 (1 comment)
+
+--- Message (Oleg Drokin, 2026-09-04 21:56:23.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 22:10:34.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:13:56.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-04 22:19:49.000000000) ---
+Patch Set 5:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69611/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 00:29:50.000000000) ---
+Patch Set 5:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69611/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-05 00:35:26.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131085/ : SUCCESS
+
+--- Message (Maloo, 2026-09-05 00:36:42.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 131085 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131085&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131085#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 05:41:33.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-06 01:51:06.000000000) ---
+Patch Set 5:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8215s)
+- 155(ls1 != ls2) 
+> replay-dual@ldiskfs+DNE Timeout(357s)
+> sanity-pcc@ldiskfs+DNE Failure(4110s)
+- 1c(/mnt/lustre/d1c.sanity-pcc/f1c.sanity-pcc expected pcc state: readwrite, but got: none) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-pcc@zfs Failure(3354s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-quota@zfs Failure(14569s)
+- 86(succeed to create files, expect failed) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69611/results.html
+
+--- Message (Maloo, 2026-09-06 03:51:20.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm251: https://testing.whamcloud.com/test_sessions/89db3222-566c-4c8a-aa70-c14a6f9f882b ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-09-06 05:35:34.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-157vm27: https://testing.whamcloud.com/test_sessions/37327d2b-c2bf-4cf0-be4a-aa3ec9b9a825 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-09-06 11:05:51.000000000) ---
+Patch Set 5: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-155vm140: https://testing.whamcloud.com/test_sessions/078800b1-b203-40ee-8023-7512b20f3f16 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 11:22:01.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; the guard and the ordering both hold up against the callers I traced. One optional inline note for whenever this is next refreshed -- no need to re-spin for it. It would also be nice to have a regression test that drives one of the abandoned-open paths (e.g. an ll_prep_inode() failure) and checks the reply buffers are not retained, though that needs a fault-injection point that does not exist today.

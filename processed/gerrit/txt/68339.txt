@@ -1,5 +1,5 @@
 Change:     68339
-Subject:    LU-12669 ec: fix reader deadlock, stale cache, EAGAIN leak
+Subject:    LU-12669 ec: serialize concurrent EC recovery readers
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68339
 Change-Id:  Ib124e31cd92b9ed24396b4b9ea63e268195f2816
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Zhenyu Xu
 Created:    2026-08-25 16:01:43.000000000
-Updated:    2026-09-03 11:42:36.000000000
-Patch Set:  4
-Insertions: +167
-Deletions:  -41
-Comments:   38 (0 unresolved)
+Updated:    2026-09-08 05:15:53.000000000
+Patch Set:  6
+Insertions: +186
+Deletions:  -39
+Comments:   50 (0 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
@@ -22,35 +22,64 @@ Hashtags:   pt_ecro
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-12669 ec: fix reader deadlock, stale cache, EAGAIN leak
+LU-12669 ec: serialize concurrent EC recovery readers
 
-Add a CP_EC_RECOVERY flag to cl_page::cp_flags to serialize concurrent
-CIT_EC_RD readers on the same page.  A second reader finding the flag
-set drops the vmpage lock, sleeps via schedule_timeout_interruptible()
-up to EC_RECOVERY_RETRY_MAX times, then bails with -EAGAIN/-EINTR,
-which triggers vvp_io_ec_rd_end() to release all held locks and clear
-the flag, with -EAGAIN ll_file_io_generic() restarts the IO, and in
-the -EINTR case the reader returns the error to userspace as the IO
-has been interrupted.  This avoids both the cp_owner assert crash and
-the AB-BA deadlock (a reader holding locked vmpages cannot block on a
-flag the recovery owner clears only after its generic_file_read_iter
-faults in a page the spinner holds).
+CIT_EC_RD reconstructs missing data stripes from parity, holding the
+recovered pages locked in ec_page_list until vvp_io_ec_rd_end().  When
+two readers reach the same page concurrently the second crashed on the
+cp_owner assert, and blocking on the first reader's locks deadlocks
+(AB-BA: the recovery owner can fault in an mmap'ed user buffer that
+maps a vmpage the spinner holds).
 
-cp_flags is an unsigned long with set_bit()/clear_bit()/test_bit() so
-the clear after cl_page_disown() does not race with readahead
-modifying the cp_defer_uptodate bitfield word.
+Add a CP_EC_RECOVERY flag to cl_page::cp_flags.  The reader that
+starts recovering a page sets the flag while the vmpage is still
+locked; a second reader finding it drops the vmpage lock and retries,
+waiting for the owner to clear the flag in vvp_io_ec_rd_end().
 
-Clear PageUptodate on reconstructed pages, forcing the next read
-through ll_readpage() for a fresh DLM lock.
+The retry loop is bounded by EC_RECOVERY_RETRY_MAX (200 x 10ms sleeps
+via schedule_timeout_killable(), ~2s per lov_ec_read_stripe_pages()
+call): on exhaustion it bails with -EAGAIN, which cl_io_loop() turns
+into ci_need_restart; cl_io_end() then runs vvp_io_ec_rd_end(),
+disowning every held vmpage and clearing the flag, and
+ll_file_io_generic() restarts the IO from scratch -- releasing all
+locks is what breaks the AB-BA cycle.  -EINTR is returned to userspace
+as the IO has genuinely been interrupted.
 
-Convert -EAGAIN from generic_file_read_iter() in vvp_io_ec_rd_end()
-into an IO restart, gated by !ci_iocb_nowait so RWF_NOWAIT reads still
-receive -EAGAIN instead of looping up to RETRY_ATTEMPTS times.
+Ordering and atomicity notes:
 
-Improve concurrent-reader test diagnostics in sanity-ec.sh.
+* cp_flags is accessed with set_bit()/clear_bit()/test_bit() because
+  the clear in vvp_io_ec_rd_end() runs after cl_page_disown() has
+  unlocked the vmpage, while readahead may concurrently touch the
+  cp_defer_uptodate bitfield word.
+
+* The recovery owner unlinks the page from ec_page_list with plain
+  stores (cl_page_list_del()) before clearing CP_EC_RECOVERY with the
+  unordered clear_bit().  A spinner that sees the flag clear and
+  immediately re-adds the page (LASSERT(list_empty(&page->cp_batch)))
+  could on a weakly ordered CPU observe the clear before the unlink.
+  smp_mb__before_atomic() before the clear_bit(), paired with
+  smp_rmb() after the reader's test_bit(), publishes the unlink first;
+  the same barrier orders the reader's PageUptodate() load after the
+  flag read, so a page the owner just invalidated is not misclassified
+  EC_DPG_UPTODATE and served stale.
+
+* Reconstructed pages that survived a failed recovery had their
+  PageUptodate cleared by vvp_io_ec_rd_end(), forcing the next read
+  through ll_readpage() for a fresh DLM lock instead of serving stale
+  data from the page cache.
+
+Also convert -EAGAIN returned by generic_file_read_iter() in
+vvp_io_ec_rd_end() (DLM lock enqueue failure on an NDELAY stripe) into
+an IO restart rather than leaking it to userspace, gated on
+!ci_iocb_nowait so RWF_NOWAIT reads still get -EAGAIN.
+
+Miscellany: cl_io_set_range() becomes static and iterates top-to-
+bottom, matching the other cl_io_*() helpers; cl_page has a
+BUILD_BUG_ON guard on cp_flags width; sanity-ec.sh concurrent-reader
+tests report per-reader failures and outputs.
 
 Assisted-by: Augment Agent:GLM 5.2
-Fixes: 42b4ceebccc0 ("LU-12669 ec: recover data from parity")
+Fixes: ef3713cae5 ("LU-12669 ec: recover data from parity")
 Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
 Change-Id: Ib124e31cd92b9ed24396b4b9ea63e268195f2816
 
@@ -235,3 +264,98 @@ https://build.whamcloud.com/job/lustre-reviews/130884/ : SUCCESS
 Patch Set 4:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-03 15:59:07.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Some concerns, see the inline comment on lustre/lov/lov_io.c - the new bounded wait does not actually wait when the reading task has a signal pending, which turns a recoverable EC read into a failed one.
+
+--- Message (Zhenyu Xu, 2026-09-04 08:13:21.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Zhenyu Xu, 2026-09-04 08:42:49.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-04 08:44:37.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 08:47:14.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-04 09:05:09.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131029/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 09:22:19.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-05 18:50:03.000000000) ---
+Patch Set 5:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly looks right. One ordering concern on the CP_EC_RECOVERY clear is inline; the other two are nits that can ride along on the same refresh.
+
+--- Message (Autotest, 2026-09-07 19:43:23.000000000) ---
+Patch Set 5:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el10.1-x86_64/zfs servers and clients for build 131029 patch 5. Requested by Andreas Dilger because of LU-16932.
+
+--- Message (Zhenyu Xu, 2026-09-08 02:37:23.000000000) ---
+Patch Set 5:
+
+(3 comments)
+
+--- Message (Zhenyu Xu, 2026-09-08 04:31:14.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 04:33:51.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-08 04:35:24.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 04:43:47.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-08 04:54:04.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131296/ : SUCCESS

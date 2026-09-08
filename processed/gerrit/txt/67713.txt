@@ -7,15 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-04 01:39:19.000000000
-Updated:    2026-08-14 22:02:51.000000000
-Patch Set:  1
-Insertions: +131
-Deletions:  -15
-Comments:   26 (13 unresolved)
+Updated:    2026-09-07 18:57:08.000000000
+Patch Set:  2
+Insertions: +126
+Deletions:  -24
+Comments:   27 (14 unresolved)
+Hashtags:   master-next
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -32,14 +33,9 @@ moves od_max_blksz and with it the units of os_blocks/os_bfree/os_bavail.
 Commit 8ee6e1c8825c ("LU-14565 ofd: Do not rely on tgd_blockbit") fixed
 the statfs reporting paths in mdt_statfs() and ofd_statfs(), which is why
 df and lfs df survive a recordsize change.  The grant code was not
-covered and still pairs the cached tgd_osfs counts with the old shift:
-
-  tgt_grant_space_left()      left = tgd_osfs.os_bavail << tgd_blockbits
-  tgt_grant_sanity_check()    maxsize = tgd_osfs.os_blocks << tgd_blockbits
-  tgt_grant_create()          ted_grant >> tgd_blockbits vs os_bavail
-  tgt_grant_commit()          pending >> tgd_blockbits
-  tgt_statfs_internal()       unstable >> tgd_blockbits
-  tgt_grant_statfs()          the D_CACHE trace of free and avail
+covered and still pairs the cached tgd_osfs counts with the old shift in
+tgt_grant_space_left(), tgt_grant_sanity_check(), tgt_grant_create(),
+tgt_grant_commit(), tgt_statfs_internal() and tgt_grant_statfs().
 
 Both directions are harmful.  Lowering the recordsize from 128K to 16K
 multiplies the block counts by 8 while tgd_blockbits still says 128K, so
@@ -51,31 +47,23 @@ instead, and tgt_grant_sanity_check() then computes a maxsize smaller
 than the grant already outstanding and LBUGs the server on the next
 statfs.
 
-Scale the cached counts by the shift that came with them, and read them
-under tgd_osfs_lock in tgt_grant_sanity_check() and tgt_grant_create(),
-which took the counts without it: the shift and the counts have to come
-from the same statfs or the mismatch is simply reintroduced by a racing
-refresh.  While rewriting the tgt_grant_create() trace, print os_bavail
-and os_blocks separately instead of their product, which was not a
-meaningful quantity, and turn the check itself into an addition: as a
-subtraction it wrapped once the grant passed the free space, skipping
-the precreate ENOSPC exactly when the target was short.  The stale shift
-had been keeping the right hand side too small to reach that.
+Convert the cached counts with the os_bsize that came with them, and
+read both under tgd_osfs_lock in tgt_grant_sanity_check() and
+tgt_grant_create(), which took the counts without it: the size and the
+counts have to come from the same statfs or a racing refresh simply
+reintroduces the mismatch.  The tgt_grant_create() precreate check is
+done in bytes, where it no longer wraps once the export's grant exceeds
+the free space, and its trace prints the free space, that grant and the
+device size instead of a product of two block counts.
 
 The sites that use tgd_blockbits as the device's allocation unit - the
 extent tax, the grant chunk rounding, tgt_grant_inflate()/deflate() and
 ocd_grant_blkbits - are left alone: those are what was negotiated with
 the connected clients and must not move underneath them.
 
-This is the first of two patches on the ticket.  The LBUG it reports
-comes from a lowered ZFS dataset quota rather than a recordsize change,
-and is fixed by the second; that fix compares the outstanding grant
-against the largest size the device has reported, which is only
-meaningful once every size the grant code derives from the cached statfs
-is in the same units.
+This is the first of two patches on the ticket.
 
-Rename test_805 to test_805a, since a number and that same number with
-a suffix are not mixed in one suite.
+Rename test_805 to test_805a.
 
 Add sanity test_805b, which emulates the recordsize change with
 OBD_FAIL_TGT_STATFS_BSIZE so it also runs on ldiskfs, and compares the
@@ -184,3 +172,52 @@ Removed cc <GERRIT_ACCOUNT_1055>.
 Patch Set 1: Code-Review-1
 
 (14 comments)
+
+--- Message (Oleg Drokin, 2026-09-04 21:53:40.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:03:36.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 22:06:37.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 23:00:28.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-05 00:18:32.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131083/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 10:29:32.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good.  The conversion itself checks out: os_bsize is the unit of os_blocks/os_bfree/os_bavail for both osd-zfs (od_max_blksz) and osd-ldiskfs (statfs_pack of f_bsize), so pairing the cached counts with os_bsize instead of tgd_blockbits is right, the tgd_grant_lock -> tgd_osfs_lock order added in tgt_grant_create() matches tgt_grant_space_left(), and none of the tgt_grant_sanity_check() callers hold tgd_osfs_lock.  One question from patchset 1 still looks unanswered inline; no need to re-spin just for that.
+
+--- Message (Marc Vef, 2026-09-07 18:57:06.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-09-07 18:57:07.000000000) ---
+Patch Set 2:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-09-07 18:57:08.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.

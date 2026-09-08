@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-02 22:14:25.000000000
-Patch Set:  15
-Insertions: +2826
+Updated:    2026-09-06 15:53:46.000000000
+Patch Set:  17
+Insertions: +2969
 Deletions:  -22
-Comments:   96 (7 unresolved)
+Comments:   130 (15 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-20606 llapi: scan an ldiskfs target directly
@@ -48,6 +48,17 @@ class.  The label is read the four ways mkfs.lustre writes it -- '-',
 while the target is stopped, which is exactly when this is what there
 is to read it with.
 
+Two more pieces of public API, so the diff holds no surprises.
+struct llapi_scan_stats is what the new sp_stats points at: the caller
+sets ss_size and owns the storage, the scan fills the rest on return,
+and the man page describes it as part of the answer rather than as a
+diagnostic.  And LLAPI_SCAN_F_INTERNAL asks for the objects a target
+holds that its namespace never shows -- the OSD's own, the DNE agent
+inodes, the ones with no LMA -- which a scan otherwise counts in
+ss_class and keeps back.  Without it "every object on this device" and
+"every object a walk would find" would be the same question, and only
+one of them is what a target scan is for.
+
 The counters are one accounting rather than several: ss_seen is
 incremented once per object, in the pre-filter, so a skip the backend
 raises after that point adds to ss_skipped alone.  ss_seen equals
@@ -64,6 +75,80 @@ filled, never that a field moved.
 llapi_scan_namespace.3 gains the pointer to this page here rather than
 in the patch that wrote it, where it would have referred to a page the
 tree did not yet have.
+
+A worker that cannot be initialised degrades the scan rather than
+failing it, once one worker exists, as the pthread_create() arm beside
+it does: a backend opens the device again per worker, sp_thread_count
+is a __u8, and the cursor feeds whatever workers there are, so running
+out of them is not a reason to turn a complete result into an error.
+
+The page says what stx_attributes carries across scanners.  A device
+scan narrows the inode's own flags to the set llite also declares, so
+one file answers "lfs find -attrs d" the same way whichever scanner
+ran, and so_attrs_mask declares that set in the record's
+stx_attributes_mask -- which is what lets a consumer tell "not
+immutable" from "this scanner cannot say".  ERRORS also spells out the
+two EINVAL cases a caller is most likely to trip, a short sp_size and
+a short ss_size.
+
+A directory's own stripe takes LMV_MAGIC_V1.  LMV_USER_MAGIC is how
+the tree marks a *default* LMV: cb_get_dirstripe() sets it exactly
+when fp_get_default_lmv is asked for and LMV_MAGIC_V1 otherwise, and a
+default lives in trusted.dmv, which is never read here -- trusted.lmv
+is the directory's actual stripe.  llite fills LMV_MAGIC_V1 for
+LL_IOC_LMV_GETSTRIPE, so LMV_USER_MAGIC here would have the two
+scanners answer one striped directory with two different values in the
+same field -- the opposite of what sr_lmv promises, which is that the
+field means one thing whichever scanner filled it.
+
+No in-tree consumer reaches that difference from a scan record yet, so
+this is a contract broken rather than a wrong answer observed.
+lmv_dump_user_lmm() is what it would break: the magic decides its
+"(Default)" prefix and which fields a bare -v shows, and
+llapi_lov_dump_user_lmm() accepts both values, so a caller pointed at
+a scan record instead of an ioctl reply would print a device scan's
+directories as defaults.  The size is unchanged either way,
+lmv_user_md_size() growing only for LMV_USER_MAGIC_SPECIFIC.
+
+A parent FID the scan will not vouch for is left cleared rather than
+written: LLAPI_SCAN_PARENT is set only where fid_is_sane() accepts what
+trusted.link held, and the field follows the bit, so a caller reading
+it without testing sr_valid does not get the raw xattr.
+
+llapi_scan_device.3 gives sr_parent_fid an entry of its own, since
+LLAPI_SCAN_PARENT is both what a caller puts in sp_want and what it has
+to test in sr_valid, and a field named in neither place is a field a
+caller cannot use.
+
+run_tests() in lustre/tests/llapi_test_utils.{c,h} is split so that
+run_test_tbl() takes the table: the new test is handed a device where
+the others take a mountpoint.  llapi_scan_test, llapi_root_test and
+llapi_pool_test share that helper, which is why the split is worth
+naming here rather than left to be read out of the diff.
+
+so_flags is narrowed to the attributes a namespace scan can also
+report.  ll_dir_ioctl() puts only IMMUTABLE, APPEND and, under
+HAVE_LUSTRE_CRYPTO, ENCRYPTED into stx_attributes_mask, and
+llapi_scan_namespace() takes stx_attributes from that mask -- so
+reporting COMPR and NODUMP here would make one file answer "lfs find
+--attrs d" differently depending on which scanner ran, where
+stx_attributes is meant to mean one thing whichever filled it.  The
+bit is on the MDT inode either way: making it answerable is llite's to
+do, for both scanners at once.
+
+so_attrs_mask carries that same set into the record's
+stx_attributes_mask, rather than the scanner assuming one set for
+every backend: a bit clear there is "cannot say", which is a different
+answer from the attribute itself being clear.  It is carved from
+so_padding, so every offset above it is unchanged, and a backend that
+leaves it zero has its records leave LLAPI_SCAN_ATTRS clear rather
+than claim attributes nothing vouches for.
+
+The EXAMPLES fragment escapes its newline with a single backslash.
+troff reads that as a register reference, so the page rendered
+printf("%llu files; %llu seen, %llu skipped0, with the escape and the
+closing quote swallowed.  It needs the doubled form that
+llapi_fid_parse.3 and llapi_scan_rec_path.3 already use.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -635,3 +720,97 @@ Patch Set 15:
 AI code review results below, please doublecheck
 
 Mostly good, minor comments inline.
+
+--- Message (Hiroshi Nishida, 2026-09-03 15:58:48.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 16:31:55.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:04:00.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-03 18:08:12.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130953/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-03 18:41:38.000000000) ---
+Patch Set 9:
+
+(2 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 19:14:56.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wc-checkpatch, 2026-09-03 20:10:30.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 08:25:52.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; a few optional notes inline for whenever this is next refreshed, no need to re-spin for them. The scan/backend split reads well and the accounting identity is nicely pinned down by the new test.
+
+--- Message (Hiroshi Nishida, 2026-09-04 21:56:30.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-04 22:04:43.000000000) ---
+Patch Set 17:
+
+(7 comments)
+
+--- Message (wc-checkpatch, 2026-09-04 22:04:57.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 22:49:36.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 01:11:35.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131094/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 02:45:53.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-09-05 08:53:08.000000000) ---
+Patch Set 16:
+
+(13 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 15:53:46.000000000) ---
+Patch Set 17:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The items inline are all optional and can ride along on the next refresh rather than being a reason to re-spin on their own.

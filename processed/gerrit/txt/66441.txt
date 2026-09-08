@@ -1,5 +1,5 @@
 Change:     66441
-Subject:    LU-20099 nrs: add zero reserved rate and unlimited rate for mClock
+Subject:    LU-20099 nrs: add zero reserved and unlimited rates for mClock
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66441
 Change-Id:  Ib527bc98e25ec824df69cf0c5aaabe9fd17f93ff
 Project:    fs/lustre-release
@@ -7,55 +7,112 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-06-03 15:23:02.000000000
-Updated:    2026-09-03 08:38:52.000000000
-Patch Set:  3
-Insertions: +408
-Deletions:  -37
-Comments:   53 (28 unresolved)
+Updated:    2026-09-08 03:16:54.000000000
+Patch Set:  7
+Insertions: +918
+Deletions:  -123
+Comments:   103 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Nikitas Angelinas, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Chris Horn
 
 --- Commit Message ---
-LU-20099 nrs: add zero reserved rate and unlimited rate for mClock
+LU-20099 nrs: add zero reserved and unlimited rates for mClock
 
-This patch adds zero reserved rate and umlimited limit rate for
-mClock NRS scheduler.
+Add a zero reserved rate and an unlimited limit rate to the mClock
+NRS scheduler.
 
-When the reserved rate for a rule is set with 0, the class bucket
-matching the rule will be skipped to add into the mClock reserved
-red-black tree when insert the bucket into the trees.
-It means that there is no any reserved rate for the class bucket.
+A rule with a reserved rate of 0 reserves nothing. The class bucket
+of that rule stays out of the mClock reserved red-black tree.
 
-When the limit rate of a rule is set with "unlimit" or "max", the
-limit deadline of the class bucket matching the rule will be
-always set with the current time when the class bucket is
-inserted into the mClock limit red-black tree.
-It means the waiting time to service the next request in the
-class bucket is always 0.
+A rule with a limit rate of "unlimit" or "max" gets no ceiling. The
+insert path sets the limit deadline of the class bucket to the
+current time. The wait before the next request of the bucket is
+therefore always 0.
+
+A rule that names no reserved rate reserves nothing. A rule that
+names no rate at all also gets no ceiling. A rule that names no
+limit rate enters the weight tree at once. An mClock policy can
+start with no dimension key. Each rule of that policy then has a
+zero reservation, an unlimited limit and the default weight. The
+default rule keeps the default limit rate of the module parameter
+nrs_class_def_rate, so the policy keeps a ceiling for the traffic
+that no rule matches.
+
+The head flag helper now masks the rate keys with the configured
+dimensions of the policy. The auto default rule of a reserve-only
+policy therefore takes the reservation slot. Its class bucket then
+enters the reserved tree. The old code left the rate in the limit
+slot, and no tree held the class bucket.
+
+The patch adds a short form for each rate key. "R" sets the
+reserved rate, "L" sets the limit rate and "W" sets the weight.
+Documentation/man8/lctl-set_param.8 now describes the rule keys,
+the short forms, the mClock dimension keys and the default
+dimension set.
+
+A rule change command replaces the rate configuration of the slot
+that the key names. A change of the limit rate leaves the reserved
+rate alone. The reserved rate must stay no greater than the new
+limit rate. The command restores the old configuration when that
+test fails.
+
+The TBF policy needs a ceiling for every rule, so a TBF rule with
+an unlimited limit rate returns -EINVAL. An mClock rule that uses
+no dimension of its policy also returns -EINVAL, because such a
+rule takes no service.
+
+A rule key that names a dimension the policy does not have still
+returns -EINVAL. The scheduler now also logs one line. The line
+names the key and the start key that turns the dimension on.
 
 Add a test case sanityn/test_77vk to verify the setting of zero
 reserved rate and unlimited limit rate.
 
+Extend sanityn/test_77ve. The test now changes the rate of a running
+rule. It asserts that the change writes the limit slot, and that the
+new ceiling holds.
+
 Add a test case sanityn/test_77vl to evaluate the case when
 setting R=0 or L="max".
-The testing results are shown as follows:
+Every scenario of the test passes the weights 100 and 200.
+Scenarios 1 to 5 call the helper that test_77vi adds.
+The table below holds the results of the scenarios 1 to 6.
+Scenario 7 asserts that a rule with R=0 keeps a finite ceiling.
 R1    L1    W1    R2    L2    W2    IOPS1   IOPS2   SUM
 5000  8000  100   5000  8000  200   3920    3920    7840
-1000  2000  null  0     max   null  1886    6291    7777
-2352  10000 null  0     max   null  3898    3898    7796
-0     10000 null  0     max   null  3937    3837    7874
+1000  2000  100   0     max   200   1886    6291    7777
+2352  10000 100   0     max   200   3898    3898    7796
+0     10000 100   0     max   200   3937    3837    7874
 2352  3000  100   0     max   200   2587    5157    7762
 2352  3000  100   4181  max   200   2562    5125    7687
 
+Add sanityn/test_77vo. The test asserts that a TBF rule with
+"rate=max", with "rate=unlimit" or with "limit_rate=max" returns
+-EINVAL. A TBF rule with a finite rate still starts.
+
+Add sanityn/test_77vp. The test starts an mClock policy that holds
+the reserve dimension only. It asserts that a rule with
+"resvd_rate=0" returns -EINVAL. It also asserts that the input and
+output path of the matched project still works.
+
+Add sanityn/test_77vq. The test starts a limit plus weight policy.
+It asserts the dump of a limit rule and of a rule with no ceiling.
+It then checks that the ceiling holds under a direct write.
+
+Add sanityn/test_77vs. The test starts a limit plus weight policy
+with one throttled class and one unlimited class. It asserts that
+the unlimited class does not wait for the throttle timer of the
+other class.
+
 Test-Parameters: trivial testlist=sanityn env=ONLY=77
-Change-Id: Ib527bc98e25ec824df69cf0c5aaabe9fd17f93ff
 Signed-off-by: Yingjin Qian <qian@ddn.com>
+Change-Id: Ib527bc98e25ec824df69cf0c5aaabe9fd17f93ff
 
 --- Review History ---
 
@@ -170,3 +227,154 @@ Patch Set 3:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The new "unlimit"/"max" and zero-rate values are accepted by the generic rule parser, but only the mClock scheduler was taught to handle them; a TBF rule with rate=max ends up with rcfg_nsecs_per_rpc == 0 and trips an assertion, and an mClock head started with only the reserve dimension can accept R=0 and then never dequeue that class. Both look worth gating in nrs_cmd_rule_check() so the invalid combinations are rejected at configuration time rather than at RPC time. It would also help to extend 77vk to cover the reserve-only head and a TBF rule, since the current cases all use "reserve=1 limit=1" under mclock.
+
+--- Message (Chris Horn, 2026-09-05 21:20:07.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-05 21:33:25.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-09-05 21:46:27.000000000) ---
+Patch Set 4:
+
+(17 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-05 21:51:08.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 21:58:30.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-05 23:30:34.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131160/ : SUCCESS
+
+--- Message (Chris Horn, 2026-09-06 02:15:51.000000000) ---
+Patch Set 4:
+
+(10 comments)
+
+--- Message (Chris Horn, 2026-09-06 14:54:03.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-09-06 14:55:59.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-06 15:05:03.000000000) ---
+Patch Set 5:
+
+(4 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-06 15:26:48.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-06 15:52:16.000000000) ---
+Patch Set 5:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-06 17:10:45.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131188/ : SUCCESS
+
+--- Message (Chris Horn, 2026-09-06 23:48:03.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-06 23:59:24.000000000) ---
+Patch Set 6:
+
+(4 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-07 00:18:27.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-07 00:30:17.000000000) ---
+Patch Set 6:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-07 02:40:45.000000000) ---
+Patch Set 6: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131211/ : FAILURE
+
+--- Message (Chris Horn, 2026-09-07 15:48:15.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (jenkins, 2026-09-07 16:31:46.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131263/ : SUCCESS
+
+--- Message (Chris Horn, 2026-09-07 21:34:39.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-07 21:44:44.000000000) ---
+Patch Set 7:
+
+(4 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-07 22:02:22.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-07 23:35:07.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131287/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 00:24:06.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful

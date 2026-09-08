@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-08-31 21:10:34.000000000
-Updated:    2026-09-02 02:51:55.000000000
-Patch Set:  7
-Insertions: +690
-Deletions:  -99
-Comments:   25 (0 unresolved)
+Updated:    2026-09-07 00:55:47.000000000
+Patch Set:  10
+Insertions: +716
+Deletions:  -103
+Comments:   54 (4 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Nikitas Angelinas, Qian Yingjin, Shaun Tancheff, Timothy Day
 
 --- Commit Message ---
@@ -35,11 +35,28 @@ pages in get user pages, this is something the kernel has to
 fix (and when they do, we'll get another several x perf
 improvement).
 
-Two latent bugs become reachable once extents span more than
-one page, and are fixed here: the short-io read copy-back did
-not decrement its per-extent byte count, running its memcpy
-past the end of the reply buffer, and osc_extent_finish()
-computed a negative lost_grant into an unsigned field.
+MAX_DIO_SIZE is recomputed here because a brw_ext is a larger
+divisor than a pointer, taking the limit from ~448MB to 1GB on
+x86_64.  The clamp is applied in page units before the shift so
+the byte product cannot wrap on 32-bit.  A sub-DIO still holds
+one transient cl_page per PAGE_SIZE of an order 0 buffer, so
+its peak footprint roughly doubles; that is bounded by the same
+pool the buffer comes from and unchanged for THP backed
+buffers, which need far fewer entries.
+
+Two bugs that only bite once extents span more than one page
+are fixed here.  The short-io read copy-back did not decrement
+its per-extent byte count, running its memcpy past the end of
+the reply buffer; that one is DIO only, since a cached read
+extent always has a page multiple bp_count.  The negative
+lost_grant in osc_extent_finish() is not latent as of this
+chain: multi-page bp_count arrives with the parent change
+("enable multi-order folios for BIO writes"), whose buffered
+writes already compute PAGE_SIZE - folio_size into an unsigned
+field.  It is fixed here rather than there only because the
+parent has not landed; the accounting now derives the offset
+and count of the extent's final page instead of using the
+whole extent, so a short tail is still charged.
 
 Improvement in time to submit a write per byte (client):
 
@@ -63,6 +80,9 @@ bottleneck, from a measured single client DIO baseline:
     64m    ~11.2 GiB/s    10.97x   ~123 GiB/s
     256m   ~16 GiB/s       6.17x   ~99 GiB/s
     1g     21.5 GiB/s      4.06x   ~87 GiB/s
+
+The dropoff at higher sizes is likely a measurement
+artifact and improvement would be the same or greater.
 
 These are best case estimates from submit-side timings, not
 IO measurements.  This is the method I've used to predict
@@ -223,3 +243,160 @@ Code-wise looks good to me.
 Patch Set 7:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-03 15:34:26.000000000) ---
+Uploaded patch set 8.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-03 15:37:57.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+rocky8.10: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69456/results.html
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 15:38:14.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 15:59:14.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 17:45:42.000000000) ---
+Patch Set 8: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/130948/ : FAILURE
+
+--- Message (Patrick Farrell, 2026-09-03 19:14:12.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 19:24:38.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-03 20:09:44.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-03 21:12:32.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130983/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 23:16:42.000000000) ---
+Patch Set 9:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-04 20:10:22.000000000) ---
+Patch Set 9:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; comments inline and none of them need to block this patch. One coverage gap worth considering: the only thing keeping encrypted DIO out of the new coalescing path is cdp_no_coalesce, and osc_brw_encrypt() enforces that with a LASSERT that would LBUG the client if it ever slipped. sanity 119t does not exercise encryption, so a sanity-sec case doing O_DIRECT from a hugepage backed buffer on an encrypted file would be worth adding alongside it.
+
+--- Message (Patrick Farrell, 2026-09-05 20:10:48.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-05 20:14:45.000000000) ---
+Patch Set 10:
+
+Responses to the AI review.  All code points below are in the new
+patchset.
+
+COMMIT_MSG (MAX_DIO_SIZE): the body now states the ~448MB -> 1GB
+change, that the clamp is applied in page units before the shift so
+the byte product cannot wrap on 32-bit, and that a sub-DIO's peak
+footprint roughly doubles and is bounded by the same pool the buffer
+comes from.
+
+COMMIT_MSG (negative lost_grant): the analysis is right and the
+message now says so -- multi-page bp_count arrives with the parent
+change, so this is fixed here only because the parent has not landed.
+I have not moved the hunk into that change because it is not mine to
+amend; raising it there instead.
+
+obd.h bp_pgno: the stale "sign bit" wording is gone.  Keeping s32 and
+the separate field: struct brw_ext is packed, so u32 is the same 4
+bytes, and bp_pgno needs 19 bits while bp_npgs is used by both paths,
+so bitfield packing buys 1-2 bytes in exchange for bitfield access on
+a per-cl_page hot path.
+
+obd.h brw_used(): agreed, no caller anywhere.  It comes in with the
+parent change rather than this one, so it is not dropped here.
+
+rw26.c: that site is now a plain IS_ENCRYPTED(inode) with no NULL
+test.
+
+lov_page.c empty component: fixed.  It zeroes the range the cl_page
+actually covers -- for a cacheable page that is the whole folio, since
+cl_page_alloc() sets cp_len = folio_size(), and for a DIO page the
+pages it spans.
+
+osc_cache.c grant: reworked rather than left as a tightened test.  It
+now derives the offset and count of the extent's final page instead of
+using the whole extent's byte count, so a short tail on a multi-page
+extent is still charged.
+
+Response prepared with Claude Code.
+
+--- Message (wc-checkpatch, 2026-09-05 20:16:22.000000000) ---
+Patch Set 10:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-05 20:18:29.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 20:35:27.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131142/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 21:14:11.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-05 21:31:30.000000000) ---
+Patch Set 10:
+
+(7 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-07 00:55:47.000000000) ---
+Patch Set 10:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. One question inline in osc_brw_prep_request() about the shift unit now used for the niobuf offset - that one looks like it changes behaviour on clients whose PAGE_SIZE is not 4kB, and is worth settling before this lands. The rest are minors that can ride along on the same refresh.

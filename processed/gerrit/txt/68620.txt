@@ -1,0 +1,224 @@
+Change:     68620
+Subject:    LU-19895 clio: use large folios for unaligned DIO
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68620
+Change-Id:  Ie8aa6c3c66f10d9c4f9a398ba8d8fb8344bdf2b6
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Patrick Farrell
+Created:    2026-09-03 20:43:00.000000000
+Updated:    2026-09-07 04:13:32.000000000
+Patch Set:  4
+Insertions: +302
+Deletions:  -57
+Comments:   24 (6 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-19895 clio: use large folios for unaligned DIO
+
+The unaligned DIO bounce buffer was filled from the order 0
+pool, one page and one cl_page per PAGE_SIZE, so it never
+benefited from the multi-order folio extents the aligned path
+now builds.  It matters more than the aligned case in practice:
+the client allocates this buffer itself, so no THP backed user
+buffer is needed, and hybrid IO routes ordinary buffered writes
+into exactly this path.
+
+Fill the buffer from the compound page pools: the bulk from the
+largest order which fits (within one brw_ext), the remainder
+from order 0.  Per-chunk bookkeeping falls from one
+cl_page/oap/brw_ext per PAGE_SIZE to one per folio extent -
+16384 entries to ~320 for a 64MiB chunk.
+
+The buffer is capped at half the order 0 pool and the caller
+loops; previously a request above the pool limit failed with
+-EINVAL.  A zero length request still fails with -EINVAL.
+Encrypted files keep order 0 entries (cdp_no_coalesce).
+
+The read side now selects copy_folio_to_iter() on a dedicated
+LC_HAVE_COPY_FOLIO_TO_ITER probe rather than inferring it from
+the older __filemap_get_folio(), which does not imply it: the
+former arrived in v5.19, the latter in v5.16, so kernels in
+between did not build.
+
+Generated with Claude Code + Tools
+
+Fixes: 59d84ec3ffb8 ("LU-19249 build: Compatibility updates for kernel v6.16")
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Change-Id: Ie8aa6c3c66f10d9c4f9a398ba8d8fb8344bdf2b6
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2026-09-03 20:43:00.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-09-03 20:44:47.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-03 20:48:54.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Lustre RISC-V Builder, 2026-09-03 22:21:23.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-03 23:18:20.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/130999/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-09-04 01:26:29.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 01:31:46.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 01:34:49.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 02:04:07.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131012/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-04 04:03:43.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-05 09:12:15.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good - the entry accounting, the head/middle/tail split and the copy loop all hold up, and the pool order used is bounded by CDP_EXT_MAX_PAGES so the transient cl_page cp_npgs/cp_len fields still fit. Only optional comments inline, no need to re-spin for them. One thing worth considering for a later patch: the buffer size is now capped and the caller loops instead of failing, which is a user-visible change in how a large unaligned DIO is split, and nothing in sanity.sh appears to exercise it - a case that drives an unaligned DIO past obd_pool_max_objects(0)/2 (a small-memory client, or a fault injection on the cap) would lock that behavior down.
+
+--- Message (Patrick Farrell, 2026-09-05 20:10:48.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-05 20:12:56.000000000) ---
+Uploaded patch set 4: Patch Set 3 was rebased.
+
+--- Message (jenkins, 2026-09-05 20:12:57.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (Patrick Farrell, 2026-09-05 20:15:09.000000000) ---
+Patch Set 4:
+
+Responses to the AI review; both points are in the new patchset.
+
+COMMIT_MSG (the m4 hunk): the message now describes it and says why it
+is an independent build fix -- copy_folio_to_iter() arrived in v5.19
+and __filemap_get_folio() in v5.16, so kernels in between did not
+build.  Added
+
+    Fixes: 59d84ec3ffb8 ("LU-19249 build: Compatibility updates for kernel v6.16")
+
+Keeping it in this patch rather than splitting it out: the same probe
+is what gates LL_DIO_POOL_MAX_ORDER here, so a separate change would
+have to land first for this one to be correct.
+
+cl_io.c:1938 (read clamp): right, it is dead, and for exactly the
+reason given.  Removed it and LL_DIO_READ_COPY_SPANS with it.
+
+Taking that rather than the other option -- dropping the
+HAVE_COPY_FOLIO_TO_ITER term from LL_DIO_POOL_MAX_ORDER -- because
+that term is deliberate.  Without copy_folio_to_iter(), a multi-page
+entry has to be read back a page at a time, and each pass flushes the
+whole folio, so the flushing cost grows with the square of the entry
+size.  Order 0 on 5.16-5.18 is the cheaper of the two.  The comment on
+LL_DIO_POOL_MAX_ORDER already records this, so the coupling is not
+lost with the macro.
+
+cl_io.c:1596 (unit check robot): the flagged expression, npages -
+head, no longer exists; the count is now built up in a local.
+
+Response prepared with Claude Code.
+
+--- Message (wc-checkpatch, 2026-09-05 20:16:11.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-09-05 20:17:40.000000000) ---
+Patch Set 3:
+
+Newer revision detected, aborting all work on revision 3
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-05 20:18:40.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-05 20:25:07.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-05 20:49:36.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131144/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 20:59:13.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-05 21:31:32.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-07 04:13:32.000000000) ---
+Patch Set 4:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. I walked the head/middle/tail decomposition, the partial-failure free path and the reworked copy loop (including short copies and the write-side cap) and did not find a correctness problem: entries always sum to the page span, cl_page_clip() only ever lands on order 0 entries, the copy loop always ends on the last entry, and every written entry is flushed exactly once. The inline comments are all minor - two kernel-version references that do not check out, a comment rationale the patch's own numbers contradict, and some cdp_npgs handling that this patch makes dead. None of them needs a re-spin on their own; fold them in whenever the patch is next refreshed. One coverage thought: sanity test_119h already compares unaligned against aligned DIO at sizes that produce multi-page entries, but the new short-buffer behaviour (request capped to half the order 0 pool, caller loops instead of getting -EINVAL) has no test - would a case that shrinks the pool via `pool_max_memory_mb` and drives a DIO larger than the cap be worth adding?

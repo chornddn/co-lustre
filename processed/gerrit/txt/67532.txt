@@ -1,5 +1,5 @@
 Change:     67532
-Subject:    LU-20522 obdclass: bound llog header length before using the tail
+Subject:    LU-20522 obdclass: size the llog header swab to its buffer
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67532
 Change-Id:  I484be880d2ede4e9ab9fdfedfe22969355bd7601
 Project:    fs/lustre-release
@@ -7,23 +7,23 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-25 18:39:08.000000000
-Updated:    2026-08-21 21:42:06.000000000
-Patch Set:  2
-Insertions: +158
-Deletions:  -14
-Comments:   13 (3 unresolved)
+Updated:    2026-09-06 08:50:11.000000000
+Patch Set:  3
+Insertions: +165
+Deletions:  -18
+Comments:   16 (4 unresolved)
 Hashtags:   testfix
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Oleg Drokin, Andreas Dilger
+  REVIEWER: Oleg Drokin, Andreas Dilger, Mikhail Pershin
 
 --- Commit Message ---
-LU-20522 obdclass: bound llog header length before using the tail
+LU-20522 obdclass: size the llog header swab to its buffer
 
 LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes
 from the start of the header buffer.  lustre_swab_llog_hdr() dereferences
@@ -72,11 +72,20 @@ lrh_len checks and return -EINVAL, which is what lod_sub_prep_llog()
 already handles by renewing the log.
 
 llog_client_read_header() then bounds lrh_len itself before it uses it.
-It has the same checks already, but they run after the memcpy and after
-LLOG_HDR_TAIL(), so a peer sending an lrh_len below the tail size read
-before the buffer, and one above the reply size read past it.  That path
-needs no byte-order difference at all: a same-endian peer is never
-swabbed, so nothing looks at the value first.
+It already rejected an lrh_len above lgh_hdr_size before the memcpy(),
+via a plain "if (handle->lgh_hdr_size < hdr->llh_hdr.lrh_len) GOTO(out,
+rc = -EFAULT)"; only the duplicate upper-bound arm in the later sanity
+block ran after the memcpy() and after LLOG_HDR_TAIL().  What is
+genuinely new is the low bound: an lrh_len under sizeof(struct
+llog_rec_tail) made LLOG_HDR_TAIL() read in front of lgh_hdr, and nothing
+checked that before.  The new check also adds a third arm bounding
+lrh_len against req_capsule_get_size(RMF_LLOG_LOG_HDR, RCL_SERVER), so a
+peer that sent fewer bytes than it claims can no longer be read past.
+That path needs no byte-order difference at all: a same-endian peer is
+never swabbed, so nothing looks at the value first.  Bounding all of this
+up front leaves the range arms of the later sanity block unreachable, so
+they are dropped and their "incorrectly sized log header" diagnostic
+moves to the new check, which also names the import.
 
 This is not test-only.  lod_update_log_stale() swabs an on-disk header
 during ordinary stale update log cleanup with no length check at all, and
@@ -218,3 +227,44 @@ Patch Set 2:
 
 --- Message (Andreas Dilger, 2026-08-21 21:42:06.000000000) ---
 Patch Set 2: Code-Review-1
+
+--- Message (Oleg Drokin, 2026-09-04 21:50:26.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-04 21:55:16.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-04 22:07:52.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-04 23:46:39.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131079/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-05 04:05:15.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-06 08:50:11.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; the bound is now tied to the caller's buffer on all three callers, and the extra lrh_type gate closes the record-swabber route into the same buffer. One optional nit inline for whenever this is next refreshed - no need to re-spin for it.
