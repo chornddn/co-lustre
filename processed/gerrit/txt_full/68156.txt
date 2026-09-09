@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-06 15:53:46.000000000
-Patch Set:  17
-Insertions: +2969
-Deletions:  -22
-Comments:   130 (15 unresolved)
+Updated:    2026-09-09 12:20:13.000000000
+Patch Set:  18
+Insertions: +3136
+Deletions:  -34
+Comments:   146 (10 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -30,16 +30,16 @@ runs against a stopped target, a snapshot or a failover partner's LUN,
 read-only and with no write path.
 
 libext2fs stays off liblustreapi.  The backend builds as
-scan_ldiskfs.so and is dlopen'ed on first use, the shape mount.lustre
-already uses for mount_osd_ldiskfs.so, so a client build has no plugin
-and the call answers ENOTSUP.  Three refusals get three answers,
-because a caller keys off them: ENOTSUP where there is no backend to
-ask, ENOPKG where the backend is there and refused the target --
-stock e2fsprogs will not open a filesystem with dirdata set, and the
-package to install is the answer -- and EINVAL for a device that is
-not a Lustre target at all.  Giving the first two the same errno would
-have conf-sanity test_165 skip itself on a node carrying a real MDT
-and a build that can scan it.
+scan_osd_ldiskfs.so and is dlopen'ed on first use, named and found the
+way mount.lustre's own mount_osd_ldiskfs.so is, so a client build has
+no plugin and the call answers ENOTSUP.  Three refusals get three
+answers, because a caller keys off them: ENOTSUP where there is no
+backend to ask, ENOPKG where the backend is there and refused the
+target -- stock e2fsprogs will not open a filesystem with dirdata set,
+and the package to install is the answer -- and EINVAL for a device
+that is not a Lustre target at all.  Giving the first two the same
+errno would have conf-sanity test_300 skip itself on a node carrying a
+real MDT and a build that can scan it.
 
 The record grows what a device answers for and a walk does not: the
 object id, the inode generation, the LMA flags, the raw linkea and a
@@ -48,10 +48,10 @@ class.  The label is read the four ways mkfs.lustre writes it -- '-',
 while the target is stopped, which is exactly when this is what there
 is to read it with.
 
-Two more pieces of public API, so the diff holds no surprises.
-struct llapi_scan_stats is what the new sp_stats points at: the caller
-sets ss_size and owns the storage, the scan fills the rest on return,
-and the man page describes it as part of the answer rather than as a
+Two more pieces of public API, so the diff holds no surprises. struct
+llapi_scan_stats is what the new lfsp_stats points at: the caller sets
+ss_size and owns the storage, the scan fills the rest on return, and
+the man page describes it as part of the answer rather than as a
 diagnostic.  And LLAPI_SCAN_F_INTERNAL asks for the objects a target
 holds that its namespace never shows -- the OSD's own, the DNE agent
 inodes, the ones with no LMA -- which a scan otherwise counts in
@@ -66,11 +66,14 @@ ss_filtered plus ss_skipped plus the sum of ss_class on any completed
 scan, and llapi_scan_device_test asserts it -- an inequality would not
 have caught counting the same object on both sides of the pre-filter.
 
-The new fields go at the end of struct llapi_scan_rec, sr_gen
-included rather than beside sr_ino where it reads better.  The man
-page promises that fields are only ever appended, and sr_size cannot
-make good on that otherwise: it says how much of the record was
-filled, never that a field moved.
+An object with no LMA is answered with its IGIF rather than with the
+parts to build one from.  The inode number and generation of such an
+object are its FID -- osd_scrub.c builds the same one, and it is not a
+reconstruction, which is LFSCK's job -- so lfsr_fid carries it and
+LLAPI_SCAN_FID is set.  That leaves the generation with no consumer of
+its own and it is not a field: what remains is lfsr_ino, which every
+object has and which names the ones no IGIF can, a ZFS object id being
+wider than an IGIF holds.  There is no LLAPI_SCAN_GEN bit for it.
 
 llapi_scan_namespace.3 gains the pointer to this page here rather than
 in the patch that wrote it, where it would have referred to a page the
@@ -78,9 +81,10 @@ tree did not yet have.
 
 A worker that cannot be initialised degrades the scan rather than
 failing it, once one worker exists, as the pthread_create() arm beside
-it does: a backend opens the device again per worker, sp_thread_count
-is a __u8, and the cursor feeds whatever workers there are, so running
-out of them is not a reason to turn a complete result into an error.
+it does: a backend opens the device again per worker,
+lfsp_thread_count is a __u8, and the cursor feeds whatever workers
+there are, so running out of them is not a reason to turn a complete
+result into an error.
 
 The page says what stx_attributes carries across scanners.  A device
 scan narrows the inode's own flags to the set llite also declares, so
@@ -88,8 +92,8 @@ one file answers "lfs find -attrs d" the same way whichever scanner
 ran, and so_attrs_mask declares that set in the record's
 stx_attributes_mask -- which is what lets a consumer tell "not
 immutable" from "this scanner cannot say".  ERRORS also spells out the
-two EINVAL cases a caller is most likely to trip, a short sp_size and
-a short ss_size.
+two EINVAL cases a caller is most likely to trip, a short lfsp_size
+and a short ss_size.
 
 A directory's own stripe takes LMV_MAGIC_V1.  LMV_USER_MAGIC is how
 the tree marks a *default* LMV: cb_get_dirstripe() sets it exactly
@@ -98,8 +102,8 @@ default lives in trusted.dmv, which is never read here -- trusted.lmv
 is the directory's actual stripe.  llite fills LMV_MAGIC_V1 for
 LL_IOC_LMV_GETSTRIPE, so LMV_USER_MAGIC here would have the two
 scanners answer one striped directory with two different values in the
-same field -- the opposite of what sr_lmv promises, which is that the
-field means one thing whichever scanner filled it.
+same field -- the opposite of what lfsr_lmv promises, which is that
+the field means one thing whichever scanner filled it.
 
 No in-tree consumer reaches that difference from a scan record yet, so
 this is a contract broken rather than a wrong answer observed.
@@ -111,14 +115,14 @@ directories as defaults.  The size is unchanged either way,
 lmv_user_md_size() growing only for LMV_USER_MAGIC_SPECIFIC.
 
 A parent FID the scan will not vouch for is left cleared rather than
-written: LLAPI_SCAN_PARENT is set only where fid_is_sane() accepts what
-trusted.link held, and the field follows the bit, so a caller reading
-it without testing sr_valid does not get the raw xattr.
+written: LLAPI_SCAN_PARENT is set only where fid_is_sane() accepts
+what trusted.link held, and the field follows the bit, so a caller
+reading it without testing lfsr_valid does not get the raw xattr.
 
-llapi_scan_device.3 gives sr_parent_fid an entry of its own, since
-LLAPI_SCAN_PARENT is both what a caller puts in sp_want and what it has
-to test in sr_valid, and a field named in neither place is a field a
-caller cannot use.
+llapi_scan_device.3 gives lfsr_parent_fid an entry of its own, since
+LLAPI_SCAN_PARENT is both what a caller puts in lfsp_want and what it
+has to test in lfsr_valid, and a field named in neither place is a
+field a caller cannot use.
 
 run_tests() in lustre/tests/llapi_test_utils.{c,h} is split so that
 run_test_tbl() takes the table: the new test is handed a device where
@@ -143,6 +147,89 @@ answer from the attribute itself being clear.  It is carved from
 so_padding, so every offset above it is unchanged, and a backend that
 leaves it zero has its records leave LLAPI_SCAN_ATTRS clear rather
 than claim attributes nothing vouches for.
+
+scan_lmv_to_user() clears the shard area, not just the header.  One
+buffer serves every object a worker meets, and a directory's converted
+LMV carries the real lum_stripe_count while the size answered is
+header-only -- the shard FIDs being left out on purpose, an MDT index
+needing an FLD lookup this has no client to make.  A consumer sizing
+lum_objects[] by the count rather than by lfsr_lmvsize, which
+lmv_dump_user_lmm() does, then read whatever the last object left
+there: a preceding foreign directory's opaque value, in full.  The
+clear now reaches as far as such a read can, bounded by the room
+before a count off a device measures anything, so what it finds is
+zeroes.  lfsr_lmvsize is the measure either way, and the header says
+so.
+
+The buffer is a union of the two structures it holds rather than a
+bare char[], which carries neither one's alignment while the call site
+casts to both.
+
+An unreadable inode is counted by the chunk that owns it and no
+other.  The skip arm continued without asking either question the
+readable path asks below it, so an inode just past end_ino was
+consumed by this chunk and read again by the chunk starting there,
+and ss_seen and ss_skipped each took it twice; a reserved inode that
+could not be read was counted as an object, where a readable one is
+not.  ext2fs_get_next_inode_full() assigns *ino before returning any
+of the three errors this arm catches -- unlike the errors above it,
+which leave it untouched -- so both questions can be asked here.
+Nothing was ever delivered twice: it was the accounting that
+overstated, which is what the counters exist to be trusted for.
+
+fid_is_root() moves to the UAPI header and the scan calls it.  It was
+in lustre_fid.h by history rather than by need: LU_ROOT_FID and
+lu_fid_eq() are both already public, so the helper is a one-line
+predicate over two things userspace has, and userspace now has the
+same question to ask -- a scan of a target has to tell the root from
+the rest of FID_SEQ_ROOT.  unlikely() is dropped, that header being
+compiled in userspace too, and the definition is removed from
+lustre_fid.h, which includes the UAPI one, so every existing caller in
+llite, lmv, lod, mdd and mdt is unaffected.
+
+That also settles a test that had drifted.  lu_fid_eq() is a
+whole-struct compare, so a hand-written test of f_seq and f_oid called
+a FID in FID_SEQ_ROOT with FID_OID_ROOT and a non-zero f_ver the root,
+where fid_is_namespace_visible() on the MDT would not.  The narrower
+point the spelling exists for is unchanged: the echo client's root
+shares the sequence and is still not visible.
+
+Both scanners fill lfsp_stats.  The structure arrives with this patch,
+which is why the walk did not fill it before -- the field came in with
+the code that needed it, not with the walk -- and there is no reason
+for it to stay that way: a walk counts an object seen once, then
+filtered, skipped, or delivered and namespace-visible, which is every
+class a walk can meet, and the same seen == filtered + skipped +
+sum(class) holds.  It counts atomically rather than per-worker,
+llapi_scan_namespace() running its callback on every thread at once
+where the device scan merges per-worker counters at the end.
+lfsp_stats is checked against LLAPI_SCAN_STATS_MIN_SIZE there too, and
+after the copy-in for the same reason: a short lfsp_size may not reach
+the field.
+
+The struct comment says what the field is rather than which scanners
+use it.  llapi_scan_device.3 also says the stats structure is
+extensible -- ss_size negotiates it exactly as lfsp_size does, so
+counters appended later leave an older caller reading its own fields
+-- which was true and written down nowhere.
+
+The struct comments describe the fields rather than which scanner uses
+them.  What each scanner offers lfsp_filter, and what each takes 0 in
+lfsp_want to mean, were spelled out in the header and again on both
+pages, and the header's copy is the one that goes stale: it claimed a
+device scan "offers no path and no name", which LU-20637 makes untrue
+two patches later by naming an OST object from the parent FID in
+trusted.fid.  What is left is the part that does not change -- the
+filter sees only what the scan already had, and 0 means a default the
+two scanners do not share -- with each page saying which fields that
+is for itself.  llapi_scan_device.3 gains the one sentence it was
+missing, what 0 means there.
+
+stack_trap is called without EXIT, which is its default, and the
+setupall after stopall carries no justification -- it is the ordinary
+shape and needs none.  The base tree passes an explicit EXIT eighteen
+times of ninety-two; this series had added thirteen more, so dropping
+ours leaves the file at the eighteen that were already there.
 
 The EXAMPLES fragment escapes its newline with a single backslash.
 troff reads that as a register reference, so the page rendered
@@ -3819,3 +3906,354 @@ Patch Set 17:
 AI code review results below, please doublecheck
 
 Looks good. The items inline are all optional and can ride along on the next refresh rather than being a reason to re-spin on their own.
+
+--- Message (Hiroshi Nishida, 2026-09-08 14:13:29.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+Replies to the aireview comments on this patchset.  Every fix named is local and unpushed; "lands in the next patchset" is meant literally.
+
+--- Message (Hiroshi Nishida, 2026-09-08 15:38:11.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-08 15:56:20.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-08 17:24:33.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+Renumbering conf-sanity 165-168 to 300-303, as asked.
+
+--- Message (Hiroshi Nishida, 2026-09-08 17:24:34.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+Renumbering conf-sanity 165-168 to 300-303, as asked.
+
+--- Message (Hiroshi Nishida, 2026-09-08 19:26:20.000000000) ---
+Patch Set 17:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:41:28.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-09 03:48:43.000000000) ---
+Patch Set 18:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69908/results.html
+
+ Commencing initial testing: conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:05.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 05:13:57.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131384/ : SUCCESS
+
+--- Message (Maloo, 2026-09-09 05:16:39.000000000) ---
+Patch Set 18:
+
+#### The following sessions will be run for Build 131384 (patch #18):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+#### The following sessions were skipped because they are untestable:
+
+#### Untestable Optional:
+
+- Test Config #74: review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #75: review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #76: review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #77: review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #78: review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #79: review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #80: review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #81: review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #82: review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #83: review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #84: review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #85: review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #86: review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #87: review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #88: review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #89: review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #91: review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #100: review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+- Test Config #101: review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131384
+
+#### Supported build configurations for lustre-reviews #131384:
+
+#### Clients
+
+  - rocky9.5   - aarch64 - inkernel
+
+  - el10.0     - x86_64  - inkernel
+
+  - el10.1     - x86_64  - inkernel
+
+  - el10.2     - x86_64  - inkernel
+
+  - el8.10     - x86_64  - inkernel
+
+  - el9.7      - x86_64  - inkernel
+
+  - el9.8      - x86_64  - inkernel
+
+  - rocky9.5   - x86_64  - inkernel
+
+  - sles15sp7  - x86_64  - inkernel
+
+  - ubuntu2404 - x86_64  - inkernel
+
+  - ubuntu2604 - x86_64  - inkernel
+
+#### Servers
+
+  - el10.0 - x86_64 - inkernel
+
+  - el10.1 - x86_64 - inkernel
+
+  - el8.10 - x86_64 - inkernel
+
+  - el9.7  - x86_64 - inkernel
+
+  - el9.8  - x86_64 - inkernel
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131384&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131384#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 06:59:57.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-09 12:20:13.000000000) ---
+Patch Set 18:
+
+Initial testing succeeded.
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity-special1@ldiskfs+DNE conf-sanity-special1@ldiskfs conf-sanity-special2@ldiskfs+DNE conf-sanity-special2@ldiskfs conf-sanity-special3@ldiskfs+DNE conf-sanity-special3@ldiskfs conf-sanity-special4@ldiskfs+DNE conf-sanity-special4@ldiskfs conf-sanity-special5@ldiskfs+DNE conf-sanity-special5@ldiskfs conf-sanity-special6@ldiskfs+DNE conf-sanity-special6@ldiskfs conf-sanity-special7@ldiskfs+DNE conf-sanity-special7@ldiskfs conf-sanity-special8@ldiskfs+DNE conf-sanity-special8@ldiskfs conf-sanity-special9@ldiskfs+DNE conf-sanity-special9@ldiskfs conf-sanity-special10@ldiskfs+DNE conf-sanity-special10@ldiskfs conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs conf-sanity-special1@zfs conf-sanity-special1@zfs+DNE conf-sanity-special2@zfs conf-sanity-special2@zfs+DNE conf-sanity-special3@zfs conf-sanity-special3@zfs+DNE conf-sanity-special4@zfs conf-sanity-special4@zfs+DNE conf-sanity-special5@zfs conf-sanity-special5@zfs+DNE conf-sanity-special6@zfs conf-sanity-special6@zfs+DNE conf-sanity-special7@zfs conf-sanity-special7@zfs+DNE conf-sanity-special8@zfs conf-sanity-special8@zfs+DNE conf-sanity-special9@zfs conf-sanity-special9@zfs+DNE conf-sanity-special10@zfs conf-sanity-special10@zfs+DNE runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69908/results.html
+Commencing standard testing: 
+- insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs

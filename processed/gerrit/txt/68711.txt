@@ -1,0 +1,122 @@
+Change:     68711
+Subject:    LU-20157 ldlm: do not block lock replay on invalidate_lock
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68711
+Change-Id:  Id334284f2b3f0b6cc307e90771068193c06ebf8c
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      wangdi
+Created:    2026-09-08 22:23:21.000000000
+Updated:    2026-09-09 11:58:59.000000000
+Patch Set:  1
+Insertions: +140
+Deletions:  -10
+Comments:   6 (0 unresolved)
+
+--- Labels ---
+  Code-Review: Patrick Farrell: -1
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Alexey Lyashkov, Lustre RISC-V Builder
+  REVIEWER: Alexander Boyko, Qian Yingjin, Patrick Farrell, Aboo Valappil
+
+--- Commit Message ---
+LU-20157 ldlm: do not block lock replay on invalidate_lock
+
+Before replaying locks, ldlm_cancel_unused_locks_for_replay() cancels
+the unused locks in the namespace. Cancelling a lock calls
+osc_lock_discard_pages(), which takes invalidate_lock exclusively for
+the whole inode mapping:
+
+  ldlm_lock_replay_thread
+   __ldlm_replay_locks
+    ldlm_cli_cancel_list_local
+     ldlm_lock_cancel
+      ldlm_cancel_callback
+       osc_ldlm_blocking_ast
+        osc_lock_flush
+         osc_lock_discard_pages
+          __cl_io_init
+           vvp_io_init
+            down_write            <== waits for invalidate_lock
+
+Meanwhile a read thread holds the same lock shared across its read RPC,
+and that RPC is delayed until the import leaves recovery. The reader
+waits for replay to finish, replay waits for the reader, and neither
+completes.
+
+Skip invalidate_lock for the lock replay thread. It only cancels unused
+locks, which ldlm_prepare_lru_list() takes with no readers or writers
+and marks CBPENDING so that they can never gain any. No page cache fill
+can be in progress under such a lock, so there is nothing for
+invalidate_lock to serialise against.
+
+Only lock replay is affected. Blocking ASTs, the LRU shrinker, lru_size
+and namespace cleanup take invalidate_lock as before.
+
+Add recovery-small test_171, which checks that the import recovers while
+a read is holding invalidate_lock of an inode with an idle lock on it.
+LU-20157 ldlm: do not block lock replay on invalidate_lock
+
+Fixes: bba59b1287 ("LU-16651 llite: hold invalidate_lock when invalidate cache pages")
+Assisted-by: Claude:claude-opus-5
+Signed-off-by: Di Wang <diwa@nvidia.com>
+Change-Id: Id334284f2b3f0b6cc307e90771068193c06ebf8c
+
+--- Review History ---
+
+--- Message (wangdi, 2026-09-08 22:23:21.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wangdi, 2026-09-08 22:24:41.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 22:26:07.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-08 22:28:39.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2026-09-08 22:33:30.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2026-09-08 22:38:44.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (jenkins, 2026-09-08 22:46:10.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131352/ : SUCCESS
+
+--- Message (wangdi, 2026-09-08 23:43:13.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 23:55:37.000000000) ---
+Patch Set 1:
+
+RISC-V Client Builder: build succesful
+
+--- Message (wangdi, 2026-09-09 03:38:38.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Alexey Lyashkov, 2026-09-09 11:58:59.000000000) ---
+Patch Set 1:
+
+(1 comment)

@@ -1,5 +1,5 @@
 Change:     68290
-Subject:    LU-18298 pcc: purge the shared page cache before removing a PCC copy
+Subject:    LU-18298 pcc: purge page cache before removing a PCC copy
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68290
 Change-Id:  Ib329b41b381b051c63a675b413dec35697764270
 Project:    fs/lustre-release
@@ -7,66 +7,37 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-25 01:00:21.000000000
-Updated:    2026-08-27 09:15:28.000000000
-Patch Set:  2
-Insertions: +36
+Updated:    2026-09-09 10:49:25.000000000
+Patch Set:  3
+Insertions: +43
 Deletions:  -15
-Comments:   6 (5 unresolved)
+Comments:   7 (5 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-18298 pcc: purge the shared page cache before removing a PCC copy
+LU-18298 pcc: purge page cache before removing a PCC copy
 
-An encrypted file and its PCC copy share clear text in one page cache and
-cipher text in the other, so pcc_inode_put() drops both when the last
-reference to the PCC inode goes away. It reaches the PCC inode through
-pcci_path.dentry->d_inode.
+An encrypted file and its PCC copy share clear text in one page cache
+and cipher text in the other, so pcc_inode_put() drops both, reaching
+the PCC inode through pcci_path.dentry->d_inode. pcc_ioctl_detach()
+removes the copy first, and vfs_unlink() turns that dentry negative,
+so the purge finds no PCC inode and the cipher text stays for the next
+reader: sanity-pcc test_21j. "lfs pcc detach_fid" reaches this on
+master today, as its ioctl never opens the target.
 
-pcc_ioctl_detach() removes the copy before that, and vfs_unlink() ends in
-d_delete(), which turns the dentry negative when nothing else holds it.
-pcc_inode_put() then sees no PCC inode, skips both truncations, and the
-cipher text pages this inode picked up while the copy was attached stay
-in its page cache. The next read of the file returns them, so
-sanity-pcc test_21j reports the file as corrupted after a PCC-RO detach.
+Purge while the copy is still named. Both truncations move to
+truncate_inode_pages(), as the _final form sets AS_EXITING for good
+and neither inode is evicted here. The attach failure paths and the
+refcount gated purge in pcc_inode_put() need S_PCCCOPY cleared as
+well, so they want their own patch.
 
-Do the purge while the copy is still named, and keep it in
-pcc_inode_put() as well since a detach is not the only way to get there.
-Truncating twice is harmless.
-
-This is only reachable once "LU-18298 utils: do not write open a file to
-detach it from PCC" lands. Before it, lfs pcc detach opened the file
-read-write, the resulting layout blocking AST detached the PCC inode
-through pcc_layout_invalidate() while the copy was still there, and the
-purge happened on that path instead. The ioctl then found nothing
-attached and did nothing, which is the bug that patch fixes.
-
-Both truncations move from truncate_inode_pages_final() to
-truncate_inode_pages(). The _final form is the ->evict_inode helper and
-sets AS_EXITING for good, which stops reclaim recording workingset
-shadow entries for the mapping; neither inode is being evicted here, and
-the Lustre one is about to be read again. That also affects the existing
-pcc_inode_put() path, which had been setting the flag on a live inode.
-
-Purging from the ioctl also widens when it happens: pcc_inode_put() only
-reached it with the last reference gone, while the detach does it with
-other descriptors still holding the copy open. That is safe for the one
-case this covers, an encrypted PCC-RO copy, as a write to such a file
-detaches it in pcc_io_init() before it can dirty anything.
-
-The same ordering exists on the attach failure paths, in
-pcc_readonly_attach(), pcc_readwrite_attach_fini() and
-pcc_attach_data_archive(), which remove a copy they have already copied
-data through. Those are unchanged here: they are reachable only when an
-attach fails, no test covers them, and they are as old as the purge
-itself rather than something this series disturbs.
-
-Test-Parameters: testlist=sanity-pcc
+Test-Parameters: trivial testlist=sanity-pcc
 Fixes: 9e37963fa05b ("LU-10499 sec: support of PCC-RO for encrypted files")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -139,3 +110,31 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Mostly good, comments inline.
+
+--- Message (Oleg Drokin, 2026-09-09 03:28:19.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:39:32.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 04:09:15.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 06:33:09.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131400/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 10:49:25.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful

@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-08-31 21:10:34.000000000
-Updated:    2026-09-07 00:55:47.000000000
-Patch Set:  10
-Insertions: +716
-Deletions:  -103
-Comments:   54 (4 unresolved)
+Updated:    2026-09-09 02:38:25.000000000
+Patch Set:  18
+Insertions: +820
+Deletions:  -109
+Comments:   95 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -35,6 +35,32 @@ pages in get user pages, this is something the kernel has to
 fix (and when they do, we'll get another several x perf
 improvement).
 
+struct brw_ext changes shape with it: bp_pgno moves out of the
+union with bp_npgs/bp_order/bp_pgoff so a DIO extent can carry
+a first sub-page and a span at once, which also changes what
+brw_npgs(), brw_dirty() and brw_size() return for one --
+brw_dirty() in particular goes from a constant 1 to the page
+span.  brw_mark_encrypted()/brw_clear_encrypted() stop encoding
+DIO in the sign of bp_pgno and use OBD_BRW_ENCRYPTED for both
+paths, so brw_pgno() grows a branch, and brw_order() loses its
+last caller and goes.  cdp_osc_off is gone too:
+osc_queue_dio_pages() derives oe_start/oe_end from the oaps.
+These are shared with the buffered path.
+
+The references have to be folded with the pages.
+iov_iter_get_pages_alloc2() takes one per PAGE_SIZE, so
+ll_get_iov_memory() drops npgs-1 of them with folio_put_refs()
+and leaves exactly one per entry, which is what
+ll_release_user_pages() then expects.  folio_put_refs() gets an
+LC_HAVE_FOLIO_PUT_REFS probe and a compat shim: it landed after
+__filemap_get_folio(), so a partial backport can have the
+pagecache folio API without it.
+
+sanity 119t and lustre/tests/dio_hugepage.c cover the merged
+path from a hugepage backed buffer, checking the data lands at
+the right offset -- a uniform offset shift would cancel out if
+the read back were DIO too, so it reads back buffered.
+
 MAX_DIO_SIZE is recomputed here because a brw_ext is a larger
 divisor than a pointer, taking the limit from ~448MB to 1GB on
 x86_64.  The clamp is applied in page units before the shift so
@@ -47,8 +73,11 @@ buffers, which need far fewer entries.
 Two bugs that only bite once extents span more than one page
 are fixed here.  The short-io read copy-back did not decrement
 its per-extent byte count, running its memcpy past the end of
-the reply buffer; that one is DIO only, since a cached read
-extent always has a page multiple bp_count.  The negative
+the reply buffer.  That is reachable on the buffered path too
+once folios are multi-page: the copy is clamped to the server's
+reply, not to bp_count, so a 16KiB folio answered with 5000
+bytes copies a full page and then reads past the reply for the
+next one.  The negative
 lost_grant in osc_extent_finish() is not latent as of this
 chain: multi-page bp_count arrives with the parent change
 ("enable multi-order folios for BIO writes"), whose buffered
@@ -100,8 +129,32 @@ at providing huge pages for us.
 Note further: Hybrid IO/unaligned DIO need a separate patch
 to fully support huge pages.
 
+Encrypted files opt out: the encryption bounce machinery works
+on single page extents, so cdp_no_coalesce keeps them on the
+old one cl_page per PAGE_SIZE path and they see none of this.
+llite.*.dio_large_folios=0 sets the same flag, so the folio
+path can be turned off at runtime as a kill switch, and can be
+A/B tested without changing the system THP policy -- which
+would change the buffer the workload hands us rather than what
+we do with it.
+
+That knob is deliberately not LL_SBI_LARGE_FOLIOS.  That one
+describes page cache large folio support and is only set where
+the kernel has mapping_set_folio_order_range(), while DIO
+builds its extents from THP backed user buffers and from its
+own compound pool objects and needs none of it -- gating on it
+would disable this on every kernel without that API, including
+RHEL 9.  Whether the client can coalesce at all is a build time
+question, so dio_large_folios comes up set only when
+LL_DIO_POOL_MAX_ORDER is non-zero and cannot be turned on
+otherwise.  The LC_HAVE_COPY_FOLIO_TO_ITER probe that answers
+that question comes with this patch, so the capability is real
+from here rather than two patches later.  sanity 119v, which
+needs the pool backed buffer, comes with the unaligned patch.
+
 Generated with Claude Code + Tools
 
+Fixes: 59d84ec3ffb8 ("LU-19249 build: Compatibility updates for kernel v6.16")
 Test-Parameters: testlist=sanity
 Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 Change-Id: I769a07bf4b4e478cad2ddc9f073b12ff314f6864
@@ -400,3 +453,224 @@ Patch Set 10:
 AI code review results below, please doublecheck
 
 Mostly good. One question inline in osc_brw_prep_request() about the shift unit now used for the niobuf offset - that one looks like it changes behaviour on clients whose PAGE_SIZE is not 4kB, and is worth settling before this lands. The rest are minors that can ride along on the same refresh.
+
+--- Message (Patrick Farrell, 2026-09-08 18:37:28.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-08 18:38:26.000000000) ---
+Patch Set 11:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 18:44:41.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-08 18:51:27.000000000) ---
+Patch Set 11:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-08 19:01:41.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131324/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 19:27:16.000000000) ---
+Patch Set 11:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-08 19:29:58.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-08 19:37:05.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 19:37:25.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Patrick Farrell, 2026-09-08 19:46:53.000000000) ---
+Uploaded patch set 13: New patch set was added with same tree, parent tree, and commit message as Patch Set 12.
+
+--- Message (wc-checkpatch, 2026-09-08 19:53:30.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 19:54:30.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (Patrick Farrell, 2026-09-08 20:06:50.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-08 20:09:23.000000000) ---
+Patch Set 14:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 20:14:30.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-08 20:29:08.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131334/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-09-08 20:35:26.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-08 20:40:25.000000000) ---
+Patch Set 15:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 20:42:40.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 20:46:56.000000000) ---
+Patch Set 13:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-08 20:58:19.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131338/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 21:07:43.000000000) ---
+Patch Set 15:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-08 21:14:04.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 21:20:56.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-08 21:26:47.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-08 21:36:46.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131342/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-09-08 21:43:24.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-08 21:51:41.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-08 21:58:11.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-08 22:15:18.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131349/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-08 23:19:57.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-09 01:40:12.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 01:47:08.000000000) ---
+Patch Set 18:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 01:47:32.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 02:11:47.000000000) ---
+Patch Set 18: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131357/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 02:38:25.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful

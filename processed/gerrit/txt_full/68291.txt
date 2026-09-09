@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-25 01:00:21.000000000
-Updated:    2026-08-27 05:37:43.000000000
-Patch Set:  2
-Insertions: +48
-Deletions:  -7
-Comments:   6 (5 unresolved)
+Updated:    2026-09-09 10:36:45.000000000
+Patch Set:  3
+Insertions: +66
+Deletions:  -8
+Comments:   7 (5 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -23,57 +23,22 @@ Comments:   6 (5 unresolved)
 --- Commit Message ---
 LU-18298 utils: do not write open a file to detach it from PCC
 
-lfs pcc detach opens the file O_RDWR only to issue LL_IOC_PCC_DETACH on
-the resulting descriptor. When llite asks for an open lock with that
-open, which its opencache heuristics do once a file has been opened a
-few times or is reopened shortly after a close, the MDT takes a CW lock
-on MDS_INODELOCK_LOOKUP|OPEN. That conflicts on the LOOKUP bit with the
-client's own cached PR lock, and that lock usually also carries
-MDS_INODELOCK_LAYOUT. Cancelling it runs vvp_conf_set(), which sets
-CL_LAYOUT_GEN_NONE and detaches the PCC inode. Without the open lock
-only trybits are asked for, no blocking AST is sent and nothing is
-cancelled, which is why the failure comes and goes.
+lfs pcc detach opened the file O_RDWR only to issue the detach ioctl.
+The open lock that comes with it takes CW on LOOKUP|OPEN, conflicting
+with the client's cached lock over LAYOUT; cancelling that runs
+vvp_conf_set() and detaches the PCC inode, so the ioctl finds nothing
+and returns success with the HSM archive still there - sanity-pcc
+test_1c, 1d and 13a fail their wait_request_state.
 
-The ioctl then finds no attached PCC inode, takes the
-"!pcci || !pcc_inode_has_layout(pcci)" path in pcc_ioctl_detach() and
-returns success with hsm_remove still false, so the HSM archive of a
-PCC-RW file is never removed. sanity-pcc test_1c, test_1d and test_13a
-then fail their following wait_request_state with "request on <fid> is
-not SUCCEED on mds1".
+Detach by FID from an O_PATH descriptor instead, held until the ioctl
+returns as it only finds a cached inode, with the FID taken from it.
+The mount root is opened before the FID lookup, so a non-Lustre path
+now gives -ENODEV, not -EBADF. The open mode gate goes away too: a
+mode 0400 file its owner could not detach now detaches, and the caller
+needs read access to the mount root. The man page gains both errors.
 
-Do not open the file for I/O at all instead. An O_PATH descriptor does
-not call the file open method, so it takes no lock and cannot attach
-anything, and llapi_pcc_detach_fid() only opens the mount root and
-detaches by FID, which is what that ioctl exists for. Opening read-only
-would avoid the
-CW lock as well, but an O_RDONLY open is exactly what
-pcc_try_readonly_open_attach() acts on, so detaching a file that was not
-cached could attach it first, and for a file above the async threshold
-the attach then outlives the detach.
-
-The by-FID ioctl only detaches an inode that is still in the client
-cache, so keep the O_PATH descriptor open until it returns, and take the
-FID from that same descriptor rather than resolving the path a second
-time. Dropping it first would leave a window in which the inode can be
-evicted and the ioctl would again return success having detached
-nothing; resolving twice would let a rename in between leave us holding
-one inode and detaching another. Resolve the path first as well, since
-llapi_search_mounts() matches it against the mount table.
-
-LL_IOC_PCC_DETACH_BY_FID applies the same pcc_inode_permission() check
-as LL_IOC_PCC_DETACH, which tests the file mode against pccs_mode and
-inode_owner_or_capable() and never the mode a descriptor was opened
-with, so the permission semantics that sanity-pcc test_1g checks are
-unchanged. Neither path needs the encryption key, so the O_CIPHERTEXT
-open this replaces is no longer needed either.
-
-This does not close the window completely: any other write open of the
-file can still cancel the layout while the detach is in flight, and
-pcc_ioctl_detach() returning success without removing the archive in
-that case is a separate defect. It does remove the one trigger the
-detach inflicts on itself, which is the one these tests hit.
-
-Test-Parameters: testlist=sanity-pcc
+Test-Parameters: trivial testlist=sanity-pcc
+Fixes: 58d744e3eaab ("LU-10092 pcc: Non-blocking PCC caching")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: If471625a63d6c514b0d5e56ef5cac552010795bc
@@ -354,3 +319,78 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 The approach looks right and the analysis in the message checks out against mdt_object_open_lock() (LCK_CW on LOOKUP|OPEN only with MDS_OPEN_LOCK) and pcc_try_readonly_open_attach() (O_ACCMODE == O_RDONLY gate). A few minor comments inline.
+
+--- Message (Oleg Drokin, 2026-09-09 03:28:19.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 03:39:21.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-09 03:46:25.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/69912/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 04:09:26.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-09 05:30:10.000000000) ---
+Patch Set 3:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/69912/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-09 06:42:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131401/ : SUCCESS
+
+--- Message (Maloo, 2026-09-09 06:43:29.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 131401 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131401&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131401#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 10:36:45.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful

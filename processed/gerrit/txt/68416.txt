@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-09-06 17:04:43.000000000
-Patch Set:  9
-Insertions: +592
-Deletions:  -4
-Comments:   62 (0 unresolved)
+Updated:    2026-09-09 12:26:54.000000000
+Patch Set:  10
+Insertions: +781
+Deletions:  -10
+Comments:   64 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -37,8 +37,8 @@ the search moves onto it in "lfs: find --changelog, the log as
 source", which is where that example starts answering.
 
 The default demand mask is the walk's, so --hsm-state and -projid
-still want naming in sp_want; what the call fixes without being asked
-is the layout, which is what the example above turns on.
+still want naming in lfsp_want; what the call fixes without being
+asked is the layout, which is what the example above turns on.
 
 llapi_scan_fid() is the fourth way into the record and fills it the
 way the walk does, because it is the walk's own gather.  It resolves
@@ -74,32 +74,60 @@ runs against a pathname, so the FID it found is checked against the
 one asked for and a name unlinked and recreated underneath it answers
 -ESTALE rather than a record for a different object.
 
-Only sp_want and sp_filter are read from the parameter block.
-sp_max_depth, sp_stats, sp_search and sp_fsname describe a traversal
-there is none of and are ignored; sp_thread_count above 1 is refused
-rather than ignored, because a caller setting it has misunderstood the
-call.
+Only lfsp_want and lfsp_filter are read from the parameter block.
+lfsp_max_depth, lfsp_stats, lfsp_search and lfsp_fsname describe a
+traversal there is none of and are ignored; lfsp_thread_count above 1
+is refused rather than ignored, because a caller setting it has
+misunderstood the call.
 
-Design: docs/design-llapi-scan-fid.md in the lfu working repo.
-
-The default demand mask moves to LLAPI_SCAN_WANT_DEFAULT in
-lustreapi_internal.h, so the two mount-side entry points share one
-definition rather than each carrying the same inline list.  That
-rewrites a line in llapi_scan_namespace(), which ships already; the
-mask it computes is unchanged.
+It widens a lfsp_want of 0 through LLAPI_SCAN_WANT_DEFAULT, the
+definition llapi_scan_namespace() already uses, so the two mount-side
+entry points mean the same thing by 0.
 
 A trailing slash on mnt_path is trimmed before the pathname is
 composed.  The leading slashes of fid2path's answer were already
 stripped, but "/mnt/lustre/" with the root FID composed
-"/mnt/lustre/" and left sr_name on the terminating NUL -- which
+"/mnt/lustre/" and left lfsr_name on the terminating NUL -- which
 lustreapi.h says means NULL, not empty -- and every other FID got a
-doubled separator in the published sr_path.
-llapi_scan_namespace() trims its own path argument for the same
-reason.
+doubled separator in the published lfsr_path.
 
-The kernel-doc no longer lists sp_flags among the fields that are
+The kernel-doc no longer lists lfsp_flags among the fields that are
 ignored.  Every flag it defines is, but a bit outside them is refused
 with -EINVAL, as the code does and llapi_scan_fid.3 already says.
+
+llapi_find_device() clears lfsp_got.  scan_param_copyin() copies the
+caller's block whole, so the caller's pointer came through and was
+answered with find's own demand mask -- a mask for a question the
+caller never asked.  The field's kernel-doc is rewritten with it, to
+say that it is per scan rather than per library and why it is reached
+through a pointer.
+
+The syscalls go through mnt_fd, not through the composed pathname.
+The FID was already resolved through that descriptor; the statx, the
+object's open and the parent's now use it too, at the name fid2path
+answered, so mnt_fd alone says which filesystem is read.  An fd pins
+its mount where a path string is resolved afresh every time, and a
+mount replaced between the open and the scan would otherwise have the
+resolve read one filesystem and the gather another, with rc 0 and
+nothing said.  It also takes the mount prefix off every lookup, three
+per object, which over a changelog's worth of FIDs is what this entry
+point is for.
+
+mnt_fd has to be the mount root now.  The ioctl behind
+llapi_fid2path_at() takes any descriptor in the filesystem, and the
+page always named llapi_root_path_open(), which returns the root; a
+caller that passed something else answered before and answers -ENOENT
+now.  mnt_path stays required and stays what lfsr_path is built from,
+so a wrong one still mislabels the answer -- it just no longer decides
+what was read.
+
+llapi_scan_test gains a case for it, so sanity 157c runs it: one
+record for a known FID, checked against the pathname and the basename
+the client sees; a filter that skips, which is a success with nothing
+delivered; the argument refusals, including the -EBADF that a
+negative mnt_fd has to answer rather than the -EINVAL that also means
+"this FID has no name"; and a FID that resolves to nothing, which
+must fail and deliver no record whichever way it fails.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -450,3 +478,48 @@ Patch Set 9:
 AI code review results below, please doublecheck
 
 Looks good; the code itself reads correct and the error, cleanup and descriptor paths all check out. One whole-patch point: llapi_scan_fid() ships with no test. The two sibling entry points in this series each landed one in the same patch -- LU-20603 added lustre/tests/llapi_scan_test.c plus sanity test_157c, and LU-20649 added lustre/tests/llapi_scan_changelog_test.c -- and nothing later in the relation chain covers this call either (68420 adds sanity cases for the lfs find flags, not for the API). A case in llapi_scan_test.c would cover the behaviours this patch argues for and that a refactor could quietly lose: a record for a known FID carrying sr_path/sr_fid and LLAPI_SCAN_LAYOUT, -ENOENT for a FID unlinked before the call, a positive sp_filter return coming back as 0 rather than 1, sp_thread_count > 1 refused with -EINVAL, and a mnt_path with a trailing slash producing no doubled separator in sr_path. Not a reason to re-spin on its own if a refresh is not otherwise needed.
+
+--- Message (Hiroshi Nishida, 2026-09-08 19:49:21.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-09 03:23:05.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Lustre Gerrit Janitor, 2026-09-09 03:36:36.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+rocky8.10: Compile failed
+
+rocky9.6: Compile failed
+
+
+ Job output URL: https://testing.whamcloud.com/gerrit-janitor/69899/results.html
+
+--- Message (wc-checkpatch, 2026-09-09 03:37:30.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 03:58:48.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 05:56:53.000000000) ---
+Patch Set 10: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/131392/ : FAILURE
+
+--- Message (Lustre RISC-V Builder, 2026-09-09 12:26:54.000000000) ---
+Patch Set 10:
+
+RISC-V Client Builder: build succesful
