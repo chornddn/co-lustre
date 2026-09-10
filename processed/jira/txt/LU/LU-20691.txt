@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Praveen Solanki
 Reporter:   Praveen Solanki
 Created:    Thu, 3 Sep 2026 17:32:15 +0000
-Updated:    Tue, 8 Sep 2026 15:39:08 +0000
+Updated:    Wed, 9 Sep 2026 19:41:14 +0000
 
 --- Description ---
 Allow hsm coordinator to move timedout restores to ARS_WAITING. Today all these requests are marked as failed. We should be able to re-use the same mechanism as intentional retry since those do get reassigned. 
@@ -32,3 +32,83 @@ See https://doc.lustre.org/lustre_manual.xhtml#hsmpolicy
 
 --- Comment (JIRAUSER19549, Tue, 8 Sep 2026 15:39:08 +0000) ---
 adegremont_nvda Yes, so the current behavior seems to honor this policy only when action is explicitly marked for retry. If there is a timeout, that action is not retried. I have confirmed this in 2.15.x.
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 14:13:37 +0000) ---
+Verified that the behavior is same in 2.17.54_419
+
+--- Comment (eaujames, Wed, 9 Sep 2026 14:49:28 +0000) ---
+What is your use case?
+
+The HSM timeout exists to prevent this. This is to avoid llog queue to fill up (e.g: no copytool to handle the request).
+
+At the CEA the retry is implemented with robinhood: an FAILED/SUCCEED changelog is emitted when the action ended,  rbh will update the database record according the result so the policy can re-schedule the action.
+
+Do you want an client to wait forever a file RESTORE?
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 15:00:45 +0000) ---
+If I have multiple copy tools registered one of them crashing/isolated should not lead to a client visible error. I should be able to chose to have a policy where I can explicitly reassign timed out restore requests. I understand this should not be default behavior. If there is none to assign, the request is anyway just going to sit in the queue. As for client remaining stuck forever, we do wish the client to stay blocked until restore completes. As I said I want this to be policy based intentional behavior.
+
+--- Comment (JIRAUSER18483, Wed, 9 Sep 2026 15:18:42 +0000) ---
+I'm not against having a policy to explicitly retry the restore, but I'm wondering if https://jira.whamcloud.com/browse/LU-18238 could not help?
+
+--- Comment (eaujames, Wed, 9 Sep 2026 15:31:24 +0000) ---
+praveen.solanki, can you check the: 59067: LU-18238 llite: deregister HSM agent on close() | https://review.whamcloud.com/c/fs/lustre-release/+/59067
+
+We are now able to detect if a client hang/disconnect or if the user-space copytool crashed. For those cases this will deregister the agent. This should mark the active requests to FAILED. For those cases we can re-schedule the request.
+
+Would something like this work for you?
+
+I have not checked the current behavior with retry policy.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 15:32:22 +0000) ---
+adegremont_nvda +1
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 17:07:38 +0000) ---
+The linked fix, unfortunately won't work for my use case. It might be the case that the host itself is wedged it won't be able to close the fd in that case. 
+
+I did test with recent tip of the master which contains this fix by the way.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 18:44:10 +0000) ---
+The linked fix, unfortunately won't work for my use case...
+
+I know. My question was:
+
+Is the following solution works for you?
+
+	Retry policy on: hsm.policy=-NRA
+
+	copytool crash
+
+	Lustre client detect the crash and inform the server (59067: LU-18238 llite: deregister HSM agent on close())
+
+	The server deregister the crash agent
+
+	For each (old) active request, the server set the on disk state to ARS_WAITING to re-schedule the action
+
+--- Comment (JIRAUSER19549, Wed, 9 Sep 2026 18:52:12 +0000) ---
+Can you elaborate on "Lustre client detect the crash and inform the server " part? If you mean the agent client on the host which had copy tool running, I am afraid it is not a reliable enough method for me. 
+
+What is the major concern if we just introduce a new policy to enable this new behavior to put timedout restores in ars_waiting ?
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:09:16 +0000) ---
+It might be the case that the host itself is wedged it won't be able to close the fd in that case
+
+If your copy tool is stuck (possibly due to a backend issue), retries won't resolve it.
+
+	resources for the action can be locked by your zombie copytool so running on another one will propagate the issue
+
+	if your zombie copytool still accept requests, the copytool will accumulate unfinished requests. If max_requests limit is reached, the coordinator stop sending requests to any copytool agents.
+
+	if the action is resend to the zombie copytool it will fail anyway.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:28:41 +0000) ---
+Can you elaborate on...
+
+This is the purpose of https://review.whamcloud.com/c/fs/lustre-release/+/59067. 
+
+llapi_hsm_copytool_register() open a fd on the Lustre mountpoint to communicate with the kernel. If the copytool crash, llapi_hsm_copytool_deregister is not called but linux will cleanup the fd (it closes the fd). On close(), the patch checks if an agent is still registered. If true, the Lustre client will automatically deregister the agent by sending an MDS_HSM_CT_UNREGISTER RPC to the MDT coordinator.
+
+--- Comment (eaujames, Wed, 9 Sep 2026 19:41:14 +0000) ---
+Note: If the entire copytool node becomes unresponsive, the server will evict it and automatically deregister the agent.
+
+This case is handle by: 59251: LU-18238 mdt: ghost hsm fix | https://review.whamcloud.com/c/fs/lustre-release/+/59251

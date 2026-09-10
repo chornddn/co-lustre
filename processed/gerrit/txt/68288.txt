@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-24 22:52:15.000000000
-Updated:    2026-09-09 12:56:56.000000000
-Patch Set:  12
-Insertions: +1872
+Updated:    2026-09-10 06:47:03.000000000
+Patch Set:  13
+Insertions: +1964
 Deletions:  -62
 Comments:   76 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1
 
 --- Reviewers ---
@@ -84,8 +84,21 @@ before the search.  A pass of its own because objects arrive in inode
 order, so an object is usually delivered before its ancestors are;
 resolving inline would mean holding every match until the scan ended.
 The pass asks for no layout, no SOM and no HSM, and a filesystem holds
-far fewer directories than files.  On an OST it stops at the first
-object and leaves the map empty.
+far fewer directories than files.  On an OST it does not run at all:
+the target's label says there are no directories to map before either
+pass starts.
+
+A striped directory's shards are in the map and have no path.  A shard
+carries a linkea and looks like a directory to anything walking one,
+but its trusted.lmv is LMV_MAGIC_STRIPE, which is not a form any
+consumer of lmv_user_md reads: scan_lmv_to_user() answers 0 to it and
+scan_lmv_is_shard() says so in as many words.  The pre-pass therefore
+asks for LLAPI_SCAN_LMV, and a shard goes into the map with an empty
+name -- composing from its linkea would give a pathname the
+filesystem does not answer for, the master directory being the one
+with the name.  scan_dirmap_path() steps through such an entry rather
+than stopping at it, so an object under a striped directory is named
+through the master.  llapi_scan_namespace.3 gained a section on it.
 
 There is no fall back to the lookup once the map is in use.  The map
 is
@@ -150,18 +163,13 @@ through a mount on the node running the scan and a server is not a
 client; a configuration that cannot mount one skips.  It is ldiskfs
 only: reading a target in service is what ZFS refuses.
 
-scan_device_run()'s comment says what a second open costs rather than
-calling it a deadlock, because it is not one: llapi_find_device()
-builds the directory map in a pass of its own, so every --fid2path and
---paths
-run already opens and closes the target twice in one process, and
-conf-sanity test_302 does exactly that against a stopped OST with its
-pool exported and passes on conf-sanity4@zfs.  The reason to test the
-fsname inside the scan's own open is the cost of the second import and
-export, not a hang.  The wasted pass on an OST -- where
-scan_dirmap_cb() stops at the first object -- is left as it is;
-folding the map into the search's own open would serve both from one
-open and is worth doing separately.
+The map runs as the search's pre-pass, on the search's own open:
+scan_device_run_prepass() does one sb_open() and runs both passes on
+it, so a --fid2path or --paths run opens the target once.  That is why
+the fsname is tested inside the scan rather than by a probe ahead of
+it -- on ZFS a second open is an import and an export, not a hang, but
+not free either.  On an OST the pre-pass is skipped from the label, so
+there is no wasted pass to fold away.
 
 The resolve-failure message names the FID that was looked up and the
 mount only when there is one.  An OST object is resolved by its
@@ -207,6 +215,14 @@ meaning the wrong composer ran.  It also asserts the two refusals:
 --paths on an OST, whose objects are named by files that live on an
 MDT, and --paths together with --fid2path.  ldiskfs only, an imported
 ZFS pool answering EBUSY by design.
+
+test_304 is that restriction lifted.  A ZFS target is readable only
+with its pool exported, so the composition had never run on one at
+all: 303 reads an MDT in service, which only ldiskfs allows.  304
+stops the MDT and, on ZFS, exports the pool and points --search at the
+directory holding the vdevs, which is the one state both backends
+share.  It asserts the same names against the client's set, and skips
+rather than fails where configure found no backend for the build.
 
 lfsp_fsname makes the check a public caller can ask for.
 llapi_scan_rec_path.3 tells one they must establish that the mount and
@@ -733,5 +749,34 @@ https://build.whamcloud.com/job/lustre-reviews/131391/ : SUCCESS
 
 --- Message (Lustre RISC-V Builder, 2026-09-09 12:56:56.000000000) ---
 Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-09 17:04:40.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-09 17:15:31.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-09 17:23:23.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-09 17:39:55.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131439/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 00:06:38.000000000) ---
+Patch Set 13:
 
 RISC-V Client Builder: build succesful

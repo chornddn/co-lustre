@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Sohei Koyama
 Created:    2026-06-09 14:19:42.000000000
-Updated:    2026-08-18 15:19:55.000000000
-Patch Set:  7
-Insertions: +507
-Deletions:  -354
-Comments:   148 (21 unresolved)
+Updated:    2026-09-10 13:01:09.000000000
+Patch Set:  8
+Insertions: +1296
+Deletions:  -384
+Comments:   152 (21 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -31,7 +31,9 @@ carries the same field values through unchanged.
 
 - sources: inode_get_[amc]time_ns() and ktime_get_real_ns() now
   provide nanoseconds, and the OSD layer reads and writes the
-  on-disk inode timespec at nanosecond resolution.
+  on-disk inode timespec at nanosecond resolution.  The client
+  superblock sets s_time_gran = 1 so that current_time() keeps
+  the sub-second part for locally generated timestamps.
 - sinks: the stat/statx paths convert the s64 nanosecond value
   back to a timespec64 with the standard ns_to_timespec64()
   (and ktime_to_timespec64() for ktime_t sources).
@@ -42,7 +44,10 @@ carries the same field values through unchanged.
   their existing on-disk and wire formats and are left unchanged.
 - the ofd and mdd atime-difference thresholds, the mdt ctime age
   limit and the cached llite inode times are kept in nanoseconds
-  internally.
+  internally, and the atime_diff tunables accept and print
+  fractional seconds.
+- the llog object mtime keeps its once-per-second update filter
+  and is stored scaled to nanoseconds.
 
 All timestamp fields and the related interval knobs keep their
 historic names here and gain a _ns suffix in the following patch,
@@ -50,8 +55,56 @@ once they all hold nanoseconds.
 
 s64 nanoseconds since the epoch covers timestamps up to year 2292.
 
-Old-client compatibility is implemented in a following patch.
+Since the units of the timestamps on the wire change, the same
+patch carries the compatibility layer so that every commit on
+master interoperates with peers that still use seconds.
 
+Negotiate OBD_CONNECT_NANOSEC_TIME on the MDT and OST connections
+(it is already advertised by clients) and add it to the connect
+flags used by the MDT when connecting to OSTs and other MDTs.  A
+node converts wire timestamps to seconds when sending to a peer
+that did not negotiate the flag, and back to nanoseconds when
+receiving from such a peer.
+
+Conversion is applied on every path that carries a timestamp:
+the MDT inode times (mdt_pack_attr2body), the setattr, create,
+open, close, unlink, link, rename, migrate and setxattr reint
+records, the Data-on-MDT glimpse reply (mdt_lvb2reply /
+mdc_body2lvb), rmfid, the DNE stripe refresh (lmv), the OST
+lvb (ofd_lvbo_fill / osc_lock_lvb_update) and the OST obdo
+(lustre_set/get_wire_obdo and the ofd reply handlers).
+
+On the client the inode times are converted where the reply
+body enters llite.  mdc_get_lustre_md() scales them keyed on the
+import of the request that carried the reply -- the target MDT
+that answered, which is correct even under LMV where the reply
+may come from an MDT other than index 0.  ll_update_times() and
+the getstripe ioctl do the same for the bodies they read
+directly.  Keying on the connection flag is exact and avoids the
+near-epoch and far-future misreads of a magnitude heuristic.
+
+Add sanity-ns.sh, a configuration-aware test suite that verifies
+timestamps warm and cold, including near-epoch and boundary values
+(pre-1970, y2038), nanosecond precision, per-MDT directory times,
+Data-on-MDT, FLR, cross-MDT operations, MDT/OST failover, setattr
+replay and cross-client coherency.  Each test detects the negotiated
+nanoseconds_times flag per target and asserts exact nanoseconds
+against a new peer or second granularity against a legacy peer, so
+it is meaningful on uniform and mixed-version clusters alike.  It is
+added to the regression test group.
+
+Assisted-by: ClaudeCode:Fable-5.1
+Test-Parameters: testlist=sanity-ns
+Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity-ns
+Test-Parameters: ostcount=4 testlist=sanity-ns
+Test-Parameters: fstype=zfs testlist=sanity-ns
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanity-ns
+Test-Parameters: clientcount=2 testlist=sanity-ns
+Test-Parameters: serverversion=2.16 testlist=sanity-ns
+Test-Parameters: serverversion=2.15 mdscount=2 mdtcount=4 testlist=sanity-ns
+Test-Parameters: clientcount=2 serverversion=2.16 testlist=sanity-ns
+Test-Parameters: clientversion=2.16 testlist=sanity env=ONLY="36 39"
+Test-Parameters: clientversion=2.15 mdscount=2 mdtcount=4 testlist=sanity env=ONLY="36 39"
 Signed-off-by: Sohei Koyama <skoyama@ddn.com>
 Change-Id: I79570bc5a66e7c15472af90d690d689d3aa36269
 
@@ -1973,3 +2026,339 @@ There is also no test for the new sub-second behaviour. Would a sanity case be w
 Patch Set 7:
 
 Failed optional test review-dne-part-3 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm237: https://testing.whamcloud.com/test_sessions/d9d0ae18-2547-4f08-b173-a53984188e35 ran 3 tests.  1 tests failed: conf-sanity.
+
+--- Message (Sohei Koyama, 2026-09-10 05:44:56.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 05:48:00.000000000) ---
+Patch Set 8:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 05:50:35.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-10 05:53:25.000000000) ---
+Patch Set 8:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70002/results.html
+
+ Commencing initial testing: pjdfstest@ldiskfs+DNE pjdfstest@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-ns-special1@ldiskfs+DNE sanity-ns-special1@ldiskfs sanity-ns-special2@ldiskfs+DNE sanity-ns-special2@ldiskfs sanity-ns-special3@ldiskfs+DNE sanity-ns-special3@ldiskfs sanity-ns-special4@ldiskfs+DNE sanity-ns-special4@ldiskfs sanity-ns-special5@ldiskfs+DNE sanity-ns-special5@ldiskfs sanity-ns-special6@ldiskfs+DNE sanity-ns-special6@ldiskfs sanity-ns-special7@ldiskfs+DNE sanity-ns-special7@ldiskfs sanity-ns-special8@ldiskfs+DNE sanity-ns-special8@ldiskfs sanity-ns-special9@ldiskfs+DNE sanity-ns-special9@ldiskfs sanity-ns-special10@ldiskfs+DNE sanity-ns-special10@ldiskfs sanity-ns-special1@zfs sanity-ns-special1@zfs+DNE sanity-ns-special2@zfs sanity-ns-special2@zfs+DNE sanity-ns-special3@zfs sanity-ns-special3@zfs+DNE sanity-ns-special4@zfs sanity-ns-special4@zfs+DNE sanity-ns-special5@zfs sanity-ns-special5@zfs+DNE sanity-ns-special6@zfs sanity-ns-special6@zfs+DNE sanity-ns-special7@zfs sanity-ns-special7@zfs+DNE sanity-ns-special8@zfs sanity-ns-special8@zfs+DNE sanity-ns-special9@zfs sanity-ns-special9@zfs+DNE sanity-ns-special10@zfs sanity-ns-special10@zfs+DNE
+
+--- Message (jenkins, 2026-09-10 06:19:17.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131490/ : SUCCESS
+
+--- Message (Maloo, 2026-09-10 06:21:22.000000000) ---
+Patch Set 8:
+
+#### The following sessions will be run for Build 131490 (patch #8):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.4-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el8.10-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.4-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.4-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131490&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131490#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 12:22:22.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-10 13:01:09.000000000) ---
+Patch Set 8:
+
+Initial testing succeeded.
+
+Succeeded:
+- pjdfstest@ldiskfs+DNE pjdfstest@zfs runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-ns-special1@ldiskfs+DNE sanity-ns-special1@ldiskfs sanity-ns-special2@ldiskfs+DNE sanity-ns-special2@ldiskfs sanity-ns-special3@ldiskfs+DNE sanity-ns-special3@ldiskfs sanity-ns-special4@ldiskfs+DNE sanity-ns-special4@ldiskfs sanity-ns-special5@ldiskfs+DNE sanity-ns-special5@ldiskfs sanity-ns-special6@ldiskfs+DNE sanity-ns-special6@ldiskfs sanity-ns-special7@ldiskfs+DNE sanity-ns-special7@ldiskfs sanity-ns-special8@ldiskfs+DNE sanity-ns-special8@ldiskfs sanity-ns-special9@ldiskfs+DNE sanity-ns-special9@ldiskfs sanity-ns-special10@ldiskfs+DNE sanity-ns-special10@ldiskfs sanity-ns-special1@zfs sanity-ns-special1@zfs+DNE sanity-ns-special2@zfs sanity-ns-special2@zfs+DNE sanity-ns-special3@zfs sanity-ns-special3@zfs+DNE sanity-ns-special4@zfs sanity-ns-special4@zfs+DNE sanity-ns-special5@zfs sanity-ns-special5@zfs+DNE sanity-ns-special6@zfs sanity-ns-special6@zfs+DNE sanity-ns-special7@zfs sanity-ns-special7@zfs+DNE sanity-ns-special8@zfs sanity-ns-special8@zfs+DNE sanity-ns-special9@zfs sanity-ns-special9@zfs+DNE sanity-ns-special10@zfs sanity-ns-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70002/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs

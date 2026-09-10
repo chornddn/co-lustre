@@ -1,0 +1,48 @@
+Key:        LU-20723
+Summary:    reduce Autotest configs to fewer VMs under load
+Link:       https://jira.whamcloud.com/browse/LU-20723
+Type:       Task
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Charlie Olmstead
+Reporter:   Andreas Dilger
+Created:    Wed, 9 Sep 2026 21:40:07 +0000
+Updated:    Wed, 9 Sep 2026 22:03:22 +0000
+Labels:     test_script_improvements
+
+--- Description ---
+It turns out that most test scripts do not use the second client during any tests, so having an extra VM configured for those scripts is just wasted resources.  This can be seen by checking for (the lack of) CLIENTS, CLIENT2 and CLIENTCOUNT usage in the test scripts.
+
+By consolidating test scripts that need multiple clients into a single test session and reducing the remaining sessions from 5 VMs to 4 (client, 2x MDS, OSS), there could be 25% more sessions running on the same hardware.  
+
+The test scripts that use CLIENTS, CLIENT2 and SINGLEAGT in a non-trivial manner and need to run with 5 VMs:
+
+	large-scale.sh, recovery-{double,mds,oss,random}-scale.sh check $CLIENTCOUNT at the start and refuse to run otherwise.  I don't think these are run during review sessions.
+
+	sanity-hsm.sh, sanity-pcc.sh depend on SINGLEAGT (usually CLIENT2) to run a separate HSM data transfer agent.  I don't know if that could be changed to use $MOUNT2 on the same node, but is not "low hanging fruit"
+
+These scripts prefer to have CLIENT2 but could live without it for most subtests, and should run with 5 VMs if available:
+
+	recovery-small.sh, replay-dual.sh, replay-vbr.sh - use CLIENT2 when available, or fall back to MOUNT2 but then some subtests are skipped entirely
+
+	parallel-scale-nfs*.sh use LUSTRE_CLIENT_NFSSRV (defaults to the MDS, not sure if Autotest puts it on CLIENT2), and NFS_CLIENTS=CLIENTS so does not actually require an additional client, but may benefit from one if that is how Autotest has previously been running it, otherwise it could go into the "never need second client VM" group
+
+These scripts use CLIENTS, CLIENT2 in a passing manner and never need a second client VM, or could easily be fixed to avoid it entirely:
+
+	replay-single.sh has a few subtests that use which could move into replay-dual.sh
+
+	sanity.sh and sanityn.sh have a few subtests that can optionally use CLIENT2, and only sanity.sh test_160v and sanityn.sh test_33[abc] *require* a second client and can very likely be changed to use MOUNT2 instead
+
+	the remaining scripts do not have any visible usage of additional client(s), though it is possible that is done in some other manner.
+
+It would also be possible to run (some? all?) review-dne-part-N sessions with a 1-MDS DNE configuration with 2-MDT (or 4-MDT) on the one MDS instead of 2-MDS 4-MDTs used today, which could reduce the test cluster size to 3 VMs under congestion.  I don't know if that would cause some other test fallout (due to hidden test assumptions) but it could be used to further decrease test resources under high demand.  Probably 1-MDS 2-MDT is enough for most cases, and I see only 3 subtests that *require* MDSCOUNT >= 3, and the rest will just optionally use more.
+
+Preferably, the review-dne-part-N sessions would run with 2-MDS 4-MDT configs when there is no (big) test queue, and drop to 1-MDS 2-MDT (or 1-MDS 4-MDT if it passes or is fixed) testing when there is a (big) backlog.
+
+--- Comment (adilger, Wed, 9 Sep 2026 22:02:43 +0000) ---
+green, mvef, colmstea, please provide your feedback on this.
+
+My suggestion would be to first reorder the test scripts between review-dne-part-N as needed, if that can be done transparently.  Then trigger a few test test sessions on existing patches explicitly using new config(s) (e.g. Test-Parameters: clientcount=1 mdscount=1 mdtcount=2) to confirm they are passing, and then roll out incrementally between Onyx and Trevis as new sessions are started (if that is possible).
+
+If getting load-demand functionality would delay the rollout, then it seems like going to a smaller static config for a few days would get us out of the current backlog and allow more time to get a load-based configuration implemented and tested.

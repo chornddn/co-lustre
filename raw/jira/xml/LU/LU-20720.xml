@@ -1,0 +1,147 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20720] LFU: in-kernel OSD scanner</title>
+                <link>https://jira.whamcloud.com/browse/LU-20720</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h3&gt;&lt;a name="Whatthisis"&gt;&lt;/a&gt;What this is&lt;/h3&gt;
+
+&lt;p&gt;A namespace scanner that runs inside the server, driving the OSD object table&lt;br/&gt;
+iterator and exporting one record per object to userspace through a ring&lt;br/&gt;
+buffer. It is the Input Scanner the LFU HLD calls Option 2.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Whyitisneeded"&gt;&lt;/a&gt;Why it is needed&lt;/h3&gt;
+
+&lt;p&gt;The userspace device scanners of &lt;a href="https://jira.whamcloud.com/browse/LU-20606" title="LFU: implement ldiskfs device scanner" class="issue-link" data-issue-key="LU-20606"&gt;LU-20606&lt;/a&gt; and &lt;a href="https://jira.whamcloud.com/browse/LU-20613" title="llapi: ZFS backend for `llapi_scan_device()`" class="issue-link" data-issue-key="LU-20613"&gt;LU-20613&lt;/a&gt; both require the target&lt;br/&gt;
+to be out of service. ZFS refuses a live pool by design, answering &lt;tt&gt;-EBUSY&lt;/tt&gt;&lt;br/&gt;
+for a pool in the &lt;tt&gt;ACTIVE&lt;/tt&gt; state. ldiskfs on a live device is exposed to torn&lt;br/&gt;
+reads: under create heavy load a prototype measured up to half of the allocated&lt;br/&gt;
+inodes reading back inconsistent, caught mid creation.&lt;/p&gt;
+
+&lt;p&gt;So a target that is serving clients cannot be scanned at all today. This is a&lt;br/&gt;
+correctness gap, not a performance one.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Whatitadds"&gt;&lt;/a&gt;What it adds&lt;/h3&gt;
+
+&lt;p&gt;The OSD already presents its object table as a DT index with a standard&lt;br/&gt;
+&lt;tt&gt;dt_it_ops&lt;/tt&gt; iterator, &lt;tt&gt;dt_otable_features&lt;/tt&gt;, implemented by ldiskfs, ZFS and&lt;br/&gt;
+WBCFS. It returns a FID and nothing else, and LFSCK is its only consumer.&lt;/p&gt;
+
+&lt;p&gt;At the OSD layer:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;attributes returned from the iterator, through the existing &lt;tt&gt;attr&lt;/tt&gt; argument&lt;br/&gt;
+of &lt;tt&gt;rec()&lt;/tt&gt;. The directory iterator already selects record content this way&lt;br/&gt;
+with the &lt;tt&gt;LUDA_*&lt;/tt&gt; flags, so this needs no new vtable and does not change&lt;br/&gt;
+LFSCK, which passes zero and keeps getting a bare FID.&lt;/li&gt;
+	&lt;li&gt;private iterator instances, so several enumerators walk disjoint ranges at&lt;br/&gt;
+once. The default iterator is a per device singleton answering &lt;tt&gt;-EALREADY&lt;/tt&gt; to&lt;br/&gt;
+a second &lt;tt&gt;init()&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;on ldiskfs, reading the inode table directly instead of through&lt;br/&gt;
+&lt;tt&gt;ldiskfs_iget()&lt;/tt&gt;, with a readahead window.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Above it, &lt;tt&gt;lfu.ko&lt;/tt&gt;: enumerator threads, the ring, the control device, and&lt;br/&gt;
+filtering.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Measured"&gt;&lt;/a&gt;Measured&lt;/h3&gt;
+
+&lt;p&gt;The unmodified iterator enumerates at 105k objects per second against 705k for&lt;br/&gt;
+the userspace device scanner. Private iterators take ldiskfs to 2.03M and ZFS&lt;br/&gt;
+to 561k. Removing &lt;tt&gt;ldiskfs_iget()&lt;/tt&gt; takes ldiskfs to 1,420,664 cold at 99% of&lt;br/&gt;
+an NVMe stripe, against the device scanner's 1,439,300 on the same stripe, a&lt;br/&gt;
+ratio of 0.99, and 0.78 hours against the HLD's four billion object hour.&lt;/p&gt;
+
+&lt;p&gt;LFSCK coexistence was measured rather than argued: a private iterator returned&lt;br/&gt;
+the full namespace at 1.41M objects per second while a verifying OI scrub ran,&lt;br/&gt;
+and the scrub finished with &lt;tt&gt;updated: 0, failed: 0&lt;/tt&gt;.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="TheObjectStream"&gt;&lt;/a&gt;The Object Stream&lt;/h3&gt;
+
+&lt;p&gt;Modelled on &lt;tt&gt;lustre/ofd/ofd_access_log.c&lt;/tt&gt;, the in tree precedent for a kernel&lt;br/&gt;
+to userspace circular buffer, with three differences. A record is never dropped&lt;br/&gt;
+silently, because a dropped record makes an incomplete listing look complete:&lt;br/&gt;
+the producer stalls, and an unavoidable drop sets an explicit gap marker.&lt;br/&gt;
+Consumers share one buffer and hold their own cursors, since one scan's IO is&lt;br/&gt;
+meant to serve all of them. The record is a compact 168 byte fixed layout,&lt;br/&gt;
+versioned, and a version or size mismatch is refused rather than misparsed.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Filteringinkernel"&gt;&lt;/a&gt;Filtering in kernel&lt;/h3&gt;
+
+&lt;p&gt;Predicates are evaluated before a record enters the ring, so a search for a&lt;br/&gt;
+rare property does not copy every object to userspace to reject it there. Over&lt;br/&gt;
+four billion objects that is roughly 672 GB copied against a few hundred&lt;br/&gt;
+kilobytes.&lt;/p&gt;
+
+&lt;p&gt;The evaluator is one source file compiled into both the kernel module and the&lt;br/&gt;
+userspace scanners, so the two agree by construction. The filter program is&lt;br/&gt;
+validated on arrival before anything is evaluated. The first version handles&lt;br/&gt;
+predicates answerable from the attributes the iterator already has; those&lt;br/&gt;
+needing an xattr follow.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Scope"&gt;&lt;/a&gt;Scope&lt;/h3&gt;
+
+&lt;p&gt;In scope: the OSD iterator extensions for ldiskfs and ZFS, &lt;tt&gt;lfu.ko&lt;/tt&gt;, and&lt;br/&gt;
+tests including a differential run against the userspace device scanner on a&lt;br/&gt;
+quiescent target, which is a stronger oracle than either scanner has alone.&lt;/p&gt;
+
+&lt;p&gt;Not in scope: reaching this from &lt;tt&gt;lfs find&lt;/tt&gt;, which is the sibling ticket;&lt;br/&gt;
+exporting scan requests from a client over the wire, which is the HLD's Client&lt;br/&gt;
+Bulk RPC Filter Rule Module; and WBCFS, pending a decision.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Knownrisks"&gt;&lt;/a&gt;Known risks&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;Foreground impact is unmeasured. A scan now consumes the server's CPU and&lt;br/&gt;
+caches, and no throughput figure speaks to what that costs a serving MDS.&lt;/li&gt;
+	&lt;li&gt;Reading the inode table directly is fresher than disk but is not the live&lt;br/&gt;
+inode, so the mid creation window is narrower than the device scanner's but not&lt;br/&gt;
+provably closed.&lt;/li&gt;
+	&lt;li&gt;The raw parse does not verify the inode metadata checksum, so it reports a&lt;br/&gt;
+corrupt inode where &lt;tt&gt;ldiskfs_iget()&lt;/tt&gt; would refuse it. Defensible, but it&lt;br/&gt;
+belongs in the documented contract.&lt;/li&gt;
+	&lt;li&gt;Whether extending &lt;tt&gt;rec()&lt;/tt&gt;'s &lt;tt&gt;attr&lt;/tt&gt; argument is acceptable upstream is the&lt;br/&gt;
+one question that could force a redesign rather than a revision.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="99307">LU-20720</key>
+            <summary>LFU: in-kernel OSD scanner</summary>
+                <type id="7" iconUrl="https://jira.whamcloud.com/images/icons/issuetypes/task_agile.png">Technical task</type>
+                            <parent id="98401">LU-20462</parent>
+                                    <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="3" iconUrl="https://jira.whamcloud.com/images/icons/statuses/inprogress.png" description="This issue is being actively worked on at the moment by the assignee.">In Progress</status>
+                    <statusCategory id="4" key="indeterminate" colorName="inprogress" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hnishida">Hiroshi Nishida</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 9 Sep 2026 20:07:35 +0000</created>
+                <updated>Wed, 9 Sep 2026 20:41:30 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06zhr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
