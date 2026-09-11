@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-05-26 08:04:28.000000000
-Updated:    2026-09-10 03:11:40.000000000
-Patch Set:  6
-Insertions: +594
-Deletions:  -102
-Comments:   91 (11 unresolved)
+Updated:    2026-09-11 05:10:18.000000000
+Patch Set:  7
+Insertions: +587
+Deletions:  -90
+Comments:   112 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,91 +24,37 @@ Comments:   91 (11 unresolved)
 --- Commit Message ---
 LU-20099 nrs: add weight based share queueing for mClock
 
-mClock uses Self-Clocked Fair Queueing (SCFQ) algorithm to achieve
-weight-based scheduling. It works well especially when the system
-is overloaded with a larger number of backlogged requests in the
-request queue.
+Add a weight dimension to the mClock scheduler. It shares the rate
+above the reservations by weight, with the Self-Clocked Fair
+Queueing (SCFQ) algorithm. See nrs_mclock_class_insert().
 
-The core idea of SCFQ is that it directly uses the "finish time of
-the request currently being served" (or deadline) as the global
-virtual time, completely eliminating the dependency on physical
-clocks and the summation of weights.
-
-The patch adds the "weight" rule key. The key takes a value from 1
-to 1000, and the default value is 100. Only a rule start command
-accepts the key.
-
-The weight dimension joins the default dimensions. An mClock
-policy that starts with no dimension key now uses the reserve,
-the limit and the weight dimension.
+The "weight" rule key takes a value from 1 to 1000, and the default
+value is 100. Only a rule start command accepts it, and a value
+outside the range returns -ERANGE. The weight dimension joins the
+default set. A policy that starts with no dimension key now uses
+reserve, limit and weight.
 
 The policy start command also gets a "weight" dimension key. The two
-keys share one name and they hold two meanings. On a policy start
-command "weight=" is a bool. It turns the weight dimension on or
-off, the same way that "reserve" and "limit" do. On a rule start
-command "weight=" is the share weight from 1 to 1000. The two
-commands take different parse paths, so no command is ambiguous. A
-dimension value that is not a bool returns -EINVAL. A rule weight
-outside 1 to 1000 returns -ERANGE.
+keys share one name and hold two meanings. On a policy start command
+"weight=" is a bool. On a rule start command it is the share weight.
+The two parse paths differ, so no command is ambiguous.
 
-The function nrs_cmd_rule_check() gives a rule that names no weight
-key the default weight NRS_WEIGHT_DEF. A head with no weight
-dimension gives no rule a weight. The patch that enforces both the
-reserved rate and the limit rate holds the move of the rate default.
+The dequeue reads the limit tree first. It moves each eligible class
+bucket into the weight tree, up to nh_mcl_peek_max buckets. A
+dequeue from the weight tree always gets a token, because the
+ceiling already passed the bucket. The deadline minimum reads the
+reserved tree and the limit tree alone. A request with no page count
+costs one 1 MiB I/O in the weight tree.
 
-A weight only policy has no rate dimension. The default rule of that
-policy therefore takes no rate. The rule dump prints no rate for a
-rule that holds no rate in either slot. The new block of
-sanityn/test_77vm starts a weight only policy and checks that the
-default rule exists.
+A weight only policy has no rate dimension. Its default rule takes
+no rate, and the rule dump prints no rate for it.
 
-The weight dimension needs the size of a request.
-nrs_req_page_count_get() therefore loses its static qualifier. It
-also gets a declaration in ptlrpc_internal.h.
+SCFQ may not hold the weight share when the server has enough
+service threads to keep no backlog. The WF2Q+ algorithm is the
+alternative for that case.
 
-The global virtual time can wrap. The tree insert path and the two
-advance paths therefore compare the signed difference of two
-deadlines.
-
-The patch deletes NRS_MCLOCK_FL_DEFAULT. The shared configuration
-flag layer holds the default set of a policy.
-
-One unlikely() hint in the dequeue path moves to cover the whole
-test. The two forms mean the same thing.
-
-Add sanityn/test_77vh to verify that the weight-based scheduling
-in mClock works as expected.
-The experiment is designed as follows:
-1. Create two rules with different weights: w1=100 w2=200
-2. To simulate the server queued with a number of backlogged RPCs,
-   set the service thread number on the server to a small value:
-   ost.OSS.ost_io.threads_max=3.
-3. Use two fio processes each with 16 threads (numjobs) to read
-   two files in direct I/O mode from two Lustre mount points with
-   the runtime of 120 seconds. These two fio workloads matches
-   with two different TBF rules, respectively.
-4. Monitor the queue depth of the mClock scheduler in the time
-   step of 10 seconds.
-5. Parse the JSON outputs of two fio benchmarks and obtain the
-   IOPS of each fio process.
-The testing output is as follows:
-
-mclock queued NR (10s): 253
-mclock queued NR (20s): 255
-mclock queued NR (30s): 255
-mclock queued NR (40s): 254
-mclock queued NR (50s): 254
-mclock queued NR (60s): 255
-mclock queued NR (70s): 253
-mclock queued NR (80s): 256
-mclock queued NR (90s): 255
-JQ Parse fio JSON OUTPUT:
-IOPS: 574.130451/1145.314122 BW: 2351638/4691206
-
-However, when the service thread is large and make the server
-not overloaded with a large number of backlogged requests, the
-weight-based scheduling SCFQ may not work well.
-In this case, we may choose the complex WF2Q+ algorithm instead.
+Add sanityn/test_77vh. With the weights 100 and 200 and 3 service
+threads, two fio flows got 574 and 1145 IOPS.
 
 Test-Parameters: trivial testlist=sanityn env=ONLY=77
 Signed-off-by: Yingjin Qian <qian@ddn.com>
@@ -336,3 +282,39 @@ Patch Set 6:
 AI code review results below, please doublecheck
 
 Looks good; the new SCFQ weight dimension holds up under review and I could not find a correctness problem in the dequeue path. Only optional nits inline for whenever this is next refreshed - no need to re-spin for them.
+
+--- Message (Chris Horn, 2026-09-11 01:16:55.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-11 01:20:37.000000000) ---
+Patch Set 7:
+
+(10 comments)
+
+10 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-09-11 01:45:11.000000000) ---
+Patch Set 7:
+
+(10 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 01:47:45.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-11 02:55:45.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131581/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 03:44:46.000000000) ---
+Patch Set 7:
+
+RISC-V Client Builder: build succesful

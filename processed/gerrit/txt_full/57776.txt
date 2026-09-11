@@ -7,7 +7,7 @@ Branch:     master
 Status:     NEW
 Owner:      Artem Blagodarenko
 Created:    2025-01-15 16:41:17.000000000
-Updated:    2026-06-23 00:24:29.000000000
+Updated:    2026-09-11 14:56:16.000000000
 Patch Set:  32
 Insertions: +4422
 Deletions:  -2
@@ -19,7 +19,7 @@ Hashtags:   csdc
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Sebastien Buisson, Lustre RISC-V Builder
+  CC: Sebastien Buisson, Patrick Farrell, Lustre RISC-V Builder
   REVIEWER: Oleg Drokin, Andreas Dilger, James Simmons, Artem Blagodarenko, Timothy Day, Marc Vef
 
 --- Commit Message ---
@@ -4160,3 +4160,45 @@ Please rebase the change locally and upload the rebased commit for review.
 Patch Set 32:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-11 14:56:16.000000000) ---
+Patch Set 32:
+
+I built this on top of the current CSDC series and tested it on a single-node EL9 OSS.  The modules work -- llz4.ko and llz4hc.ko build, auto-load via the crypto-llz4 alias, register at priority 110, and make the compression level real, which the kernel's own algorithms do not.  Three things worth fixing before it lands.
+
+1. The registered names do not match what Lustre asks for.
+
+This patch registers cra_name "lz4" and "lz4hc".  crypto_name_from_type() in lustre/obdclass/lustre_compr.c asks for:
+
+    case LL_COMPR_TYPE_LZ4FAST:
+            return "lz4fast";
+    case LL_COMPR_TYPE_LZ4:
+            if (level < LZ4HC_MIN_CLEVEL - 1)
+                    return "lz4fast";
+            return "lz4";
+
+Nothing registers "lz4fast" -- not this patch, not the kernel (no such name in crypto/ or lib/lz4 in either 5.14-rhel9 or 6.12-rhel10), and the only cra_names anywhere in the tree with this applied are lz4, lz4hc and adler32.  So -Z lz4fast returns -ENOENT and falls back to LZO even with both modules loaded:
+
+    LustreError: __alloc_compr()) Cannot initialize compressor 4, error -2.
+    Lustre: ...: type 4 crypto setup failed, try LZO(6): rc = -2
+
+And LL_COMPR_TYPE_LZ4 asks for "lz4", the acceleration-factor algorithm, so lz4hc is never requested by any path.  I confirmed that by removing llz4.ko while leaving llz4hc.ko loaded: -Z lz4 then failed -ENOENT rather than using lz4hc.
+
+This is wider than an explicit -Z lz4fast, because ldlm_lib.c sets cl_compr_type_fast = LL_COMPR_TYPE_LZ4FAST, so plain -Z fast hits the same dead name and silently becomes LZO.
+
+The surrounding logic is already right: LZ4HC_MIN_CLEVEL is 3 and to_lz4_level() is level + 1, so "level < LZ4HC_MIN_CLEVEL - 1" correctly picks plain lz4 when the level is below what lz4hc accepts.  Only the two names are shifted by one notch:
+
+    case LL_COMPR_TYPE_LZ4FAST:
+            return "lz4";
+    case LL_COMPR_TYPE_LZ4:
+            if (level < LZ4HC_MIN_CLEVEL - 1)
+                    return "lz4";
+            return "lz4hc";
+
+With that, no fallbacks are logged for any type, and lz4 becomes the best of the family instead of the worst (1192 KiB, against 1500-1976 KiB for lz4fast at various levels, on the same payload).
+
+66001 takes the other approach for zstd and registers "zstdfast" to match the existing name.  Either is fine, but the lz4 pair currently matches neither.
+
+2. It no longer applies to master.  It patches Makefile.in and config/Rules.in, both replaced by the top-level Kbuild; the hook is now "obj-m += lustre_compat/crypto/" in Kbuild.
+
+3. to_lz4_level() in lustre_compat/crypto/lz4/lz4.h now collides with the to_lz4_level() the CSDC series added to lustre_user.h, so the build fails with "redefinition of 'to_lz4_level'".  They also mean different things -- the vendored one maps a level to an LZ4 acceleration factor, the uapi one to an lz4hc compression level -- so renaming one of them is needed regardless.

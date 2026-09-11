@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-20 01:08:10.000000000
-Updated:    2026-09-10 01:17:40.000000000
-Patch Set:  18
-Insertions: +1368
-Deletions:  -97
-Comments:   84 (0 unresolved)
+Updated:    2026-09-11 14:30:02.000000000
+Patch Set:  19
+Insertions: +1441
+Deletions:  -103
+Comments:   85 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -42,18 +42,61 @@ all.  The ldiskfs backend separates the same two with ENOPKG; a caller
 that skips its work where a build cannot scan must not also skip it
 where the build can and the target was misnamed.
 
-conf-sanity 300 is extended to cover it rather than left ldiskfs-only:
-its gate becomes ldiskfs-or-zfs, the OST half keys off
-ost1_FSTYPE == mds1_FSTYPE, and both facets grow an export_zpool and
-import_zpool pair around the scan, because a pool still imported by
-its server answers EBUSY.  -p and --search are passed so a pool on
-file vdevs is found.
+conf-sanity 300 is extended to cover it rather than left
+ldiskfs-only: its gate becomes ldiskfs-or-zfs, and so does the OST
+half's, which asks about ost1_FSTYPE for itself rather than about
+whether it matches the MDT's.  MDSFSTYPE and OSTFSTYPE are set
+separately -- facet_fstype() reads the facet's own first -- so an
+ldiskfs OST under a ZFS MDT is a real combination, and keying off
+the match would leave it unscanned by a backend that can read it.
+Both facets grow an export_zpool and import_zpool pair around the
+scan, because a pool still imported by its server answers EBUSY.
+-p and --search are passed so a pool on file vdevs is found.
 
-Its own autotest still cannot exercise that half: the build hosts
-answer no to "zfs libzpool headers usable from userspace", so they
-install no scan_osd_zfs.so and the ZFS arm of 300 skips there.  The
-Test-Parameters lines below ask for the two sessions that can say
-something.
+The backend goes into the programs that scan, not into liblustreapi,
+which is what mkfs.lustre already does with -lzfs -lnvpair -lzpool.
+libzpool is the DMU built for userspace and it arrives with libspl and
+libnvpair behind it.  In the no-plugins build those are linked into
+the library, so they reach every program that links it -- lfs, lctl,
+and every helper under lustre/tests -- and not only the ones that
+scan.  sanity 131d is what noticed: it reads errno through rwv, which
+links liblustreapi and never scans anything.  libext2fs is one
+ordinary library and does not carry that, so the ldiskfs backend stays
+where it is.
+
+So liblustreapi keeps -DHAVE_ZFS_SCAN and declares the five entry
+points weak, and libscan_zfs_in.la is linked into lfind and into
+llapi_scan_device_test, the two programs conf-sanity 300 drives.  A
+program without it links and leaves the slot NULL, which is the
+-ENOTSUP llapi_scan_device.3 already describes -- the same answer as
+a build whose configure found no libzpool headers at all, so no
+caller and no test learns a new outcome.  lfind is sbin and SERVER
+only, which is where a libzpool dependency belongs.
+
+The weak reference is not on its own enough to link the backend in,
+and the failure is silent.  libtool hands a convenience library to
+the link as a plain .a, and an undefined *weak* symbol is not a
+reason for the linker to extract an archive member -- so the five
+stay NULL, lfind answers -ENOTSUP on a build that has the backend,
+and nothing says why.  A lab build is what caught it: nm on lfind
+still read "w scan_zfs_open" and the binary held no libzpool symbol
+at all.  So the two programs name one symbol undefined up front,
+-Wl,-u,scan_zfs_open, which extracts the member that defines it and
+brings the other four with it.
+
+Its own autotest reaches the ZFS half only where configure finds the
+headers; the Test-Parameters lines below ask for the two sessions that
+can say something.
+
+Neither of them exercises the weak slot, and that is not an omission.
+PLUGINS is enable_shared, so the weak references, libscan_zfs_in.la
+and the -u exist only in a --disable-shared build; the autotest
+sessions are built from the spec, which is %bcond_without shared, and
+take the dlopen() path.  The build that does carry them is the
+janitor's, which configures --disable-shared and runs the whole of
+sanity on every change -- which is how 131d found this to begin with.
+Asking for ONLY=131d here would run it against the shared build,
+where the condition cannot arise.
 
 lustre.spec.in changes with it: %files osd-zfs-mount becomes a
 generated lustre-osd-zfs-mount.files, carrying its %dir and zed.d
@@ -74,6 +117,13 @@ keys its skip on: this build has no backend for the target.
 SCAN_CHUNKS_MAX is DN_MAX_OBJECT from <sys/dnode.h>, the bound the
 walk needs, so a ZFS that widens the object id carries this along
 with it.
+
+A pool this kernel holds is told from one that is merely named like
+a kstat by asking for a directory.  /proc/spl/kstat/zfs holds about
+twenty global kstats -- zil, fm, dbufs, arcstats and the rest -- as
+regular files in the same directory pools appear in, so a stat() that
+only asks "does the name exist" would answer -EBUSY for an exported
+pool called fm.  Only a directory there is a pool.
 
 -EBUSY names both of the things that raise it: a pool another mount
 holds, and a dataset already owned within this process, which is a
@@ -767,5 +817,36 @@ https://build.whamcloud.com/job/lustre-reviews/131437/ : SUCCESS
 
 --- Message (Lustre RISC-V Builder, 2026-09-10 00:37:26.000000000) ---
 Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Hiroshi Nishida, 2026-09-10 14:30:42.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-10 14:45:09.000000000) ---
+Patch Set 19:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-10 14:57:49.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-10 15:15:54.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131518/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-10 17:13:11.000000000) ---
+Patch Set 19:
 
 RISC-V Client Builder: build succesful

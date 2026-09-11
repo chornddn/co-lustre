@@ -7,7 +7,7 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-09-03 20:43:00.000000000
-Updated:    2026-09-10 02:31:15.000000000
+Updated:    2026-09-11 07:09:55.000000000
 Patch Set:  15
 Insertions: +198
 Deletions:  -82
@@ -15,7 +15,7 @@ Comments:   46 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -2607,3 +2607,118 @@ Commencing standard testing:
 Patch Set 15:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Maloo, 2026-09-10 21:07:26.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-124vm3: https://testing.whamcloud.com/test_sessions/2bc1b5a6-47c2-4918-ae6e-748774fdd84a ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Patrick Farrell, 2026-09-10 22:50:14.000000000) ---
+Patch Set 15:
+
+Triaged the enforced failures on this patchset; none of them are from
+this series.
+
+sanityn crashed (test_71d here, test_71c on 68620).  Both are
+
+    Kernel panic - not syncing: Out of memory:
+    system-wide panic_on_oom is enabled
+
+not an LBUG or an assertion.  67791 ps9 crashes the same way in
+sanityn test_70b, so this predates the DIO work by two patches; the
+subtest number moves around because it is memory pressure timing
+rather than anything a particular test does.
+
+The memory profile is the same in all three, and it is ZFS:
+
+    kmalloc-4k          14464 KB    (68619)  14372 (68620)  14560 (67791)
+    dmu_buf_impl_t      10732       11610          9988
+    dbuf_dirty_record_t  8887        8590          8982
+    zio_buf_comb_16384   4480        7776
+
+No Lustre slab appears near the top of any of them, and the page pools
+this series adds do not appear at all.  On 68619 the OOM was invoked by
+rpm, on a node with about 2GB (DMA32 present:2080624kB) running a ZFS
+OST with panic_on_oom set, so any allocation failure there is fatal.
+
+sanity-scrub test_10a and test_12 on 68541 fail with "Fail to cleanup
+the env!"; 67791 ps9 fails the same two plus test_13.  Also inherited.
+
+Triage done with Claude Code.
+
+--- Message (Maloo, 2026-09-10 23:15:32.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.5 / aarch64 uploaded by Onyx Autotest from onyx-154vm9: https://testing.whamcloud.com/test_sessions/020b19f7-aebc-42bf-a111-bc03aa877353 ran 6 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-09-11 00:15:54.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-153vm16: https://testing.whamcloud.com/test_sessions/9fd6ac89-4b18-473e-a84f-3b8c0c6de6e3 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-11 01:09:25.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-69vm14: https://testing.whamcloud.com/test_sessions/040fc480-e88b-4d55-a541-ad0e6852b4fe ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-09-11 05:21:31.000000000) ---
+Patch Set 15: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-159vm138: https://testing.whamcloud.com/test_sessions/a11f982e-fb53-4311-b686-f08a47681964 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 05:42:06.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2026-09-11 05:54:04.000000000) ---
+Patch Set 15:
+
+sanity-lfsck 18b and 18c on patch set 15 (review-dne-zfs-part-2,
+el10.1, session 9fd6ac89-4b18-473e-a84f-3b8c0c6de6e3) are one failure,
+not two, and it is not from this series.
+
+18c is a cascade.  18b aborts at its --dryrun check ("Expect 3 found
+on mds1, but got: 5"), which is before $START_LAYOUT -r -o, so 18b's
+own three orphan OST-objects are never repaired and stay on the
+filesystem.  18c then expects 4 on mds1 and gets 4 + 3 = 7, which is
+exactly the number reported.
+
+The primary failure is 18b overcounting by 2.  The lfsck orphan
+counters are filesystem-global and this suite does not clean up
+between subtests -- check_mount_and_prep only removes the current
+$tdir -- so any OST-object an earlier subtest leaves unreferenced is
+counted.  In this run 15d, 16, 17 and 18a all passed and their
+directories are still there.
+
+Evidence that this is environmental:
+
+  - 68620, one patch up and a strict superset of this code, ran the
+    same suite in the same test group on el9.8 (session
+    5af23b16-a057-48f9-817b-b6ba5fd94917) and passed 18b and 18c.  It
+    failed 18e instead, also by exactly 2.  A defect in orphan
+    accounting would not move between subtests and distros like that.
+  - Locally, tests 17, 18a, 18b, 18c and 18e all pass on this series
+    at the tip (2 MDT, 3 OST, ldiskfs).
+
+Nothing in this series is in that path: it is client side CLIO/DIO
+plus the obd page pools, and the higher order pools have no in-tree
+consumer until the patch above this one.
+
+--- Message (Patrick Farrell, 2026-09-11 06:19:39.000000000) ---
+Patch Set 15:
+
+Cross reference: DIO runs 50-90x slower on ZFS with this stack, and
+that is what ran sanity out of the session budget on 68619 at
+test_398b (so that TIMEOUT is not a hang).  ldiskfs is unaffected and
+ZFS without the stack is unaffected.  Measurements and the control
+runs are on 68541.
+
+Not bisected inside the stack yet: 68619 already shows it, so it is at
+or below there.
+
+--- Message (Patrick Farrell, 2026-09-11 07:09:55.000000000) ---
+Patch Set 15:
+
+Correction to the cross reference above: 65094 and 68541 ps10 both have clean ZFS runs, so the slowdown is not inherited from below 68541.  It came in after 68541 ps10, and 68619 ps15 already shows it (test_119t 801s against 22s at 68541 ps10).  Details and sessions are on 68541.

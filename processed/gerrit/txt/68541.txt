@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-08-31 21:10:34.000000000
-Updated:    2026-09-10 10:31:06.000000000
+Updated:    2026-09-11 07:09:53.000000000
 Patch Set:  20
 Insertions: +817
 Deletions:  -120
-Comments:   107 (1 unresolved)
+Comments:   111 (4 unresolved)
 
 --- Labels ---
   Code-Review: Shaun Tancheff: +1
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -745,3 +745,177 @@ RISC-V Client Builder: build succesful
 Patch Set 20: Code-Review+1
 
 (1 comment)
+
+--- Message (Patrick Farrell, 2026-09-10 15:07:25.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2026-09-10 22:50:20.000000000) ---
+Patch Set 20:
+
+Triaged the enforced failures on this patchset; none of them are from
+this series.
+
+sanityn crashed (test_71d here, test_71c on 68620).  Both are
+
+    Kernel panic - not syncing: Out of memory:
+    system-wide panic_on_oom is enabled
+
+not an LBUG or an assertion.  67791 ps9 crashes the same way in
+sanityn test_70b, so this predates the DIO work by two patches; the
+subtest number moves around because it is memory pressure timing
+rather than anything a particular test does.
+
+The memory profile is the same in all three, and it is ZFS:
+
+    kmalloc-4k          14464 KB    (68619)  14372 (68620)  14560 (67791)
+    dmu_buf_impl_t      10732       11610          9988
+    dbuf_dirty_record_t  8887        8590          8982
+    zio_buf_comb_16384   4480        7776
+
+No Lustre slab appears near the top of any of them, and the page pools
+this series adds do not appear at all.  On 68619 the OOM was invoked by
+rpm, on a node with about 2GB (DMA32 present:2080624kB) running a ZFS
+OST with panic_on_oom set, so any allocation failure there is fatal.
+
+sanity-scrub test_10a and test_12 on 68541 fail with "Fail to cleanup
+the env!"; 67791 ps9 fails the same two plus test_13.  Also inherited.
+
+Triage done with Claude Code.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 05:20:19.000000000) ---
+Patch Set 20:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new MAX_DIO_SIZE also sizes the unaligned DIO buffer, and that looks like it can turn large unaligned O_DIRECT into a hard error on mid-sized clients; the rest are opportunistic notes for a refresh.
+
+--- Message (Patrick Farrell, 2026-09-11 05:51:47.000000000) ---
+Patch Set 20:
+
+The Maloo -1 on patch set 20 is sanity-quota test_3c in
+review-dne-zfs-part-4, session a2cb261a-4fe0-403b-97fc-ad1578b99e14.
+That is a sick test node, not this patch.
+
+test_3c writes 8 MiB up to the pool soft limit, then 10 KiB past it,
+then does an mmap write which is still expected to succeed.  In that
+session the writes crawled:
+
+  Write up to soft limit:  8388608 bytes copied, 34.1453 s, 246 kB/s
+  Write to exceed soft limit: 10240 bytes copied, 35.3705 s, 0.3 kB/s
+
+The mmap write then took SIGBUS.  The quota dump printed immediately
+after shows why: lustre-OST0001 is at 36 KiB used against a 36 KiB
+granted block limit and flagged over, so the fault got EDQUOT because
+the slave never acquired more quota.
+
+The same subtest, same test group, same distro, elsewhere:
+
+  68620 ps15 (this change plus three more on top of it),
+    el9.8 review-dne-zfs-part-4, session 0175c4bb-...:
+    8388608 bytes copied, 0.15495 s, 54.1 MB/s -- PASS
+  another lustre-reviews el9.8 review-dne-zfs-part-4 run the same
+    day, session bea4fa20-...:
+    8388608 bytes copied, 0.142079 s, 59.0 MB/s -- PASS
+  58097 ps55, the bottom of this stack, review-dne-zfs-part-4,
+    session 5bd77631-...:
+    8388608 bytes copied, 0.139613 s, 60.1 MB/s -- PASS
+
+220x slower on the failing node, and a strict superset of this code
+passes the same subtest on the same configuration.  This is not a
+regression from this patch.
+
+--- Message (Patrick Farrell, 2026-09-11 06:19:30.000000000) ---
+Patch Set 20:
+
+DIO is 50-90x slower on ZFS with this stack, and that, not a hang, is
+what ran sanity out of the session budget on 68619.
+
+Subtest durations in seconds, lustre-reviews, 2026-09-10/11.  "ours" is
+this stack (68620 ps15 for ZFS, 68621 ps15 for ldiskfs); the controls
+are other changes in the same test group on the same day, and carry
+none of this stack (they have no test_119t).
+
+              398a  398b  398c  398q  399a  119e  119f  248b   65k  total
+  ZFS   ctl1     2    47    47    47    27     7     8    12   340  4.52h
+  ZFS   ctl2     2    52    52    50    27     8     8    13   345  4.53h
+  ZFS   ctl3     2    56    52    50    28     8     9    15   355  4.75h
+  ZFS   ours     7  4132  2418  2244  1605    71    70   325   352 10.06h
+  ldisk ctl1     2    31    10    30    19     8     7     9   346  4.75h
+  ldisk ctl2     2    30     9    29    16     7     7     9   338  4.64h
+  ldisk ours     2    31    10    25    17     8     8     9   344  4.70h
+
+Three of the four cells are identical.  Only ours-on-ZFS moves, and it
+moves only on the DIO tests: test_65k, which does no DIO, is 338-355
+in every one of the seven runs, so the nodes are equally fast.
+
+sanity took 10.06h instead of 4.5h.  On 68619 the same thing hit the
+430 minute session timeout while test_398b was running, which is why
+that one reports TIMEOUT rather than a failure.  Nothing is hung: I
+ran test_398b 27 times locally on the series tip (ldiskfs, 8 OST and
+3 OST configs) and it passes in 8-22s every time.
+
+test_119v measures it inside one test on one node, back to back on the
+same file, 8 MiB unaligned DIO:
+
+  ZFS      dio_large_folios=1   8.22 s (1.0 MB/s)
+           dio_large_folios=0   2.62 s (3.2 MB/s)
+  ldiskfs  dio_large_folios=1   0.062 s (136 MB/s)
+           dio_large_folios=0   0.099 s (85 MB/s)
+
+So on ZFS the folio path is 3x slower than the same build with the
+knob off, and on ldiskfs it is slightly faster.  The knob does not
+explain the rest of the gap: 2.62 s against 0.099 s for the same
+build with coalescing off.
+
+Not bisected inside the stack.  68619 already shows it (test_119t 801s
+there against 13s on ldiskfs), so it is at or below 68619, and no ZFS
+run exists for 65094 or 68541 on their own.
+
+The only client-visible ZFS difference in this path is cl_chunkbits,
+taken from the OST's ocd_grant_blkbits, which feeds the DIO grant
+reservation in osc_queue_dio_pages() and osc_max_write_chunks() in
+osc_dio_submit().  I have checked the chunk arithmetic in
+osc_dio_submit() against the old code for the single page case and it
+is equivalent, so that is a lead, not a diagnosis.
+
+I cannot reproduce this locally: our VM images have no ZFS.  Next step
+is either a ZFS capable test setup or a CI run of the lower patches on
+review-dne-zfs-part-1.
+
+--- Message (Patrick Farrell, 2026-09-11 07:09:53.000000000) ---
+Patch Set 20:
+
+Correction and narrowing on the ZFS slowdown I posted above.
+
+I said no ZFS run existed for 65094 or this change on their own.  That
+was wrong -- I had not found them.  Both exist and both are clean:
+
+  68541 ps10, el9.8 review-dne-zfs-part-1, session
+  c09621fb-3e02-4530-acc4-3a444d2baaa7:
+    398b 50  398c 45  398q 52  399a 27  119t 22   sanity 4.55h
+
+  65094 ps28, el10.1 review-dne-zfs-part-1, session
+  e6afa2a5-d41b-4ee4-a6db-b6c7c197216c:
+    398b 48  398c 43  398q 52  399a 22            sanity 4.96h
+
+against the controls at 398b 45-56 and 4.1-4.75h, and against 68620
+ps15 at 398b 4132, 398c 2418, 119t 1771, sanity 10.06h.
+
+ps10 of this change sits on c160a34c09, the same parent commit as
+ps20, so the folio DIO work on that parent was fine on ZFS.  The
+regression came in after 68541 ps10.  The candidates left are the
+ps10 to ps20 interdiff of this change and the page pools patch
+(68619); 68619 ps15 already shows it, with test_119t at 801s.
+
+test_119t is the sharpest single number: 22s at 68541 ps10, 801s at
+68619 ps15, 1771s at 68620 ps15, and 13s on ldiskfs at 68621 ps15.
+The test body is byte for byte identical between ps10 and ps20 apart
+from an added skip_env gate.
+
+I cannot split the last two candidates from existing CI data -- there
+is no ZFS run of 68541 ps20 or of 68619 below the page pools patch --
+and I cannot reproduce it locally, since our VM images have no ZFS.

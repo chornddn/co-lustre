@@ -1,5 +1,5 @@
 Change:     68600
-Subject:    LU-20354 quota: aggregate LQA usage from per-ID cache
+Subject:    LU-20354 quota: serve LQA usage from QMT cache
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68600
 Change-Id:  I63f53ba1d21f2bb6cc419c3d09b3f9337eaa1f17
 Project:    fs/lustre-release
@@ -7,35 +7,47 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-09-03 03:44:03.000000000
-Updated:    2026-09-03 10:43:23.000000000
-Patch Set:  1
-Insertions: +482
-Deletions:  -46
-Comments:   10 (6 unresolved)
+Updated:    2026-09-11 10:28:49.000000000
+Patch Set:  2
+Insertions: +1331
+Deletions:  -128
+Comments:   26 (6 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20354 quota: aggregate LQA usage from per-ID cache
+LU-20354 quota: serve LQA usage from QMT cache
 
-Serve lfs quota --lqa by scanning the global index for IDs in
-the LQA ranges and summing each ID's existing usage-cache
-entries, so GETQUOTALQA can return QIF_SPACE/QIF_INODES without
-a slave-side range protocol.
+GETQUOTALQA previously returned limits only. Wire it through the
+usage cache so lfs quota --lqa can set QIF_SPACE/QIF_INODES from
+the LQA shared lqe (qid=1). LQA has no llite fan-out and no
+per-slave DQACQ piggyback, so a miss collects glb IDs in the
+current ranges and batch-fetches each slave with
+LUSTRE_Q_GETOQUOTAIDS (list mode). Per-slave range sums land on
+the shared lqe with the existing TTL; reply lists also warm
+already cached per-ID global slots. Any slave failure aborts
+(no granted fallback, no partial sum). QIF_SPACE follows DT
+alone and QIF_INODES follows MD alone. Treat LQA inacc like
+GETQUOTA in lfs.
 
-LQA's shared lqe still skips per-slave caching. Add
-qmt_lqa_get_usage() with batched glb-index walks, wire it from
-qmt_quotactl, treat LQA inacc like GETQUOTA in lfs, and cover
-with kunit plus sanity-quota/312. Document LQA behavior in the
-usage_cache_* man pages.
+Range add/remove bumps qpi_lqa_gen with the rbtree update.
+Later GETQUOTALQA sees lqu_lqa_gen != qpi_lqa_gen, treats the
+slots as stale, and refreshes. The bump stays under the same
+write_lock as insert/erase so the new tree and new generation
+become visible together.
+
+Add MDT/OFD GETOQUOTAIDS handlers, OSP/LOD iobuf async, and
+mdt_qmt_fetch_ids_batch. Cover with kunit and sanity-quota/312
+(MDS >= 2.17.58). Document LQA behavior in the usage_cache_*
+man pages.
 
 Test-Parameters: trivial
-Assisted-by: Cursor:Fable5.1/Composer llm_code_and_review_tools
+Assisted-by: Cursor:Grok-4.6 llm_code_and_review_tools
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: I63f53ba1d21f2bb6cc419c3d09b3f9337eaa1f17
 
@@ -218,3 +230,137 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The two that look worth another round are the partially-initialized union lquota_id that ends up stored in a newly created lqe, and the unbounded per-ID refresh loop now running inside the MDS_QUOTACTL handler.
+
+--- Message (Keguang Xu, 2026-09-11 03:15:07.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 03:18:08.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-11 03:18:27.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70103/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-quota@ldiskfs+DNE sanity-quota-special1@ldiskfs+DNE sanity-quota-special1@ldiskfs sanity-quota-special2@ldiskfs+DNE sanity-quota-special2@ldiskfs sanity-quota-special3@ldiskfs+DNE sanity-quota-special3@ldiskfs sanity-quota-special4@ldiskfs+DNE sanity-quota-special4@ldiskfs sanity-quota-special5@ldiskfs+DNE sanity-quota-special5@ldiskfs sanity-quota-special6@ldiskfs+DNE sanity-quota-special6@ldiskfs sanity-quota-special7@ldiskfs+DNE sanity-quota-special7@ldiskfs sanity-quota-special8@ldiskfs+DNE sanity-quota-special8@ldiskfs sanity-quota-special9@ldiskfs+DNE sanity-quota-special9@ldiskfs sanity-quota-special10@ldiskfs+DNE sanity-quota-special10@ldiskfs sanity-quota@zfs sanity-quota-special1@zfs sanity-quota-special1@zfs+DNE sanity-quota-special2@zfs sanity-quota-special2@zfs+DNE sanity-quota-special3@zfs sanity-quota-special3@zfs+DNE sanity-quota-special4@zfs sanity-quota-special4@zfs+DNE sanity-quota-special5@zfs sanity-quota-special5@zfs+DNE sanity-quota-special6@zfs sanity-quota-special6@zfs+DNE sanity-quota-special7@zfs sanity-quota-special7@zfs+DNE sanity-quota-special8@zfs sanity-quota-special8@zfs+DNE sanity-quota-special9@zfs sanity-quota-special9@zfs+DNE sanity-quota-special10@zfs sanity-quota-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-09-11 03:23:55.000000000) ---
+Patch Set 2:
+
+(15 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-11 03:51:13.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131590/ : SUCCESS
+
+--- Message (Maloo, 2026-09-11 04:04:54.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 131590 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### The following sessions were skipped because they are untestable:
+
+#### Untestable Optional:
+
+- Test Config #96: review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+  - server: el10.2 - x86_64 | lustre-reviews #131590
+
+#### Supported build configurations for lustre-reviews #131590:
+
+#### Clients
+
+  - rocky9.5   - aarch64 - inkernel
+
+  - el10.0     - x86_64  - inkernel
+
+  - el10.1     - x86_64  - inkernel
+
+  - el10.2     - x86_64  - inkernel
+
+  - el8.10     - x86_64  - inkernel
+
+  - el9.7      - x86_64  - inkernel
+
+  - el9.8      - x86_64  - inkernel
+
+  - rocky9.5   - x86_64  - inkernel
+
+  - sles15sp7  - x86_64  - inkernel
+
+  - ubuntu2404 - x86_64  - inkernel
+
+  - ubuntu2604 - x86_64  - inkernel
+
+#### Servers
+
+  - el10.0 - x86_64 - inkernel
+
+  - el10.1 - x86_64 - inkernel
+
+  - el8.10 - x86_64 - inkernel
+
+  - el9.7  - x86_64 - inkernel
+
+  - el9.8  - x86_64 - inkernel
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131590&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131590#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-11 07:20:10.000000000) ---
+Patch Set 2:
+
+Initial testing failed:
+IMPORTANT: these tests appear to be new failures unique to this patch
+- sanity-quota@ldiskfs+DNE:test_16a(Seen in reviews: 67482), test_17(Seen in reviews: 68228 58554 51236 50314 43876), test_33(Seen in reviews: 68598), test_34(Seen in reviews: 68598), test_35(Seen in reviews: 68598), test_37(Seen in reviews: 68598 67482 64469), test_40c(Seen in reviews: 68598), test_64(Seen in reviews: 68598), test_75(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_78A(Seen in reviews: 68598 67482 61943 59974), test_78a(Seen in reviews: 68598 67482 61943), test_97c(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+- sanity-quota@zfs:test_16a(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews), test_17(Seen in reviews: 66990 66755 66707 66609 66535 66041 65198 65154 63255 63156 61334 60840 60529 60370 59673 58554 58407 57989 57885 54293 54069 53933 53930 53731 53560 53003 50790 50314 47483 43601 41771 41689 37222), test_33(Seen in reviews: 68598), test_34(Seen in reviews: 68598), test_35(Seen in reviews: 68598), test_37(Seen in reviews: 68598), test_64(Seen in reviews: 68598), test_75(Seen in reviews: 68598), test_97c(NEW unique failure for this branch in the last 30 days, and was seen 0 times across 0 other branches 0 reviews)
+
+
+> runtests@ldiskfs+DNE Timeout(3009s)
+> sanity-quota@ldiskfs+DNE Failure(12219s)
+- 16a(failed to get quota after deactivate OSC) 17(Used space(10240) for user quota_usr isn't 0.) 33(Used space for user 60000:0, expected:20480) 34(Used space for user 60000 is 0, expected 2048) 35(Used space for user 60000 is 0, expected 2M) 37(Used space is 0) 40c(file count expected 3 got 2) 64(expected 0 got 6) 75(user quota not released after deletion) 78A(fallocate did not use quota. kbytes returned:4) 78a(fallocate did not use projectid. kbytes returned:4) 97c(bhard limit  != 8000 for lqa:lqa1) 
+> sanity-quota-special8@ldiskfs+DNE Timeout(3567s)
+> sanity-quota-special8@ldiskfs Timeout(3574s)
+> sanity-quota@zfs Failure(14306s)
+- 16a(failed to get quota after deactivate OSC) 17(Used space(10244) for user quota_usr isn't 0.) 33(Used space for user 60000:0, expected:20480) 34(Used space for user 60000 is 0, expected 2048) 35(Used space for user 60000 is 0, expected 2M) 37(Used space is 0) 64(expected 0 got 6) 75(user quota not released after deletion) 97c(bhard limit  != 8000 for lqa:lqa1) 
+> sanity-quota-special4@zfs Timeout(3559s)
+> sanity-quota-special9@zfs+DNE Timeout(4010s)
+
+Succeeded:
+- runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-quota-special1@ldiskfs+DNE sanity-quota-special1@ldiskfs sanity-quota-special2@ldiskfs+DNE sanity-quota-special2@ldiskfs sanity-quota-special3@ldiskfs+DNE sanity-quota-special3@ldiskfs sanity-quota-special4@ldiskfs+DNE sanity-quota-special4@ldiskfs sanity-quota-special5@ldiskfs+DNE sanity-quota-special5@ldiskfs sanity-quota-special6@ldiskfs+DNE sanity-quota-special6@ldiskfs sanity-quota-special7@ldiskfs+DNE sanity-quota-special7@ldiskfs sanity-quota-special9@ldiskfs+DNE sanity-quota-special9@ldiskfs sanity-quota-special10@ldiskfs+DNE sanity-quota-special10@ldiskfs sanity-quota-special1@zfs sanity-quota-special1@zfs+DNE sanity-quota-special2@zfs sanity-quota-special2@zfs+DNE sanity-quota-special3@zfs sanity-quota-special3@zfs+DNE sanity-quota-special4@zfs+DNE sanity-quota-special5@zfs sanity-quota-special5@zfs+DNE sanity-quota-special6@zfs sanity-quota-special6@zfs+DNE sanity-quota-special7@zfs sanity-quota-special7@zfs+DNE sanity-quota-special8@zfs sanity-quota-special8@zfs+DNE sanity-quota-special9@zfs sanity-quota-special10@zfs sanity-quota-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70103/results.html
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 10:28:49.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful

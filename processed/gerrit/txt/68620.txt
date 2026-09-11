@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-09-03 20:43:00.000000000
-Updated:    2026-09-10 04:04:53.000000000
+Updated:    2026-09-11 07:09:57.000000000
 Patch Set:  15
 Insertions: +417
 Deletions:  -58
-Comments:   78 (0 unresolved)
+Comments:   81 (3 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -559,3 +559,121 @@ https://build.whamcloud.com/job/lustre-reviews/131462/ : SUCCESS
 Patch Set 15:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-10 22:50:16.000000000) ---
+Patch Set 15:
+
+Triaged the enforced failures on this patchset; none of them are from
+this series.
+
+sanityn crashed (test_71d here, test_71c on 68620).  Both are
+
+    Kernel panic - not syncing: Out of memory:
+    system-wide panic_on_oom is enabled
+
+not an LBUG or an assertion.  67791 ps9 crashes the same way in
+sanityn test_70b, so this predates the DIO work by two patches; the
+subtest number moves around because it is memory pressure timing
+rather than anything a particular test does.
+
+The memory profile is the same in all three, and it is ZFS:
+
+    kmalloc-4k          14464 KB    (68619)  14372 (68620)  14560 (67791)
+    dmu_buf_impl_t      10732       11610          9988
+    dbuf_dirty_record_t  8887        8590          8982
+    zio_buf_comb_16384   4480        7776
+
+No Lustre slab appears near the top of any of them, and the page pools
+this series adds do not appear at all.  On 68619 the OOM was invoked by
+rpm, on a node with about 2GB (DMA32 present:2080624kB) running a ZFS
+OST with panic_on_oom set, so any allocation failure there is fatal.
+
+sanity-scrub test_10a and test_12 on 68541 fail with "Fail to cleanup
+the env!"; 67791 ps9 fails the same two plus test_13.  Also inherited.
+
+Triage done with Claude Code.
+
+--- Message (Patrick Farrell, 2026-09-11 05:52:20.000000000) ---
+Patch Set 15:
+
+sanity test_56ab ("lfs find --blocks") on patch set 15, session
+1209a807-ec16-42ff-ba05-e57bae494378, is a race in the test on ZFS,
+not this patch.
+
+The test writes 8 KiB at 16 MiB, 4 KiB at 16 MiB and 2 MiB at 16 MiB
+into three files and expects exactly one of them to report more than
+1 MiB of blocks.  On a ZFS OST the two sparse files are not cheap: the
+object is far larger than one record, so a single small write in the
+middle allocates a full record.  The test only passes while that
+allocation has not been reported back to the client.
+
+ls -ls in the failing run:
+     2  f56ab.sanity.1
+  1028  f56ab.sanity.2
+  2052  f56ab.sanity.3
+
+ls -ls in a passing el9.8 review-dne-zfs-part-1 run the same day
+(session 79b5dd6c-1eb0-42f0-8d8c-dde921fd4791):
+     2  f56ab.sanity.1
+     2  f56ab.sanity.2
+  2052  f56ab.sanity.3
+
+1028 = 1024 + 4, against 2052 = 2048 + 4 for the 2 MiB file, so the
+4 KiB write was charged a full 1 MiB record.  The only difference
+between the runs is whether the OST had reported that yet.  The test
+does sync_all_data and then wait_zfs_commit ost1 2, which waits on
+ost1 alone while the three files are on different OSTs.
+
+Nothing in this series is in that path.  The writes are buffered dd,
+page cache large folios are off on el9.x (no
+mapping_set_folio_order_range), and the block count comes from record
+allocation on the OST.  68619 in this same series, one patch down,
+ran the same subtest in the same test group on the same distro
+(session 040fc480-e88b-4d55-a541-ad0e6852b4fe) and passed it.
+
+--- Message (Patrick Farrell, 2026-09-11 05:54:15.000000000) ---
+Patch Set 15:
+
+sanity-lfsck test_18e on patch set 15 (review-dne-zfs-part-2, el9.8,
+session 5af23b16-a057-48f9-817b-b6ba5fd94917), "(6) Expect 2 orphans
+have been fixed, but got: 4", is the same class of failure I described
+on 68619 for 18b/18c, and is not from this series.
+
+The lfsck orphan counters are filesystem-global and sanity-lfsck does
+not clean up between subtests -- check_mount_and_prep only removes the
+current $tdir -- so OST-objects left unreferenced by an earlier
+subtest are counted.  18e runs a full repair (lfsck_start -r -o -c)
+after 18a through 18d have each left their directories behind, and it
+overcounted by exactly 2.
+
+This run passed 18b and 18c, which 68619 one patch down failed on
+el10.1; that run passed 18e.  The subtest that fails moves between
+runs and distros, which a defect in orphan accounting would not do.
+Locally 17, 18a, 18b, 18c and 18e all pass on this series at the tip
+(2 MDT, 3 OST, ldiskfs).
+
+--- Message (Patrick Farrell, 2026-09-11 06:19:41.000000000) ---
+Patch Set 15:
+
+Cross reference: DIO runs 50-90x slower on ZFS with this stack, and
+that is what ran sanity out of the session budget on 68619 at
+test_398b (so that TIMEOUT is not a hang).  ldiskfs is unaffected and
+ZFS without the stack is unaffected.  Measurements and the control
+runs are on 68541.
+
+Not bisected inside the stack yet: 68619 already shows it, so it is at
+or below there.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-11 06:27:30.000000000) ---
+Patch Set 15:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the piecewise fill, the run-batched free and the entry-based copy loop all check out against the entry bookkeeping. Only optional nits inline for whenever it is next refreshed - no need to re-spin for them.
+
+--- Message (Patrick Farrell, 2026-09-11 07:09:57.000000000) ---
+Patch Set 15:
+
+Correction to the cross reference above: 65094 and 68541 ps10 both have clean ZFS runs, so the slowdown is not inherited from below 68541.  It came in after 68541 ps10, and 68619 ps15 already shows it (test_119t 801s against 22s at 68541 ps10).  Details and sessions are on 68541.

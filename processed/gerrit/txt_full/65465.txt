@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-04-22 10:53:37.000000000
-Updated:    2026-09-09 23:37:08.000000000
-Patch Set:  11
-Insertions: +528
+Updated:    2026-09-11 06:49:09.000000000
+Patch Set:  12
+Insertions: +530
 Deletions:  -16
-Comments:   205 (6 unresolved)
+Comments:   216 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: James Simmons, Etienne AUJAMES, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,72 +24,41 @@ Comments:   205 (6 unresolved)
 --- Commit Message ---
 LU-20184 nrs: extend TBF rate to support bandwidth (BPS) mode
 
-The Lustre NRS TBF scheduler currently enforces rate limits in
-term of IOPS (operations per second).
-This model works well for controlling metadata or small,
-relatively uniform I/O. However, on OSS servers with large and
-variable-sized I/O, IOPS is often a poor proxy for bandwidth of
-how much resource a class is consuming:
-- A client issuing 100 X 4 KiB writes is much less demanding than
-  one issuing 100 X 4 MiB writes.
-- Admins often want to bound bandwidth (bytes/s) per class bucket
-  (i.e, per user/job/nodemap, et al).
+The NRS TBF scheduler enforces a rate in IOPS alone. On an OSS with
+variable I/O sizes, IOPS is a poor proxy for the resource of a
+class. 100 writes of 4 KiB cost much less than 100 writes of 4 MiB.
 
-To address this, we propose extending TBF to support bandwidth
-based performance control (BPS) in addition to the existing IOPS
-mode.
-- Rules can specify rates in bytes per second (or equivalent
-  units).
-- Enforcement is based on the actual I/O size of read/write
-  requests.
+Extend TBF with a bandwidth mode (BPS). A rule can name its rate in
+bytes per second. The enforcement reads the I/O size of each read
+request and write request. The default unit is MiB/s:
+  nrs_tbf_rule="start r1 projid={100} bps=5MB/s"
+  nrs_tbf_rule="start r1 projid={100} bps=5"
+  nrs_tbf_rule="start r1 projid={100} rate=5MiB/s"
 
-The bandwidth cost of an OST_READ or OST_WRITE request is a page
-count. The niobuf count comes from the size of the niobuf buffer
-that the request carries. The code does not read the client field
-ioo_bufcnt. The cost rounds each niobuf up to whole pages. This
-model counts the partial pages at the fragment boundaries. The OSS
-pins those pages.
-
-The following command will start a rule in BPS mode:
-nrs_tbf_rule="start r1 projid={100} bps=5MB/s"
-nrs_tbf_rule="start r1 projid={100} bps=5MB"
-nrs_tbf_rule="start r1 projid={100} bps=5MiB/s"
-nrs_tbf_rule="start r1 projid={100} bps=5MiB"
-nrs_tbf_rule="start r1 projid={100} bps=5"
-nrs_tbf_rule="start r1 projid={100} rate=5MiB/s"
-
-The default unit for the BPS mode is MiB/s.
-And it can also set rate explicitly in IOPS mode:
-nrs_tbf_rule="start r1 projid={100} iops=1000"
-
-A rule can also limit both the IOPS and the BPS dimensions:
+The "iops=" key sets an IOPS rate. A rule can limit both dimensions:
 nrs_tbf_rule="start r1 projid={100} iops=1000 bps=5MB/s"
 
-The rule dump appends a "bps=" field to the line of a rule in BPS
-mode. The prefix of the line does not change. A tool that reads the
-dump of an IOPS rule therefore keeps its behavior.
+The rule dump appends a "bps=" field for a BPS rule. The prefix of
+the line does not change, so a reader of an IOPS rule keeps its
+behavior.
 
 A start command that pairs "realtime=" with "bps=" returns
--EOPNOTSUPP. The BPS dequeue path reads neither the real time flag
-nor the token depth, so the pair has no meaning. A change command
-with "rate=" on a BPS rule replaces the byte rate with an IOPS rate.
-A change command also accepts the "iops=" and "bps=" keys.
+-EOPNOTSUPP. A change command with "rate=" on a BPS rule replaces
+the byte rate with an IOPS rate. A rate of zero, or a rate at or
+above LPROCFS_NRS_RATE_MAX, now returns -ERANGE instead of -EINVAL.
 
-A rate of zero, or a rate at or above LPROCFS_NRS_RATE_MAX, now
-returns -ERANGE. The old code returned -EINVAL for both.
+Add sanityn/test_77u{a,b,c,d}.
 
-A new test case sanityn/77u{a,b,c,d} is added to verify it works as
-expected. Test 77uc asserts the -EOPNOTSUPP refusal. Test 77ud
-asserts the rate replacement of a change command.
-We set the following rules to limit the read BPS to 5 MiB/s
-and write BPS to 15 MiB/s:
-"start nidrd nid={0@lo}&opcode={ost_read} bps=5"
-"start nidwr nid={0@lo}&opcode={ost_write} bps=15"
-The I/O size is varying from 4KiB to 1MiB, the performance is
-shown as follows (The unit is MB/s):
-blksz	4KiB	64KiB	128KiB	256KiB	1MiB
-write	5.7	14.6	14.8	15.3	15.7
-read	4.6	5.0	5.1	5.2	5.3
+e.g. the rules below limit the read BPS to 5 MiB/s and write BPS to
+15 MiB/s.
+  nrs_tbf_rule="start nidrd nid={0@lo}&opcode={ost_read} bps=5"
+  nrs_tbf_rule="start nidwr nid={0@lo}&opcode={ost_write} bps=15"
+
+With I/O size varying from 4KiB to 1MiB, the performance is shown as
+follows (The unit is MB/s):
+  blksz   4KiB    64KiB   128KiB  256KiB  1MiB
+  write   5.7     14.6    14.8    15.3    15.7
+  read    4.6     5.0     5.1     5.2     5.3
 
 Test-Parameters: trivial testlist=sanityn env=ONLY=77
 Signed-off-by: Yingjin Qian <qian@ddn.com>
@@ -1676,3 +1645,107 @@ Patch Set 11:
 AI code review results below, please doublecheck
 
 Mostly good. One question inline on the new tc_nsecs recompute in nrs_tbf_req_add(), one correction to the commit message, and a couple of cosmetic items that can ride along on the next refresh.
+
+--- Message (Chris Horn, 2026-09-11 01:16:55.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-11 01:21:48.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-09-11 01:30:23.000000000) ---
+Patch Set 12:
+
+(5 comments)
+
+--- Message (Chris Horn, 2026-09-11 01:30:44.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+--- Message (Lustre Gerrit Janitor, 2026-09-11 01:31:58.000000000) ---
+Patch Set 12:
+
+(1 comment)
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70097/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 01:47:14.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-11 02:11:16.000000000) ---
+Patch Set 12: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131575/ : SUCCESS
+
+--- Message (Maloo, 2026-09-11 02:12:01.000000000) ---
+Patch Set 12:
+
+#### The following sessions will be run for Build 131575 (patch #12):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.5-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-ldiskfs-dne on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=131575&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=131575#redirect
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 05:12:12.000000000) ---
+Patch Set 12:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Lustre Gerrit Janitor, 2026-09-11 06:49:09.000000000) ---
+Patch Set 12:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanityn@ldiskfs+DNE sanityn-special1@ldiskfs+DNE sanityn-special1@ldiskfs sanityn-special2@ldiskfs+DNE sanityn-special2@ldiskfs sanityn-special3@ldiskfs+DNE sanityn-special3@ldiskfs sanityn-special4@ldiskfs+DNE sanityn-special4@ldiskfs sanityn-special5@ldiskfs+DNE sanityn-special5@ldiskfs sanityn-special6@ldiskfs+DNE sanityn-special6@ldiskfs sanityn-special7@ldiskfs+DNE sanityn-special7@ldiskfs sanityn-special8@ldiskfs+DNE sanityn-special8@ldiskfs sanityn-special9@ldiskfs+DNE sanityn-special9@ldiskfs sanityn-special10@ldiskfs+DNE sanityn-special10@ldiskfs sanityn@zfs sanityn-special1@zfs sanityn-special1@zfs+DNE sanityn-special2@zfs sanityn-special2@zfs+DNE sanityn-special3@zfs sanityn-special3@zfs+DNE sanityn-special4@zfs sanityn-special4@zfs+DNE sanityn-special5@zfs sanityn-special5@zfs+DNE sanityn-special6@zfs sanityn-special6@zfs+DNE sanityn-special7@zfs sanityn-special7@zfs+DNE sanityn-special8@zfs sanityn-special8@zfs+DNE sanityn-special9@zfs sanityn-special9@zfs+DNE sanityn-special10@zfs sanityn-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70097/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs

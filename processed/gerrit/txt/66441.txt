@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-06-03 15:23:02.000000000
-Updated:    2026-09-10 02:36:20.000000000
-Patch Set:  7
-Insertions: +918
-Deletions:  -123
-Comments:   111 (8 unresolved)
+Updated:    2026-09-11 07:35:04.000000000
+Patch Set:  8
+Insertions: +948
+Deletions:  -120
+Comments:   126 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Nikitas Angelinas, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -25,90 +25,44 @@ Comments:   111 (8 unresolved)
 LU-20099 nrs: add zero reserved and unlimited rates for mClock
 
 Add a zero reserved rate and an unlimited limit rate to the mClock
-NRS scheduler.
-
-A rule with a reserved rate of 0 reserves nothing. The class bucket
-of that rule stays out of the mClock reserved red-black tree.
-
-A rule with a limit rate of "unlimit" or "max" gets no ceiling. The
-insert path sets the limit deadline of the class bucket to the
-current time. The wait before the next request of the bucket is
-therefore always 0.
-
-A rule that names no reserved rate reserves nothing. A rule that
-names no rate at all also gets no ceiling. A rule that names no
-limit rate enters the weight tree at once. An mClock policy can
-start with no dimension key. Each rule of that policy then has a
-zero reservation, an unlimited limit and the default weight. The
-default rule keeps the default limit rate of the module parameter
-nrs_class_def_rate, so the policy keeps a ceiling for the traffic
-that no rule matches.
+scheduler. A rule with a reserved rate of 0 reserves nothing. A rule
+with a limit rate of "unlimit" or "max" gets no ceiling. A rule that
+names no rate takes neither. The default rule still keeps
+nrs_class_def_rate in the limit slot, so the traffic that no rule
+matches keeps a ceiling.
 
 The head flag helper now masks the rate keys with the configured
-dimensions of the policy. The auto default rule of a reserve-only
-policy therefore takes the reservation slot. Its class bucket then
-enters the reserved tree. The old code left the rate in the limit
-slot, and no tree held the class bucket.
+dimensions. The auto default rule of a reserve-only policy therefore
+takes the reservation slot and enters the reserved tree. The old
+code left it in the limit slot, and no tree held it.
 
-The patch adds a short form for each rate key. "R" sets the
-reserved rate, "L" sets the limit rate and "W" sets the weight.
-Documentation/man8/lctl-set_param.8 now describes the rule keys,
-the short forms, the mClock dimension keys and the default
-dimension set.
+The TBF policy needs a ceiling for every rule, so a TBF rule with an
+unlimited limit rate returns -EINVAL. So does an mClock rule that
+uses no dimension of its policy, because such a rule takes no
+service. A rule key that names a dimension the policy does not have
+also returns -EINVAL. The log then names the start key that turns
+the dimension on.
 
-A rule change command replaces the rate configuration of the slot
-that the key names. A change of the limit rate leaves the reserved
-rate alone. The reserved rate must stay no greater than the new
-limit rate. The command restores the old configuration when that
-test fails.
+The deadline minimum of a class bucket returns the current time when
+the weight tree holds that bucket. The arrival path then arms the
+throttle timer at the right time.
 
-The TBF policy needs a ceiling for every rule, so a TBF rule with
-an unlimited limit rate returns -EINVAL. An mClock rule that uses
-no dimension of its policy also returns -EINVAL, because such a
-rule takes no service.
+The rule dump prints a rate range. The forms are "R-max", "0-L" and
+"rate 0-max", which an administrator reads.
 
-A rule key that names a dimension the policy does not have still
-returns -EINVAL. The scheduler now also logs one line. The line
-names the key and the start key that turns the dimension on.
+Documentation/man8/lctl-set_param.8 gains a section on the rule keys,
+the short forms "R", "L" and "W", and the dimension keys.
 
-Add a test case sanityn/test_77vk to verify the setting of zero
-reserved rate and unlimited limit rate.
+Add sanityn/test_77v{k,l,o,p,q,s}, and extend test_77ve.
 
-Extend sanityn/test_77ve. The test now changes the rate of a running
-rule. It asserts that the change writes the limit slot, and that the
-new ceiling holds.
-
-Add a test case sanityn/test_77vl to evaluate the case when
-setting R=0 or L="max".
-Every scenario of the test passes the weights 100 and 200.
-Scenarios 1 to 5 call the helper that test_77vi adds.
-The table below holds the results of the scenarios 1 to 6.
-Scenario 7 asserts that a rule with R=0 keeps a finite ceiling.
-R1    L1    W1    R2    L2    W2    IOPS1   IOPS2   SUM
-5000  8000  100   5000  8000  200   3920    3920    7840
-1000  2000  100   0     max   200   1886    6291    7777
-2352  10000 100   0     max   200   3898    3898    7796
-0     10000 100   0     max   200   3937    3837    7874
-2352  3000  100   0     max   200   2587    5157    7762
-2352  3000  100   4181  max   200   2562    5125    7687
-
-Add sanityn/test_77vo. The test asserts that a TBF rule with
-"rate=max", with "rate=unlimit" or with "limit_rate=max" returns
--EINVAL. A TBF rule with a finite rate still starts.
-
-Add sanityn/test_77vp. The test starts an mClock policy that holds
-the reserve dimension only. It asserts that a rule with
-"resvd_rate=0" returns -EINVAL. It also asserts that the input and
-output path of the matched project still works.
-
-Add sanityn/test_77vq. The test starts a limit plus weight policy.
-It asserts the dump of a limit rule and of a rule with no ceiling.
-It then checks that the ceiling holds under a direct write.
-
-Add sanityn/test_77vs. The test starts a limit plus weight policy
-with one throttled class and one unlimited class. It asserts that
-the unlimited class does not wait for the throttle timer of the
-other class.
+The testing results are shown as follows:
+  R1    L1    W1    R2    L2    W2    IOPS1   IOPS2   SUM
+  5000  8000  100   5000  8000  200   3920    3920    7840
+  1000  2000  null  0     max   null  1886    6291    7777
+  2352  10000 null  0     max   null  3898    3898    7796
+  0     10000 null  0     max   null  3937    3837    7874
+  2352  3000  100   0     max   200   2587    5157    7762
+  2352  3000  100   4181  max   200   2562    5125    7687
 
 Test-Parameters: trivial testlist=sanityn env=ONLY=77
 Signed-off-by: Yingjin Qian <qian@ddn.com>
@@ -387,3 +341,39 @@ Patch Set 7:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The unlimited limit rate does not deliver "no ceiling" on every dimension set the policy accepts, and test_77vk step (8) builds exactly that configuration but only checks the dump, so no test covers the throughput. Worth a coverage case that measures the rate of an R=N/L=max rule on a reserve+limit policy.
+
+--- Message (Chris Horn, 2026-09-11 01:16:55.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-11 01:20:04.000000000) ---
+Patch Set 8:
+
+(6 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 01:48:01.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (Chris Horn, 2026-09-11 01:49:18.000000000) ---
+Patch Set 8:
+
+(8 comments)
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 03:02:31.000000000) ---
+Patch Set 8:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-11 03:20:43.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131584/ : SUCCESS

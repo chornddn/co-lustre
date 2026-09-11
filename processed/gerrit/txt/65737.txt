@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Marc Vef
 Created:    2026-05-07 17:54:37.000000000
-Updated:    2026-09-07 02:36:56.000000000
+Updated:    2026-09-11 07:12:50.000000000
 Patch Set:  14
 Insertions: +1081
 Deletions:  -10
-Comments:   289 (17 unresolved)
+Comments:   292 (17 unresolved)
 Hashtags:   csdc
 
 --- Labels ---
@@ -19,7 +19,7 @@ Hashtags:   csdc
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Oleg Drokin, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Oleg Drokin, Patrick Farrell, Lustre RISC-V Builder, Roman Bolshakov, Gerrit AI review for Lustre
   REVIEWER: Zhenyu Xu, Andreas Dilger, James Simmons, Artem Blagodarenko
 
 --- Commit Message ---
@@ -693,3 +693,55 @@ Patch Set 14: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Patrick Farrell, 2026-09-10 23:21:08.000000000) ---
+Patch Set 14:
+
+sanity-compr test_1000d fails because lfs getstripe shows no compression attributes for a directory's default layout.  --compr-type, --compr-level, --compr-chunk and --compress-chunk all come back empty on a directory, though they work on a file.
+
+test_1000d does:
+
+    local dchunk=$($LFS getstripe --compress-chunk $DIR)
+
+and then compares every inherited value against $dchunk, so it is comparing against an empty string and fails on the first file it checks.
+
+The values are on disk.  Decoding the directory's lustre.lov EA after
+"lfs setstripe -Z lz4 --compress-level=9 --compress-chunk=128 $DIR":
+
+    lcme_compr_type = 5 (lz4)
+    lcme_compr_lvl = 8 (mapped back to 9)
+    lcme_compr_chunk_lum_bits = 1 (128K)
+    lcme_flags = 0x0
+    lmm_pattern = 0x801  (LOV_PATTERN_COMPRESS set)
+
+lov_dump_comp_v1_entry() gates the whole compression block on
+LCME_FL_COMPRESS.  The MDT sets that when it packs a file layout
+(lod_lov.c, under "if (lod_comp->llc_pattern & LOV_PATTERN_COMPRESS)")
+and llapi never sets it when building a layout, so a directory's
+default layout never has it.  The pattern is the signal, and
+llapi_layout's own parsing path already uses
+"v1->lmm_pattern & LOV_PATTERN_COMPRESS" rather than the flag.
+
+What I tested, in lov_dump_comp_v1_entry():
+
+    -       if (entry->lcme_flags & LCME_FL_COMPRESS) {
+    +       /*
+    +        * A directory's default layout never gets LCME_FL_COMPRESS: the MDT
+    +        * sets that when it packs a file layout, so only the pattern says
+    +        * whether the component is compressed.
+    +        */
+    +       if (entry->lcme_flags & LCME_FL_COMPRESS ||
+    +           (entry->lcme_size >= sizeof(struct lov_user_md_v1) &&
+    +            ((struct lov_user_md_v1 *)((char *)comp_v1 +
+    +               entry->lcme_offset))->lmm_pattern & LOV_PATTERN_COMPRESS)) {
+
+test_1000d passes with that.  Setting LCME_FL_COMPRESS on the directory
+default layout instead would also work for new directories, but the
+display path has to cope with existing ones either way.
+
+Happy to push this as its own patch if you would rather not carry it here.
+
+--- Message (Roman Bolshakov, 2026-09-11 07:12:50.000000000) ---
+Patch Set 14:
+
+(3 comments)
