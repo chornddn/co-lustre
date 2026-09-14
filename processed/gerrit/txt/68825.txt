@@ -7,45 +7,65 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-09-11 01:16:55.000000000
-Updated:    2026-09-11 12:06:55.000000000
-Patch Set:  2
-Insertions: +389
-Deletions:  -24
-Comments:   6 (0 unresolved)
+Updated:    2026-09-13 12:33:27.000000000
+Patch Set:  4
+Insertions: +519
+Deletions:  -35
+Comments:   33 (5 unresolved)
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1
-  Verified: jenkins: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Qian Yingjin
 
 --- Commit Message ---
 LU-20107 nrs: one ceiling per CPT for both scheduler heads
 
-A global rule divides its rate over the scheduler heads that the
-start command reaches. A command for both queues reaches two heads
-for each CPU partition. The node tier change therefore divides the
-rate over 2 * ncpts. The ceiling holds, but the high priority head
-takes
-an I/O RPC only under a blocking lock callback. Half of the node
-rate idles in the common case.
+A global rule divides its rate over the scheduler heads that the start
+command reaches. A command for both queues reaches two heads for each
+CPU partition. The node tier change therefore divides the rate over
+2 * ncpts. The ceiling holds. But the high priority head takes an I/O
+RPC only under a blocking lock callback. Half of the node rate idles
+in the common case.
 
-A divisor of the partition count alone gives the other defect. The
-two heads keep two clocks, so the pair can pass twice the partition
-share. A limit rule must never pass its rate.
+A divisor of the partition count alone gives the other defect. The two
+heads keep two clocks, so the pair can pass twice the partition share.
+A limit rule must never pass its rate.
 
-Give the node class one limit clock for each CPU partition. Both
-heads of a partition read and advance that clock, and the divisor
-goes back to the partition count. The high priority head still wins
-a tie, because ptlrpc_server_allow_high() polls it first.
+Give the node class one clock pair for each CPU partition: a limit
+clock and a reserved clock. Both heads of a partition read and
+advance that pair, and the divisor goes back to the partition count.
+The high priority head still wins a tie, because
+ptlrpc_server_allow_high() polls it first. Each pair takes a cache
+line of its own, so one partition does not move the line of another
+partition.
 
-Add sanityn/test_77xj, which measures one job under real high
-priority traffic and bounds its RPC rate by the node rate.
+The reserved clock keeps the lag bound of the mClock reservation. A
+backlogged class still wakes at most NRS_MCLOCK_RESVD_LAG_MAX behind
+the current time. An idle class still wakes at the current time.
+The bound now holds for the head pair, not for each head alone.
 
-This change replaces the 2 * ncpts divisor of the node tier change.
-It stands on its own so that it can be reviewed apart, and can be
+A re-key of a shared clock moves the class bucket in its tree. The
+peek of the mClock trees therefore reads the minimum again, and the
+TBF dequeue reads the heap root again. A throttle arms the whole
+head, so it must never read a bucket that the re-key moved.
+
+Add sanityn/test_77xj. The test measures one job under real high
+priority traffic. It bounds the rate of the job by the node rate. It
+also holds that rate to at least 70% of the partition share. A divisor
+of the head count gives half the share and fails the test. The test
+runs the same bounds against a rule that names the node rate as a
+reservation.
+
+The test first runs a plain rule as an environment probe. That rule
+gives each head its own clock, so its rate is not a bar for the global
+rule. A node that cannot reach the ceiling skips the test.
+
+This change replaces the 2 * ncpts divisor of the node tier change. It
+stands on its own so that it can be reviewed apart, and can be
 squashed into that change.
 
 Test-Parameters: trivial testlist=sanityn env=ONLY=77xj,ONLY_REPEAT=3
@@ -113,3 +133,89 @@ https://build.whamcloud.com/job/lustre-reviews/131593/ : SUCCESS
 Patch Set 2:
 
 RISC-V Client Builder: build succesful
+
+--- Message (Chris Horn, 2026-09-11 16:25:40.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 16:29:03.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-11 16:39:27.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 16:47:13.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-11 16:54:26.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131617/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-12 09:51:00.000000000) ---
+Patch Set 3:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The shared-clock re-key happens after the scheduler has already picked the tree/heap minimum, and neither the TBF nor the mClock caller re-reads the minimum afterwards, so an unrelated class can lose its turn and the whole head gets throttled. The divisor change also applies to the reserved rate, which has no shared clock, so a global rule that names a reserved rate now passes twice what it asks for.
+
+--- Message (Chris Horn, 2026-09-12 22:54:07.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-09-12 23:02:22.000000000) ---
+Patch Set 4:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2026-09-12 23:09:17.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-12 23:36:00.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-13 00:56:59.000000000) ---
+Patch Set 4:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-13 01:07:42.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131657/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-13 07:18:16.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The TBF BPS path looks like it can still let the head pair pass the node rate; the rest are optional nits that can ride along on the same refresh.

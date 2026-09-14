@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      wangdi
 Created:    2026-09-08 22:23:21.000000000
-Updated:    2026-09-10 08:30:06.000000000
-Patch Set:  1
-Insertions: +140
+Updated:    2026-09-14 15:32:16.000000000
+Patch Set:  2
+Insertions: +144
 Deletions:  -10
-Comments:   16 (10 unresolved)
+Comments:   33 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Patrick Farrell: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -46,18 +46,52 @@ and that RPC is delayed until the import leaves recovery. The reader
 waits for replay to finish, replay waits for the reader, and neither
 completes.
 
-Skip invalidate_lock for the lock replay thread. It only cancels unused
-locks, which ldlm_prepare_lru_list() takes with no readers or writers
-and marks CBPENDING so that they can never gain any. No page cache fill
-can be in progress under such a lock, so there is nothing for
-invalidate_lock to serialise against.
+Skip invalidate_lock for the lock replay thread. That is safe here for
+three reasons.
+
+First, no page cache fill can be in progress under the lock being
+cancelled. ldlm_prepare_lru_list() selects it under lock_res_and_lock()
+with LASSERT(!lock->l_readers && !lock->l_writers) and sets CBPENDING,
+which stops it gaining any, and lock_matches() refuses to match a
+CBPENDING lock with no users, so nothing can find it to use it either.
+Filling a page requires a DLM reference on a lock covering that page:
+cl_io_lock() takes one for reads and for the mmap fault path, and
+osc_io_read_ahead_prep() takes one for readahead, which is clipped to
+the extent of the lock it found. So the fill that invalidate_lock exists
+to serialise against cannot exist under this lock.
+
+Second, a page in the extent may still be covered by another lock and be
+in use under it. That is the LU-16651 case: a reader sitting between
+->readpage() unlocking its page and its own PageUptodate() check, which
+holds no page lock. Such a reader holds a lock over the page with
+l_readers set, so check_and_discard_cb() finds that lock and keeps the
+page. Use check_and_discard_cb() in this mode even when discarding, so
+the page is left to the lock that covers it.
+
+Third, what keeps a page from outliving the lock that covered it does
+not change. Pages which are discarded are still taken with the blocking
+cl_page_own() and removed while holding the page lock, and the discard
+still runs inside the cancelling AST and completes before
+ldlm_lock_cancel() releases the lock. invalidate_lock was not what
+enforced either of those.
+
+Note that a read of an already cached uptodate page takes neither a DLM
+lock nor invalidate_lock, so it is not serialised against a discard with
+or without this patch. ll_read_from_cache() calls
+generic_file_read_iter() with no cl_io, and in the read path
+invalidate_lock is taken only while filling - filemap_create_page() on a
+miss and filemap_update_page() under !PageUptodate - and by readahead in
+page_cache_ra_unbounded(), each of which releases it before returning.
+filemap_read() then copies out of the page holding only the reference
+taken by filemap_get_read_batch(). A discard can land between that
+reference and the copy either way, so this patch does not change that
+exposure.
 
 Only lock replay is affected. Blocking ASTs, the LRU shrinker, lru_size
 and namespace cleanup take invalidate_lock as before.
 
 Add recovery-small test_171, which checks that the import recovers while
 a read is holding invalidate_lock of an inode with an idle lock on it.
-LU-20157 ldlm: do not block lock replay on invalidate_lock
 
 Fixes: bba59b1287 ("LU-16651 llite: hold invalidate_lock when invalidate cache pages")
 Assisted-by: Claude:claude-opus-5
@@ -129,3 +163,77 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Approach looks sound and the change is small and well contained. It does need a refresh for the stray duplicated subject line in the commit message body; the remaining inline items are minors that can ride along on that same refresh.
+
+--- Message (wangdi, 2026-09-11 17:57:04.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-09-11 17:57:17.000000000) ---
+Patch Set 2:
+
+(10 comments)
+
+--- Message (wangdi, 2026-09-11 17:58:45.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 18:00:29.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-11 18:12:08.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 18:26:12.000000000) ---
+Patch Set 2:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-11 18:31:03.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131621/ : SUCCESS
+
+--- Message (Alexander Boyko, 2026-09-11 20:58:50.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (wangdi, 2026-09-11 22:18:14.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (wangdi, 2026-09-11 22:19:55.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-12 13:04:39.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Autotest, 2026-09-12 15:47:36.000000000) ---
+Patch Set 2:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 131621 patch 2. Requested by ddiwang because of LU-17891.
+
+--- Message (Alexander Boyko, 2026-09-14 08:27:23.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (wangdi, 2026-09-14 15:32:16.000000000) ---
+Patch Set 2:
+
+(1 comment)

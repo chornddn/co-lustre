@@ -1,5 +1,5 @@
 Change:     63511
-Subject:    LU-19809 utils: Fixes lfs migrate to return correct exit code
+Subject:    LU-19809 utils: fix lfs migrate to return correct exit code
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/63511
 Change-Id:  Ie4ebef7927c9505af5778b645ea1440285cd1aa4
 Project:    fs/lustre-release
@@ -7,31 +7,64 @@ Branch:     master
 Status:     NEW
 Owner:      Rajeev Mishra
 Created:    2026-01-22 04:12:31.000000000
-Updated:    2026-08-28 09:04:10.000000000
-Patch Set:  25
-Insertions: +40
-Deletions:  -12
-Comments:   100 (6 unresolved)
+Updated:    2026-09-12 13:10:35.000000000
+Patch Set:  26
+Insertions: +45
+Deletions:  -15
+Comments:   108 (8 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: Andreas Dilger: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Sebastien Buisson, Janitor Bot, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, Nikitas Angelinas, Shaun Tancheff
+  CC: Janitor Bot, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Nikitas Angelinas, Sebastien Buisson, Shaun Tancheff
 
 --- Commit Message ---
-LU-19809 utils: Fixes lfs migrate to return correct exit code
+LU-19809 utils: fix lfs migrate to return correct exit code
 
-The `lfs migrate` command does not propagate the
-correct exit code when `cb_migrate_mdt_fini()` fails.
-This patch fixes `llapi_semantic_traverse()` so a
-`cb_migrate_mdt_fini()` failure is returned correctly.
-The failure now reaches the existing
-`rc < 0 && rc != -EALREADY && param->fp_stop_on_error`
-check in `llapi_semantic_traverse()`, so the traversal
-stops on error as expected.
+The `lfs migrate` command does not propagate the correct exit
+code when `cb_migrate_mdt_fini()` fails.
+`llapi_semantic_traverse()` discarded the return value of its
+sem_fini callback, so a `cb_migrate_mdt_fini()` failure was lost
+and the command reported success. Capture that result and fold
+it into the traversal exit status so the failure is reported.
+The walk itself is not aborted on a sem_fini failure: the
+remaining entries are still migrated, so a single unmigratable
+directory no longer abandons the rest of the tree.
+
+The same stricter error handling required a few related changes:
+
+- cb_migrate_mdt_init() no longer overwrites a real migrate
+  error with the depth marker at fp_max_depth. The marker
+  (ret = 1) is a sentinel for "reached the deepest level, skip
+  the fini"; it is now written only when ret == 0. Previously a
+  per-entry LL_IOC_MIGRATE failure under `lfs migrate -m N -d DIR`
+  was replaced by the marker and dropped, so the command exited
+  0; it now aborts on the first failing entry.
+
+- llapi_semantic_traverse() records the first real error using
+  `ret >= 0` at each accumulation point. A positive depth marker
+  parked in ret (from a max-depth sem_init) previously made the
+  `ret == 0` guards false, so a later negative error was dropped
+  and `lfs migrate` could abort mid-tree yet still exit 0.
+
+- cb_migrate_mdt_fini() now reports a close() failure (as -errno)
+  before the layout setxattr, instead of silently returning the
+  raw close() result.
+
+- sanity test_60h now expects `lfs migrate` on a directory with
+  missing stripes to fail rather than succeed: the missing stripe
+  makes close() fail with ENOENT while finalizing the migration,
+  an error that was previously discarded. The directory is still
+  accessible afterwards.
+
+- conf-sanity t32_test now prunes `.fscrypt` (alongside `.lustre`)
+  from the directories it migrates. Migrating `.fscrypt` fails
+  with ENOTEMPTY from the layout shrink (setxattr cannot drop a
+  stripe that still has entries); that failure is now reported
+  and would otherwise fail the test.
 
 Fixes: 0a83d948f37b ("LU-4684 migrate: shrink dir layout after migration")
 
@@ -932,3 +965,45 @@ Patch Set 25:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The traversal fix itself looks right, but the same wrong-exit-code hole still exists for the depth-limited case, and the conf-sanity change looks like it is hiding a failure this patch is meant to surface.
+
+--- Message (Rajeev Mishra, 2026-09-11 18:28:17.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-11 18:31:17.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-11 18:42:49.000000000) ---
+Patch Set 26:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-11 18:44:50.000000000) ---
+Patch Set 26:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-11 18:53:21.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131622/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-09-11 23:18:34.000000000) ---
+Patch Set 26: Code-Review-1
+
+(5 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-12 13:10:35.000000000) ---
+Patch Set 26:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the code change itself reads correctly to me. The findings inline are commit-message accuracy and one formatting item, so nothing here alone is worth a CI cycle - fold them in whenever the patch is next refreshed.

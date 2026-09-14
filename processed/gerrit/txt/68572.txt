@@ -1,5 +1,5 @@
 Change:     68572
-Subject:    LU-20682 llite: guard NULL value in ll_xattr_set()
+Subject:    LU-20682 llite: validate xattr value in ll_xattr_set()
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68572
 Change-Id:  I25005947b324d615e00f30a4f591837ad40e30af
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Sohei Koyama
 Created:    2026-09-02 06:58:23.000000000
-Updated:    2026-09-05 19:47:50.000000000
-Patch Set:  2
-Insertions: +21
-Deletions:  -2
-Comments:   6 (6 unresolved)
+Updated:    2026-09-14 12:34:31.000000000
+Patch Set:  3
+Insertions: +34
+Deletions:  -4
+Comments:   15 (7 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -19,16 +19,27 @@ Comments:   6 (6 unresolved)
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger
 
 --- Commit Message ---
-LU-20682 llite: guard NULL value in ll_xattr_set()
+LU-20682 llite: validate xattr value in ll_xattr_set()
 
-removexattr(2) reaches ll_xattr_set() with value == NULL, but the LOV
-EA byte-swap branch loads value->lmm_magic and the LMV branch loads
-lmu->lum_magic before anything else, so removexattr of a suffixed
-lustre.lov.<x> name or of lustre.lmv oopses the client.  Any user who
-can write the file can trigger it.  Skip both branches when value is
-NULL.
+ll_xattr_set() reads the LOV and LMV EA handed in by setxattr(2)
+before passing it to the MDT, with no check that the value exists
+or that it is long enough.  removexattr(2) and a zero-length
+setxattr(2) both arrive with value == NULL, so the lmm_magic and
+lum_magic loads oops the client.  A short value carrying a
+big-endian LOV magic is byte-swapped in place by
+lustre_swab_lov_user_md() past the end of the kernel buffer, and a
+short value under the "lmv" name has its lum_hash_type rewritten
+past the end of the buffer.
+
+Skip both branches when value is NULL.  Swab the LOV EA only when
+the value holds at least ll_lov_user_md_size() bytes, the same check
+ll_lov_setstripe_ea_info() makes before it swabs, and apply the LMV
+fixups only to a value that holds a whole struct lmv_user_md.
+Anything shorter goes to the MDT unchanged, which validates the
+layout as before.
 
 Fixes: 9d17996766e0 ("LU-10100 llite: swab LOV EA user data")
 Fixes: 19e6393c24e2 ("LU-18904 llite: set hash fnv_1a_64 for old server")
@@ -118,3 +129,51 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Looks good. The guard is correct, and both Fixes: tags name the commits that actually introduced the two dereferences. Two optional notes inline about the other way `value` arrives NULL; neither is a reason to re-spin a patch that has already been tested.
+
+--- Message (Andreas Dilger, 2026-09-13 23:24:50.000000000) ---
+Patch Set 2: Code-Review+1
+
+(3 comments)
+
+--- Message (Sohei Koyama, 2026-09-14 00:53:20.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-14 00:56:29.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-14 01:05:43.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Lustre RISC-V Builder, 2026-09-14 01:09:04.000000000) ---
+Patch Set 3:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-14 01:17:26.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131684/ : SUCCESS
+
+--- Message (Sohei Koyama, 2026-09-14 08:20:35.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-14 12:34:31.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new sanity case only feeds NULL and 4-byte values, so nothing exercises a full-size value through the lov. swab branch - a case that sets a complete byte-swapped lov_user_md_v1 would cover the path the inline comment is about.
