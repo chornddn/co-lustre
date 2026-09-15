@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-09-03 20:43:00.000000000
-Updated:    2026-09-11 07:09:57.000000000
-Patch Set:  15
-Insertions: +417
-Deletions:  -58
-Comments:   81 (3 unresolved)
+Updated:    2026-09-14 18:08:57.000000000
+Patch Set:  16
+Insertions: +381
+Deletions:  -49
+Comments:   86 (3 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -35,7 +35,10 @@ Fill the buffer from the compound page pools: the bulk from the
 largest order which fits (within one brw_ext), the remainder
 from order 0.  Per-chunk bookkeeping falls from one
 cl_page/oap/brw_ext per PAGE_SIZE to one per folio extent -
-16384 entries to ~320 for a 64MiB chunk.
+16384 entries to ~320 for a 64MiB chunk.  The high order is
+tried once; a binary decomposition would reach ~73 entries but
+costs an all-or-nothing contiguous allocation per order, on
+pools this node may otherwise never use.
 
 ll_free_dio_buffer() follows the piecewise fill: it walks the
 array in runs of a common order, takes that order from cdp_npgs
@@ -43,32 +46,35 @@ rather than folio_order(), stops at the first NULL so a partly
 filled array is never handed back to the pool, and clears
 cdp_page_count.
 
-The buffer is capped at half the order 0 pool and the caller
-loops; previously a request above the pool limit failed with
--EINVAL.  A zero length request still fails with -EINVAL.
-Encrypted files keep order 0 entries (cdp_no_coalesce).
+A zero length request fails with -EINVAL rather than building an
+empty cdp.  Encrypted files keep order 0 entries
+(cdp_no_coalesce).
 
 The copy loop is reworked with the entries.  A write flushes
 the dcache once per entry rather than once per copy; a short
 write copy re-faults the user pages and retries; the
 short_copies budget resets each pass, so it bounds a pass
-rather than the whole sub-DIO; and a single write copy is
+rather than the whole sub-DIO; the refault covers what the next
+pass will ask for, since asking for only what this one had left
+lets the retry come up short again and spend the budget while
+making progress; and a single write copy is
 bounded because it runs under kmap_atomic() with pagefaults
 disabled -- at 64KiB where copy_folio_from_iter_atomic()
 exists and highmem is off, at the page boundary otherwise.
-cdp_to is now set from the byte count ll_get_iov_memory()
-actually returned rather than the requested one, which also
-corrects when the aligned path marks a DIO extent no-merge.
 
-sanity 398w drives the short-buffer loop with a single write
-larger than the cap, read from sptlrpc.encrypt_page_pools --
-the cap applies per write(2), and a striped file would have LOV
-trim the IO to a stripe first, so the file is unstriped and the
-write is one call.  sanity 119v covers the
-dio_large_folios gate, which needs this buffer to observe.
+The entry order is clamped to cdp_max_ext_pgs as well, so a
+buffer entry cannot exceed the target's pages-per-RPC any more
+than a user buffer entry can.
+
+sanity 119v covers the dio_large_folios gate, which needs this
+buffer to observe, and 119w checks the pages-per-RPC clamp from
+this side: with max_pages_per_rpc tuned to half of
+CDP_EXT_MAX_PAGES, an unaligned DIO must not put a wider bucket
+in rpc_stats.
 
 Generated with Claude Code + Tools
 
+Fixes: 7194eb6431d2 ("LU-13805 clio: bounce buffer for unaligned DIO")
 Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 Change-Id: Ie8aa6c3c66f10d9c4f9a398ba8d8fb8344bdf2b6
 
@@ -677,3 +683,34 @@ Looks good; the piecewise fill, the run-batched free and the entry-based copy lo
 Patch Set 15:
 
 Correction to the cross reference above: 65094 and 68541 ps10 both have clean ZFS runs, so the slowdown is not inherited from below 68541.  It came in after 68541 ps10, and 68619 ps15 already shows it (test_119t 801s against 22s at 68541 ps10).  Details and sessions are on 68541.
+
+--- Message (Patrick Farrell, 2026-09-14 17:17:22.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-14 17:23:23.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-14 17:30:45.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-14 17:56:38.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131729/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-14 18:08:57.000000000) ---
+Patch Set 16:
+
+RISC-V Client Builder: build succesful

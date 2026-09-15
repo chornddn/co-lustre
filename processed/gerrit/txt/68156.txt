@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-11 22:04:30.000000000
-Patch Set:  19
-Insertions: +3136
+Updated:    2026-09-15 14:02:21.000000000
+Patch Set:  20
+Insertions: +3209
 Deletions:  -34
-Comments:   152 (10 unresolved)
+Comments:   163 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -23,228 +23,76 @@ Comments:   152 (10 unresolved)
 --- Commit Message ---
 LU-20606 llapi: scan an ldiskfs target directly
 
-Add llapi_scan_device(), which reads an MDT's or OST's objects
-straight off the device with libext2fs and delivers the same records
-llapi_scan_namespace() does.  No mount, no MDS, no kernel change: it
-runs against a stopped target, a snapshot or a failover partner's LUN,
-read-only and with no write path.
+Add llapi_scan_device(). It reads the objects of an MDT or OST
+directly from the device with libext2fs, and gives the same records as
+llapi_scan_namespace(). It needs no mount, no MDS and no kernel change,
+so it works on a stopped target, a snapshot, or a failover partner's
+LUN. It only reads.
 
-libext2fs stays off liblustreapi.  The backend builds as
-scan_osd_ldiskfs.so and is dlopen'ed on first use, named and found the
-way mount.lustre's own mount_osd_ldiskfs.so is, so a client build has
-no plugin and the call answers ENOTSUP.  Three refusals get three
-answers, because a caller keys off them: ENOTSUP where there is no
-backend to ask, ENOPKG where the backend is there and refused the
-target -- stock e2fsprogs will not open a filesystem with dirdata set,
-and the package to install is the answer -- and EINVAL for a device
-that is not a Lustre target at all.  Giving the first two the same
-errno would have conf-sanity test_300 skip itself on a node carrying a
-real MDT and a build that can scan it.
+The backend is a plugin, scan_osd_ldiskfs.so, loaded with dlopen() in
+the same way as mount.lustre's mount_osd_ldiskfs.so. So liblustreapi
+does not link libext2fs. The errors are different so that a caller can
+tell them apart:
+- ENOTSUP: there is no backend, for example on a client build.
+- ENOPKG: the backend cannot open the target. Stock e2fsprogs refuses
+  dirdata, so Lustre's e2fsprogs is needed.
+- EINVAL: the device is not a Lustre target.
 
-The record grows what a device answers for and a walk does not: the
-object id, the inode generation, the LMA flags, the raw linkea and a
-class.  The label is read the four ways mkfs.lustre writes it -- '-',
-':', '=' and the '+' that tunefs.lustre --nolocallogs leaves on disk
-while the target is stopped, which is exactly when this is what there
-is to read it with.
+New record fields for a device scan: object id, inode generation, LMA
+flags, raw linkea, parent FID and a class. The target label is read in
+all four forms that mkfs.lustre and tunefs.lustre write: '-', ':', '='
+and '+'.
 
-lfsp_stats is appended after lfsp_got rather than placed beside the
-other pointers.  The struct's own rule is that a field appended here
-does not break an application that does not use it, and
-scan_param_whole() implements exactly that, an ascending list of
-field ends chosen by byte count.  Putting it earlier would move
-lfsp_got, so a caller built against the LU-20603 definition and
-passing that lfsp_size would have this library read its lfsp_got as
-lfsp_stats -- and write through it.  Appending costs nothing.
+New public API:
+- lfsp_stats points to a struct llapi_scan_stats that the caller owns.
+  It is added after lfsp_got, so older callers are not affected. Both
+  scanners fill it. On a completed scan, ss_seen equals ss_filtered +
+  ss_skipped + the sum of ss_class. ss_size works like lfsp_size, so
+  the struct can grow later.
+- LLAPI_SCAN_F_INTERNAL also returns the objects that the namespace
+  does not show: the OSD's own objects, DNE agent inodes, and objects
+  with no LMA.
 
-Two more pieces of public API, so the diff holds no surprises. struct
-llapi_scan_stats is what the new lfsp_stats points at: the caller sets
-ss_size and owns the storage, the scan fills the rest on return, and
-the man page describes it as part of the answer rather than as a
-diagnostic.  And LLAPI_SCAN_F_INTERNAL asks for the objects a target
-holds that its namespace never shows -- the OSD's own, the DNE agent
-inodes, the ones with no LMA -- which a scan otherwise counts in
-ss_class and keeps back.  Without it "every object on this device" and
-"every object a walk would find" would be the same question, and only
-one of them is what a target scan is for.
+So that both scanners give the same answer for one file:
+- An object with no LMA on MDT0000 gets its IGIF, built the same way
+  as osd_scrub.c does. This is done only on MDT0000, and only from
+  inode 12: fid_is_igif() is used, not fid_is_sane(). An OST object's
+  FID is read from trusted.fid.
+- A directory's own stripe uses LMV_MAGIC_V1, as llite returns.
+  LMV_USER_MAGIC means a default LMV.
+- stx_attributes has only the flags llite also reports (immutable,
+  append, encrypted), and so_attrs_mask says which flags the scan can
+  answer.
+- LLAPI_SCAN_PARENT is set only when the parent FID is sane.
+- An OST scan does not report the MDT index, linkea or parent in
+  lfsp_got.
+- LLAPI_SCAN_LMV_FOREIGN asked for alone also reads the LMV.
 
-The counters are one accounting rather than several: ss_seen is
-incremented once per object, in the pre-filter, so a skip the backend
-raises after that point adds to ss_skipped alone.  ss_seen equals
-ss_filtered plus ss_skipped plus the sum of ss_class on any completed
-scan, and llapi_scan_device_test asserts it -- an inequality would not
-have caught counting the same object on both sides of the pre-filter.
+Other fixes in the scanner:
+- The LMV buffer is cleared as far as the stripe count reaches, so a
+  reader does not see the previous directory's data. The buffer is a
+  union of the two structures, so it has the right alignment.
+- An inode that cannot be read is counted once, by the chunk that owns
+  it.
+- If a worker cannot start, the scan goes on with fewer workers.
+- If one worker gets a read error, all workers stop.
 
-An object with no LMA is answered with its IGIF rather than with the
-parts to build one from.  The inode number and generation of such an
-object are its FID -- osd_scrub.c builds the same one, and it is not a
-reconstruction, which is LFSCK's job -- so lfsr_fid carries it and
-LLAPI_SCAN_FID is set.  That leaves the generation with no consumer of
-its own and it is not a field: what remains is lfsr_ino, which every
-object has and which names the ones no IGIF can, a ZFS object id being
-wider than an IGIF holds.  There is no LLAPI_SCAN_GEN bit for it.
+fid_is_root() moves to the UAPI header, so userspace can use it.
+Existing callers are not affected. A hand-written root test that also
+accepted a non-zero f_ver now uses it.
 
-llapi_scan_namespace.3 gains the pointer to this page here rather than
-in the patch that wrote it, where it would have referred to a page the
-tree did not yet have.
+The header and the man pages describe what each field is. Each page
+says what its scanner offers lfsp_filter, and llapi_scan_device.3 says
+what 0 in lfsp_want means for a device scan. The man page example now
+escapes its newline correctly.
 
-A worker that cannot be initialised degrades the scan rather than
-failing it, once one worker exists, as the pthread_create() arm beside
-it does: a backend opens the device again per worker,
-lfsp_thread_count is a __u8, and the cursor feeds whatever workers
-there are, so running out of them is not a reason to turn a complete
-result into an error.
+run_tests() in lustre/tests/llapi_test_utils.{c,h} is split, so that
+run_test_tbl() can take a device instead of a mount point.
 
-The page says what stx_attributes carries across scanners.  A device
-scan narrows the inode's own flags to the set llite also declares, so
-one file answers "lfs find -attrs d" the same way whichever scanner
-ran, and so_attrs_mask declares that set in the record's
-stx_attributes_mask -- which is what lets a consumer tell "not
-immutable" from "this scanner cannot say".  ERRORS also spells out the
-two EINVAL cases a caller is most likely to trip, a short lfsp_size
-and a short ss_size.
-
-A directory's own stripe takes LMV_MAGIC_V1.  LMV_USER_MAGIC is how
-the tree marks a *default* LMV: cb_get_dirstripe() sets it exactly
-when fp_get_default_lmv is asked for and LMV_MAGIC_V1 otherwise, and a
-default lives in trusted.dmv, which is never read here -- trusted.lmv
-is the directory's actual stripe.  llite fills LMV_MAGIC_V1 for
-LL_IOC_LMV_GETSTRIPE, so LMV_USER_MAGIC here would have the two
-scanners answer one striped directory with two different values in the
-same field -- the opposite of what lfsr_lmv promises, which is that
-the field means one thing whichever scanner filled it.
-
-No in-tree consumer reaches that difference from a scan record yet, so
-this is a contract broken rather than a wrong answer observed.
-lmv_dump_user_lmm() is what it would break: the magic decides its
-"(Default)" prefix and which fields a bare -v shows, and
-llapi_lov_dump_user_lmm() accepts both values, so a caller pointed at
-a scan record instead of an ioctl reply would print a device scan's
-directories as defaults.  The size is unchanged either way,
-lmv_user_md_size() growing only for LMV_USER_MAGIC_SPECIFIC.
-
-A parent FID the scan will not vouch for is left cleared rather than
-written: LLAPI_SCAN_PARENT is set only where fid_is_sane() accepts
-what trusted.link held, and the field follows the bit, so a caller
-reading it without testing lfsr_valid does not get the raw xattr.
-
-llapi_scan_device.3 gives lfsr_parent_fid an entry of its own, since
-LLAPI_SCAN_PARENT is both what a caller puts in lfsp_want and what it
-has to test in lfsr_valid, and a field named in neither place is a
-field a caller cannot use.
-
-run_tests() in lustre/tests/llapi_test_utils.{c,h} is split so that
-run_test_tbl() takes the table: the new test is handed a device where
-the others take a mountpoint.  llapi_scan_test, llapi_root_test and
-llapi_pool_test share that helper, which is why the split is worth
-naming here rather than left to be read out of the diff.
-
-so_flags is narrowed to the attributes a namespace scan can also
-report.  ll_dir_ioctl() puts only IMMUTABLE, APPEND and, under
-HAVE_LUSTRE_CRYPTO, ENCRYPTED into stx_attributes_mask, and
-llapi_scan_namespace() takes stx_attributes from that mask -- so
-reporting COMPR and NODUMP here would make one file answer "lfs find
---attrs d" differently depending on which scanner ran, where
-stx_attributes is meant to mean one thing whichever filled it.  The
-bit is on the MDT inode either way: making it answerable is llite's to
-do, for both scanners at once.
-
-so_attrs_mask carries that same set into the record's
-stx_attributes_mask, rather than the scanner assuming one set for
-every backend: a bit clear there is "cannot say", which is a different
-answer from the attribute itself being clear.  It is carved from
-so_padding, so every offset above it is unchanged, and a backend that
-leaves it zero has its records leave LLAPI_SCAN_ATTRS clear rather
-than claim attributes nothing vouches for.
-
-scan_lmv_to_user() clears the shard area, not just the header.  One
-buffer serves every object a worker meets, and a directory's converted
-LMV carries the real lum_stripe_count while the size answered is
-header-only -- the shard FIDs being left out on purpose, an MDT index
-needing an FLD lookup this has no client to make.  A consumer sizing
-lum_objects[] by the count rather than by lfsr_lmvsize, which
-lmv_dump_user_lmm() does, then read whatever the last object left
-there: a preceding foreign directory's opaque value, in full.  The
-clear now reaches as far as such a read can, bounded by the room
-before a count off a device measures anything, so what it finds is
-zeroes.  lfsr_lmvsize is the measure either way, and the header says
-so.
-
-The buffer is a union of the two structures it holds rather than a
-bare char[], which carries neither one's alignment while the call site
-casts to both.
-
-An unreadable inode is counted by the chunk that owns it and no
-other.  The skip arm continued without asking either question the
-readable path asks below it, so an inode just past end_ino was
-consumed by this chunk and read again by the chunk starting there,
-and ss_seen and ss_skipped each took it twice; a reserved inode that
-could not be read was counted as an object, where a readable one is
-not.  ext2fs_get_next_inode_full() assigns *ino before returning any
-of the three errors this arm catches -- unlike the errors above it,
-which leave it untouched -- so both questions can be asked here.
-Nothing was ever delivered twice: it was the accounting that
-overstated, which is what the counters exist to be trusted for.
-
-fid_is_root() moves to the UAPI header and the scan calls it.  It was
-in lustre_fid.h by history rather than by need: LU_ROOT_FID and
-lu_fid_eq() are both already public, so the helper is a one-line
-predicate over two things userspace has, and userspace now has the
-same question to ask -- a scan of a target has to tell the root from
-the rest of FID_SEQ_ROOT.  unlikely() is dropped, that header being
-compiled in userspace too, and the definition is removed from
-lustre_fid.h, which includes the UAPI one, so every existing caller in
-llite, lmv, lod, mdd and mdt is unaffected.
-
-That also settles a test that had drifted.  lu_fid_eq() is a
-whole-struct compare, so a hand-written test of f_seq and f_oid called
-a FID in FID_SEQ_ROOT with FID_OID_ROOT and a non-zero f_ver the root,
-where fid_is_namespace_visible() on the MDT would not.  The narrower
-point the spelling exists for is unchanged: the echo client's root
-shares the sequence and is still not visible.
-
-Both scanners fill lfsp_stats.  The structure arrives with this patch,
-which is why the walk did not fill it before -- the field came in with
-the code that needed it, not with the walk -- and there is no reason
-for it to stay that way: a walk counts an object seen once, then
-filtered, skipped, or delivered and namespace-visible, which is every
-class a walk can meet, and the same seen == filtered + skipped +
-sum(class) holds.  It counts atomically rather than per-worker,
-llapi_scan_namespace() running its callback on every thread at once
-where the device scan merges per-worker counters at the end.
-lfsp_stats is checked against LLAPI_SCAN_STATS_MIN_SIZE there too, and
-after the copy-in for the same reason: a short lfsp_size may not reach
-the field.
-
-The struct comment says what the field is rather than which scanners
-use it.  llapi_scan_device.3 also says the stats structure is
-extensible -- ss_size negotiates it exactly as lfsp_size does, so
-counters appended later leave an older caller reading its own fields
--- which was true and written down nowhere.
-
-The struct comments describe the fields rather than which scanner uses
-them.  What each scanner offers lfsp_filter, and what each takes 0 in
-lfsp_want to mean, were spelled out in the header and again on both
-pages, and the header's copy is the one that goes stale: it claimed a
-device scan "offers no path and no name", which LU-20637 makes untrue
-two patches later by naming an OST object from the parent FID in
-trusted.fid.  What is left is the part that does not change -- the
-filter sees only what the scan already had, and 0 means a default the
-two scanners do not share -- with each page saying which fields that
-is for itself.  llapi_scan_device.3 gains the one sentence it was
-missing, what 0 means there.
-
-stack_trap is called without EXIT, which is its default, and the
-setupall after stopall carries no justification -- it is the ordinary
-shape and needs none.  The base tree passes an explicit EXIT eighteen
-times of ninety-two; this series had added thirteen more, so dropping
-ours leaves the file at the eighteen that were already there.
-
-The EXAMPLES fragment escapes its newline with a single backslash.
-troff reads that as a register reference, so the page rendered
-printf("%llu files; %llu seen, %llu skipped0, with the escape and the
-closing quote swallowed.  It needs the doubled form that
-llapi_fid_parse.3 and llapi_scan_rec_path.3 already use.
+conf-sanity test_300 checks the MDS version. It fails, not skips, if
+the scanner is missing, because that is a broken install. It skips the
+OST part for a ZFS, unreachable or older OST, and says so. The
+stack_trap calls no longer pass EXIT, which is the default.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -1025,5 +873,56 @@ Patch Set 19:
 
 --- Message (Hiroshi Nishida, 2026-09-11 22:04:30.000000000) ---
 Patch Set 19:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-15 00:52:09.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-15 00:58:28.000000000) ---
+Patch Set 20:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 00:59:07.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-15 01:00:50.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-15 01:00:51.000000000) ---
+Patch Set 16:
+
+(7 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-15 01:01:09.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+--- Message (jenkins, 2026-09-15 01:27:55.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131758/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 01:40:35.000000000) ---
+Patch Set 20:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Andreas Dilger, 2026-09-15 05:45:24.000000000) ---
+Patch Set 20:
 
 (1 comment)

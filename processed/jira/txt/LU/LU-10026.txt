@@ -8,9 +8,9 @@ Resolution: Unresolved
 Assignee:   Artem Blagodarenko
 Reporter:   Andreas Dilger
 Created:    Sat, 23 Sep 2017 08:01:41 +0000
-Updated:    Thu, 10 Sep 2026 19:48:47 +0000
+Updated:    Mon, 14 Sep 2026 18:59:02 +0000
 Labels:     patch
-Links:      Related: is related to LU-19208; Related: is related to LU-16085; Related: is related to LU-17761; Related: is related to LU-20178; Related: is related to LU-20532; Related: is related to LU-19895; Related: is related to LU-16837; Related: is related to LU-18586
+Links:      Related: is related to LU-19208; Related: is related to LU-16085; Related: is related to LU-17761; Related: is related to LU-20178; Related: is related to LU-20532; Related: is related to LU-19895; Related: is related to LU-20751; Related: is related to LU-16837; Related: is related to LU-18586
 Attachments: BGI-Intel-QAT-Performance-2016-09.pdf, LAD2016-compression_kuhn.pdf, Lustre-client-compression-poster_ISC17.pdf, compression-lz4-chunksize.png, intel_hub_isc17.pdf, ipcc_12_17.pdf
 
 --- Description ---
@@ -2169,3 +2169,35 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 748fc9fc7d14c3c3cbc7b381ad852df55f725dea
+
+--- Comment (paf0186, Mon, 14 Sep 2026 18:06:46 +0000) ---
+CSDC and ZFS OSTs
+
+While looking at server-side compression I checked what CSDC does on a ZFS OST, and it appears to be broken, with nothing preventing its use.
+
+On osd-zfs, osd_write_prep() is a no-op and osd_bufs_get_write() hands out ARC zero-copy buffers without reading any existing data. The OST read-modify-write of a compressed chunk depends on that read: ofd_map_chunks_to_lnb_write() calls is_chunk_start() on the first page of the chunk after dt_write_prep(). On ZFS that page has never been read, so the chunk looks uncompressed, the merge is skipped, and the partial write is stored plain over the compressed image. The chunk is then unreadable.
+
+ofd_decompress_chunk() has the same shape of dependency, collecting source pages with PageUptodate(); the code already notes "XXX: uptodate is not zfs-friendly, need another means".
+
+The CSDC integration commit says "we do not support CSDC with ZFS", but nothing enforces it: tgt_init() sets lut_compress_types_supported = OBD_COMPR_ALL regardless of backend, so a ZFS OST advertises every compression type and clients happily send it compressed data.
+
+This is from reading the code; I have not yet reproduced it on a ZFS VM.
+
+Proposed first step is simply to block the combination, in two small patches:
+
+1. Client: honour an OST that advertises no compression types. Today, if the requested type is not in ocd_compress_types the client falls back to LL_COMPR_TYPE_FAST without checking whether that is supported either, so an OST advertising nothing still receives compressed data.
+
+2. Server: a ZFS OSD advertises no compression types (ddp_mount_type == LDD_MT_ZFS).
+
+Whether to then implement CSDC on ZFS properly - making osd-zfs read the chunk range for DT_BUFS_TYPE_COMPRESSION writes, and replacing the uptodate checks with something ZFS-friendly - is a separate question.
+
+--- Comment (adilger, Mon, 14 Sep 2026 18:34:01 +0000) ---
+Since ZFS already supports compressed data (on the server) natively, I think implementing CSDC for it is not a high priority compared to getting ldiskfs working.  Disabling its use on ZFS targets definitely makes sense.
+
+When integrating CSDC with osd-zfs, I think that rather than writing/reading CSDC data as-is straight through to the ZFS backend, the right approach is to integrate CSDC to provide compressed data blocks that match ZFS's on-disk compressed blocks natively.  That might need some massaging of ll_compr_hdr for osd-zfs, and translating the compression algorithm numbering to match what ZFS uses internally, and then bypassing the ZFS compression engine to provide already-compressed data to ZFS in some manner (this might need a new API, but may have been implemented for the Uni Hamburg work originally).  Hopefully that can be done without copying every byte of data on the OSS, but an initial implementation might keep the CSDC wire protocol intact and rejig the format to match ZFS and only copy the data instead of recompressing it.
+
+--- Comment (paf0186, Mon, 14 Sep 2026 18:40:05 +0000) ---
+Yeah, the main thing for now is we need a proper gate on the client and server sides.  Can be done.
+
+--- Comment (adilger, Mon, 14 Sep 2026 18:59:02 +0000) ---
+I filed LU-20751 for tracking CSDC integration with osd-zfs, which can be done separately after it is disabled for CSDC clients today..

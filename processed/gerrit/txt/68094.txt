@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-18 21:39:22.000000000
-Updated:    2026-09-12 07:29:33.000000000
-Patch Set:  18
-Insertions: +2342
+Updated:    2026-09-15 12:05:36.000000000
+Patch Set:  19
+Insertions: +2413
 Deletions:  -7
-Comments:   164 (7 unresolved)
+Comments:   171 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -23,127 +23,52 @@ Comments:   164 (7 unresolved)
 --- Commit Message ---
 LU-20603 llapi: namespace scanner API
 
-Add llapi_scan_namespace(), which walks a mounted filesystem and hands
-a consumer one record per object rather than a formatted line.
+Add llapi_scan_namespace(). It walks a mounted filesystem and gives
+the caller one record per object, instead of a formatted line.
 
-The record is versioned twice over: lfsp_size says how much of the
-parameter block the caller built, and a validity mask says which
-fields the scanner could answer for, so a field it could not fetch
-leaves its bit clear instead of reading as zero.  lfsp_want is a demand
-mask, so a consumer pays only for what it asks for -- a name test
-costs no ioctl.  An lfsp_flags bit this library does not define is
-refused, because setting a flag leaves lfsp_size unchanged and nothing
-else would keep a newer caller's flag from being ignored in silence.
-The reserved bytes are must-be-zero for the same reason: they are
-already counted in lfsp_size, so a field carved out of them later can
-only be refused here, never noticed.
+The parameter block and the record can grow later:
+- lfsp_size says how much of the parameter block the caller knows.
+  Bytes past this library's definition must be zero, up to
+  LLAPI_SCAN_PARAM_MAX_SIZE (4096 bytes). Only whole fields are
+  copied, so a size that ends inside a field drops that field.
+- lfsp_want says which fields the caller needs, so it pays only for
+  those. A bit this library does not know is dropped, not refused,
+  and lfsp_got reports what the scan can answer.
+- lfsr_valid says which fields were filled. A field the scanner could
+  not get has its bit clear, so it is not mistaken for zero.
+- An unknown lfsp_flags bit, or reserved bytes that are not zero, are
+  refused. Otherwise a newer caller's flag would be ignored silently.
 
-A foreign directory's LMV is left alone.  LL_IOC_LMV_GETSTRIPE answers
-0 with a struct lmv_foreign_md in the same buffer, so fp_get_lmv is
-set for one, and lum_stripe_offset and lfm_type both sit at offset 8,
-so storing the MDT index there would land on the foreign type.  The
-record publishes that buffer as lfsr_lmv with LLAPI_SCAN_LMV_FOREIGN
-set, so a consumer reading exactly what the bit promises would have
-got an MDT index where the type belongs.
+The record starts with a struct statx, so a consumer can cast it to
+one and read the Lustre fields after it. Static asserts check the
+offset and the size. lfsr_padding names a hole the compiler left.
+The prefixes are lfsr_ and lfsp_, because sp_ is already used in the
+tree.
 
-A stat answers for an object the ioctl could not, and lmd_fid then
-holds whatever was written there last: for the walk, the name it
-passed to the ioctl, which fid_is_sane() reads as an IGIF.  So a
-record off Lustre came back with LLAPI_SCAN_FID set and a FID built
-from the object's own name, [0x676962:0x0:0x0] for a file called
-"big".  Cleared where the stat answer is built, in
-convert_lmd_statx(), which is the fallback's last step and also runs
-on the V1-ioctl path, so both callers are covered by the one clear.
+Fixes in the shared helpers, so that they can be shared safely:
+- For an object that is not on Lustre, lmd_fid kept an old value, so
+  the record got a FID made from the file name. The two callers that
+  have no FID now clear it. convert_lmd_statx() no longer clears it,
+  because cb_find_init() has a real FID there.
+- llapi_scan_get_lmv() also clears lum_pool_name, which kept the
+  previous directory's value.
+- A foreign directory's LMV is not changed. Writing the MDT index at
+  offset 8 overwrote the foreign type.
+- STATX_INO is added to LLAPI_SCAN_MDT_MASK. Asked for alone, it came
+  back as zero with its bit clear.
+- LLAPI_SCAN_LMV_FOREIGN asked for alone now also fetches the LMV.
 
-llapi_scan_get_lmv() clears lum_pool_name for the same reason.  A
-directory that answers ENODATA or ENOTTY keeps the caller's one lmv
-buffer, and the four fields a consumer reads for shape are zeroed
-there; the pool name was not, so what stayed was the previous
-directory's.
-
-No consumer can observe that yet.  A directory with no stripe of its
-own leaves lfsr_lmv NULL, so nothing reads the buffer at this patch,
-and the clear is what makes the helper safe to share rather than a
-wrong answer being fixed.  cb_find_init() fills the lmv itself here
-and joins the helper in LU-20605, which is where the clear first
-reaches a caller -- lfs find -printf %Lp.
-
-That makes the HLD's POSIX Input Scanner a contract rather than an
-accident: the same scanner with a different attribute source, filling
-what a stat answers and leaving FID, layout, LMV, MDT index and HSM
-clear.  test10 asserts both halves on a tree that is not Lustre, and
-skips itself where the tree it was given is Lustre, the FID and the
-layout being present there for a good reason.
-
-The copy-in takes whole fields only.  lfsp_size is the caller's and the
-range test alone does not bound it to a field: lfsp_filter is a function
-pointer ending at 32 while the minimum is 24, so a size of 25..31
-passed and memcpy left the pointer built from some of the caller's
-bytes and some zeros -- which the scan then calls.  scan_param_whole()
-rounds the length down to the last field that fits, which is what a
-short size already means, and the field it stops inside is exactly the
-one to drop.
-
-get_projid() loses its static and moves into lustreapi_internal.h.
-The gather needs it, and it is the only function this patch takes out
-of liblustreapi_pfind.c's file scope.  Its own per-object messages
-drop to LLAPI_MSG_DEBUG at the same time, marking them diagnostic: a
-scan calls it once per object where lfs find called it once per match,
-and scan_rec_gather() answers the failure by leaving LLAPI_SCAN_PROJID
-clear rather than by reporting.  The level does not quiet them by
-itself -- llapi_msg_level starts at LLAPI_MSG_MAX and neither lfs nor
-lfind lowers it -- so what changes for those two is the dropped
-"warning: " prefix; what the level buys is a caller able to silence
+get_projid() is no longer static, so the gather can use it. Its
+per-object messages are now LLAPI_MSG_DEBUG, so a caller can silence
 them with llapi_msg_set_level().
 
-STATX_INO joins LLAPI_SCAN_MDT_MASK.  LLAPI_SCAN_STATX_MASK promises
-the whole low half whether this API names the bit or not, and the
-ioctl fills stx_ino, but nothing else does and the bit was in neither
-that mask nor LLAPI_SCAN_DIRENT_MASK -- so lfsp_want = STATX_INO alone
-returned before any fetch and the field arrived zero with its bit
-clear, while STATX_INO|STATX_SIZE answered it.
+llapi_scan_namespace.3 says how long each part of a record stays
+valid. Some parts end when the callback returns, and the layout and
+LMV buffers stay until the next object is gathered.
 
-The lmd_fid clear moves out of convert_lmd_statx() to the two callers
-that have no FID to give.  The third, cb_find_init() under gather_all,
-runs after the V2 ioctl has put a real one there, so clearing inside
-the shared helper threw it away.  Nothing reads lmd_fid on that path
-today; the patch after this one moves lfs find onto the record, where
-lfsr_fid is filled from it.
-
-llapi_scan_namespace.3 says how long each part of a record lasts,
-rather than only that it does not outlive the callback.  The answers
-differ and two are shorter than that rule reads: lfsr_name points into
-lfsr_path rather than beside it, and a directory's lfsr_path is rewritten
-by its own descent before any callback below it runs, while lfsr_fd for
-anything but a directory is closed the moment the callback returns.
-The layout and LMV buffers last longer than the rule instead, until
-the next object is gathered, which is the more dangerous half -- code
-that keeps them works until it does not.
-
-The record begins with its statx, so a consumer can cast it to a
-struct statx and read the Lustre fields past it.  Two static_asserts
-hold that: lfsr_stx at offset 0 and lstatx_t exactly 256 bytes, so a
-foreign binding that mirrors the layout by hand is caught at compile
-time rather than reading every field at the wrong offset.
-
-lfsp_size no longer gates.  A caller built against a longer parameter
-structure is accepted when the bytes past this library's definition
-are zero, rather than refused: the size says what the caller knows,
-not which version it must be.  lfsp_want becomes advisory the same
-way -- a bit this library does not know, or knows but this scan cannot
-answer for, is dropped rather than refused -- and lfsp_got reports the
-subset that was answered, so an application built against a newer
-header can ask an older library for everything it might want and find
-out what it got.
-
-lfsr_padding names the hole the compiler was leaving.  Three
-consecutive __u32 before a pointer left four bytes unnamed inside
-lfsr_size, and a field carved out of them later can only be used if a
-consumer could not have been reading something else there.
-
-The prefixes are lfsr_ and lfsp_ rather than sr_ and sp_.  sp_ is
-already md_op_spec's and ptlrpc_sec_policy's, and a public header
-should not make a reader guess which one a field belongs to.
+test10 scans a tree that is not Lustre: the stat fields are set, and
+FID, layout, LMV, MDT index and HSM are clear. It skips itself when
+the tree is on Lustre.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -893,3 +818,41 @@ Patch Set 18:
 Patch Set 18:
 
 (2 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-15 00:52:09.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-15 00:56:44.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-15 00:57:52.000000000) ---
+Patch Set 19:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 00:58:56.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-15 01:00:50.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+--- Message (jenkins, 2026-09-15 01:20:33.000000000) ---
+Patch Set 19: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131757/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 02:08:30.000000000) ---
+Patch Set 19:
+
+RISC-V Client Builder: build succesful

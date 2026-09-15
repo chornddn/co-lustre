@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-08-31 21:10:34.000000000
-Updated:    2026-09-12 01:27:19.000000000
-Patch Set:  20
-Insertions: +817
-Deletions:  -120
-Comments:   117 (1 unresolved)
+Updated:    2026-09-14 18:00:36.000000000
+Patch Set:  21
+Insertions: +979
+Deletions:  -135
+Comments:   123 (1 unresolved)
 
 --- Labels ---
-  Code-Review: Shaun Tancheff: +1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -50,6 +50,21 @@ goes as well -- both callers already skip a NULL
 coo_dio_pages_init.
 These are shared with the buffered path.
 
+An extent cannot be split across RPCs, so it must not be wider
+than the target's max_pages_per_rpc or the client silently sends
+larger RPCs than configured -- with the tunable at 16 pages a
+THP backed DIO write went out at 256.
+osc_io_publish_dio_maxes() keeps the smallest max_pages_per_rpc
+among the targets an io spans, DoM included, in
+ci_dio_rd_max/ci_dio_wr_max, and cdp_max_ext_pgs carries it into
+the extent build.
+
+lov_page_init_empty()
+zeroes from cp_pgno as well as cp_off, so an uninstantiated PFL
+component is zeroed at the entry's own place in the folio rather
+than at its start -- also a shared path, and the reason a DIO
+entry mid-folio gets the right range.
+
 The references have to be folded with the pages.
 iov_iter_get_pages_alloc2() takes one per PAGE_SIZE, so
 ll_get_iov_memory() drops npgs-1 of them with folio_put_refs()
@@ -73,22 +88,28 @@ its peak footprint roughly doubles; that is bounded by the same
 pool the buffer comes from and unchanged for THP backed
 buffers, which need far fewer entries.
 
-Two bugs that only bite once extents span more than one page
-are fixed here.  The short-io read copy-back did not decrement
-its per-extent byte count, running its memcpy past the end of
-the reply buffer.  That is reachable on the buffered path too
-once folios are multi-page: the copy is clamped to the server's
-reply, not to bp_count, so a 16KiB folio answered with 5000
-bytes copies a full page and then reads past the reply for the
-next one.  The negative
-lost_grant in osc_extent_finish() is not latent as of this
-chain: multi-page bp_count arrives with the parent change
-("enable multi-order folios for BIO writes"), whose buffered
-writes already compute PAGE_SIZE - folio_size into an unsigned
-field.  It is fixed here rather than there only because the
-parent has not landed; the accounting now derives the offset
-and count of the extent's final page instead of using the
-whole extent, so a short tail is still charged.
+The unaligned path fills its buffer from the order 0 pool, which
+refuses a request above its own capacity outright rather than
+returning what it has, so the raised limit would turn a large
+unaligned DIO into -EINVAL on a client without the memory for it.
+ll_allocate_dio_buffer() caps the request at half that pool and
+returns the bytes it covered instead of a page count; the caller
+already loops per buffer.  sanity 398w drives that loop with a
+single write larger than the cap, read from
+sptlrpc.encrypt_page_pools -- the cap applies per write(2), and a
+striped file would have LOV trim the IO to a stripe first, so the
+file is unstriped and the write is one call.
+
+One bug that only bites once extents span more than one page
+is fixed here.  The negative lost_grant in osc_extent_finish()
+is not latent as of this chain: multi-page bp_count arrives
+with the parent change ("enable multi-order folios for BIO
+writes"), whose buffered writes already compute PAGE_SIZE -
+folio_size into an unsigned field.  It is fixed here rather
+than there only because the parent has not landed; the
+accounting now derives the offset and count of the extent's
+final page instead of using the whole extent, so a short tail
+is still charged.
 
 Improvement in time to submit a write per byte (client):
 
@@ -949,3 +970,35 @@ Patch Set 20:
 Patch Set 20:
 
 (1 comment)
+
+--- Message (Patrick Farrell, 2026-09-14 17:17:22.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-14 17:23:18.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-14 17:30:23.000000000) ---
+Patch Set 21:
+
+(6 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre RISC-V Builder, 2026-09-14 17:41:04.000000000) ---
+Patch Set 21:
+
+RISC-V Client Builder: build succesful
+
+--- Message (jenkins, 2026-09-14 17:57:20.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131727/ : SUCCESS
