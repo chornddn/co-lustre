@@ -8,7 +8,7 @@ It need not be default behavior, can be enabled/disabled via policy flags.&lt;/p
         <key id="99210">LU-20691</key>
             <summary>Allow hsm coordinator to move timedout restores to ARS_WAITING</summary>
                 <type id="2" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11311&amp;avatarType=issuetype">New Feature</type>
-                                            <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
                         <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
                     <statusCategory id="2" key="new" colorName="default" />
                                     <resolution id="-1">Unresolved</resolution>
@@ -17,7 +17,7 @@ It need not be default behavior, can be enabled/disabled via policy flags.&lt;/p
                         <labels>
                     </labels>
                 <created>Thu, 3 Sep 2026 17:32:15 +0000</created>
-                <updated>Wed, 9 Sep 2026 19:41:14 +0000</updated>
+                <updated>Wed, 16 Sep 2026 15:54:29 +0000</updated>
                                             <version>Lustre 2.15.5</version>
                                                         <due />
                             <votes>0</votes>
@@ -87,6 +87,65 @@ I did test with recent tip of the master which contains this fix by the way. &l
 llapi_hsm_copytool_register() open a fd on the Lustre mountpoint to communicate with the kernel. If the copytool crash, llapi_hsm_copytool_deregister is not called but linux will cleanup the fd (it closes the fd). On close(), the patch checks if an agent is still registered. If true, the Lustre client will automatically deregister the agent by sending an MDS_HSM_CT_UNREGISTER RPC to the MDT coordinator.&lt;/p&gt;</comment>
                             <comment id="501303" author="eaujames" created="Wed, 9 Sep 2026 19:41:14 +0000">&lt;p&gt;Note: If the entire copytool node becomes unresponsive, the server will evict it and automatically deregister the agent.&lt;br/&gt;
 This case is handle by: 59251: &lt;a href="https://jira.whamcloud.com/browse/LU-18238" title="Ghost hsm/agents on MDTs" class="issue-link" data-issue-key="LU-18238"&gt;&lt;del&gt;LU-18238&lt;/del&gt;&lt;/a&gt; mdt: ghost hsm fix | &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/59251" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/59251&lt;/a&gt;&lt;/p&gt;</comment>
+                            <comment id="501575" author="JIRAUSER19549" created="Tue, 15 Sep 2026 15:58:20 +0000">&lt;p&gt;What if &lt;tt&gt;active_request_timeout&lt;/tt&gt; is shorter than the adaptive client-eviction interval? At the action timeout, the copytool’s export may still be alive, so &lt;a href="https://jira.whamcloud.com/browse/LU-18238" title="Ghost hsm/agents on MDTs" class="issue-link" data-issue-key="LU-18238"&gt;&lt;del&gt;LU-18238&lt;/del&gt;&lt;/a&gt; has not necessarily unregistered or fenced it. Waiting for eviction therefore does not provide a bounded recovery time.&lt;/p&gt;
+
+&lt;p&gt;Since the proposed &lt;tt&gt;ARS_STARTED → ARS_WAITING&lt;/tt&gt; transition is explicitly policy-controlled, administrators can choose between the current terminal behavior and automatic redispatch. I am still not hearing a strong reason against providing that option. If duplicate execution is the concern, could we identify the concrete restore failure mode that makes an opt-in retry unsafe?&lt;/p&gt;</comment>
+                            <comment id="501601" author="JIRAUSER18483" created="Wed, 16 Sep 2026 08:01:52 +0000">&lt;p&gt;As I said, i'm not against, we can have a policy where timeout request are eventually rescheduled. Just keep in mind that a stale restore could still be running somewhere and it should not interfere with the new restore. (ie: the old restore eventually finishing, sending a successfull progress, and be sure no swap or related thing happens).&lt;/p&gt;</comment>
+                            <comment id="501632" author="JIRAUSER19549" created="Wed, 16 Sep 2026 12:01:36 +0000">&lt;p&gt;Yes &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=adegremont_nvda" class="user-hover" rel="adegremont_nvda"&gt;adegremont_nvda&lt;/a&gt; thats a valid concern.The duplicate data transfer itself should be safe because each restore writes to a separate volatile object; the original file is unchanged until successful completion causes the layout swap. Once the new request is bound to its volatile FID, progress from the old restore’s different volatile FID should be rejected. We do have a gap where either copytools can still bind so will handle this in implementation to make sure after timeout previous copy tool it not binding its volatile FID.&lt;/p&gt;</comment>
+                            <comment id="501636" author="eaujames" created="Wed, 16 Sep 2026 13:06:43 +0000">&lt;p&gt;My concern with your proposal is that it presents a solution rather than addressing the underlying issue. I need to fully grasp the problem and its implications before moving forward. The key question we need to address is: Why are there timeout requests in the first place?.&lt;/p&gt;
+
+&lt;p&gt;For example, copytool can reset active request timer on the coordinator by sending hsm_progress request if the data transfer is long.&lt;/p&gt;
+
+&lt;p&gt;You seems to argue that a timeout request have more chance to succeed on another copytool, but that is not always the case. If the backend resource is not accessible, it could pause all the actions for that ressource. In such cases, you shouldn’t immediately reschedule timeout actions, as this could cause actions involving accessible resources to be unnecessarily delayed (or failed). You want the jobs accessing the unreachable resource to fail so that others can proceed.&lt;/p&gt;
+
+&lt;blockquote&gt;
+&lt;p&gt;If duplicate execution is the concern, could we identify the concrete restore failure mode that makes an opt-in retry unsafe?&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;Its depends of your backend, if an action is still running on a copytool it can lock the resource and prevents an another copytool to access it. If no protection are implemented, It can corrupt your backend (more for archive retry, but if you trigger some backend action on restore it can do unexpected things).&lt;/p&gt;
+
+&lt;p&gt;That why I tried to distinguish a stuck copytool/client from a stuck global backend resource.&lt;/p&gt;</comment>
+                            <comment id="501637" author="eaujames" created="Wed, 16 Sep 2026 13:18:04 +0000">&lt;blockquote&gt;
+&lt;p&gt;What if active_request_timeout is shorter than the adaptive client-eviction interval&lt;/p&gt;&lt;/blockquote&gt;
+
+&lt;p&gt;This is a configuration issue.&lt;/p&gt;</comment>
+                            <comment id="501638" author="JIRAUSER19549" created="Wed, 16 Sep 2026 13:25:19 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=eaujames" class="user-hover" rel="eaujames"&gt;eaujames&lt;/a&gt; &lt;br/&gt;
+"it presents a solution rather than addressing the underlying issue. " &lt;br/&gt;
+Intention is to fix a gap with current design. &lt;/p&gt;
+
+&lt;p&gt;"Why are there timeout requests in the first place?"&lt;br/&gt;
+Host crash, network isolation, wedged process etc. &lt;/p&gt;
+
+&lt;p&gt;"You seems to argue that a timeout request have more chance to succeed on another copytool"&lt;br/&gt;
+I am arguing that some other copytool might be able to make progress or determine that the action should be failed if existing copytool is not able to provide any update&lt;/p&gt;
+
+&lt;p&gt;" if an action is still running on a copytool it can lock the resource and prevents an another copytool to access it."&lt;br/&gt;
+Are you referring to volatile FID? Can you explain how that prevents another copytool to complete its write? Might be something I need to handle in implementation. ( I was intending this policy for only restores but I don't see an issue with archives as well ) &lt;/p&gt;</comment>
+                            <comment id="501639" author="JIRAUSER19549" created="Wed, 16 Sep 2026 13:26:33 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=eaujames" class="user-hover" rel="eaujames"&gt;eaujames&lt;/a&gt; &lt;br/&gt;
+"This is a configuration issue."&lt;/p&gt;
+
+&lt;p&gt;Why do I need to depend on these seemingly unrelated configs to reason about my failure cases when I can be more intentional in my approach. &lt;/p&gt;</comment>
+                            <comment id="501640" author="courrier" created="Wed, 16 Sep 2026 14:04:18 +0000">&lt;p&gt;Hi,&lt;/p&gt;
+
+&lt;p&gt;I'm not sure I understand the actual issue.&lt;br/&gt;
+Assuming there is a feature to enable retry when the coordinator sees that a copytool/HSM agent is down (which does not exist yet), I think most of the issues you mention are solved. On client eviction (crash or network split) or copytool crash, the requests would be rescheduled. The only thing which would not be rescheduled is a timeout when a copytool is actually stuck (internal deadlock for instance) but this is a bug in the copytool so I'm not sure this is a good argument for this feature. As Aurélien, I'm not against the feature but I agree with Etienne that it seems to be a solution to a non existing problem. I'd much rather spend energy on implementing a "retry on agent crash" feature. As for the case where eviction timeout is longer than action timeout, I agree with Etienne, I would consider this a configuration issue. HSM progress is tracked through the call to `llapi_hsm_action_progress` which sends an RPC to the MDS so if the timeout of HSM requests is shorter than the request timeout, you will have more timeouts than necessary.&lt;/p&gt;</comment>
+                            <comment id="501642" author="eaujames" created="Wed, 16 Sep 2026 14:17:41 +0000">&lt;blockquote&gt;
+&lt;p&gt;Intention is to fix a gap with current design. &lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;I already said that this is intentional, we want to failed actions on inaccessible backend resources. Keep in mind that HSM have been implemented primarily  for tapes archiving.&lt;br/&gt;
+But I agree that the design can be improved, that why asked questions. For me, blindly resend request to a random copytool is more a workaround than an fix (and if you hide it inside a specific policy, it might not been used).&lt;br/&gt;
+I will reach out to the CEA copytool developers and backend maintainers to get their input on this.&lt;/p&gt;
+
+&lt;blockquote&gt;
+&lt;p&gt;Host crash, network isolation, wedged process etc. &lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;Host crash, network isolation -&amp;gt; Handle by Lustre timeout -&amp;gt; deregister&lt;br/&gt;
+wedged process -&amp;gt; inaccessible from Lustre, this have to be managed outside (HA monitoring?). We still can deregister/evict the copytool on active request timeout but this is expensive and will not solve completely the issue (external resources can still be locked).&lt;/p&gt;
+
+&lt;blockquote&gt;
+&lt;p&gt;Are you referring to volatile FID....&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;I talk about accessing to the backend resource (e.g: HPSS). Lustre have no way to know if the backend resource is busy.&lt;/p&gt;</comment>
+                            <comment id="501651" author="eaujames" created="Wed, 16 Sep 2026 15:54:29 +0000">&lt;blockquote&gt;
+&lt;p&gt;Why do I need to depend on these seemingly unrelated configs to reason about my failure cases when I can be more intentional in my approach.&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;HSM, bulk IO, LDLM... RPCs depend of Lustre adaptive timeout. So set a timeout lower than this one make no sense.&lt;br/&gt;
+For example, in another context, you can set Lustre timeout (at_min/at_max/timeout) lower than lnd_timeout (network timeout) but you could get unwanted client evictions/reconnexions...&lt;br/&gt;
+In your context, it could lead to unwanted retries and flood your backend.&lt;/p&gt;</comment>
                     </comments>
                     <attachments>
                     </attachments>

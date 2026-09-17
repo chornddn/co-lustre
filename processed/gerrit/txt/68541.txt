@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-08-31 21:10:34.000000000
-Updated:    2026-09-14 18:00:36.000000000
-Patch Set:  21
-Insertions: +979
+Updated:    2026-09-16 13:47:11.000000000
+Patch Set:  23
+Insertions: +989
 Deletions:  -135
-Comments:   123 (1 unresolved)
+Comments:   134 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -1002,3 +1002,178 @@ Patch Set 21: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/131727/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-09-15 16:11:17.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-15 16:12:37.000000000) ---
+Patch Set 22:
+
+Patch set 22 fixes a test-ordering problem this change
+introduced, found by sanity 120a failing on 68619 patch set 16.
+
+119t stripes over every OST and writes 32MiB twice, then
+unlinks it.  That leaves one destroy per OST in flight --
+measured at 8 on an 8-OST VM, still 8 a second later -- and
+sanity 120a, which runs next, allows exactly zero cancel RPCs
+across a mkdir.  Its own comment names async object destroy as
+the hazard.
+
+119t now drains them before it returns:
+
+    stack_trap "rm -rf $DIR/$tdir; wait_delete_completed"
+
+destroys_in_flight is 0 on return with that in place.  398w is
+-c 1 and needs nothing.
+
+Also shortened two over-long lines checkpatch flagged in 398w.
+No C code changed.
+
+Full triage, including the unrelated ZFS OOM crash on the same
+run, is on 68619.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 16:16:46.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-15 16:19:00.000000000) ---
+Patch Set 22:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-15 16:37:11.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131788/ : SUCCESS
+
+--- Message (Autotest, 2026-09-15 16:37:52.000000000) ---
+Patch Set 21:
+
+Trevis Autotest 2 is abandoning the following sessions because: later build 131788 found
+- Enforced review-dne-part-3 on el9.8-x86_64/ldiskfs servers and clients
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 16:45:34.000000000) ---
+Patch Set 22:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-15 17:48:03.000000000) ---
+Patch Set 22:
+
+Context I should have had on the ZFS numbers above, and a
+correction to how I framed them.
+
+Slow DIO on ZFS is a known property, and sanity 398b timing out
+on ZFS specifically is LU-15941, open since June 2022 -- the
+same test and the same signature I attributed to this stack.
+398b is fio randrw --direct=1 at 4k and 16k blocks, which is
+ZFS's worst case: small random DIO against a 128k record.  So
+"that, not a hang, is what ran sanity out of the session
+budget" should not have been written as though this series
+introduced the failure mode.  It did not; the failure mode
+predates it by years.
+
+What the known issue does not account for is the size of the
+gap against my own ZFS controls, which were the same test on
+the same filesystem in the same week:
+
+    398b   45-56s   controls, 65094 ps28, 68541 ps10
+    398b   4132s    68620 ps15
+
+If ZFS DIO were uniformly slow those controls would be slow
+too.  So I am not claiming the delta is explained -- only that
+its baseline is a known-bad one and that I should have said so.
+
+For anyone picking this up, the concrete lead is DIO grant
+reservation rather than the DIO path itself.
+osc_queue_dio_pages() reserves
+
+    cl_grant_extent_tax + (1 << cl_chunkbits) *
+        ceil(page_count / ppc)
+
+and cl_chunkbits comes from the OST's ocd_grant_blkbits: 12 on
+ldiskfs, larger on ZFS, so a chunk costs 128k there rather than
+4k.  When the reservation fails, wait_sync makes the extent
+synchronous.  That is a ZFS-only amplifier sitting directly on
+the code this series changes, and it would show up as exactly
+this shape -- fine on ldiskfs, pathological on ZFS.
+
+I have not measured it; these VM images have no ZFS.  Dropping
+it as a blocker for this series either way.
+
+--- Message (Patrick Farrell, 2026-09-15 17:53:11.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-15 17:53:26.000000000) ---
+Patch Set 23:
+
+Cut the cost of 119t on ZFS.
+
+The test ran both transfer sizes over 32MiB.  At 16kiB that is
+2048 separate DIOs, and small DIO on ZFS is slow enough for
+that to matter to a suite that already times out there
+(LU-15941).  The small size only has to cross a couple of 2MiB
+folios to exercise the sub-page index, so it now runs over
+4MiB; the 4MiB transfer keeps the full 32MiB, since it needs
+the repeats to show the 0, 256 extent pattern.
+
+256 transfers instead of 2048.  Measured on ldiskfs, the leg
+alone:
+
+    16k x 2048 (32MiB)   6.24s
+    16k x  256 ( 4MiB)   0.76s
+
+8.2x, scaling with the op count, so the same factor should
+apply to whatever that leg costs on ZFS -- where it was the
+larger share of the 801s this test took at 68619 ps15.
+
+Coverage is unchanged: both transfer sizes still run, still
+from a hugepage backed buffer, still verified by buffered read.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 17:58:25.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-15 18:05:54.000000000) ---
+Patch Set 23:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-15 18:23:27.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131795/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 19:48:31.000000000) ---
+Patch Set 23:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-16 13:47:11.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; the DIO folio extent build, the reference folding in ll_get_iov_memory(), the page-vs-cl_page accounting in osc_dio_submit()/osc_queue_dio_pages() and the reworked lost_grant arithmetic all trace correctly.
+
+One coverage gap: honouring osc.*.max_pages_per_rpc for DIO folio extents (osc_io_publish_dio_maxes() -> ci_dio_{rd,wr}_max -> cdp_max_ext_pgs) is new user-visible behaviour with a concrete failure named in the body -- "with the tunable at 16 pages a THP backed DIO write went out at 256" -- but neither new test exercises it. sanity 119t never touches max_pages_per_rpc, and with the default the CDP_EXT_MAX_PAGES ceiling binds first, so the cap is never the limiting term; 398w is about the order 0 pool cap instead. Would it be worth a case that lowers osc.*.max_pages_per_rpc, drives the 119t hugepage path, and then checks osc.*.rpc_stats for a bucket above the tunable? Not a reason to re-spin on its own.

@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-09-03 20:43:00.000000000
-Updated:    2026-09-15 13:32:45.000000000
-Patch Set:  16
+Updated:    2026-09-16 11:24:48.000000000
+Patch Set:  18
 Insertions: +178
 Deletions:  -82
-Comments:   48 (0 unresolved)
+Comments:   54 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -682,3 +682,144 @@ Patch Set 16: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/131728/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-09-15 16:11:17.000000000) ---
+Uploaded patch set 17: Patch Set 16 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-09-15 16:12:26.000000000) ---
+Patch Set 17:
+
+Triaged both enforced failures on patch set 16.
+
+1. sanityn test_70b, review-dne-zfs-part-5 (CRASH)
+
+Pre-existing, not from this series.  It is
+
+    Kernel panic - not syncing: Out of memory:
+    system-wide panic_on_oom is enabled
+
+with the failing allocation order 0, inside ZFS:
+
+    spl_kmem_cache_alloc -> dbuf_dirty -> dnode_free_range ->
+    dmu_free_long_range -> osd_unlinked_object_free -> ofd_destroy
+
+so it is an OSS draining its unlinked-object list, not client
+code.  The node has zero anon memory, 29 pagecache pages and
+3.7GB of swap untouched, i.e. it is kernel memory, and only
+~400MB of that is slab; the rest is ARC.
+
+Same panic already reported on 67791 ps9 in this same subtest,
+two patches below the DIO work, and on ps15 of this change it
+landed on 71c/71d instead.  The subtest number moves because it
+is wherever the allocation happens to fail.
+
+The obd page pool this patch changes is not a factor on that
+node: its only callers are the client DIO path in cl_io.c and
+gss_bulk.c, and neither runs on an OSS without krb5.
+
+2. sanity test_120a, review-dne-part-1 (FAIL, ldiskfs)
+
+This one is ours, via the test added in 68541, and is fixed in
+the new patch set.
+
+120a tolerates exactly zero cancel RPCs across a mkdir, and its
+own comment names the hazard: "asynchronous object destroy at
+MDT could cause bl ast to client".  119t runs immediately
+before it and is the worst possible neighbour for that -- it
+stripes over every OST (setstripe -c -1) and writes 32MiB
+twice, then unlinks the lot.
+
+Measured on an 8-OST VM, sampling right after that unlink:
+
+    destroys_in_flight=8, still 8 a full second later
+
+one per OST, none drained.  The pre-existing neighbour 119r
+uses -c 2 on a 1MiB file, so the window 120a was exposed to
+before was far smaller.  120a itself passes 81/81 on master
+over the last 14 days, so it is the new neighbour that changed,
+not the test.
+
+Fix is one line in 119t, matching the idiom sanity.sh already
+uses in 49 places:
+
+    stack_trap "rm -rf $DIR/$tdir; wait_delete_completed"
+
+After it, destroys_in_flight is 0 immediately on return from
+119t.  119v, 119w and 398w are all -c 1 and need nothing.
+
+To be clear about what is and is not shown: the mechanism and
+the fix are measured, but I did not reproduce the 120a failure
+itself locally -- it passed 3/3 before the fix as well, which
+is what a narrow race looks like.
+
+Also in the new patch sets: two over-long lines checkpatch
+flagged (sanity.sh, in 398w and 119w).  No C code changed, so
+the standalone builds are unaffected.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 16:16:53.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-15 16:18:48.000000000) ---
+Patch Set 17:
+
+(2 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-15 16:41:16.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131789/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 17:13:51.000000000) ---
+Patch Set 17:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Patrick Farrell, 2026-09-15 17:53:11.000000000) ---
+Uploaded patch set 18: Patch Set 17 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-15 17:58:31.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-15 18:06:05.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-15 18:15:23.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131794/ : SUCCESS
+
+--- Message (Lustre RISC-V Builder, 2026-09-15 18:33:36.000000000) ---
+Patch Set 18:
+
+RISC-V Client Builder: build succesful
+
+--- Message (Gerrit AI review for Lustre, 2026-09-16 11:24:48.000000000) ---
+Patch Set 18:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The two ride-along fixes and both Fixes: tags check out, and the commit message matches what the diff does. Only optional naming/comment nits inline for whenever it is next refreshed - no need to re-spin for them.
