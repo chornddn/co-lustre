@@ -1,0 +1,431 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20778] Unified I/O target selection and object-offset I/O</title>
+                <link>https://jira.whamcloud.com/browse/LU-20778</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h1&gt;&lt;a name="UnifiedI%2FOtargetselectionandobjectoffsetI%2FO"&gt;&lt;/a&gt;Unified I/O target selection and object-offset I/O&lt;/h1&gt;
+
+&lt;p&gt;Give the whole family of "do I/O against one stripe (i.e. one OST object) inside a layout component" operations a single addressing model and a single userspace interface, so that FLR designated mirror, EC parity resync/verify, single-stripe migration (&lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt; / &lt;a href="https://jira.whamcloud.com/browse/LU-20541" title="FLR-EC: lfs support to migrate a stripe to a different OST" class="issue-link" data-issue-key="LU-20541"&gt;LU-20541&lt;/a&gt;), EC rebuild and PFL/DoM merging (&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;) all share the same target description and UAPI.&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;One target-selection UAPI: &lt;tt&gt;struct lov_io_target&lt;/tt&gt; plus &lt;tt&gt;LL_IOC_LOV_SET_IO_TARGET&lt;/tt&gt; / &lt;tt&gt;LL_IOC_LOV_CLEAR_IO_TARGET&lt;/tt&gt;. All four &lt;tt&gt;lov_io_scope&lt;/tt&gt; values — &lt;tt&gt;FILE&lt;/tt&gt; / &lt;tt&gt;MIRROR&lt;/tt&gt; / &lt;tt&gt;STRIPE&lt;/tt&gt; / &lt;tt&gt;OBJECT&lt;/tt&gt; — are defined in the first UAPI version; &lt;tt&gt;OBJECT&lt;/tt&gt; is initially reserved and implemented in P2.&lt;/li&gt;
+	&lt;li&gt;Identity and offset space are kept separate: &lt;tt&gt;STRIPE&lt;/tt&gt; pins one object but keeps using file offsets; only &lt;tt&gt;OBJECT&lt;/tt&gt; reinterprets &lt;tt&gt;pos&lt;/tt&gt; as an object offset.&lt;/li&gt;
+	&lt;li&gt;Object-offset I/O is a &lt;b&gt;separate entry path&lt;/b&gt;; it does not restructure the existing file→stripe mapping. It is &lt;tt&gt;O_DIRECT&lt;/tt&gt; only and serves &lt;tt&gt;lfs&lt;/tt&gt; / &lt;tt&gt;llapi&lt;/tt&gt; only.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="0.Terminology"&gt;&lt;/a&gt;0. Terminology&lt;/h2&gt;
+
+&lt;p&gt;Terminology follows existing Lustre / LOV usage. Note in particular that &lt;tt&gt;lmm_stripe_offset&lt;/tt&gt; in the UAPI is the starting OST index, &lt;b&gt;not&lt;/b&gt; a byte offset within an object. The latter is always called an &lt;b&gt;object offset&lt;/b&gt; here.&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Term&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Meaning&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;file offset&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Byte offset in the parent file (LOV coordinate, &lt;tt&gt;lov_off&lt;/tt&gt;)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;object offset&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Byte offset within one OST object (&lt;tt&gt;obdoff&lt;/tt&gt;)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;obj(X)&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The object offset obtained by projecting file offset &lt;tt&gt;X&lt;/tt&gt; onto a given stripe under the component's striping geometry; &lt;tt&gt;obj(e_start)&lt;/tt&gt; / &lt;tt&gt;obj(e_end)&lt;/tt&gt; are the projections of the component boundaries&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;prefix hole&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The range &lt;tt&gt;[0, obj(e_start))&lt;/tt&gt; in an object's address space: it does not contribute to the parent file's &lt;tt&gt;i_size&lt;/tt&gt;, cannot be reached through that component's file-offset path, and is exactly what &lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt; needs to write&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+&lt;h2&gt;&lt;a name="1.Background"&gt;&lt;/a&gt;1. Background&lt;/h2&gt;
+&lt;h3&gt;&lt;a name="1.1Today%3Athreeunrelatedwaystodesignateatarget"&gt;&lt;/a&gt;1.1 Today: three unrelated ways to designate a target&lt;/h3&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Consumer&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Current mechanism&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Offset space&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Problem&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;FLR resync / verify&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;LL_IOC_FLR_SET_MIRROR(long)&lt;/tt&gt;, &lt;tt&gt;fd_designated_mirror&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Can only select a mirror, not a stripe; no layout_version / FID validation&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;EC parity resync / verify (EC branch)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;LL_IOC_FLR_SET_STRIPE(long)&lt;/tt&gt;, meaning "which parity within the raidset"&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset (parity relative to component &lt;tt&gt;e_start&lt;/tt&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The interface exposes raidset-internal geometry; inconsistent with the mirror interface&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Single-stripe migration (&lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Userspace converts file offset to object offset via &lt;tt&gt;lov_stripe_offset()&lt;/tt&gt; and then copies; swap uses &lt;tt&gt;LL_IOC_LOV_SWAP_LAYOUTS_FID&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset for the copy, FID for the swap&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The copy duplicates the conversion in userspace; PFL components, parity, and &lt;tt&gt;SEEK_DATA&lt;/tt&gt; on the parent file crossing stripes / components all need separate handling&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;All three are fundamentally the same operation: &lt;b&gt;select one OST object identified by (component, stripe), then read or write it in some offset space&lt;/b&gt;. Today identity, offset space and failure policy are tangled inside each individual ioctl. Once such an interface ships, any later consolidation must retain compatibility paths.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="1.2Usecases"&gt;&lt;/a&gt;1.2 Use cases&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;EC rebuild: data on a failed OST is recovered from parity and written into a new object.&lt;/li&gt;
+	&lt;li&gt;OST decommissioning / moving a single stripe to another OST: relocate one object as a whole, leaving the rest of the file untouched.&lt;/li&gt;
+	&lt;li&gt;PFL/DoM merging (&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;): write the data of the DoM component (or of the previous component) into the prefix hole of the next component's object, then move that component's &lt;tt&gt;e_start&lt;/tt&gt; down and delete the previous component. Whole-file DoM→OST migration (&lt;a href="https://jira.whamcloud.com/browse/LU-10177" title="DoM: manual migration MDT-OST" class="issue-link" data-issue-key="LU-10177"&gt;&lt;del&gt;LU-10177&lt;/del&gt;&lt;/a&gt; / &lt;a href="https://jira.whamcloud.com/browse/LU-11421" title="DoM: manual migration OST-MDT, MDT-MDT" class="issue-link" data-issue-key="LU-11421"&gt;&lt;del&gt;LU-11421&lt;/del&gt;&lt;/a&gt;) already exists, but at the cost of rewriting the whole file; &lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt; is the optimisation of that.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Object bytes outside the visible range cannot be reached through that component's file-offset path, which is why &lt;tt&gt;OBJECT&lt;/tt&gt; is needed.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="2.Goals"&gt;&lt;/a&gt;2. Goals&lt;/h2&gt;
+&lt;ol&gt;
+	&lt;li&gt;One SET/CLEAR ioctl pair and one structure that can name a mirror, a parity, or a single stripe, with layout_version and FID validation. FLR mirror stays on &lt;tt&gt;SET_MIRROR&lt;/tt&gt; as an alias for {MIRROR, mirror_id}; behaviour is unchanged.&lt;/li&gt;
+	&lt;li&gt;Object-offset I/O is a &lt;b&gt;separate entry path&lt;/b&gt; in the kernel: it does not restructure the existing file→stripe mapping and introduces no regression on the file-offset path.&lt;/li&gt;
+	&lt;li&gt;Replacing an OST object (migration, rebuild) always uses single-stripe swap; on an existing data object, object-offset writes are only opened up for the prefix hole (&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;), and no other range — see §3.1.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h2&gt;&lt;a name="3.Addressingmodel"&gt;&lt;/a&gt;3. Addressing model&lt;/h2&gt;
+
+&lt;p&gt;A single I/O selects its target by scope, and the offset space of &lt;tt&gt;pos&lt;/tt&gt; follows the scope:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;scope&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Target&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Space of &lt;tt&gt;pos&lt;/tt&gt;&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;FILE&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The whole file&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;MIRROR&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;One FLR mirror (&lt;tt&gt;mirror_id&lt;/tt&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;STRIPE&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;One OST object (&lt;tt&gt;comp_id&lt;/tt&gt;, &lt;tt&gt;stripe_idx&lt;/tt&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;file offset, via the file→stripe mapping&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;OBJECT&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;The same OST object (same fields)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;object offset&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;stripe_idx&lt;/tt&gt; is the object index within the component (same ordering as &lt;tt&gt;lfs getstripe&lt;/tt&gt;). On parity, "which parity within the raidset" is &lt;tt&gt;idx % p&lt;/tt&gt; and the raidset is &lt;tt&gt;idx / p&lt;/tt&gt;; these are derived quantities, not interface concepts.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;fid&lt;/tt&gt; is the same FID used by &lt;tt&gt;LL_IOC_LOV_SWAP_LAYOUTS_FID&lt;/tt&gt;. A non-zero &lt;tt&gt;lit_fid&lt;/tt&gt; is validated; all-zero is not. &lt;tt&gt;OBJECT&lt;/tt&gt; scope requires a non-zero FID.&lt;/li&gt;
+	&lt;li&gt;Whether a failure triggers recovery is only defined under file offsets; it follows the existing read path by default and is not part of the UAPI.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="3.1OBJECTI%2FOrules"&gt;&lt;/a&gt;3.1 OBJECT I/O rules&lt;/h3&gt;
+
+&lt;p&gt;OBJECT reads may target the selected data or parity object; writes to an existing data object do not open up the whole object. The rules below define the read and write boundaries; replacing the object is a different operation (single-stripe swap).&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Reads: the target object's kms determines the boundary. Glimpse first if kms is invalid or the requested position exceeds it; return &lt;tt&gt;-EIO&lt;/tt&gt; if the target is unavailable.&lt;/li&gt;
+	&lt;li&gt;Writes to a data object: only the prefix hole.&lt;/li&gt;
+	&lt;li&gt;Replacing an object: independent of offset space; fill the new object, do a final data version check, then single-stripe swap.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Object range&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Object-offset write&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;[0, obj(e_start))&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;accepted — the prefix hole, &lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;[obj(e_start), obj(e_end))&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;rejected — the visible range uses file offset + designated (already covered by P1)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;[obj(e_end), ∞)&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;-EINVAL&lt;/tt&gt; — no consumer&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;An object's size may exceed the component's visible span: that is the prefix hole, already true for PFL. &lt;tt&gt;lov_stripe_size()&lt;/tt&gt; maps those bytes to a file offset below &lt;tt&gt;e_start&lt;/tt&gt;; &lt;tt&gt;lov_attr_get_composite()&lt;/tt&gt; takes the max across components, so a prefix write cannot raise &lt;tt&gt;i_size&lt;/tt&gt;. Writes past &lt;tt&gt;obj(e_end)&lt;/tt&gt; are rejected by rule 2. Under the prefix-hole-only rule, the existing size/kms merge path does not change; the OBJECT write path itself must not use an object offset to update the VVP inode's &lt;tt&gt;i_size&lt;/tt&gt; (see §4.2).&lt;/p&gt;
+&lt;h2&gt;&lt;a name="4.Design"&gt;&lt;/a&gt;4. Design&lt;/h2&gt;
+&lt;h3&gt;&lt;a name="4.1UAPI"&gt;&lt;/a&gt;4.1 UAPI&lt;/h3&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+&lt;span class="code-keyword"&gt;enum&lt;/span&gt; lov_io_scope {
+	LOV_IO_SCOPE_FILE	= 0,	&lt;span class="code-comment"&gt;/* whole file; pos is a file offset */&lt;/span&gt;
+	LOV_IO_SCOPE_MIRROR	= 1,	&lt;span class="code-comment"&gt;/* one FLR mirror; pos is a file offset */&lt;/span&gt;
+	&lt;span class="code-comment"&gt;/* pin one OST object; pos is still a file offset, via file-&amp;gt;stripe mapping */&lt;/span&gt;
+	LOV_IO_SCOPE_STRIPE	= 2,
+	&lt;span class="code-comment"&gt;/* pos is an object offset */&lt;/span&gt;
+	LOV_IO_SCOPE_OBJECT	= 3,
+};
+
+&lt;span class="code-keyword"&gt;struct&lt;/span&gt; lov_io_target {
+	__u32		lit_scope;		&lt;span class="code-comment"&gt;/* &lt;span class="code-keyword"&gt;enum&lt;/span&gt; lov_io_scope */&lt;/span&gt;
+	__u32		lit_flags;		&lt;span class="code-comment"&gt;/* must be 0; reserved */&lt;/span&gt;
+	__u32		lit_mirror_id;		&lt;span class="code-comment"&gt;/* MIRROR */&lt;/span&gt;
+	__u32		lit_comp_id;		&lt;span class="code-comment"&gt;/* STRIPE / OBJECT */&lt;/span&gt;
+	__u32		lit_stripe_idx;		&lt;span class="code-comment"&gt;/* STRIPE / OBJECT, object index in component */&lt;/span&gt;	
+	&lt;span class="code-keyword"&gt;struct&lt;/span&gt; lu_fid	lit_fid;		&lt;span class="code-comment"&gt;/* validated&lt;span class="code-keyword"&gt; if&lt;/span&gt; non-zero; required &lt;span class="code-keyword"&gt;for&lt;/span&gt; OBJECT */&lt;/span&gt;	
+};
+
+&lt;span class="code-macro"&gt;#define LL_IOC_LOV_SET_IO_TARGET	_IOW(&lt;span class="code-quote-red"&gt;'f'&lt;/span&gt;, 180, &lt;span class="code-keyword"&gt;struct&lt;/span&gt; lov_io_target)
+&lt;/span&gt;&lt;span class="code-macro"&gt;#define LL_IOC_LOV_CLEAR_IO_TARGET	_IO (&lt;span class="code-quote-red"&gt;'f'&lt;/span&gt;, 181)&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Enum-valued fields in UAPI structures are declared as &lt;tt&gt;__u32&lt;/tt&gt; with the real &lt;tt&gt;enum&lt;/tt&gt; named in a comment next to the field: the width and signedness of a C &lt;tt&gt;enum&lt;/tt&gt; vary between compilers, while ioctl structures must have fixed widths. This matches &lt;tt&gt;idv_flags&lt;/tt&gt; / &lt;tt&gt;pccs_type&lt;/tt&gt; in the tree. No &lt;tt&gt;lov_io_target_flags&lt;/tt&gt; is defined: object offsets are a scope value, not a bit.&lt;/p&gt;
+
+&lt;p&gt;Validation and semantics:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;Unknown &lt;tt&gt;lit_scope&lt;/tt&gt;, &lt;tt&gt;lit_flags != 0&lt;/tt&gt;, or non-zero &lt;tt&gt;lit_padding&lt;/tt&gt; → &lt;tt&gt;-EINVAL&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;STRIPE&lt;/tt&gt;: pins one object, &lt;tt&gt;pos&lt;/tt&gt; is still a file offset. Object bytes outside that component's visible extent remain unreachable.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;OBJECT&lt;/tt&gt;: same &lt;tt&gt;comp_id&lt;/tt&gt; / &lt;tt&gt;stripe_idx&lt;/tt&gt;, &lt;tt&gt;pos&lt;/tt&gt; is an object offset; requires a non-zero &lt;tt&gt;lit_fid&lt;/tt&gt;, &lt;tt&gt;O_DIRECT&lt;/tt&gt;, and no mmap. Mutating operations added in P3 also require a non-zero &lt;tt&gt;lit_layout_version&lt;/tt&gt;. Unavailable objects return &lt;tt&gt;-EIO&lt;/tt&gt; and do not enter &lt;tt&gt;CIT_EC_RD&lt;/tt&gt;. Reserved in the enum from P1, returning &lt;tt&gt;-EOPNOTSUPP&lt;/tt&gt; until implemented; I/O is wired up in P2.&lt;/li&gt;
+	&lt;li&gt;Non-&lt;tt&gt;FILE&lt;/tt&gt; scopes require &lt;tt&gt;O_DIRECT&lt;/tt&gt;; &lt;tt&gt;LL_IOC_FLR_SET_MIRROR&lt;/tt&gt; is kept as an alias for {MIRROR, mirror_id}.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="4.2Kernel"&gt;&lt;/a&gt;4.2 Kernel&lt;/h3&gt;
+
+&lt;p&gt;No new &lt;tt&gt;cl_io_type&lt;/tt&gt;: when &lt;tt&gt;ci_obj_offset&lt;/tt&gt; is set, &lt;tt&gt;lov_io_init_composite()&lt;/tt&gt; attaches &lt;tt&gt;&amp;amp;lov_obj_io_ops&lt;/tt&gt; instead of &lt;tt&gt;&amp;amp;lov_io_ops&lt;/tt&gt;. Identity filtering stays on &lt;tt&gt;ci_designated_*&lt;/tt&gt; + &lt;tt&gt;lov_io_stripe_wanted()&lt;/tt&gt;; the file→stripe algorithm is unchanged.&lt;/p&gt;
+
+&lt;p&gt;Only one LOV callback is &lt;b&gt;rewritten&lt;/b&gt; for the OBJECT path. Every other difference is a &lt;b&gt;short-circuit (early-return) branch&lt;/b&gt; that performs the minimum object-coordinate work and returns. The file-offset helpers (&lt;tt&gt;lov_io_rw_iter_init()&lt;/tt&gt;, &lt;tt&gt;lov_io_iter_init()&lt;/tt&gt;, &lt;tt&gt;lov_offset.c&lt;/tt&gt;) are not modified.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Rewrite&lt;/b&gt; — only &lt;tt&gt;cio_iter_init&lt;/tt&gt;. Existing iterator callbacks split a file-offset range across components and stripes; OBJECT wants one sub-io, identity &lt;tt&gt;lis_pos&lt;/tt&gt; / &lt;tt&gt;lis_endpos&lt;/tt&gt;, and &lt;tt&gt;ci_continue = 0&lt;/tt&gt;. It therefore uses &lt;tt&gt;lov_obj_io_iter_init&lt;/tt&gt; rather than adding branches to &lt;tt&gt;lov_io_rw_iter_init()&lt;/tt&gt; / &lt;tt&gt;lov_io_iter_init()&lt;/tt&gt;. Writes are range-checked per rule 2 of §3.1. P2 covers READ/LSEEK; P3 covers WRITE/DV/FSYNC. Except for the dedicated short-circuit callbacks listed below, the remaining &lt;tt&gt;cio_&lt;b&gt;{&lt;/b&gt;&lt;/tt&gt;} &lt;b&gt;keep pointing at the existing &lt;tt&gt;lov_io_&lt;/tt&gt;&lt;/b&gt;.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Short-circuit branches&lt;/b&gt; — any existing path that would map &lt;tt&gt;pos&lt;/tt&gt; as a file offset, cross components, or update the file's &lt;tt&gt;i_size&lt;/tt&gt; returns after the OBJECT-specific identity work. For a &lt;tt&gt;cio_&lt;b&gt;{&lt;/b&gt;}{&lt;/tt&gt;}&lt;b&gt;, &lt;tt&gt;lov_obj_io_ops&lt;/tt&gt; points at a dedicated callback; where that table cannot select the call (layout &lt;tt&gt;llo_&lt;/tt&gt;&lt;/b&gt;, before the table is attached, or VVP), the existing function gets a branch.&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Function&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;OBJECT branch does&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;lov_obj_io_lseek_end&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Return an object offset, never crossing components&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;lov_obj_io_lru_reserve&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Reserve on the single object &lt;tt&gt;lis_obj_*&lt;/tt&gt;; do not call &lt;tt&gt;lov_stripe_intersects()&lt;/tt&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;lov_lock_sub_init()&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;One identity sub-lock on &lt;tt&gt;lis_obj_&lt;b&gt;{&lt;/b&gt;&lt;/tt&gt;} &lt;b&gt;(&lt;tt&gt;llo_&lt;/tt&gt;&lt;/b&gt;, still &lt;tt&gt;LLT_COMP&lt;/tt&gt;)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;lov_page_init_composite()&lt;/tt&gt; / &lt;tt&gt;lov_dio_pages_init_composite()&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;suboff = offset&lt;/tt&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;lov_io_slice_init()&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Before the table is attached, resolve (comp_id, idx) into &lt;tt&gt;lis_obj_*&lt;/tt&gt; (do not set &lt;tt&gt;LU_LAYOUT_RESYNC&lt;/tt&gt;; that bit is only for designated resync writes)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;ll_direct_IO()&lt;/tt&gt; / &lt;tt&gt;vvp_prep_size()&lt;/tt&gt; / lseek&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;EOF from the target object's kms, not the file's &lt;tt&gt;i_size&lt;/tt&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;vvp_io_write_start()&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Do not update the file's &lt;tt&gt;i_size&lt;/tt&gt; from an object offset&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;EOF has three cases: &lt;tt&gt;OBJECT&lt;/tt&gt; → kms of the target object (glimpse if kms is invalid or &lt;tt&gt;pos &amp;gt; kms&lt;/tt&gt;); &lt;tt&gt;ci_parity_io&lt;/tt&gt; → &lt;tt&gt;ci_parity_eof&lt;/tt&gt;; otherwise the file's &lt;tt&gt;i_size&lt;/tt&gt;. &lt;tt&gt;OBJECT&lt;/tt&gt; does not set &lt;tt&gt;ci_parity_io&lt;/tt&gt; and does not use &lt;tt&gt;ci_parity_eof&lt;/tt&gt; (that is the projection of designated parity into file space, a different space). The read path must not go through &lt;tt&gt;generic_file_read_iter()&lt;/tt&gt;, or a DIO short-read fallback would pull object pages into the file page cache.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="4.3Userspace"&gt;&lt;/a&gt;4.3 Userspace&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;llapi_io_target_set/clear&lt;/tt&gt;; &lt;tt&gt;llapi_mirror_set/clear&lt;/tt&gt; become wrappers.&lt;/li&gt;
+	&lt;li&gt;Target resolution: by (comp_id, idx), by FID, or by OST.&lt;/li&gt;
+	&lt;li&gt;OBJECT-scope &lt;tt&gt;pread&lt;/tt&gt; / &lt;tt&gt;lseek&lt;/tt&gt; (P2) and &lt;tt&gt;pwrite&lt;/tt&gt; (P3, prefix hole &lt;b&gt;&lt;tt&gt;[0, obj(e_start))&lt;/tt&gt; only&lt;/b&gt;). Use the &lt;tt&gt;llapi_io_object_*&lt;/tt&gt; prefix (the same family as &lt;tt&gt;llapi_io_target_set&lt;/tt&gt;, matching &lt;tt&gt;LOV_IO_SCOPE_OBJECT&lt;/tt&gt;).&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="4.4Whereeachconsumerlands"&gt;&lt;/a&gt;4.4 Where each consumer lands&lt;/h3&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Consumer&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Source&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Destination&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Single-stripe migration (&lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Today userspace converts file offsets to object offsets → becomes &lt;tt&gt;SEEK_DATA&lt;/tt&gt; + &lt;tt&gt;pread&lt;/tt&gt; on the object&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Identity &lt;tt&gt;pwrite&lt;/tt&gt; on a volatile file with &lt;tt&gt;stripe_count = 1&lt;/tt&gt; + single-stripe swap (unchanged)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;EC rebuild&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Recovery read by file offset (automatically entering &lt;tt&gt;CIT_EC_RD&lt;/tt&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Same as above: identity write to a volatile file + single-stripe swap&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;EC resync / verify&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Still operates on raidset rows; I3 may switch the read side to object offsets&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;File offset + designated / &lt;tt&gt;CIT_EC_WR&lt;/tt&gt; (unchanged)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;EC dump&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Linear address → (idx, object offset); geometry stays in userspace&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;—&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;PFL/DoM merging (&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;—&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Client writes the prefix hole by object offset &lt;b&gt;or&lt;/b&gt; MDS &lt;tt&gt;OUT_WRITE&lt;/tt&gt;; both options stand, and both need the MDS layout change&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+&lt;h2&gt;&lt;a name="5.Implementationphases"&gt;&lt;/a&gt;5. Implementation phases&lt;/h2&gt;
+
+&lt;p&gt;P1–P3 are core implementation phases; I1–I4 are consumer-integration phases.&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;P1 ──► P2 ──► P3 ──► I4 client (LU-13612 prefix write)
+ │      │
+ │      ├──► I1  migration copy source uses object read
+ │      └──► I3  dump/verify reads use object offset (may defer)
+ └──► I2  EC rebuild (file-offset recovery; no object I/O)
+
+MDS layout change ──► I4 client
+                  └──► I4 MDS OUT_WRITE
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Phase&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Content&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Depends on&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Notes&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;P1&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ioctl; FILE / MIRROR / STRIPE; OBJECT reserved&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;—&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Land with &lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt; or EC&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;P2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;OBJECT read + lseek&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P1&lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;P3&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Prefix-hole write&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;I1&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Migration copy source uses object read&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt; / &lt;a href="https://jira.whamcloud.com/browse/LU-20541" title="FLR-EC: lfs support to migrate a stripe to a different OST" class="issue-link" data-issue-key="LU-20541"&gt;LU-20541&lt;/a&gt;: move one stripe; dest + swap unchanged&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;I2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;File-offset recovery + volatile write + swap&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P1&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;EC rebuild; no object I/O&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;I3&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;dump/verify reads use object offset&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20690" title="FLR-EC: handle '--ec k+p' components with p &amp;gt; k" class="issue-link" data-issue-key="LU-20690"&gt;LU-20690&lt;/a&gt;; may defer&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;I4&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Prefix-hole write or MDS &lt;tt&gt;OUT_WRITE&lt;/tt&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;P3 / MDS&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;; &lt;a href="https://jira.whamcloud.com/browse/LU-10177" title="DoM: manual migration MDT-OST" class="issue-link" data-issue-key="LU-10177"&gt;&lt;del&gt;LU-10177&lt;/del&gt;&lt;/a&gt; / &lt;a href="https://jira.whamcloud.com/browse/LU-11421" title="DoM: manual migration OST-MDT, MDT-MDT" class="issue-link" data-issue-key="LU-11421"&gt;&lt;del&gt;LU-11421&lt;/del&gt;&lt;/a&gt; already landed as whole-file fallback&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;Ordering principles: identity before offset space; reads before writes; replacing an object always goes through single-stripe swap; object-offset writes are only opened up for the prefix hole.&lt;/p&gt;
+
+&lt;p&gt;I3 may be deferred independently; whether P2 itself slips depends on the I1 / I4 schedule. Neither P2 nor P3 is removed from the model.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="AppendixA.Rationale"&gt;&lt;/a&gt;Appendix A. Rationale&lt;/h2&gt;
+&lt;h3&gt;&lt;a name="A.1Whyobjectoffsetsareneeded"&gt;&lt;/a&gt;A.1 Why object offsets are needed&lt;/h3&gt;
+
+&lt;p&gt;Migration and rebuild write a &lt;b&gt;new&lt;/b&gt; OST object: a plain &lt;tt&gt;pwrite&lt;/tt&gt; on a volatile file with &lt;tt&gt;stripe_count = 1&lt;/tt&gt; (an identity mapping) followed by single-stripe swap is enough, so the destination side does not need object-offset writes on the parent file (&lt;a href="https://jira.whamcloud.com/browse/LU-20534" title="FLR-EC: Stripe replacement: swapping individual stripes between components" class="issue-link" data-issue-key="LU-20534"&gt;LU-20534&lt;/a&gt; lands as it stands).&lt;/p&gt;
+
+&lt;p&gt;What file offsets &lt;b&gt;cannot reach&lt;/b&gt;, and therefore still requires object offsets, is mainly:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;Writes (&lt;a href="https://jira.whamcloud.com/browse/LU-13612" title="efficient DoM-&amp;gt;OST component migration" class="issue-link" data-issue-key="LU-13612"&gt;&lt;del&gt;LU-13612&lt;/del&gt;&lt;/a&gt;)&lt;/b&gt;: only the DoM / previous component is touched; the next object stays in place. The prefix hole on that object does not contribute to &lt;tt&gt;i_size&lt;/tt&gt; and that component's file-offset path cannot reach it, so it has to be written by object offset, or via MDS &lt;tt&gt;OUT_WRITE&lt;/tt&gt; (see §4.4).&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Reads (the source side of a single-stripe copy)&lt;/b&gt;: on a healthy object this becomes &lt;tt&gt;lseek(SEEK_DATA)&lt;/tt&gt; + &lt;tt&gt;pread&lt;/tt&gt;, so userspace no longer has to convert file offsets into object offsets itself.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Verify / dump are not strictly required: the geometry stays in userspace (raidset rows, linear address → (row, raidset, idx) → parity object offset). Object reads only replace the final hop, which today additionally has to be folded back into a RAID10 file offset to perform designated I/O. The user-visible dump remains a linear address.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="A.2WhyobjectoffsetmodeisODIRECTonly"&gt;&lt;/a&gt;A.2 Why object-offset mode is O_DIRECT only&lt;/h3&gt;
+
+&lt;p&gt;The client page cache indexes pages by &lt;b&gt;file&lt;/b&gt; offset. An object offset is not a file offset: if object offset 0 of two different stripes were cached as file page 0, they would overwrite each other, and the prefix hole has no corresponding page in the file at all. So object mode does not use the page cache and only supports &lt;tt&gt;O_DIRECT&lt;/tt&gt;. The existing &lt;tt&gt;SET_MIRROR&lt;/tt&gt; / &lt;tt&gt;SET_STRIPE&lt;/tt&gt; likewise force &lt;tt&gt;O_DIRECT&lt;/tt&gt;. If buffered object I/O is ever wanted, it has to be done on the OST object's own pages, which is out of scope here.&lt;/p&gt;</description>
+                <environment />
+        <key id="99432">LU-20778</key>
+            <summary>Unified I/O target selection and object-offset I/O</summary>
+                <type id="2" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11311&amp;avatarType=issuetype">New Feature</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="kxu">Keguang Xu</reporter>
+                        <labels>
+                    </labels>
+                <created>Fri, 18 Sep 2026 07:46:22 +0000</created>
+                <updated>Fri, 18 Sep 2026 09:00:25 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i06zzz:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
