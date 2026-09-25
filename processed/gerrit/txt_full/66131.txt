@@ -7,58 +7,50 @@ Branch:     master
 Status:     NEW
 Owner:      Sergey Cheremencev
 Created:    2026-05-25 20:33:01.000000000
-Updated:    2026-05-29 03:49:38.000000000
-Patch Set:  1
-Insertions: +106
-Deletions:  -15
-Comments:   5 (2 unresolved)
+Updated:    2026-09-25 08:00:49.000000000
+Patch Set:  2
+Insertions: +70
+Deletions:  -3
+Comments:   19 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1; wc-checkpatch: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: wc-checkpatch: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Lustre RISC-V Builder
+  CC: Andreas Dilger, Lustre RISC-V Builder, patrick bot
   REVIEWER: Patrick Farrell
 
 --- Commit Message ---
 LU-19900 lov: DIO+APPEND corruption on PFL extent boundaries
 
-Data corruption occurs when O_DIRECT|O_APPEND writes cross PFL
-component or stripe boundaries.  The root cause is the DIO stripe
-cache in lov_page_init_composite(): once the first page resolves a
-(component, stripe) pair, every subsequent page in the same DIO batch
-blindly reuses that cached value, even when the page offset falls in a
-different PFL component or a different stripe within the same
-component.
+An O_DIRECT|O_APPEND write which crosses a PFL component or
+stripe boundary lands entirely in the stripe the append started
+in, so the data is written at the wrong offset and the bytes
+past the component end are not counted in the file size.
 
-For O_APPEND the LOV iter_init phase runs before vvp_io_write_start()
-resolves the real file-end position (crw_pos is still 0 at that
-point), so the batch is never pre-split at component/stripe
-boundaries. A single DIO batch can therefore span multiple components
-and stripes.
+Direct IO submits a whole batch of pages to the sub-object of
+its first page, so it must never span more than one stripe.
+lov_io_rw_iter_init() trims the IO to the next stripe boundary
+for that reason, but the append branch returns before it does,
+because the lock range for append has to cover the whole
+instantiated layout rather than just the written extent.
 
-lov_page.c - lov_page_init_composite():
-  Invalidate the DIO stripe cache when the page offset crosses:
-  1) A PFL component boundary (offset >= lsme_extent.e_end), or
-  2) A stripe boundary within a multi-stripe component (the
-     stripe-size-relative chunk index differs from the cached one).
-  On invalidation the full lov_io_layout_at / lov_stripe_number /
-  lov_stripe_offset lookup is re-executed for the new page.
-
-lov_io.c - lov_io_submit():
-  Remove the CPT_TRANSIENT shortcut that spliced all remaining DIO
-  pages into a single sub-IO batch regardless of cp_lov_index.  With
-  the cache fix, DIO pages in an append batch can now carry different
-  cp_lov_index values (different components/stripes).  Always group
-  pages by cp_lov_index so each group is submitted to the correct
-  sub-object.
+Trim direct IO appends as well, and let the IO loop continue
+into the next stripe or component.  The trim is computed from
+the position sampled before the lock is taken, so the size
+check in the write start now restarts the IO whenever that
+position has moved, in either direction, and ends the loop
+when part of the write has already been done.  A crossing
+append no longer completes under a single lock, so an appender
+on another client can land between its halves.
 
 Add sanity-pfl_101 which reproduces the problem without the fix.
 
-Test-Parameters: fortestonly
+Fixes: d31647c017a3 ("LU-13799 lov: Improve DIO submit")
 Signed-off-by: Justin Oberdorf <joberdorf@ddn.com>
 Signed-off-by: Sergey Cheremencev <scherementsev@ddn.com>
+Assisted-by: ClaudeCode:claude-opus-5
 Change-Id: I110ccc8ed5e114e87c784e330b0ef08149d3ddba
 
 --- Review History ---
@@ -406,3 +398,144 @@ Patch Set 1:
 Patch Set 1:
 
 Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-09-18 22:06:51.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-18 22:11:32.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-18 22:12:26.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-18 22:12:26.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-18 22:14:24.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-18 22:34:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-18 22:39:13.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-19 01:30:17.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-09-19 01:30:23.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-19 01:33:22.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-19 01:34:27.000000000) ---
+Patch Set 2:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70543/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pfl@ldiskfs+DNE sanity-pfl-special1@ldiskfs+DNE sanity-pfl-special1@ldiskfs sanity-pfl-special2@ldiskfs+DNE sanity-pfl-special2@ldiskfs sanity-pfl-special3@ldiskfs+DNE sanity-pfl-special3@ldiskfs sanity-pfl-special4@ldiskfs+DNE sanity-pfl-special4@ldiskfs sanity-pfl-special5@ldiskfs+DNE sanity-pfl-special5@ldiskfs sanity-pfl-special6@ldiskfs+DNE sanity-pfl-special6@ldiskfs sanity-pfl-special7@ldiskfs+DNE sanity-pfl-special7@ldiskfs sanity-pfl-special8@ldiskfs+DNE sanity-pfl-special8@ldiskfs sanity-pfl-special9@ldiskfs+DNE sanity-pfl-special9@ldiskfs sanity-pfl-special10@ldiskfs+DNE sanity-pfl-special10@ldiskfs sanity-pfl@zfs sanity-pfl-special1@zfs sanity-pfl-special1@zfs+DNE sanity-pfl-special2@zfs sanity-pfl-special2@zfs+DNE sanity-pfl-special3@zfs sanity-pfl-special3@zfs+DNE sanity-pfl-special4@zfs sanity-pfl-special4@zfs+DNE sanity-pfl-special5@zfs sanity-pfl-special5@zfs+DNE sanity-pfl-special6@zfs sanity-pfl-special6@zfs+DNE sanity-pfl-special7@zfs sanity-pfl-special7@zfs+DNE sanity-pfl-special8@zfs sanity-pfl-special8@zfs+DNE sanity-pfl-special9@zfs sanity-pfl-special9@zfs+DNE sanity-pfl-special10@zfs sanity-pfl-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-09-19 01:44:52.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-19 02:41:48.000000000) ---
+Patch Set 2: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-19 02:46:45.000000000) ---
+Patch Set 2:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-pfl@ldiskfs+DNE sanity-pfl-special1@ldiskfs+DNE sanity-pfl-special1@ldiskfs sanity-pfl-special2@ldiskfs+DNE sanity-pfl-special2@ldiskfs sanity-pfl-special3@ldiskfs+DNE sanity-pfl-special3@ldiskfs sanity-pfl-special4@ldiskfs+DNE sanity-pfl-special4@ldiskfs sanity-pfl-special5@ldiskfs+DNE sanity-pfl-special5@ldiskfs sanity-pfl-special6@ldiskfs+DNE sanity-pfl-special6@ldiskfs sanity-pfl-special7@ldiskfs+DNE sanity-pfl-special7@ldiskfs sanity-pfl-special8@ldiskfs+DNE sanity-pfl-special8@ldiskfs sanity-pfl-special9@ldiskfs+DNE sanity-pfl-special9@ldiskfs sanity-pfl-special10@ldiskfs+DNE sanity-pfl-special10@ldiskfs sanity-pfl@zfs sanity-pfl-special1@zfs sanity-pfl-special1@zfs+DNE sanity-pfl-special2@zfs sanity-pfl-special2@zfs+DNE sanity-pfl-special3@zfs sanity-pfl-special3@zfs+DNE sanity-pfl-special4@zfs sanity-pfl-special4@zfs+DNE sanity-pfl-special5@zfs sanity-pfl-special5@zfs+DNE sanity-pfl-special6@zfs sanity-pfl-special6@zfs+DNE sanity-pfl-special7@zfs sanity-pfl-special7@zfs+DNE sanity-pfl-special8@zfs sanity-pfl-special8@zfs+DNE sanity-pfl-special9@zfs sanity-pfl-special9@zfs+DNE sanity-pfl-special10@zfs sanity-pfl-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70543/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-19 04:33:46.000000000) ---
+Patch Set 2: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132009/ : FAILURE
+
+--- Message (Lustre Gerrit Janitor, 2026-09-19 08:40:53.000000000) ---
+Patch Set 2:
+
+Testing has completed with errors!
+
+> recovery-small@ldiskfs+DNE Failure(7561s)
+- 24b(no discarded dirty page found!) 
+> sanity3@ldiskfs+DNE Failure(10820s)
+- 816(client: import is not in IDLE state after 50) 
+> sanity-pcc@ldiskfs+DNE Failure(3800s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3459s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-quota@zfs Failure(10218s)
+- 1b(user write success, but expect EDQUOT) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-quota@ldiskfs+DNE sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70543/results.html
+
+--- Message (patrick bot, 2026-09-19 18:49:37.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-20 05:40:19.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-20 05:40:19.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-09-20 05:40:20.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-25 05:34:35.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-09-25 08:00:49.000000000) ---
+Patch Set 2:
+
+Superseded by https://review.whamcloud.com/69187 ("LU-19900 lov: split DIO appends at stripe boundaries").  Rather than trimming the append in lov_io_rw_iter_init() and dropping the lock between the halves (with the restart needed in vvp_io_write_start()), it limits each DIO page array of an append to one stripe chunk before the pages are pinned, so the whole append stays in one cl_io_loop() iteration under one lock.  It also resets the lov DIO stripe cache per page array (what the PS1 lov_page.c hunk was aiming at).  sanity-pfl_101 from this patch is included there as sanity-pfl_300, thanks Justin/Sergey.

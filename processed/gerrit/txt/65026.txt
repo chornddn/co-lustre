@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-04-01 17:00:15.000000000
-Updated:    2026-09-18 14:52:55.000000000
-Patch Set:  12
-Insertions: +206
+Updated:    2026-09-24 16:51:28.000000000
+Patch Set:  13
+Insertions: +212
 Deletions:  -15
-Comments:   88 (0 unresolved)
+Comments:   101 (1 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1
+  Code-Review: Sebastien Buisson: +1; Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -36,8 +36,14 @@ Widen ret to int and decode the three cases separately, with raw
 bit tests since WIFEXITED/WEXITSTATUS are userspace macros:
 
   ret < 0            ->  kernel failed to launch the helper
-  (ret & 0x7f) == 0  ->  normal exit (WIFEXITED)
-  (ret >> 8) & 0xff  ->  exit code   (WEXITSTATUS)
+  (ret & 0x7f) == 0  ->  normal exit, status (ret >> 8) & 0xff
+  otherwise          ->  killed by signal ret & 0x7f  ->  -EPROTO
+
+The signal case is the one reported as success before, the shift
+leaving 0. It is -EPROTO and not -EINTR: no signal was delivered
+to the calling task, so EINTR would surface from whatever syscall
+drove the RPC -- open(), mkdir(), stat() -- and a caller looping
+on EINTR would spin against a helper that stays dead.
 
 The exit code must be sign-extended: l_getsepol returns -errno
 whenever stdin is not a tty, always the case under
@@ -574,3 +580,92 @@ Patch Set 12: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/131950/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-20 20:42:38.000000000) ---
+Patch Set 12:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The three-way decode matches call_usermodehelper()/kernel_wait() semantics, the (signed char) cast preserves the accidental sign extension the old signed short gave, and the mdc error tails are correct on both sides of the prep call (ldlm_prep_elc_req() consumes @cancels on success and on pack failure, and LU-20546 clears rq_import so ptlrpc_req_put() drops the import ref exactly once). Only optional notes inline; no need to re-spin for them.
+
+One coverage gap worth considering for whenever this is refreshed: test_21d exercises the missing-helper and -ENODEV cases, but nothing covers the new -EPROTO mapping for a positive exit status. A stub exiting 1 would fail the mount with "Protocol error" on a patched client and "Operation not permitted" on an unpatched one, so it would actually pin that branch.
+
+--- Message (Hiroshi Nishida, 2026-09-21 13:31:17.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 13:34:15.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-21 13:35:30.000000000) ---
+Patch Set 13:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-09-21 14:38:35.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132066/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-21 15:21:10.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-21 15:21:15.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-21 15:21:19.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+--- Message (Hiroshi Nishida, 2026-09-21 15:21:24.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-21 22:50:34.000000000) ---
+Patch Set 13:
+
+AI code review results below, please doublecheck
+
+Looks good. The status decode and the mdc error-path rework both hold up under tracing, and nothing here needs a re-spin.
+
+One coverage gap worth recording: test_21d only makes the helper fail at connect time, which exercises ptlrpc_connect_import_locked() - code this patch does not touch. None of the eight mdc error paths, and none of the mdc_elc_req_put() lock releases, are reached by it: in the exit-237 case sptlrpc_sepol_get() succeeds and returns NULL, and in the exit-234 and missing-helper cases the mount fails at the first connect, long before any metadata RPC is packed.
+
+Covering the paths this patch actually changes would mean mounting first, then setting sptlrpc.send_sepol=-1 with a stubbed helper and running touch/mkdir/rm/mv/ln/setfattr, checking the decoded errno, and finally verifying umount and remount still work with the helper restored. Both the import reference and the ELC locks that were leaking show up there.
+
+--- Message (Hiroshi Nishida, 2026-09-23 13:50:24.000000000) ---
+Patch Set 13:
+
+Filed the pre-existing mdc_create() reply leak (mdc_reint.c) as LU-20812.
+
+--- Message (Andreas Dilger, 2026-09-23 20:29:46.000000000) ---
+Patch Set 13: Code-Review+1
+
+(2 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-23 20:41:20.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+--- Message (Sebastien Buisson, 2026-09-24 07:14:25.000000000) ---
+Patch Set 13: Code-Review+1
+
+--- Message (Lustre Gerrit Janitor, 2026-09-24 16:51:28.000000000) ---
+Patch Set 13:
+
+[lander-bot:mn-conflict]
+Notice! This patch conflicts with another change that was already cherry-picked to master-next, consider rebasing your patch on top of that change.

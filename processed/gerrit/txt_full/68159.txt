@@ -7,142 +7,148 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-11 22:04:37.000000000
-Patch Set:  19
-Insertions: +1010
-Deletions:  -67
-Comments:   121 (6 unresolved)
+Updated:    2026-09-25 06:25:00.000000000
+Patch Set:  24
+Insertions: +1648
+Deletions:  -108
+Comments:   151 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Oleg Drokin, Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Artem Blagodarenko
 
 --- Commit Message ---
 LU-20611 llapi: run find over a device scan
 
-Add llapi_find_device(), which puts llapi_scan_device()'s records
-through the same checks llapi_find() applies to a namespace walk.  The
-checks are not reimplemented: the record is presented as the
-lov_user_mds_data every find_check_* helper already reads.
+Add llapi_find_device(). It passes the records of llapi_scan_device()
+through the same checks that llapi_find() uses for a namespace walk.
+The checks are not written again: the record is presented as the
+lov_user_mds_data that every find_check_* helper already reads.
 
-A field the scan could not answer for is left out of stx_mask, as
-llite leaves it out when the MDT's answer is not authoritative.  Both
-the layout and the directory-stripe buffers live for the whole scan,
-so an object without one has to say so rather than inherit the last
-one's.
+A field that the scan could not answer is left out of stx_mask, as
+llite does when the MDT's answer is not authoritative. The layout and
+directory-stripe buffers live for the whole scan, so an object without
+one must say so, and not reuse the previous object's.
 
-A search needing something a target scan has not -- a path (-printf),
-a mounted filesystem (--ost, --mdt), an xattr read, or a walk to
-describe (--maxdepth, --threads) -- is refused before the scan starts,
-because afterwards "no matches" and "cannot answer" look alike.  A
-field the inode format has no room for, a project id or a birth time,
-counts as undecided and is reported at the end rather than ending the
-search.  sp_filter is cleared with the other fields the search
-decides: there is no caller data to pair a callback with, since the
-scan carries this function's own state.
+Some searches need something that a target scan does not have. They
+are refused before the scan starts, because afterwards "no matches"
+and "cannot answer" look the same:
+- --xattr needs a mounted filesystem
+- -printf %p needs a path; the check skips the same flags and width as
+  the printer, so "%+5p" and "% 5p" are refused too
+- --maxdepth, --mindepth and --threads describe a walk
+A field that the inode format has no room for, such as a project id or
+a birth time, is counted as undecided and reported at the end.
+lfsp_filter is cleared, because the scan carries this function's own
+state.
 
-The layout is bounded before it is swabbed, not after.
-layout_swab_lov_user_md() walks lcm_entry_count and stores through
-lcme_offset, both read from bytes that came off a target something
-may have been writing, so find_lmm_fits() has to see them first.  It
-reads every field through whichever byte order it found, so running
-ahead of the swab costs it nothing.  That is the order
-llapi_layout_get_by_xattr() uses on the same bytes.
+--ost and --mdt are answered from the target itself. Every object in
+an MDT scan is on that MDT, and every object in an OST scan is on that
+OST. find_tgt_index() matches each name against the label that the
+backend read: a numeric index as given, and a UUID through
+llapi_uuid_match(). A name of another target never matches, so the
+predicate is false for every object, and true for every object under
+"!". This is not an error, so one --ost can be used over many devices.
+When no object on the target can match, the scan is skipped.
 
-A top-level foreign magic in the target's byte order is refused there
-rather than accepted, because layout_swab_lov_user_md() does not swab
-one: accepting it would leave the EA swapped with lmd_lmmsize set, and
---foreign would then miss every HSM-released or PCC file on a big-
-endian host.  Refusing sends it down the no-layout path instead.
+--ost is decided before the scan, removed from the search and put back
+afterwards. check_obd_match() reads the layout, and an OST object has
+none, so it would reject every object of the requested target. --mdt
+uses check_mdt_match(), with fp_file_mdt_index set once from the
+target. --mdt over an OST and --ost over an MDT are refused: an OST
+object names its MDT only through an FLD lookup, which needs a client,
+and --ost over an MDT asks about layouts, not about the target. The
+layout options over an OST are refused for the same reason: an OST
+object has no layout, so they would compare a default never read.
 
-The floor that check starts from is per-magic, not a blanket
-sizeof(lov_user_md_v1).  A foreign layout's is the smaller
-offsetof(lov_foreign_md, lfm_value): llapi_file_create_foreign()
-accepts any non-zero length and lod_verify_striping() checks the
-foreign magic before the 32-byte test that covers the normal ones, so
-`lfs setstripe --foreign=none --xattr=abc` stores a legal 19-byte
-trusted.lov.  A blanket floor refused it before the magic was read,
-sending the file down the no-layout path to be answered off a forged
-default -- so --foreign missed it and --stripe-count answered from the
-forgery, which is the silent wrong answer the SEL and SPECIFIC arms
-below exist to avoid.  Only lmm_magic is read before the switch, and
-every arm carries its own floor.
+find_lmm_fits() checks the layout before layout_swab_lov_user_md()
+uses it, because lcm_entry_count and lcme_offset come from a target
+that may be in the middle of a write. It reads each field in the byte
+order it found, as llapi_layout_get_by_xattr() does.
+- Each magic has its own minimum size. A foreign layout's is smaller
+  than lov_user_md_v1: "lfs setstripe --foreign=none --xattr=abc"
+  stores a legal 19-byte trusted.lov.
+- A top-level foreign magic in the other byte order is refused. The
+  swab does not convert it, so --foreign would miss the file.
+- A composite entry must hold a v1 header, and a V3 or SPECIFIC entry
+  must hold a whole lov_user_md_v3, because
+  llapi_layout_get_by_xattr() reads the pool name of both.
 
-Three shapes only a target scan meets are accepted there.  A
-directory's default layout has lmm_stripe_count set and no
-lmm_objects[] at all -- lod_gen_component_ea() sizes the EA with
-op_count, 0 for a directory -- so `lfs setstripe -c 4 dir` is 32
-bytes claiming four stripes, and
-bounding by the count refused it.  The array is measured by the buffer
-instead, as llapi_layout_objects_in_lum() measures it.  LOV_MAGIC_SEL
-and LOV_USER_MAGIC_SPECIFIC are the other two: lod writes both and
-rewrites neither for a client, so they reached the no-layout path and
-every --stripe-*, --pool and --component-* answer for such an object
-was compared against a forged filesystem default.  Both are given the
-form a client would have been shown, SEL as COMP_V1 and SPECIFIC as
-V3, so the checks below read one shape.
+Some layouts are seen only by a target scan, and are accepted:
+- A directory default layout has a stripe count but no lmm_objects[]
+  ("lfs setstripe -c 4 dir" is 32 bytes). The object array is measured
+  by the buffer, as llapi_layout_objects_in_lum() does.
+- LOV_MAGIC_SEL and LOV_USER_MAGIC_SPECIFIC are written by lod and
+  never rewritten for a client. They are converted to the forms that a
+  client sees, COMP_V1 and V3.
+Otherwise such objects would take the no-layout path and be compared
+against the filesystem default layout.
 
-The linkea side of the diff.  scan_linkea() gains a
-scan_linkea_entry() that indexes into trusted.link rather than always
-reading the first record, exported through lustreapi_internal.h, and
-find_device_prefilter() runs --name against every name the object has.
-A walk meets a hardlinked file once per link and tests the name it
-arrived by; a scan meets the object once, so testing one name would
-answer for a file by whichever link the linkea happened to hold first.
-The object is still reported once.  llapi_find_device.3 says so beside
-the size and time notes, those being the other places a target scan
-answers differently.
+--name is tested against every name in trusted.link. A walk meets a
+hardlinked file once per link, but a scan meets the object once, so it
+must test all names. The object is still reported once.
+scan_linkea_entry() reads any entry, not only the first. A linkea
+whose first entry does not parse no longer sets LLAPI_SCAN_LINKEA. A
+linkea that ends before all its names are read makes the object
+undecided, not a non-match. Before an object is called undecided,
+find_device_prefilter() runs the other predicates, so an OST scan with
+"-name X -type d" does not warn about objects that -type rejected.
+find_prefilter() skips -name for a record with no name, because
+fnmatch() does not accept NULL.
 
-That changes one thing worth naming: a linkea whose header parses but
-whose first entry does not no longer sets LLAPI_SCAN_LINKEA, where it
-used to.  A record claiming a linkea nothing can read is worse than
-one admitting it has none, and --name now has entries beyond the
-first to lose.
+--links on a foreign directory: find_decide() read the lfm_length of a
+foreign LMV as a stripe count. It now tests lmv_is_foreign() first,
+like the --mdt-count, --hash-type and --hash-flag checks.
 
-A torn linkea further in is the same case and is counted the same way.
-leh_reccount is capped by the smallest entry that could fit, so a
-buffer claiming three names can spell one and still report three; the
-loop over the names then ran out partway and fell through to a
-rejection, reporting the object as a non-match on a name list it never
-finished reading.  It asks the other predicates and counts the object
-undecided instead, which is what the no-name case beside it does.
+-printf answers from the record. %LF is the record's FID, the layout
+directives read trusted.lov through llapi_layout_get_by_xattr(), %i is
+the object id on the target, and %LP needs no open.
+printf_format_want() decides the %p refusal and what a format needs to
+read, so "-printf %i" does not read a layout.
 
-find_device_prefilter() asks the other predicates before calling an
-object undecided.  Answering 2 for "no name anywhere" without running
-them would, over an OST target -- where no record has a linkea --
-count every data object undecided for `-name X -type d` even though
--type rejects all of them, and llapi_find_device() would then warn
-that N objects could not be decided for a search whose answer was
-complete.  Every other undecided point sits after the checks that
-precede it, and this one does too.
+Three -printf answers were wrong in a walk too. For a layout that only
+says "the default", the stripe count, size and index printed
+LLAPI_LAYOUT_DEFAULT. They now print nothing. %Lo skips a component
+whose stripe count is not a number of objects (the default, or -1 for
+all OSTs, on a component with no objects yet). Before, it filled the
+buffer with "?," and lost the newline and the later components.
+A device scan has no shard FIDs, so %Lo prints nothing for a striped
+directory. %s, %b and %k print nothing for an object the scan has no
+size or blocks for, rather than 0.
 
-find_prefilter() leaves -name alone for a record with no name, so
-asking it costs nothing and answers exactly the other predicates.  It
-has to: fnmatch() dereferences its string argument, so testing a NULL
-sr_name would fault rather than not match, and an OST data object
-reaches it that way -- the object carries no linkea, and neither do
-the CLS_INTERNAL, CLS_NO_LMA and CLS_AGENT records
-LLAPI_SCAN_F_INTERNAL delivers.
+-btime and -newerXb change in a walk too. An object with no birth
+time (off Lustre, or through the V1 ioctl) used to return
+-EOPNOTSUPP, which ended the walk of the whole subtree. It is now a
+non-match.
 
-A foreign directory answers --links here.  find_decide()'s nlink gate
-reads fp_lmv_md->lum_stripe_count to decide whether a stat is needed,
-and lmv_foreign_md's lfm_length sits at that offset, so a foreign
-LMV's value length was read as a stripe count and asked for one.  A
-walk pays the stat and answers correctly; a scan has neither path nor
-descriptor, so the object went undecided and was dropped out of both
---links N and its negation.  The gate now tests lmv_is_foreign()
-first, as the --mdt-count, --hash-type and --hash-flag arms beside it
-already do.
+When a search only prints, an object without a layout does not get
+the filesystem default layout, and the per-object layout messages are
+quiet on a scan.
 
-llapi_find_device.3 describes an object by its FID, and by its object
-id where there is no FID.  It does not describe one with neither: the
-scan sets the object id on every record, so the second form always
-applies where the first does not.
+An object the scan delivers with no FID is printed as obj:ID: an OST
+object with no LMA (its object id is in the directory entry, not in
+the inode, so there is no IDIF to build), or an MDT object with no LMA
+outside MDT0000. On MDT0000, llapi_scan_device() already gives such an
+object its IGIF. The MDT FID in an OST object's trusted.fid is not
+read yet; that is left for a later change. llapi_find_device.3
+describes how a target scan answers differently.
 
+A foreign LMV larger than the search's buffer grows the buffer, as a
+walk does, so --foreign and the other LMV checks still see it.
+
+A size the scan did not report is undecided for -size and -blocks,
+whatever the layout says: a Data-on-MDT file's stripe count is 0, so
+it would otherwise be decided on a stx_size the scan never reported.
+The fix is Artem Blagodarenko's.
+
+Fixes: 6b8e97b76c47 ("LU-10378 utils: add formatted printf to lfs find")
+Fixes: 186b97e68abb ("LU-11971 utils: Send file creation time to clients")
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: Ibf2dcf71e5444914f306ad37a551262cddd8e1de
 
@@ -4752,3 +4758,994 @@ Looks good. Three optional items inline for whenever this is next refreshed; non
 Patch Set 19:
 
 (3 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:26:59.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 19:29:14.000000000) ---
+Patch Set 20:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 19:33:58.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-21 19:34:07.000000000) ---
+Patch Set 20:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70624/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (jenkins, 2026-09-21 20:07:05.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132083/ : SUCCESS
+
+--- Message (Maloo, 2026-09-21 20:08:40.000000000) ---
+Patch Set 20:
+
+#### The following sessions will be run for Build 132083 (patch #20):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132083&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132083#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-21 20:49:39.000000000) ---
+Patch Set 20:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70624/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Maloo, 2026-09-21 21:07:39.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-selinux-ssk-part-1 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm146: https://testing.whamcloud.com/test_sessions/88ac9730-61d5-47f4-bd48-ee71294d3a61 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-09-21 22:40:22.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-selinux-ssk-part-2 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm213: https://testing.whamcloud.com/test_sessions/38d7c8fd-bc24-4706-a047-c9b1ddf44655 ran 5 tests.  3 tests failed: sanity-selinux, sanity-sec, recovery-small.
+
+--- Message (Maloo, 2026-09-22 00:40:21.000000000) ---
+Patch Set 20:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm138: https://testing.whamcloud.com/test_sessions/ce105f84-8e88-411f-85c4-df23dd98013b ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-09-22 00:41:59.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm219: https://testing.whamcloud.com/test_sessions/dfad65b4-1c44-40a1-ab3b-13a0026c27a7 ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-09-22 01:30:23.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-selinux-ssk-part-2 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm175: https://testing.whamcloud.com/test_sessions/b7064cbc-44c1-43e3-8167-bf3f188328b7 ran 5 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-09-22 01:52:44.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-part-2 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm72: https://testing.whamcloud.com/test_sessions/4255f148-eecf-4b99-99fc-55ed9a9a9a47 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 02:19:39.000000000) ---
+Patch Set 20:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8657s)
+- 155(ls1 != ls2) 
+> sanity-pcc@ldiskfs+DNE Failure(3725s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+> sanity-pcc@zfs Failure(3493s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70624/results.html
+
+--- Message (Maloo, 2026-09-22 03:09:10.000000000) ---
+Patch Set 20:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm35: https://testing.whamcloud.com/test_sessions/0ed1a30e-0f8d-49d7-8877-b0ee5cd84838 ran 6 tests.  1 tests failed: sanity-sec.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-09-22 03:09:50.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm214: https://testing.whamcloud.com/test_sessions/671d690e-2841-4fda-a9e3-8e600b7f4815 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-22 03:26:51.000000000) ---
+Patch Set 20:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm83: https://testing.whamcloud.com/test_sessions/668297ac-a2d4-4baa-a206-7a2c0ee411fa ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-09-22 04:07:30.000000000) ---
+Patch Set 20:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm213: https://testing.whamcloud.com/test_sessions/f82d30c9-cb47-488f-967a-f4ace2f7a406 ran 6 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-09-22 07:24:11.000000000) ---
+Patch Set 20: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm154: https://testing.whamcloud.com/test_sessions/4363ec6c-ea8f-47cf-832f-1203c8f31a2d ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 07:47:32.000000000) ---
+Patch Set 20:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the scan/walk split reads well and the layout bounding is careful. One inline concern about the new %Lo bound on the directory side, plus a pre-existing note that could ride along on the same refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:35.000000000) ---
+Patch Set 21:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:41.000000000) ---
+Patch Set 21:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 21:49:02.000000000) ---
+Patch Set 21:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70701/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 22: New patch set was added with same tree, parent tree, and commit message as Patch Set 21.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:56:48.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:03:03.000000000) ---
+Patch Set 22:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 22:07:27.000000000) ---
+Patch Set 22:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70712/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:18:51.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-22 22:43:22.000000000) ---
+Patch Set 22:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70712/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-23 03:01:45.000000000) ---
+Patch Set 21: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 22 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132158/ : SUCCESS
+
+--- Message (Maloo, 2026-09-23 03:04:43.000000000) ---
+Patch Set 21:
+
+#### The following sessions will be run for Build 132158 (patch #21):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132158&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132158#redirect
+
+--- Message (Maloo, 2026-09-23 04:22:59.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-part-1 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm240: https://testing.whamcloud.com/test_sessions/1ad7e89f-a6e7-46d9-900a-1839a250b579 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-part-1 %%
+https://testing.whamcloud.com/test_sessions/1ad7e89f-a6e7-46d9-900a-1839a250b579
+https://testing.whamcloud.com/test_sessions/7ad0ca91-6e08-4723-82a9-47a8f186a7e5
+
+--- Message (Maloo, 2026-09-23 04:24:01.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-3 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm224: https://testing.whamcloud.com/test_sessions/c77dad32-e09a-4319-9d78-5b6cabaf420e ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-zfs-part-3 %%
+https://testing.whamcloud.com/test_sessions/c77dad32-e09a-4319-9d78-5b6cabaf420e
+https://testing.whamcloud.com/test_sessions/992e398b-5179-44f8-948d-90a1494dfb0d
+
+--- Message (Maloo, 2026-09-23 04:24:31.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-6 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm6: https://testing.whamcloud.com/test_sessions/3786aecb-2162-4d65-b978-d9deb70eaed5 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-zfs-part-6 %%
+https://testing.whamcloud.com/test_sessions/3786aecb-2162-4d65-b978-d9deb70eaed5
+https://testing.whamcloud.com/test_sessions/d57985e4-7a0b-4069-a0b9-773baf9656aa
+
+--- Message (Maloo, 2026-09-23 04:24:31.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-part-6 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm10: https://testing.whamcloud.com/test_sessions/e1a81ecd-fece-4c61-925d-3082d44c856e ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-part-6 %%
+https://testing.whamcloud.com/test_sessions/e1a81ecd-fece-4c61-925d-3082d44c856e
+https://testing.whamcloud.com/test_sessions/c687c97d-a31c-45ef-8221-5de82d1eec89
+
+--- Message (Maloo, 2026-09-23 04:25:02.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm166: https://testing.whamcloud.com/test_sessions/83378856-c3e6-499d-9221-0bec0f9bde10 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-zfs-part-1 %%
+https://testing.whamcloud.com/test_sessions/83378856-c3e6-499d-9221-0bec0f9bde10
+https://testing.whamcloud.com/test_sessions/0f3f7aae-7966-4fe0-a5ad-b5f1a793d6fa
+
+--- Message (Maloo, 2026-09-23 04:25:10.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-part-4 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm203: https://testing.whamcloud.com/test_sessions/c318379a-0223-4ae3-9065-4773c6c0bce9 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-part-4 %%
+https://testing.whamcloud.com/test_sessions/c318379a-0223-4ae3-9065-4773c6c0bce9
+https://testing.whamcloud.com/test_sessions/f1cff9d6-21f6-4c87-9ccd-2da83ed75761
+
+--- Message (Maloo, 2026-09-23 04:26:56.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm149: https://testing.whamcloud.com/test_sessions/98ea9347-f709-4cd5-b176-017aea2aea3d ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-zfs-part-4 %%
+https://testing.whamcloud.com/test_sessions/98ea9347-f709-4cd5-b176-017aea2aea3d
+https://testing.whamcloud.com/test_sessions/44735cec-14a3-4211-b1aa-6720e84170ea
+
+--- Message (Maloo, 2026-09-23 04:26:57.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-part-8 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm70: https://testing.whamcloud.com/test_sessions/ab54c225-0267-4123-856e-d9b3bb4c2db7 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-part-8 %%
+https://testing.whamcloud.com/test_sessions/ab54c225-0267-4123-856e-d9b3bb4c2db7
+https://testing.whamcloud.com/test_sessions/114a55f9-0d72-4aa1-a6b8-03b01b61b3ff
+
+--- Message (Maloo, 2026-09-23 04:27:16.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-143vm10: https://testing.whamcloud.com/test_sessions/8a2c440c-26c4-4c0f-a317-7160b3753f93 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-ldiskfs %%
+https://testing.whamcloud.com/test_sessions/8a2c440c-26c4-4c0f-a317-7160b3753f93
+https://testing.whamcloud.com/test_sessions/adf5bc86-c46d-48b7-8094-fa985b587f73
+
+--- Message (Maloo, 2026-09-23 04:28:18.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm55: https://testing.whamcloud.com/test_sessions/b247644b-dc70-4b7d-bcd4-48d48752ff60 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-dne-zfs-part-2 %%
+https://testing.whamcloud.com/test_sessions/b247644b-dc70-4b7d-bcd4-48d48752ff60
+https://testing.whamcloud.com/test_sessions/9d41a55c-db3e-4342-8c83-c7eaf61fa6b1
+
+--- Message (Maloo, 2026-09-23 07:29:15.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-124vm1: https://testing.whamcloud.com/test_sessions/f1a98b02-af74-41b1-95fa-e15d606c3c33 ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Lustre Gerrit Janitor, 2026-09-23 07:59:09.000000000) ---
+Patch Set 22:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8277s)
+- 155(ls1 != ls2) 
+> replay-dual@ldiskfs+DNE Timeout(382s)
+> sanity3@ldiskfs+DNE Failure(13575s)
+- 816(client: import is not in IDLE state after 50) 
+> sanity-lfsck@zfs Failure(4110s)
+- 18e((6) Expect 2 orphans have been fixed, but got: 4) 
+> sanity-pcc@ldiskfs+DNE Failure(3819s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3679s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70712/results.html
+
+--- Message (Maloo, 2026-09-23 12:53:27.000000000) ---
+Patch Set 21:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-141vm1: https://testing.whamcloud.com/test_sessions/da172782-b46f-425c-a09c-58afcc3ba923 ran 9 tests.  2 tests failed: sanity-quota, sanity-flr.
+
+--- Message (Artem Blagodarenko, 2026-09-23 14:03:54.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+One finding, from the same conf-sanity run as on 68156; the fix is in https://github.com/TheLustreCollective/lustre/commit/ae5a21241a.
+
+--- Message (Maloo, 2026-09-23 15:14:11.000000000) ---
+Patch Set 21: Verified-1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified-1 has been copied to patch set 22 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm216: https://testing.whamcloud.com/test_sessions/e67fd49f-aad6-4bc6-8d0c-f05446f23bf6 ran 3 tests.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:51.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-23 19:02:20.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-23 19:08:40.000000000) ---
+Patch Set 23:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70785/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:14.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 19:58:30.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132227/ : SUCCESS
+
+--- Message (Maloo, 2026-09-23 19:59:40.000000000) ---
+Patch Set 23:
+
+#### The following sessions will be run for Build 132227 (patch #23):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132227&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132227#redirect
+
+--- Message (Lustre Gerrit Janitor, 2026-09-23 20:22:04.000000000) ---
+Patch Set 23:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70785/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (Lustre Gerrit Janitor, 2026-09-24 09:20:20.000000000) ---
+Patch Set 23:
+
+Testing has completed with errors!
+
+> recovery-small@zfs Failure(8397s)
+- 24b(no discarded dirty page found!) 
+> sanity-pcc@ldiskfs+DNE Failure(3574s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+> sanity-pcc@zfs Failure(3084s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(expected /mnt/pcc.d1d.sanity-pcc/d1d.sanity-pcc/13a3/0x2000013a1:0x2:0x0 size: 7654321 got: 0) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70785/results.html
+
+--- Message (Maloo, 2026-09-24 10:43:23.000000000) ---
+Patch Set 23:
+
+Failed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm40: https://testing.whamcloud.com/test_sessions/361989b0-c9e0-469f-94a6-25512a21a35c ran 9 tests.  1 tests failed: sanity-dom.
+
+--- Message (Maloo, 2026-09-24 11:56:47.000000000) ---
+Patch Set 23:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm1: https://testing.whamcloud.com/test_sessions/9bb8edbf-aee1-4268-bb0a-865b158a6b5d ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Artem Blagodarenko, 2026-09-24 13:15:16.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+One finding from a review of this change mirrored on the TLC GitHub (by the Claude review bot), checked against ps23.
+
+--- Message (Autotest, 2026-09-24 13:59:25.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Autotest, 2026-09-24 14:07:21.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.7-x86_64/ldiskfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-20827.
+
+--- Message (Hiroshi Nishida, 2026-09-24 14:23:20.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+--- Message (Maloo, 2026-09-24 16:16:55.000000000) ---
+Patch Set 23: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm22: https://testing.whamcloud.com/test_sessions/0a8c171d-9a8d-4864-9630-ce870f1f2124 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 16:48:27.000000000) ---
+Patch Set 23:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The risky parts hold up: find_lmm_fits() bounds every field a consumer later walks, the linkea cursor cannot run past its buffer, and the new loops all terminate. No defect found, so there is no need to re-spin for the inline items -- they are opportunistic, for whenever this is next refreshed.
+
+One whole-patch point: the walk-only fixes riding along here -- the -printf answers the body calls out, and the btime hunk -- apply to released code and arrive with no test. A sanity case for `lfs find -printf '%Lo\n'` over a PFL file with an uninstantiated `-c -1` component would cover the one that silently truncated the output, and it can run on a mount today, which the rest of this patch cannot until the --device front end lands.
+
+--- Message (Maloo, 2026-09-24 20:39:42.000000000) ---
+Patch Set 23:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm111: https://testing.whamcloud.com/test_sessions/98b97ae5-bba6-4ab3-9f45-ab594e38b125 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-24 20:59:58.000000000) ---
+Patch Set 23:
+
+Passed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-143vm10: https://testing.whamcloud.com/test_sessions/cc8ea628-8d04-41aa-af78-30b6fda37354 ran 9 tests.
+
+--- Message (Autotest, 2026-09-24 21:25:16.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:53.000000000) ---
+Patch Set 23:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:38:14.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:58.000000000) ---
+Patch Set 24:
+
+Looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-25 01:40:03.000000000) ---
+Patch Set 24:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70854/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:13.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-25 02:15:16.000000000) ---
+Patch Set 24:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70854/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-25 02:47:11.000000000) ---
+Patch Set 24: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132287/ : FAILURE
+
+--- Message (Maloo, 2026-09-25 04:02:13.000000000) ---
+Patch Set 23: Verified+1
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm189: https://testing.whamcloud.com/test_sessions/d6c7e221-f338-4a3c-a255-6ee41922dba7 ran 11 tests.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-25 06:25:00.000000000) ---
+Patch Set 24:
+
+Testing has completed with errors!
+
+> sanity-pcc@ldiskfs+DNE Failure(3514s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 13a(request on 0x2000032e1:0x2f:0x0 is not SUCCEED on mds1) 
+> sanity-pcc@zfs Failure(3032s)
+- 1c(expected /mnt/pcc.d1c.sanity-pcc/d1c.sanity-pcc/0bd3/0x200000bd1:0x2:0x0 size: 7654321 got: 0) 1d(/mnt/lustre/d1d.sanity-pcc/f1d.sanity-pcc expected pcc state: readwrite, but got: none) 
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-ec@ldiskfs+DNE sanity-ec@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70854/results.html

@@ -1,0 +1,99 @@
+Change:     69146
+Subject:    LU-18461 mdd: fix merge buffers and refresh the merged layout
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69146
+Change-Id:  I5844790204a72de077b119255e8ddfa0255d33a7
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Alexey Lyashkov
+Created:    2026-09-23 12:48:02.000000000
+Updated:    2026-09-24 09:21:26.000000000
+Patch Set:  1
+Insertions: +158
+Deletions:  -30
+Comments:   9 (8 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-18461 mdd: fix merge buffers and refresh the merged layout
+
+mdd_xattr_merge() only clears mdi_buf[0] once it has read the layout
+of the victim, while the rest of the MDD makes that very slot point
+at a buffer owned by someone else, mdd_buf_get() style:
+mdd_links_write() leaves it pointing at the link xattr buffer of the
+thread.  A victim with no layout to give, or a failure of the
+project ID declare, leaves the function through 'stop', where
+lu_buf_free() then frees a buffer the thread info still holds, which
+KASAN reports as a use after free in linkea_data_new().  Claim both
+slots before the first error path may free them.
+
+lod_declare_layout_merge() also reloaded the striping of the target
+from the merged layout it had just built.  A declare may still be
+rolled back, so the target was left with an in-memory layout its
+inode does not carry, and only the rollback path dropped it, by way
+of the LU_XATTR_REPLACE set.
+
+Refresh the striping in the execute phase instead, once the new
+layout is on disk, exactly as a split already does.  A failed
+lod_striping_reload() drops the cached striping itself and a
+rollback goes through LU_XATTR_REPLACE, which frees it as well, so
+no explicit invalidation is needed and the layout no longer has to
+be declared last.  As the declare no longer bumps the generation,
+lod_save_layout_gen_intrans() records the pre-merge one and
+lod_check_layout_gen_intrans() detects a foreign change instead of
+the value the declare itself stored.  Only the buffer checks the
+reload used to perform are kept in the declare, as
+lod_comp_md_check().
+
+The layout built by the declare is kept in a buffer owned by the
+MDD, described by struct md_layout_build, and stored as is by
+lod_layout_build_store().  lod_layout_gen_next() is split out of
+lod_obj_inc_layout_gen() for a declare that computes a generation
+without publishing it.  A layout join is built on top of all of
+those.
+
+lod_invalidate() left the cached striping behind while its caller
+asks for everything to be read again, make it drop that as well.
+
+Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
+Change-Id: I5844790204a72de077b119255e8ddfa0255d33a7
+
+--- Review History ---
+
+--- Message (Alexey Lyashkov, 2026-09-23 12:48:02.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-09-23 12:52:11.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 12:55:23.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 14:26:09.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132201/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 09:21:26.000000000) ---
+Patch Set 1:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The mdi_buf[] part looks right, but the move of lod_striping_reload() into the execute phase changes what ends up on disk and what happens when the reload fails, and the lod_invalidate() change is much wider than the commit message describes. It would also help a lot to have a regression test in sanity-flr.sh for the paths this fixes: a merge where the victim has no layout to give (the KASAN case), and a plain 'lfs mirror extend' that checks the resulting layout generation and per-component lmm_object_id.

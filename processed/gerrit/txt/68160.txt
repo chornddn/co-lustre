@@ -1,5 +1,5 @@
 Change:     68160
-Subject:    LU-20611 utils: lfind, find over a target
+Subject:    LU-20611 lfs: find over a target, with --device
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68160
 Change-Id:  Ib25109943ad40afbc2d272a65e70c364c376b2b7
 Project:    fs/lustre-release
@@ -7,77 +7,80 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-11 20:37:12.000000000
-Patch Set:  20
-Insertions: +755
-Deletions:  -14
-Comments:   128 (24 unresolved)
+Updated:    2026-09-25 08:58:11.000000000
+Patch Set:  25
+Insertions: +728
+Deletions:  -16
+Comments:   175 (6 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Artem Blagodarenko, Lustre RISC-V Builder
   REVIEWER: Andreas Dilger, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20611 utils: lfind, find over a target
+LU-20611 lfs: find over a target, with --device
 
-Add lfind(8), a server-side command.  It runs lfs find's predicates
-against a Lustre target's own objects, read straight off the device on
-the MDS or OSS whose disks hold it, and it is built under SERVER so a
-client package does not carry a command with nothing to read.
+lfs find can read a Lustre target directly from its device, instead of
+walking a directory. It runs the same predicates over the target's own
+objects through llapi_find_device(). Nothing needs to be mounted, and
+no client or MDS is used.
 
-Not a mode on lfs find, which is a client command by construction:
-llapi_is_lustre_mnt() requires ":/" in the mount's device name, so a
-server target mount is deliberately not recognised, and lfs ships in
-lustre-client while the scan backend does not.
+There are five ways to name the target:
+- --device DEVICE: a block device, disk image or snapshot
+- a block device given where a directory would be; lfs_find_is_device()
+  checks with stat(), and a disk image is a regular file, so it needs
+  --device. A block device node stored on Lustre is a file, and is
+  walked as before: statfs() tells it apart
+- --target NAME: a target mounted on this node, found through
+  osd-*.NAME.mntdev
+- --fsname FSNAME: this node's mounted targets of that filesystem
+- --local: every MDT and OST mounted here; the MGS is skipped
+Only one target may be named. --internal adds the objects that the
+target keeps for itself; without a target it is a usage error.
 
-The predicates are the same ones, not a second copy.  What differs is
-in lfind(8): it prints FIDs because a target has no paths, one
-invocation covers one target, and a predicate the target cannot answer
-is refused rather than quietly matching nothing.  The target is named
-with --device, --target, --local, or as a plain argument; naming two
-is an error rather than a scan of the first.
+--fsname must be a name that mkfs.lustre accepts, checked with
+llapi_name_verify(), so a typo is refused instead of matching
+nothing. A label is split at its last '-', because a filesystem name
+may contain '-'. Unlike lsnapshot -F, the lengths are compared too, so
+test-MDT0000 is not taken as a target of testfs. There is no short
+option, because -F is --fid. A bare FSNAME is still a relative path.
 
-conf-sanity 300 grows the other half of the same question, which is a
-third of this diff.  It already compared a target scan's FIDs against
-what a client walk sees; now it runs lfind over that scan with a
-predicate -- --type f -- and requires every regular file the client
-listed to come back and no directory with it, taking the
-subdirectory's own FID from the client first because after stopall
-there is nothing left to ask.  The test is renamed to say so.
+The options are parsed by lfs_find_parse() and kept in struct
+find_param: fp_device, fp_target and fp_fsname at its end, and two of
+fp_unused_bits for --local and --internal. The library's find
+functions do not read them. lfs_find() hands the search to the target
+before it applies the walk's defaults, because the walk's default
+thread count is one that llapi_find_device() refuses.
 
-Its capability gate moves rather than goes.  The old check was [[ -x
-$scanner ]] against the local build tree, which is the wrong node: the
-scanner and lfind both run on mds1, so both are now checked there,
-with do_facet mds1 "test -x $scanner" and a which for lfind.  Both are
-tested up front rather than around the block that uses them, so a
-build without either leaves a skip in the results instead of a pass
-that ran none of the predicate half.
+--local and --fsname go on past a target that cannot be read, and
+report the failure in the exit status. With --ost or --mdt they skip
+the targets of the other type, which those options cannot name.
+ENOTSUP does not end a sweep either: an OST cannot answer everything an
+MDT can, and a node may serve a kind of target this build cannot read.
 
-main() seeds the parameter block through lfs_find_parse_init() rather
-than repeating lfs_find()'s initialiser, which is the second copy that
-would otherwise have to be kept in step -- and was already one field
-short of it here, fp_min_depth having been left to the designated
-initialiser rather than named.
+Without the scan backend from the server package, llapi_find_device()
+fails with ENOTSUP and says why. This is what a client gets.
 
-main() clears opterr, as lfs.c's does.  lfs_find_parse() prints its
-own diagnostic for an unrecognised option and asks the caller for
-opterr == 0 so getopt_long_only() does not print a second one; glibc
-defaults it to 1, so every option error here was printed twice where
-the same mistake under lfs printed it once.  optind wants no such
-setting: lfind_parse_target() compares strings rather than calling
-getopt(), so it is still 1 when the parser is reached.
+conf-sanity 300 runs lfs find over the scan that it already compares
+with a client walk. "--type f" must return every regular file that the
+client listed, and no directory. Both sides print FIDs with
+"-printf %LF", and the temporary files go through stack_trap. The test
+also checks --device=VALUE, both ways of naming a target twice, and
+that --internal only adds objects. Where mds1 and ost1 are one ldiskfs
+node, it runs --local with --ost and with --mdt while the targets are
+mounted, and checks that each reads only targets of that type.
+--local, --target and --fsname run again after everything is stopped,
+and each must report what it could not find; an invalid --fsname is
+refused. The plain-argument form is checked only when the MDT is a
+block device.
 
-conf-sanity 300 covers the three selectors this adds.  --internal
-is the same scan without the class filter, so the answer without it
-has to be a subset and strictly smaller -- an MDT that reported none
-of its own objects would pass a count test and fail the point.
---local and --target are checked where the suite has already stopped
-everything: each has to name the target it could not find rather than
-scan something else, or report an empty node as an empty filesystem.
+lfs-find.1 documents the five selectors, and how a search of a target
+answers differently: one MDT of a DNE namespace, sizes from SOM, --ost
+and --mdt naming the target, and the refused options.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -830,3 +833,172 @@ Patch Set 20:
 AI code review results below, please doublecheck
 
 Mostly good. Two optional items inline for whenever this is next refreshed; neither is a reason to re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:26:59.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 19:29:02.000000000) ---
+Patch Set 21:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 19:34:03.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:35:02.000000000) ---
+Patch Set 20:
+
+(2 comments)
+
+PS21 addresses the Code-Review-1 on PS20. lfind is gone: it is "lfs find --device" now, with -target, -local and -internal as long options, which is what most of that review asked for. The two threads still open are answered inline. PS21 also carries the review rounds of 09-13 through 09-21, which had not reached Gerrit for this change.
+
+--- Message (jenkins, 2026-09-21 20:31:03.000000000) ---
+Patch Set 21: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132084/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 08:24:05.000000000) ---
+Patch Set 21:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The fold of the standalone lfind into `lfs find` reads well, the selector parsing and the sweep bookkeeping hold up, and the reuse of `llapi_find_device()` before the walk's thread-count default is correct. Only optional nits inline for whenever this is next refreshed -- nothing here is worth a re-spin on its own.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:35.000000000) ---
+Patch Set 22:
+
+(6 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:29.000000000) ---
+Patch Set 22:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 23: New patch set was added with same tree, parent tree, and commit message as Patch Set 22.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:56:53.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:02:51.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:18:56.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (Autotest, 2026-09-23 13:28:18.000000000) ---
+Patch Set 22:
+
+Onyx Autotest 2 retesting enforced review-dne-part-1 session on el10.1-x86_64/ldiskfs servers and clients for build 132159 patch 22. Requested by Jin Gwoun because of DCO-11631.
+
+--- Message (Artem Blagodarenko, 2026-09-23 14:03:58.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+conf-sanity/300 fails on ps23 at its new last check (it passed on ps21). Seen on a rocky10 mob cluster; the TLC review bot found the same independently.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:52.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-23 19:01:56.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:20.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 20:06:29.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132228/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-09-24 14:23:21.000000000) ---
+Patch Set 20:
+
+(18 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 16:31:13.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The device/target selection, the one-target check and the --ost/--mdt sweep filter all trace correctly, the sweep reuses struct find_param safely across llapi_find_device() calls (common_param_init() re-initialises and find_param_fini() is reached on every path), and conf-sanity 300 covers the new paths including the error messages it greps for. Two optional nits inline for whenever it is next refreshed -- no need to re-spin for them.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 25.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:53.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:46.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:18.000000000) ---
+Patch Set 25:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 03:08:03.000000000) ---
+Patch Set 25: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132289/ : FAILURE

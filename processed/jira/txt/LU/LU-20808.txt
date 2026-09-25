@@ -1,0 +1,251 @@
+Key:        LU-20808
+Summary:    Reduce DNE Cross-MDT RPCs for DNE operation
+Link:       https://jira.whamcloud.com/browse/LU-20808
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Di Wang
+Created:    Wed, 23 Sep 2026 03:40:59 +0000
+Updated:    Thu, 24 Sep 2026 23:36:54 +0000
+Links:      Related: is related to  LU-19189; Related: is related to  LU-19038; Related: is related to  LU-7427; Related: is related to  LU-7426
+Attachments: Reduce DNE Cross-MDT Metadata RPC.pdf
+
+--- Description ---
+Introduce new cross-MDT intent to save some cross-MDT RPCs. Here is the proposal, please check the desgin. Reduce DNE Cross-MDT Metadata RPC.pdf
+
+--- Comment (JIRAUSER24000, Wed, 23 Sep 2026 03:42:56 +0000) ---
+adilger laisiyao bzzz  Sorry I do not have right to create new page on wiki right now. So I upload the design here.  Do you think it make sense?
+
+--- Comment (gerrit, Wed, 23 Sep 2026 23:46:47 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69170
+
+Subject: LU-20808 mdt: skip subdir check for non-dir rename
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ae26d3201ad52e1c3de7b77cc35ec37dd81eee13
+
+--- Comment (adilger, Thu, 24 Sep 2026 00:19:37 +0000) ---
+diwa thanks for the document. Definitely improving DNE performance is of interest to many people. I think there are two main areas that can be improved:
+
+	RPC protocol optimization as you discuss here, to reduce or completely eliminate round-trip times. Your document already discusses this in detail.
+
+	reducing DNE recovery llog overhead/serialization, as proposed in LU-7426 and LU-7427. Alex has been doing work in this area for some time (in particular indexed llog) that would reduce the needless serialization and sync writes that were added to avoid 1-bit writes to the remote llog over OUT.
+
+I think the two optimizations could potentially be done independently, but if we are already making a protocol change/OBD_CONNECT2_xxx for one of them, then it would be simpler to have that compatibility check cover both of these changes.
+
+Some review comments from AI review of your document.  One issue that appears with the benchmarks is that the rr=2 testing appears to mostly generate remote-MDT rename operations, so the "local MDT" slowdown for crossdir rename is likely caused by BFL overhead and the conclusion that it doesn't matter whether the directory is local or remote is wrong.
+
+There is a slowdown for renames across pathnames that cross into a remote MDT but land back on the same MDT due to an unnecessary mdo_is_subdir() call (which is Read 1 in the design) when renaming regular files that cannot be ancestors of any directory.  This overhead increases with the number of directories crossed by the rename.
+
+Major issues
+
+	Thread starvation or deadlock on the mdt_out service.
+	
+		Enqueues from one MDT to another go to OUT_PORTAL (ldlm_lib.c:329, mdt_mds.c:309). The same mdt_out threads also run the OUT_UPDATE requests.
+
+		A plain enqueue replies right away, and the requester waits for the completion callback. For the intent result to be computed "under the exact lock being granted", the handler has to wait for the grant on the server side, the way mdt_intent_getattr() does. That means an mdt_out thread blocks.
+
+		If the lock that conflicts is held by an operation that needs an OUT_UPDATE on this same MDT to finish, and every mdt_out thread is blocked in an intent enqueue, nothing can make progress.
+
+		Fix to specify: run the intent only if the lock can be granted immediately. Otherwise grant it the normal way with an empty result, so the coordinator falls back to today's reads.
+
+	
+	
+
+	Running permission and inheritance checks on the parent MDT causes more problems than it solves.
+	
+		Credentials: the document says the intent carries the "full caller context" in one place and "limited supplementary groups" in another. It also says handlers "adopt user identities directly from incoming RPC contexts", but on a connection between two MDTs, the RPC context is the other MDT, not the user.
+
+		Per-MDT settings: policy settings can differ between MDTs (enable_remote_dir_gid, the RBAC check on DNE operations, the SGID behaviour). Default layout choice depends on the coordinator's own view of pools and free space.
+
+		Recursive RPCs: when the parent has no default layout, the fallback is the root's default layout. Root lives on MDT0000, which may be remote from the parent MDT, so the handler would need its own remote reads. That contradicts "avoiding recursive OSP RPCs".
+
+		Rolling upgrades: different MDD versions would compute the child's inherited state differently.
+
+		Inconsistency: the unlink and rename paths in the same document already bring attributes back and check them on the coordinator.
+
+		Recommendation: use a generic "read under lock" intent instead. It would return the parent's attributes, access ACL, default ACL, default LMV and LOV, pin, linkEA and LMV, plus the looked-up child FID, as bitmask-selected buffers. The existing MDD code would then run unchanged on the coordinator, reading from the OSP cache.
+
+		This keeps almost all of the RPC savings. It removes the need to ship credentials and the MDD refactor, and the protocol shrinks to one opcode. At a minimum, the document must say why it rejected this option; right now it only asserts "operation-aware rather than a generic prefetch".
+
+	
+	
+
+	Security: the handler trusts credentials sent by the caller.
+	
+		"Only over secure MDT-to-MDT connections" is never defined. The handler must reject these opcodes from any export that lacks OBD_CONNECT_MDS_MDS.
+
+		Otherwise any client can send a forged UID and use the handler to test names and permissions in directories it cannot search.
+
+		Issue 2's recommendation would make this much less dangerous.
+
+	
+	
+
+	Skipping the lockless pre-lock lookup (LU-10235) undoes that fix.
+	
+		mdt_create() does that lookup specifically to avoid huge numbers of lock recalls on directories that already exist, as in mkdir -p storms. The venv and git workloads the document cites run mkdir -p constantly.
+
+		The same lookup is also part of the restripe path: when the entry exists and restripe is set, the code continues instead of returning EEXIST (mdt_reint.c:647-653).
+
+		Either keep the lookup, or measure a many-client EEXIST storm before and after the change.
+
+	
+	
+
+	The OSP cache rules are not specified.
+	
+		"Suppress post-lock invalidation… invalidate stale entries immediately after these entries are accessed" is not a rule anyone can implement against.
+
+		Cached data needs to be tied to a specific lock and dropped when that lock is cancelled. The document also needs to cover:
+		
+			other threads on the coordinator reading the same osp_object without holding the lock;
+
+			how this interacts with opo_stale, which osp_write_interpreter() sets on error.
+
+		
+		
+
+		The unexplained −23% directory-stat regression may be a symptom of this. It needs a root cause before landing, not "verify in a larger environment later".
+
+	
+	
+
+	Striped and migrating directories are not covered.
+	
+		The name-hash lock goes to the stripe that owns the name. Picking that stripe needs the LMV first, and in the rename trace that LMV read happens before any lock.
+
+		A directory that is migrating or being split has entries in two stripes, possibly on different MDTs. The intent handler cannot do an authoritative lookup there.
+
+		It must detect this case from the LMV hash flags and layout version, and fall back. Today the document mentions layout versions only for create.
+
+	
+	
+
+Medium issues:
+
+	Missing reply buffers:
+	
+		There is no buffer for the parent's access ACL. The coordinator needs it to check unlink and rename permissions. The "Access ACL" row in the table is the child's computed ACL, not the parent's.
+
+		There is no buffer for linkEA, which rename needs.
+
+		Nothing covers encryption context or the encrypted-parent checks.
+
+		LOV layouts with many components, or with mirrors, can be several KB. The document should say how the reply grows and what happens when it overflows.{}
+
+	
+	
+
+	Error semantics:
+	
+		The three outcomes include "Advisory results", which is never defined.
+
+		A real EACCES, ENOENT or EEXIST needs a status field that is separate from "not prepared". Otherwise a failed operation redoes every read and is slower than it is today.
+
+	
+	
+
+	Resend and replay:
+	
+		A resent intent enqueue needs the same fixup that mdt_intent_fixup_resent() does for client intents.
+
+		After the remote MDT restarts, OSP lock replay sends a plain enqueue with no intent, and the document should say so.
+
+		It should also state explicitly that values computed remotely (mode, GID, ACL) are logged by value in the coordinator's update log, so DNE update-log recovery is unaffected.
+
+		Separately, osp_md_object_lock() turns every error into -EIO, which the new error statuses can't survive as-is.
+
+	
+	
+
+	Scope:
+	
+		A regular file is always created on its parent's MDT, so IT_DNE_CREATE_PREPARE is effectively mkdir-only.
+
+		Hard links and lfs migrate -m are not covered.
+
+		Cross-MDT directory rename is the slowest operation (20.2 ms, with 5 foreground transaction RPCs) and is not addressed at all. It could also be a one-time update-log creation cost caught by a single trace on a fresh tree; check it in steady state.
+
+	
+	
+
+	File cross rename and the BFL:
+	
+		the claim that the rename lock is taken "whether or not the two directories live on the same MDT" is wrong for master.
+
+		With mdt_enable_parallel_rename_crossdir=1, which is the default, need_bfl is set only when the rename involves a remote MDT (mdt_reint.c:2897).
+
+		Both configurations probably measure the same 30 ms because rename_dst is on a different MDT from most task directories in both. The promised treatment "in the next section" does not exist.
+
+	
+	
+
+	Wire Protocol:
+	
+		It should name the OBD_CONNECT2_* flag, and describe renegotiation when a peer reconnects after an upgrade or downgrade.
+
+		Add a tunable to disable the feature and counters for intent hits and fallbacks.
+
+	
+	
+
+Suggested Phase 0 (no wire changes)
+
+	fix the name looked up three times;
+
+	fix the duplicate linkEA read caused by mdd_parent_fid() invalidating the cache;
+
+	fix read 8 duplicating read 7.
+
+	remove unnecessary mdo_is_subdir() overhead for cross-directory regular file renames
+
+	determine how much of the gain these fixes deliver alone. That separates the low-risk part of the win from the protocol change.
+
+--- Comment (adilger, Thu, 24 Sep 2026 01:35:15 +0000) ---
+I posted Reduce DNE Cross-MDT Metadata RPC.pdf to the Lustre wiki  (unchanged, unless the LLM did it behind my back).
+
+--- Comment (JIRAUSER24000, Thu, 24 Sep 2026 18:39:33 +0000) ---
+Thanks adilger , there is another ticket LU-19189, though I tried that by setting mdt.*.sync_lock_cancel=never, it does not help much in my environment, and I will check further. 
+
+> so the "local MDT" slowdown for crossdir rename is likely caused by BFL overhead and the conclusion that it doesn't matter whether the directory is local or remote is wrong.
+
+Thanks. Btw: I remember there is an effort about limit BFL to per MDT if all parties are in the same MDT? is it being tracked somewhere? or there are no such efforts at all?
+
+I will check other comments and update the design. Thanks!
+
+--- Comment (adilger, Thu, 24 Sep 2026 18:55:58 +0000) ---
+I remember there is an effort about limit BFL to per MDT if all parties are in the same MDT? is it being tracked somewhere? or there are no such efforts at all?
+
+that would only be safe if the whole directory tree lives on a single MDT.  With DNE3 it is likely that every level of the directory tree is on a different MDT, so a directory tree like dirM1.1->dirM2->dirM3->dirM1.2 (on their respective MDT numbers) that is doing a rename of dirM1.1 and dirM1.2 locking only on MDT1 would be unsafe if renames could also happen to dirM2 or dirM3 in parallel.
+
+If it was something simple like renaming a subdirectory rename("foo/tmp/sub", "foo/sub") and all of them are on the same MDT, then possibly single-MDT BFL locking would be useful.  The trick is to (somehow) ensure that those entries are created on the same MDT.  There are the existing lmv.*.qos_exclude_{pattern,prefix}" parameters that can force specific subdirectories (e.g. "tmp/" in this case) to stay on a local MDT, but I'm also open to improvements in when the DNE3 QOS/RR allocation decided to create remote subdirectories I would be open to this.  Unfortunately, I haven't come across any "simple and correct" heuristics about how to do this well.
+
+I think it makes sense to focus first on reducing the cost of individual DNE operations, as you are doing in this ticket, and continue the work to make DNE recovery more efficient (LU-7426).  That helps everything that goes cross-MDT, and will also help the renames.  Of course, Metadata WBC would be the ultimate solution - local memory latency for creates, batch flushing to the MDTs, but it needs significantly more work.
+
+--- Comment (JIRAUSER24000, Thu, 24 Sep 2026 21:58:55 +0000) ---
+>Unfortunately, I haven't come across any "simple and correct" heuristics about how to do this well.
+
+Yes, we’ve seen this problem here as well. Users can easily create deeply nested directory structures, and once the depth exceeds rr_max, all metadata load is directed to a single MDT. Users then begin to notice and complain about increased metadata operation latency.
+
+We haven’t found a simple solution yet. Do you think it would be feasible to incorporate MDS load into the QoS policy? For example, if the queue depth or MDS load becomes too high, the MDS could return EREMOTE, prompting the LMV to select a different MDT for a new directory regardless of rr_max. Though probably tracking the MDT load could be nasty and inaccurate. Indeed allowing all operations to go across MDTs would certainly be the ideal solution.
+
+--- Comment (gerrit, Thu, 24 Sep 2026 23:36:54 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69181
+
+Subject: LU-20808 mdt: add local/remote MDT rename statistics
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 85f3aeed4da95645511baa4d42f5a3096c64d0c0

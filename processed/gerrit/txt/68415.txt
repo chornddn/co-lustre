@@ -1,5 +1,5 @@
 Change:     68415
-Subject:    LU-20649 llapi: a changelog as an Object Stream
+Subject:    LU-20649 llapi: add llapi_scan_changelog()
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68415
 Change-Id:  I12efd3bd2150592a4507533129ab56573ef924d9
 Project:    fs/lustre-release
@@ -7,21 +7,21 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-09-11 22:26:07.000000000
-Patch Set:  12
-Insertions: +2560
+Updated:    2026-09-25 09:20:26.000000000
+Patch Set:  16
+Insertions: +2947
 Deletions:  -3
-Comments:   101 (5 unresolved)
+Comments:   132 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20649 llapi: a changelog as an Object Stream
+LU-20649 llapi: add llapi_scan_changelog()
 
 The two scanners we have enumerate what exists.  A changelog
 enumerates what happened, and llapi_scan_changelog() delivers it in
@@ -39,18 +39,23 @@ matches. Delivering it as lfsr_uid would have answered "-uid alice"
 from the identity of whoever last touched her file.  The record
 carries no size, mode, owner, times, layout or HSM state at any
 setting, so those arrive absent with their lfsr_valid bit clear.  With
-LLAPI_SCAN_CL_F_RESOLVE they are filled by opening the object through
-a client mount, which is one open and one stat each, or two of each
-for a regular file whose size was asked for; the demand mask decides
-whether that happens at all, so a consumer reading only what an event
-carries pays nothing.  Resolution fills what the stream lacks and
-never restates what it has, which is what lets a caller ask what an
-event recorded rather than what is true now.
+LLAPI_SCAN_CL_F_RESOLVE they are filled through a client mount: an
+O_PATH open by FID and a stat for each object, and a glimpse for a
+regular file whose size, blocks or mtime was asked for; the demand
+mask decides whether that happens at all, so a consumer reading only
+what an event carries pays nothing.  Resolution fills what the stream
+lacks and never restates what it has, which is what lets a caller ask
+what an event recorded rather than what is true now.
 
 Two modes.  Event mode delivers one record per event, in order.
 Object mode holds events in a FID-keyed cache and delivers one record
 per object once it has been quiet, so a file written a hundred times
 is one record and one lookup rather than a hundred of each.
+
+LLAPI_SCAN_CL_F_FOLLOW keeps reading as the log grows, as lfs changelog
+--follow does. LLAPI_SCAN_CL_F_ONCE, which needs _COALESCE, delivers an
+object at most once per run: a set of the FIDs already delivered drops
+the repeats. test5 covers it.
 
 Clearing is off by default and never runs ahead of the callback: it is
 irreversible and it purges the registered user's whole backlog, not
@@ -97,16 +102,21 @@ at the last index delivered.  Coalescing puts those apart: create B at
 while B is still held with a record at 10.  Clearing to 11 there and
 then stopping the scan loses B entirely -- no callback saw it, and a
 restart from sc_startrec cannot read it back, because the record is
-gone.
+gone. An object that never goes quiet would hold that point for ever,
+and would never be delivered either, so one held for six times
+sc_min_age since its first event is delivered on its next event and
+held afresh.
 
-An event with no target object is delivered per event even in object
-mode.  mdd_changelog_ns_store() zeroes cr_tfid when its target is
-NULL, which mdd_rename() passes whenever the destination name did not
-already exist, and cr_markerflags -- a CL_MARK's union with the same
-bytes -- is not a FID either.  Coalescing keys on the FID, so all of
-them shared one cache entry and only the last survived: an ordinary
-`mv a b` was enough to lose the one before it, and with clearing on,
-the record it came from is gone as well.
+A rename is about the object that moved.  mdd_changelog_ns_store()
+zeroes cr_tfid when mdd_rename() passes no target, which it does
+whenever the destination name did not exist, and the moved object is
+then only in the rename extension's cr_sfid.  Keying on cr_tfid alone
+would give every such rename no object, and a consumer such as
+lfs find --since would miss the renamed file.  A rename over an
+existing name is about both objects, so it is delivered for each.  A
+CL_MARK is about none: cr_markerflags shares its bytes with cr_tfid
+and is not a FID.  A record about no object is delivered per event
+even in object mode, since coalescing keys on the FID.
 
 The parent FID is taken only from an event that carries one.  CL_CLOSE
 does not -- mdd_changelog_data_store() is called with pfid NULL -- so
@@ -121,11 +131,13 @@ record types that imply one and no others, so counting it there would
 leave a consumer asking for FID and type with neither a lookup nor a
 type on a CL_CLOSE.
 
-Resolution opens O_PATH and takes a real open only for the regular
-file whose size it came for.  llite gives a special file
-init_special_inode(), so opening every object for read opened the
-driver behind a device node stored in the filesystem; O_NONBLOCK holds
-off the wait, not the rest of what an open does.
+Resolution opens O_PATH only, never for read. A real open is an MDS
+open, which writes CL_OPEN and CL_CLOSE records when a changelog user's
+mask includes OPEN, so resolving would feed the log it reads; and on a
+device node stored in the filesystem it opens the driver. The stat is
+statx() without AT_STATX_DONT_SYNC, which revalidates with the MDT and
+glimpses the OSTs as stat(2) does, so a cached inode does not answer for
+an owner or mode another client has changed.
 
 The uidgid extension is asked for when sc_want is 0, and that case is
 tested on its own rather than by a mask.  Zero means "everything", so
@@ -134,15 +146,15 @@ it is the caller that most needs the extension -- and `0 &
 precisely the caller that wanted it, leaving LLAPI_SCAN_EVENT_UID out
 of lfsr_valid.
 
-A size is reported strict only where the OSTs were actually glimpsed.
-The second open runs for a regular file whose demand mask names a
-size and can still fail, so a consumer asking for an mtime alone
-reaches the fill on the O_PATH descriptor; that is the MDT's lazy
-answer, and LLAPI_SCAN_LAZY_SIZE and LLAPI_SCAN_LAZY_BLOCKS are what
-say so.  liblustreapi_pfind.c maps the two to OBD_MD_FLSIZE and
-OBD_MD_FLLAZYSIZE, so they are not interchangeable.
+A regular file's size and mtime are strict only when the OSTs were
+glimpsed, which happens when the demand mask is 0 or names a size,
+blocks or an mtime. Otherwise the size is the MDT's lazy one, which
+LLAPI_SCAN_LAZY_SIZE and LLAPI_SCAN_LAZY_BLOCKS say, and the mtime is
+left out.  liblustreapi_pfind.c maps the two to OBD_MD_FLSIZE and
+OBD_MD_FLLAZYSIZE, so they are not interchangeable.  sc_got counts
+them under a resolve, as both siblings' masks do.
 
-LLAPI_SCAN_CL_F_RESOLVE is one open and one fstat, so the page says
+LLAPI_SCAN_CL_F_RESOLVE is one open and a stat, so the page says
 which six of the ten fields it fills.  The project id, the layout,
 the directory stripe and the HSM state each cost an ioctl or an xattr
 of their own and are not filled at any setting; the page said
@@ -163,14 +175,8 @@ is cr_flags & CLF_FLAGMASK, so CLF_RENAME, CLF_JOBID and
 CLF_EXTRA_FLAGS are masked off -- they say which extensions a record
 carries, not what happened.
 
-Three smaller things.  The second fstat() is taken only when the
-glimpse replaced the descriptor.  scan_cl_bucket() drops a modulo
-that cannot change llapi_fid_hash()'s value, that being hash_long()
-on the same shift.  The sc_mdtname test after the memcpy goes: the
-minimum sc_size reaches through that field and the caller's own
-struct was tested at the top, so it could never fire.  Four comments
-described an earlier revision of this patch rather than the code and
-now describe the code.
+scan_cl_bucket() takes llapi_fid_hash() as it is: that is hash_long()
+on the same shift, and a modulo on top could not change it.
 
 The COALESCE flag says which event's fields the one record carries. It
 promised one record per object and left open which of the object's
@@ -180,15 +186,18 @@ log recorded -- an object created under one name and hardlinked under
 another arrives carrying only the last of them.  lfs find --changelog
 -name is that consumer, and the gap showed there first.
 
-sc_type_mask without sc_user is refused.  The mask reaches the server
-only through llapi_changelog_start_user(), which needs a registered
-user to filter for; on the other branch llapi_changelog_start() never
-sees it, so a caller asking for CL_UNLINK alone read every event type
-and nothing said so.  Refused rather than applied client-side, because
-that is a different thing -- the records still cross the wire -- and
-sc_filter is already the client-side spelling.  The man page said only
-that the mask is intersected with the user's own, which does not tell
-a caller what happens when there is no user.
+sc_type_mask without sc_user is refused. The mask is intersected with
+the registered user's own, which the client's mdc asks the MDS for
+through llapi_changelog_start_user(); the mdc then drops the other
+records as it reads them. On the other branch llapi_changelog_start()
+never saw the mask, so a caller asking for CL_UNLINK alone read every
+event type and nothing said so. It is refused rather than given a
+second meaning: sc_filter already filters without a user. The man page
+said only that the mask is intersected with the user's own, which does
+not tell a caller what happens when there is no user. With no mask the
+plain reader is used even when sc_user is set: the filtered one looks
+the user up on the MDS, which an MDS before 2.17.0 cannot do, and
+sc_user is then needed only to clear.
 
 llapi_scan_changelog_test covers the five things the shape of this
 stream turns on: that a record describes the event it came from, that
@@ -197,19 +206,13 @@ keeps a lookup from happening at all, that a consumer's own return
 value comes back unchanged, and that bad parameters are refused rather
 than crashed on.  It takes -m for the MDT, -u for a registered user
 and -d for a client mount, since three of those need a live log.
-Nothing in lustre/tests drives it yet, unlike its two siblings, which
-land their suite case with the scanner: that case wants a changelog
-registered and cleared around it and a skip where the MDT records
-nothing, and is left for its own patch rather than grown here.
-
 sanity 157d runs it, so the binary is not merely built.  Its events
 have to be on the MDT whose log it reads, which under DNE a mkdir
 below a striped root does not guarantee, so the test makes the
 directory on MDT0 itself rather than leaving the binary to notice and
-refuse.  -u passes a registered Changelog user, which puts the read on
-llapi_changelog_start_user() and so exercises the server-side filter;
-test6 is the one case that needs the user for itself, and skips
-without one because clearing cannot be undone.
+refuse.  -u passes a registered Changelog user; test6 is the one case
+that needs it, and skips without one because clearing cannot be
+undone.
 
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -667,3 +670,135 @@ Patch Set 12:
 AI code review results below, please doublecheck
 
 Looks good overall; the entry point, the coalescing cache and the clearing bound all read correctly, and the man page matches the code. Only optional items inline -- none of them needs a re-spin on their own, they are just free to pick up if the patch is refreshed for another reason.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:37.000000000) ---
+Patch Set 13:
+
+(5 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 21:44:54.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 14: Patch Set 13 was rebased.
+
+--- Message (jenkins, 2026-09-22 21:54:47.000000000) ---
+Patch Set 13:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:57:10.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:02:16.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:19:12.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 03:28:03.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132162/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-23 16:12:31.000000000) ---
+Patch Set 14:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The interop gate on the new sanity case looks like it needs a refresh; the two library items can ride along on the same cycle.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:54.000000000) ---
+Patch Set 14:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-09-23 19:01:20.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:37.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 20:30:07.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132231/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 18:34:16.000000000) ---
+Patch Set 15:
+
+(8 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them are about fields the record advertises as valid but whose source the MDS never fills (lfsr_event_prev) or leaves untouched (cr_pfid on a record with no parent), so a consumer is handed a plausible-looking number it cannot tell from a real one. The rest are optional and can ride along on the refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:55.000000000) ---
+Patch Set 15:
+
+(8 comments)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:10.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:34.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 02:52:27.000000000) ---
+Patch Set 16: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132291/ : FAILURE

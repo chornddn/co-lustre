@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Alexander Boyko
 Created:    2026-09-15 16:11:47.000000000
-Updated:    2026-09-17 14:41:37.000000000
-Patch Set:  1
-Insertions: +1734
-Deletions:  -25
-Comments:   57 (11 unresolved)
+Updated:    2026-09-25 06:47:19.000000000
+Patch Set:  2
+Insertions: +1183
+Deletions:  -44
+Comments:   98 (21 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -24,31 +24,20 @@ Comments:   57 (11 unresolved)
 --- Commit Message ---
 LU-19672 osp: batch object destroy over OUT protocol
 
-Replace the OSP llog sync path's per-record OST_DESTROY/OST_SETATTR
-RPCs with batched OUT_UPDATE RPCs so MDT->OST processing no longer
-costs one network round-trip per object.
+Replace the OSP llog sync path's per-record OST_DESTROY RPCs with
+batched OUT_UPDATE RPCs, so MDT->OST unlink processing no longer
+costs one round-trip per object. Only destroy records are
+batched (idempotent, safe to reorder/replay); a destroy is packed
+as OUT_REF_DEL + OUT_DESTROY, as ofd_destroy_by_fid() does.
 
-Add two new opcodes for osp_sync's batched RPCs: OUT_BATCH_DSTR_UNLNK
-combines LDLM lock discard, ref_del, and destroy into one
-ENOENT-tolerant sub-update, mirroring ofd_destroy_by_fid();
-OUT_BATCH_ATTR_SET clears a precreated object's ownership markers,
-also ENOENT-tolerant. Records needing the FLR layout version still use
-the legacy OST_SETATTR RPC.
+Add UPDATE_FL_TOLERATE_ENOENT so the target records -ENOENT for a
+sub-update instead of aborting the batch. OBD_CONNECT2_BATCH_DESTROY
+advertises target support; osp_sync_process_record() accumulates
+destroys into one osp_update_request, flushed at
+sync_max_records_per_rpc records or sync_batch_max_age_ms.
 
-osp_sync_process_record() accumulates consecutive destroy/setattr
-llog records into one osp_update_request, flushing at
-sync_max_records_per_rpc sub-updates or sync_batch_max_age_ms. The
-interpret callback walks the per-index reply: success and tolerated
-ENOENT cancel the llog record after commit; other errors or missing
-indices (partial abort) go through the per-object retry path.
-
-out_handle() skips LFSCK's fid-accessed marking and retries split
-batches on -EOVERFLOW.
-
-New tunables sync_max_records_per_rpc and sync_batch_max_age_ms
-control batch size and flush interval; sync_max_records_per_rpc also
-auto-detects target support for the new opcodes, falling back to
-legacy RPCs when unsupported.
+New tunables: sync_max_records_per_rpc (0 disables batching),
+sync_batch_max_age_ms.
 
 Assisted-by: GitHub Copilot CLI:claude-opus-5
 HPE-bug-id: LUS-13499
@@ -131,3 +120,46 @@ Patch Set 1:
 Patch Set 1:
 
 (1 comment)
+
+--- Message (Alex Zhuravlev, 2026-09-21 16:19:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Alexander Boyko, 2026-09-24 08:50:43.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-24 08:56:18.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+4 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-24 09:03:38.000000000) ---
+Patch Set 2:
+
+(30 comments)
+
+33 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-24 09:32:06.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132259/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-25 06:47:19.000000000) ---
+Patch Set 2:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The replay path and the dt_sync()/osp_sync() barrier interaction look like real problems that need a refresh; the rest can ride along. test_239c only covers the happy path, so it would help to also exercise a batch that hits -ENOENT mid-batch and one that spans enough distinct owners to trigger the -EOVERFLOW split.

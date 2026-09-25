@@ -1,5 +1,5 @@
 Key:        LU-20778
-Summary:    Unified I/O target selection and object-offset I/O
+Summary:    Unified I/O scope and object-offset I/O
 Link:       https://jira.whamcloud.com/browse/LU-20778
 Type:       New Feature
 Priority:   Major
@@ -8,14 +8,16 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Keguang Xu
 Created:    Fri, 18 Sep 2026 07:46:22 +0000
-Updated:    Fri, 18 Sep 2026 09:00:25 +0000
+Updated:    Mon, 21 Sep 2026 07:49:58 +0000
 
 --- Description ---
-Unified I/O target selection and object-offset I/O
+Give the whole family of "do I/O against one stripe (i.e. one OST object) inside a layout component" operations a single addressing model and a single userspace interface.
 
-Give the whole family of "do I/O against one stripe (i.e. one OST object) inside a layout component" operations a single addressing model and a single userspace interface, so that FLR designated mirror, EC parity resync/verify, single-stripe migration (LU-20534 / LU-20541), EC rebuild and PFL/DoM merging (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612) all share the same target description and UAPI.
+FLR designated mirror, EC parity resync/verify, single-stripe migration (LU-20534 / LU-20541), EC rebuild and PFL/DoM merging (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612) all share the same I/O-scope description and UAPI.
 
-	One target-selection UAPI: struct lov_io_target plus LL_IOC_LOV_SET_IO_TARGET / LL_IOC_LOV_CLEAR_IO_TARGET. All four lov_io_scope values — FILE / MIRROR / STRIPE / OBJECT — are defined in the first UAPI version; OBJECT is initially reserved and implemented in P2.
+Key points
+
+	One I/O-scope UAPI: struct ll_ioc_io_scope plus LL_IOC_SET_IO_SCOPE / LL_IOC_CLEAR_IO_SCOPE. All four ll_io_scope values — FILE / MIRROR / STRIPE / OBJECT — are defined in the first UAPI version; OBJECT is initially reserved and implemented in P2.
 
 	Identity and offset space are kept separate: STRIPE pins one object but keeps using file offsets; only OBJECT reinterprets pos as an object offset.
 
@@ -23,7 +25,9 @@ Give the whole family of "do I/O against one stripe (i.e. one OST object) inside
 
 0. Terminology
 
-Terminology follows existing Lustre / LOV usage. Note in particular that lmm_stripe_offset in the UAPI is the starting OST index, not a byte offset within an object. The latter is always called an object offset here.
+Terminology follows existing Lustre / LOV usage.
+
+lmm_stripe_offset in the UAPI is the starting OST index, not a byte offset within an object. The latter is always called an object offset here.
 
 Term
 Meaning
@@ -35,35 +39,40 @@ object offset
 Byte offset within one OST object (obdoff)
 
 obj(X)
-The object offset obtained by projecting file offset X onto a given stripe under the component's striping geometry; obj(e_start) / obj(e_end) are the projections of the component boundaries
+File offset X projected onto a given stripe under the component's striping geometry. obj(e_start) / obj(e_end) are the component boundaries.
 
 prefix hole
-The range [0, obj(e_start)) in an object's address space: it does not contribute to the parent file's i_size, cannot be reached through that component's file-offset path, and is exactly what OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612 needs to write
+[0, obj(e_start)) on the object: does not contribute to the parent i_size, unreachable via that component's file-offset path. This is what OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612 needs to write.
 
 1. Background
 1.1 Today: three unrelated ways to designate a target
-
-Consumer
-Current mechanism
-Offset space
-Problem
-
 FLR resync / verify
-LL_IOC_FLR_SET_MIRROR(long), fd_designated_mirror
-file offset
-Can only select a mirror, not a stripe; no layout_version / FID validation
+
+	Mechanism: LL_IOC_FLR_SET_MIRROR(long), fd_designated_mirror
+
+	Offset space: file offset
+
+	Problem: can only select a mirror, not a stripe; no layout_version / FID validation
 
 EC parity resync / verify (EC branch)
-LL_IOC_FLR_SET_STRIPE(long), meaning "which parity within the raidset"
-file offset (parity relative to component e_start)
-The interface exposes raidset-internal geometry; inconsistent with the mirror interface
+
+	Mechanism: LL_IOC_FLR_SET_STRIPE(long), meaning "which parity within the raidset"
+
+	Offset space: file offset (parity relative to component e_start)
+
+	Problem: the interface exposes raidset-internal geometry; inconsistent with the mirror interface
 
 Single-stripe migration (LU-20534)
-Userspace converts file offset to object offset via lov_stripe_offset() and then copies; swap uses LL_IOC_LOV_SWAP_LAYOUTS_FID
-file offset for the copy, FID for the swap
-The copy duplicates the conversion in userspace; PFL components, parity, and SEEK_DATA on the parent file crossing stripes / components all need separate handling
 
-All three are fundamentally the same operation: select one OST object identified by (component, stripe), then read or write it in some offset space. Today identity, offset space and failure policy are tangled inside each individual ioctl. Once such an interface ships, any later consolidation must retain compatibility paths.
+	Mechanism: userspace converts file offset to object offset via lov_stripe_offset() and then copies; swap uses LL_IOC_LOV_SWAP_LAYOUTS_FID
+
+	Offset space: file offset for the copy, FID for the swap
+
+	Problem: the copy duplicates the conversion in userspace. PFL components, parity, and SEEK_DATA on the parent file crossing stripes / components all need separate handling.
+
+All three are the same operation: select one OST object identified by (component, stripe), then read or write it in some offset space.
+
+Today identity, offset space and failure policy are tangled inside each individual ioctl. Once such an interface ships, any later consolidation must retain compatibility paths.
 
 1.2 Use cases
 
@@ -71,21 +80,23 @@ All three are fundamentally the same operation: select one OST object identified
 
 	OST decommissioning / moving a single stripe to another OST: relocate one object as a whole, leaving the rest of the file untouched.
 
-	PFL/DoM merging (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612): write the data of the DoM component (or of the previous component) into the prefix hole of the next component's object, then move that component's e_start down and delete the previous component. Whole-file DoM→OST migration (LU-10177 / LU-11421) already exists, but at the cost of rewriting the whole file; OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612 is the optimisation of that.
+	PFL/DoM merging (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612): write the data of the DoM component (or of the previous component) into the prefix hole of the next component's object, then move that component's e_start down and delete the previous component.
+
+Whole-file DoM→OST migration (LU-10177 / LU-11421) already exists, but at the cost of rewriting the whole file; OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612 is the optimisation of that.
 
 Object bytes outside the visible range cannot be reached through that component's file-offset path, which is why OBJECT is needed.
 
 2. Goals
 
-	One SET/CLEAR ioctl pair and one structure that can name a mirror, a parity, or a single stripe, with layout_version and FID validation. FLR mirror stays on SET_MIRROR as an alias for {MIRROR, mirror_id}; behaviour is unchanged.
+	One SET/CLEAR ioctl pair and one structure that can name a mirror, a parity, or a single stripe, with ios_layout_version. ios_fid is OBJECT-only. FLR mirror stays on SET_MIRROR as an alias for MIRROR + ios_mirror_id; behaviour is unchanged.
 
 	Object-offset I/O is a separate entry path in the kernel: it does not restructure the existing file→stripe mapping and introduces no regression on the file-offset path.
 
-	Replacing an OST object (migration, rebuild) always uses single-stripe swap; on an existing data object, object-offset writes are only opened up for the prefix hole (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612), and no other range — see §3.1.
+	Replacing an OST object (migration, rebuild) always uses single-stripe swap. On an existing data object, object-offset writes are only opened up for the prefix hole (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612), and no other range — see §3.1.
 
 3. Addressing model
 
-A single I/O selects its target by scope, and the offset space of pos follows the scope:
+A single I/O selects its target by scope. The offset space of pos follows the scope:
 
 scope
 Target
@@ -96,26 +107,38 @@ The whole file
 file offset
 
 MIRROR
-One FLR mirror (mirror_id)
+One FLR mirror (ios_mirror_id)
 file offset
 
 STRIPE
-One OST object (comp_id, stripe_idx)
+One OST object (ios_comp_id, ios_stripe_idx)
 file offset, via the file→stripe mapping
 
 OBJECT
 The same OST object (same fields)
 object offset
 
-	stripe_idx is the object index within the component (same ordering as lfs getstripe). On parity, "which parity within the raidset" is idx % p and the raidset is idx / p; these are derived quantities, not interface concepts.
+	ios_stripe_idx is the object index within the component (same ordering as lfs getstripe). On parity, "which parity within the raidset" is idx % p and the raidset is idx / p; these are derived quantities, not interface concepts.
 
-	fid is the same FID used by LL_IOC_LOV_SWAP_LAYOUTS_FID. A non-zero lit_fid is validated; all-zero is not. OBJECT scope requires a non-zero FID.
+	Whether a failure triggers recovery is only defined under file offsets. It follows the existing read path by default and is not part of the UAPI.
 
-	Whether a failure triggers recovery is only defined under file offsets; it follows the existing read path by default and is not part of the UAPI.
+Identity fields
+
+Unused identity fields must be 0:
+
+	FILE rejects all of them
+
+	MIRROR rejects ios_comp_id / ios_stripe_idx / ios_fid
+
+	STRIPE rejects ios_mirror_id / ios_fid
+
+ios_fid is OBJECT-only (the same FID as LL_IOC_LOV_SWAP_LAYOUTS_FID). FILE / MIRROR / STRIPE require a zero FID. OBJECT requires a non-zero FID.
 
 3.1 OBJECT I/O rules
 
-OBJECT reads may target the selected data or parity object; writes to an existing data object do not open up the whole object. The rules below define the read and write boundaries; replacing the object is a different operation (single-stripe swap).
+OBJECT reads may target the selected data or parity object. Writes to an existing data object do not open up the whole object.
+
+The rules below define the read and write boundaries. Replacing the object is a different operation (single-stripe swap).
 
 	Reads: the target object's kms determines the boundary. Glimpse first if kms is invalid or the requested position exceeds it; return -EIO if the target is unavailable.
 
@@ -130,58 +153,79 @@ Object-offset write
 accepted — the prefix hole, OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612
 
 [obj(e_start), obj(e_end))
-rejected — the visible range uses file offset + designated (already covered by P1)
+rejected — visible range uses file offset + designated (P1)
 
 [obj(e_end), ∞)
 -EINVAL — no consumer
 
-An object's size may exceed the component's visible span: that is the prefix hole, already true for PFL. lov_stripe_size() maps those bytes to a file offset below e_start; lov_attr_get_composite() takes the max across components, so a prefix write cannot raise i_size. Writes past obj(e_end) are rejected by rule 2. Under the prefix-hole-only rule, the existing size/kms merge path does not change; the OBJECT write path itself must not use an object offset to update the VVP inode's i_size (see §4.2).
+An object's size may exceed the component's visible span: that is the prefix hole, already true for PFL.
+
+lov_stripe_size() maps those bytes to a file offset below e_start. lov_attr_get_composite() takes the max across components, so a prefix write cannot raise i_size.
+
+Writes past obj(e_end) are rejected by rule 2. Under the prefix-hole-only rule, the existing size/kms merge path does not change.
+
+The OBJECT write path itself must not use an object offset to update the VVP inode's i_size (see §4.2).
 
 4. Design
 4.1 UAPI
+ll_ioc_io_scope
 
-enum lov_io_scope {
-	LOV_IO_SCOPE_FILE	= 0,	/* whole file; pos is a file offset */
-	LOV_IO_SCOPE_MIRROR	= 1,	/* one FLR mirror; pos is a file offset */
-	/* pin one OST object; pos is still a file offset, via file->stripe mapping */
-	LOV_IO_SCOPE_STRIPE	= 2,
-	/* pos is an object offset */
-	LOV_IO_SCOPE_OBJECT	= 3,
+enum ll_io_scope {
+	LL_IO_SCOPE_FILE	= 0,	/* whole file, file offset */
+	LL_IO_SCOPE_MIRROR	= 1,	/* one FLR mirror, file offset */
+	LL_IO_SCOPE_STRIPE	= 2,	/* one object, file offset */
+	LL_IO_SCOPE_OBJECT	= 3,	/* one object, object offset */
 };
 
-struct lov_io_target {
-	__u32		lit_scope;		/* enum lov_io_scope */
-	__u32		lit_flags;		/* must be 0; reserved */
-	__u32		lit_mirror_id;		/* MIRROR */
-	__u32		lit_comp_id;		/* STRIPE / OBJECT */
-	__u32		lit_stripe_idx;		/* STRIPE / OBJECT, object index in component */	
-	struct lu_fid	lit_fid;		/* validated if non-zero; required for OBJECT */	
+struct ll_ioc_io_scope {
+	__u32		ios_scope;		/* enum ll_io_scope */
+	__u32		ios_flags;		/* reserved; must be 0 */
+	__u32		ios_mirror_id;		/* MIRROR */
+	__u32		ios_comp_id;		/* STRIPE/OBJECT */
+	__u32		ios_stripe_idx;		/* STRIPE/OBJECT */
+	__u32		ios_layout_version;	/* 0 = skip check */
+	struct lu_fid	ios_fid;		/* OBJECT; must be 0 otherwise */
+	__u64		ios_padding[2];		/* must be 0 */
 };
 
-#define LL_IOC_LOV_SET_IO_TARGET	_IOW('f', 180, struct lov_io_target)
-#define LL_IOC_LOV_CLEAR_IO_TARGET	_IO ('f', 181)
+#define LL_IOC_SET_IO_SCOPE		_IOW('f', 180, struct ll_ioc_io_scope)
+#define LL_IOC_CLEAR_IO_SCOPE		_IO('f', 181)
 
-Enum-valued fields in UAPI structures are declared as __u32 with the real enum named in a comment next to the field: the width and signedness of a C enum vary between compilers, while ioctl structures must have fixed widths. This matches idv_flags / pccs_type in the tree. No lov_io_target_flags is defined: object offsets are a scope value, not a bit.
+Enum-valued fields in UAPI structures are declared as __u32 with the real enum named in a comment next to the field. The width and signedness of a C enum vary between compilers, while ioctl structures must have fixed widths. This matches idv_flags / pccs_type in the tree.
 
-Validation and semantics:
+No flags enum is defined: object offsets are a scope value, not a bit.
 
-	Unknown lit_scope, lit_flags != 0, or non-zero lit_padding → -EINVAL.
+	Unknown ios_scope, ios_flags != 0, non-zero ios_padding, or unused identity fields set → -EINVAL.
 
-	STRIPE: pins one object, pos is still a file offset. Object bytes outside that component's visible extent remain unreachable.
+	STRIPE: pins one object by ios_comp_id / ios_stripe_idx; pos is still a file offset. ios_mirror_id and ios_fid must be 0. Object bytes outside that component's visible extent remain unreachable.
 
-	OBJECT: same comp_id / stripe_idx, pos is an object offset; requires a non-zero lit_fid, O_DIRECT, and no mmap. Mutating operations added in P3 also require a non-zero lit_layout_version. Unavailable objects return -EIO and do not enter CIT_EC_RD. Reserved in the enum from P1, returning -EOPNOTSUPP until implemented; I/O is wired up in P2.
+	OBJECT: same ios_comp_id / ios_stripe_idx; pos is an object offset. Requires a non-zero ios_fid, O_DIRECT, and no mmap. Mutating operations added in P3 also require a non-zero ios_layout_version. Unavailable objects return -EIO and do not enter CIT_EC_RD. Reserved in the enum from P1, returning -EOPNOTSUPP until implemented; I/O is wired up in P2.
 
-	Non-FILE scopes require O_DIRECT; LL_IOC_FLR_SET_MIRROR is kept as an alias for {MIRROR, mirror_id}.
+	Non-FILE scopes require O_DIRECT. LL_IOC_FLR_SET_MIRROR is kept as an alias for MIRROR + ios_mirror_id. The fd stores the whole struct ll_ioc_io_scope in fd_io_scope.
 
 4.2 Kernel
 
-No new cl_io_type: when ci_obj_offset is set, lov_io_init_composite() attaches &lov_obj_io_ops instead of &lov_io_ops. Identity filtering stays on ci_designated_* + lov_io_stripe_wanted(); the file→stripe algorithm is unchanged.
+The fd stores struct ll_ioc_io_scope as fd_io_scope. ll_io_set_scope() copies it into ci_designated_* at I/O init:
 
-Only one LOV callback is rewritten for the OBJECT path. Every other difference is a short-circuit (early-return) branch that performs the minimum object-coordinate work and returns. The file-offset helpers (lov_io_rw_iter_init(), lov_io_iter_init(), lov_offset.c) are not modified.
+	MIRROR sets ci_designated_mirror
 
-Rewrite — only cio_iter_init. Existing iterator callbacks split a file-offset range across components and stripes; OBJECT wants one sub-io, identity lis_pos / lis_endpos, and ci_continue = 0. It therefore uses lov_obj_io_iter_init rather than adding branches to lov_io_rw_iter_init() / lov_io_iter_init(). Writes are range-checked per rule 2 of §3.1. P2 covers READ/LSEEK; P3 covers WRITE/DV/FSYNC. Except for the dedicated short-circuit callbacks listed below, the remaining cio_{} keep pointing at the existing lov_io_.
+	STRIPE sets ci_designated_comp (lsme_id) and ci_designated_stripe (stored as idx + 1; 0 = unset)
 
-Short-circuit branches — any existing path that would map pos as a file offset, cross components, or update the file's i_size returns after the OBJECT-specific identity work. For a cio_{}{}, lov_obj_io_ops points at a dedicated callback; where that table cannot select the call (layout llo_, before the table is attached, or VVP), the existing function gets a branch.
+	On FLR, STRIPE derives ci_designated_mirror from mirror_id_of(ios_comp_id)
+
+Identity filtering stays on ci_designated_* plus lov_io_comp_wanted() / lov_io_stripe_wanted() / lov_io_designated_pos_check(). The file→stripe algorithm is unchanged.
+
+STRIPE is not a resync: it must not set LU_LAYOUT_RESYNC.
+
+No new cl_io_type: when ci_obj_offset is set, lov_io_init_composite() attaches &lov_obj_io_ops instead of &lov_io_ops.
+
+Only one LOV callback is rewritten for the OBJECT path. Every other difference is a short-circuit (early-return) branch that performs the minimum object-coordinate work and returns.
+
+The file-offset helpers (lov_io_rw_iter_init(), lov_io_iter_init(), lov_offset.c) are not modified.
+
+	Rewrite — only cio_iter_init. Existing iterator callbacks split a file-offset range across components and stripes. OBJECT wants one sub-io, identity lis_pos / lis_endpos, and ci_continue = 0. It therefore uses lov_obj_io_iter_init rather than adding branches to lov_io_rw_iter_init() / lov_io_iter_init(). Writes are range-checked per rule 2 of §3.1. P2 covers READ/LSEEK; P3 covers WRITE/DV/FSYNC. Except for the dedicated short-circuit callbacks listed below, the remaining cio_{} keep pointing at the existing lov_io_.
+
+	Short-circuit branches — any existing path that would map pos as a file offset, cross components, or update the file's i_size returns after the OBJECT-specific identity work. For a cio_{}{}, lov_obj_io_ops points at a dedicated callback. Where that table cannot select the call (layout llo_, before the table is attached, or VVP), the existing function gets a branch.
 
 Function
 OBJECT branch does
@@ -199,7 +243,7 @@ lov_page_init_composite() / lov_dio_pages_init_composite()
 suboff = offset
 
 lov_io_slice_init()
-Before the table is attached, resolve (comp_id, idx) into lis_obj_* (do not set LU_LAYOUT_RESYNC; that bit is only for designated resync writes)
+Before the table is attached, resolve (comp_id, idx) into lis_obj_*. Do not set LU_LAYOUT_RESYNC; that bit is only for designated resync writes.
 
 ll_direct_IO() / vvp_prep_size() / lseek
 EOF from the target object's kms, not the file's i_size
@@ -207,41 +251,52 @@ EOF from the target object's kms, not the file's i_size
 vvp_io_write_start()
 Do not update the file's i_size from an object offset
 
-EOF has three cases: OBJECT → kms of the target object (glimpse if kms is invalid or pos > kms); ci_parity_io → ci_parity_eof; otherwise the file's i_size. OBJECT does not set ci_parity_io and does not use ci_parity_eof (that is the projection of designated parity into file space, a different space). The read path must not go through generic_file_read_iter(), or a DIO short-read fallback would pull object pages into the file page cache.
+EOF has three cases:
+
+	OBJECT → kms of the target object (glimpse if kms is invalid or pos > kms)
+
+	ci_parity_io → ci_parity_eof
+
+	otherwise the file's i_size
+
+OBJECT does not set ci_parity_io and does not use ci_parity_eof (that is the projection of designated parity into file space, a different space).
+
+The read path must not go through generic_file_read_iter(), or a DIO short-read fallback would pull object pages into the file page cache.
 
 4.3 Userspace
 
-	llapi_io_target_set/clear; llapi_mirror_set/clear become wrappers.
+	llapi_io_scope_set/clear. llapi_mirror_set/clear keep their signatures and still issue LL_IOC_FLR_SET_MIRROR; the kernel handles that ioctl as an alias for MIRROR + ios_mirror_id.
 
 	Target resolution: by (comp_id, idx), by FID, or by OST.
 
-	OBJECT-scope pread / lseek (P2) and pwrite (P3, prefix hole [0, obj(e_start)) only). Use the llapi_io_object_* prefix (the same family as llapi_io_target_set, matching LOV_IO_SCOPE_OBJECT).
+	OBJECT-scope pread / lseek (P2) and pwrite (P3, prefix hole [0, obj(e_start)) only). Use the llapi_io_object_* prefix (alongside llapi_io_scope_set, matching LL_IO_SCOPE_OBJECT).
 
 4.4 Where each consumer lands
-
-Consumer
-Source
-Destination
-
 Single-stripe migration (LU-20534)
-Today userspace converts file offsets to object offsets → becomes SEEK_DATA + pread on the object
-Identity pwrite on a volatile file with stripe_count = 1 + single-stripe swap (unchanged)
+
+	Source: today userspace converts file offsets to object offsets → becomes SEEK_DATA + pread on the object
+
+	Destination: identity pwrite on a volatile file with stripe_count = 1 + single-stripe swap (unchanged)
 
 EC rebuild
-Recovery read by file offset (automatically entering CIT_EC_RD)
-Same as above: identity write to a volatile file + single-stripe swap
+
+	Source: recovery read by file offset (automatically entering CIT_EC_RD)
+
+	Destination: identity write to a volatile file + single-stripe swap
 
 EC resync / verify
-Still operates on raidset rows; I3 may switch the read side to object offsets
-File offset + designated / CIT_EC_WR (unchanged)
+
+	Source: still operates on raidset rows; I3 may switch the read side to object offsets
+
+	Destination: file offset + designated / CIT_EC_WR (unchanged)
 
 EC dump
-Linear address → (idx, object offset); geometry stays in userspace
-—
+
+	Source: linear address → (idx, object offset); geometry stays in userspace
 
 PFL/DoM merging (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612)
-—
-Client writes the prefix hole by object offset or MDS OUT_WRITE; both options stand, and both need the MDS layout change
+
+	Destination: client writes the prefix hole by object offset or MDS OUT_WRITE. Both options stand, and both need the MDS layout change.
 
 5. Implementation phases
 
@@ -303,16 +358,26 @@ I3 may be deferred independently; whether P2 itself slips depends on the I1 / I4
 Appendix A. Rationale
 A.1 Why object offsets are needed
 
-Migration and rebuild write a new OST object: a plain pwrite on a volatile file with stripe_count = 1 (an identity mapping) followed by single-stripe swap is enough, so the destination side does not need object-offset writes on the parent file (LU-20534 lands as it stands).
+Migration and rebuild write a new OST object: a plain pwrite on a volatile file with stripe_count = 1 (an identity mapping) followed by single-stripe swap is enough.
 
-What file offsets cannot reach, and therefore still requires object offsets, is mainly:
+The destination side does not need object-offset writes on the parent file (LU-20534 lands as it stands).
+
+What file offsets cannot reach, and therefore still requires object offsets:
 
 	Writes (OST component migration" class="issue-link" data-issue-key="LU-13612">LU-13612): only the DoM / previous component is touched; the next object stays in place. The prefix hole on that object does not contribute to i_size and that component's file-offset path cannot reach it, so it has to be written by object offset, or via MDS OUT_WRITE (see §4.4).
 
 	Reads (the source side of a single-stripe copy): on a healthy object this becomes lseek(SEEK_DATA) + pread, so userspace no longer has to convert file offsets into object offsets itself.
 
-Verify / dump are not strictly required: the geometry stays in userspace (raidset rows, linear address → (row, raidset, idx) → parity object offset). Object reads only replace the final hop, which today additionally has to be folded back into a RAID10 file offset to perform designated I/O. The user-visible dump remains a linear address.
+Verify / dump are not strictly required: the geometry stays in userspace (raidset rows, linear address → (row, raidset, idx) → parity object offset).
+
+Object reads only replace the final hop, which today additionally has to be folded back into a RAID10 file offset to perform designated I/O. The user-visible dump remains a linear address.
 
 A.2 Why object-offset mode is O_DIRECT only
 
-The client page cache indexes pages by file offset. An object offset is not a file offset: if object offset 0 of two different stripes were cached as file page 0, they would overwrite each other, and the prefix hole has no corresponding page in the file at all. So object mode does not use the page cache and only supports O_DIRECT. The existing SET_MIRROR / SET_STRIPE likewise force O_DIRECT. If buffered object I/O is ever wanted, it has to be done on the OST object's own pages, which is out of scope here.
+The client page cache indexes pages by file offset. An object offset is not a file offset.
+
+If object offset 0 of two different stripes were cached as file page 0, they would overwrite each other, and the prefix hole has no corresponding page in the file at all.
+
+So object mode does not use the page cache and only supports O_DIRECT. Non-FILE scopes of SET_IO_SCOPE (and the SET_MIRROR alias) likewise force O_DIRECT.
+
+If buffered object I/O is ever wanted, it has to be done on the OST object's own pages, which is out of scope here.

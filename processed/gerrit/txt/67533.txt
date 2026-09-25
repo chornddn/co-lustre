@@ -7,16 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-25 21:30:28.000000000
-Updated:    2026-09-12 08:13:25.000000000
-Patch Set:  3
-Insertions: +107
-Deletions:  -18
-Comments:   24 (12 unresolved)
-Hashtags:   master-next
+Updated:    2026-09-25 08:26:08.000000000
+Patch Set:  5
+Insertions: +109
+Deletions:  -53
+Comments:   26 (12 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -25,60 +24,58 @@ Hashtags:   master-next
 --- Commit Message ---
 LU-20523 target: don't LBUG when the device shrinks
 
-tgt_grant_sanity_check() panics the server whenever the space granted
-to a client exceeds the size of the backing device, assuming that such
-a value can only come from counter corruption.  The device size is not
-an invariant: a ZFS dataset quota can be lowered at runtime, and
-os_blocks is (used + avail), so the reported total collapses to little
-more than the used space.  Space granted while the device was large is
-still legitimately outstanding, and the next statfs takes the server
-down:
+tgt_grant_sanity_check() panics the server whenever the
+space granted to a client exceeds the size of the backing
+device, assuming that such a value can only come from
+counter corruption.  The device size is not an invariant:
+a ZFS dataset quota can be lowered at runtime, and
+os_blocks is (used + avail), so the reported total
+collapses to little more than the used space.  Space
+granted while the device was large is still legitimately
+outstanding, and the next statfs takes the server down:
 
   lustre-MDT0000: cli 2665b580.../... ted_grant(29622272) +
                   ted_pending(0) > maxsize(6946816)
   (tgt_grant.c:209:tgt_grant_sanity_check()) LBUG
 
-sanity test_805a does exactly this to the MDT: it lowers the MDT dataset
-quota to (used + 5MB) to reach ENOSPC quickly, so any client holding
-DoM grant from earlier tests panics the MDS - in test_805a itself, or in
-a later test whose statfs runs the check (test_807a).
+sanity test_805a does exactly this to the MDT: it lowers
+the MDT dataset quota to (used + 5MB) to reach ENOSPC
+quickly, so any client holding DoM grant from earlier
+tests panics the MDS - in test_805a itself, or in a later
+test whose statfs runs the check (test_807a).  The same
+panic has been recorded since 2022-01, on master, b2_15
+and in review runs.
 
-This is not new: the same panic has been recorded in test_805a (and in a
-later statfs of test_806/807a) since 2022-01, on master, b2_15 and in
-review runs, with per-export grants from 3MB to 355MB against a maxsize
-of 1MB to 64MB.
-
-Compare against the largest device size seen since mount rather than
-the current cached one, so grants that were legitimate when they were
-issued are not mistaken for corruption, while corrupt counters are
+Compare against the largest device size seen since mount,
+kept in tgd_osfs_peaksize, rather than the current cached
+one, so grants that were legitimate when they were issued
+are not mistaken for corruption, while corrupt counters are
 still caught.
 
-Only the fatal check moves: the aggregate warnings at the end of
-tgt_grant_sanity_check() keep comparing against the size the device
-reports now, so an over-committed target still says so in the log
-instead of going quiet - they just repeat now, rather than being cut
-short by the LBUG() on the first statfs.  CERROR() is CDEBUG_LIMIT() on
-D_ERROR, so repeating does not flood the console.
+Only the fatal check moves: the aggregate warnings at the
+end of tgt_grant_sanity_check() keep comparing against the
+size the device reports now, so an over-committed target
+still says so in the log.  The sample is converted with
+the os_bsize that came with it, as tgt_grant_space_left()
+now does, so both stay in the same units across a ZFS
+recordsize change.
 
-The sample is converted with the os_bsize that came with it, which is
-what the preceding patch made tgt_grant_space_left() use as well, so the
-recorded size and the space the allocator is willing to hand out stay in
-the same units across a ZFS recordsize change.
+Also fix osd_objset_statfs() so a dataset with less than
+the 16MB reserve free (e.g. after a low quota) doesn't
+report a size below its used space, or underflow os_blocks
+if the dataset is smaller than 16MB.
 
-The check stays fatal.  What was wrong is the threshold, not the
-reaction to crossing it: gating these LBUG() calls on
-lbug_on_grant_miscount would also stop catching the genuine counter
-corruption the check exists for, which is a separate decision.
-
-Add sanity test_805c, which takes DoM grant on the MDT and then shrinks
-the size reported to the grant code with OBD_FAIL_TGT_STATFS_SHRINK.
-The shrink is injected rather than done with "zfs set quota" as test_805a
-does, so that the case also runs on an ldiskfs MDT; the code being fixed
-is target-generic and ldiskfs is what most of CI runs.
+Make sanity test_805a take DoM grant on the MDT and free
+the space it was taken for before it lowers the quota, so
+the shrink reliably drops the MDT below the client grant,
+and check that tgt_grant_sanity_check() saw it.  Without
+the fix this LBUGs the MDS.  Also update test_805a to the
+current test script style.
 
 Fixes: 71d68757c76c ("LU-1406 ofd: grant support")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I3df1560b83bb3c76f89dc11c9281ed1f7d4116bf
 
 --- Review History ---
@@ -270,3 +267,56 @@ Removed cc <GERRIT_ACCOUNT_1055>.
 Patch Set 3: Code-Review-1
 
 (1 comment)
+
+--- Message (Marc Vef, 2026-09-21 07:54:09.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-09-21 07:54:10.000000000) ---
+Patch Set 3:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-09-21 07:54:10.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-09-25 04:05:56.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 04:09:29.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-09-25 04:11:10.000000000) ---
+Uploaded patch set 5.
+
+--- Message (jenkins, 2026-09-25 04:11:17.000000000) ---
+Patch Set 4: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132294/ : ABORTED
+
+--- Message (wc-checkpatch, 2026-09-25 04:11:38.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 04:14:01.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 04:35:31.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132295/ : FAILURE

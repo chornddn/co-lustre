@@ -1,14 +1,15 @@
 Key:        LU-20770
-Summary:    interop sanity-pfl: Request sent has failed due to network error
+Summary:    interop sanity-pfl,sanityn: Request sent has failed due to network error
 Link:       https://jira.whamcloud.com/browse/LU-20770
 Type:       Bug
 Priority:   Major
 Status:     Open
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Cyril Bordage
 Reporter:   Maloo
 Created:    Thu, 17 Sep 2026 09:10:27 +0000
-Updated:    Thu, 17 Sep 2026 09:16:36 +0000
+Updated:    Wed, 23 Sep 2026 12:02:57 +0000
+Links:      Related: is related to  LU-20213; Related: is related to  LU-19763; Related: is related to LU-19868; Related: is related to LU-20673; Related: is related to LU-12945
 
 --- Description ---
 This issue was created by maloo for Marc Vef 
@@ -82,3 +83,83 @@ It seems this issue can also show up as a timeout: https://testing.whamcloud.com
    ... same req ffff9231d65730c0 / x1876523869107456 resent every 5 s, client_bulk_callback status -5 ×1054, "Connection restored" ×19, "was lost" ×18 ...
 [Wed Sep 16 22:38:00 2026] LustreError: 3613:0:(events.c:193:client_bulk_callback()) event type 1, status -5, req ffff9231d65730c0 desc ffff9231d6613400 mbits 1876523870515072
 [Wed Sep 16 22:38:00 2026] Autotest: Timing session out! Timeout has been exceeded but the test framework is still running (lustre-reviews_custom_131862.1001)
+
+--- Comment (JIRAUSER19288, Fri, 18 Sep 2026 16:04:54 +0000) ---
+It seems this issue has been occurring consistently since January 2026 in interop with b2_15 and b2_16, particularly starting with build 4697.
+
+Build 4695 (Jan 15) for sanity-pfl and sanityn had seen 36 testsets passing in full-part-3, and 34 of 36 testsets timed out in build 4697.
+
+A few examples of the passing sessions (from 4695):
+
+	server b2_15 client rhel10.0: https://testing.whamcloud.com/test_sessions/2e84a751-5817-4339-9244-d2593261b771
+
+	server b2_16 client rhel10.0: https://testing.whamcloud.com/test_sessions/4401a22b-b07c-4b67-8ac6-cdba9a363eb4
+
+	server b2_15 client rhel9.7: https://testing.whamcloud.com/test_sessions/8cafb174-4a3c-40d1-92cf-362b3d04df76 
+
+	server b2_16 client rhel9.7: https://testing.whamcloud.com/test_sessions/ee1759a8-6e0a-4858-94c6-cd47ab58f24f 
+
+The same as timing out in 4697:
+
+	server b2_15 client rhel10.0: https://testing.whamcloud.com/test_sessions/bda8696e-bd95-4737-ba6a-e7a42fcdacd5
+
+	server b2_16 client rhel10.0: https://testing.whamcloud.com/test_sessions/a46944ae-b073-4e37-9f09-2fb9653514c3
+
+	server b2_15 client rhel9.7: https://testing.whamcloud.com/test_sessions/bbf5bdc6-e298-4e5d-a873-ab6b015e3294 
+
+	server b2_16 client rhel9.7: https://testing.whamcloud.com/test_sessions/87c735a4-a095-4b3d-ab6b-d2ad677d6a5c
+
+--- Comment (JIRAUSER19288, Tue, 22 Sep 2026 21:27:02 +0000) ---
+I confirmed via the debug patch https://review.whamcloud.com/c/fs/lustre-release/+/69014 that the failures and timeouts since January seem to be due to LU-19763 socklnd: Check sendpage_ok for ZC | https://review.whamcloud.com/c/fs/lustre-release/+/63266 , which removed some special handling for VM hosts and enabled socklnd zero-copy. The debug patch disabled this once again, and the issues disappeared. Similar issues exist on sanity-sec (LU-20213). It is not yet clear why this issue occurs only during interop. I cannot reproduce this issue locally.
+
+--- Comment (adilger, Wed, 23 Sep 2026 10:49:48 +0000) ---
+Root cause: patch https://review.whamcloud.com/60202 ("LU-19139 lnet: add accept_port_bulk module parameter") (commit ce7611a495, v2_16_57-74) added accept_port_bulk with a fixed default of 988 that does not follow accept_port. Autotest sets accept_port=7988, so a master client connects its socklnd BULK_IN/BULK_OUT sockets to port 988, which 2.15/2.16 servers never listen on. The client silently runs with only a CONTROL conn to each server. Patch https://review.whamcloud.com/63266 ("LU-19763 socklnd: Check sendpage_ok for ZC") (commit bf67df3212, v2_17_50-65) then enabled zero-copy for >=16KiB sends on VMs; the server must send the ZC-ACK on its BULK_IN conn (the client's BULK_OUT, since nonblk_zcack=1), which doesn't exist, so ksocknal_launch_packet() fails with -EHOSTUNREACH, all conns to the client are closed, and the client is evicted. LU-19763 is only the trigger; reverting it (patch https://review.whamcloud.com/65658 ("LU-20213 dbg: revert patch")), or restoring the VM zc_min_payload default (patch https://review.whamcloud.com/69014 ("LU-20770 dbg: disable socklnd zero-copy for 2.16 interop test")), hides the problem but the client still has no bulk conns.
+
+Evidence, from sanity test_27cg https://testing.whamcloud.com/test_sets/df2265f8-c35f-4596-9a0c-b53345f620b8 (client 2.17.56.51, servers 2.16.1.2), subtest debug logs:
+
+servers:        LNet: Accept all, port 7988
+client dk:      (lib-socket.c:436:lnet_sock_connect()) Error -111 connecting 1023 -> 10.240.26.124:988
+client dk:      Too soon to retry route 10.240.26.124 (cnted 2, interval 60, ...)   
+
+(The console "Connection to ... at host 10.240.26.124:7988 was refused" message is misleading: lnet_connect() prints the control port, but the refused connect was to 988.)
+
+Server version correlation (sanity test_27cg, master client, last 27 days):
+
+servers
+runs
+failed
+has LU-19139
+
+b2_15
+37
+4
+no
+
+b2_16
+30
+4
+no
+
+b2_17
+16
+0
+yes
+
+b2_17/master servers open a second listener on 988 whenever accept_port_bulk != accept_port (lnet_acceptor_add_sockets()), so the client's bulk connects succeed there.
+
+Same failure also seen as OST bulk evictions (server_bulk_callback() event type 3, status -113) in sanity-pfl test_0a, and in sanity-pfl test_16b (see also LU-20673, LU-19868, LU-20213). Sites using the default accept_port=988 are not affected, since both ports are then the same.
+
+Fix (patch to follow): default accept_port_bulk to accept_port, and retry a refused bulk connect on accept_port for older peers. Workaround until then: options lnet accept_port_bulk=7988 on master nodes in interop testing.
+
+--- Comment (gerrit, Wed, 23 Sep 2026 12:02:57 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69145
+
+Subject: LU-20770 lnet: bulk conns use accept_port by default
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 31e3dfe2212b52d3a24ac07b96f41f1cf92b3fb0

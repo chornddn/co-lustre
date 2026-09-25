@@ -7,142 +7,148 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-09-11 22:04:37.000000000
-Patch Set:  19
-Insertions: +1010
-Deletions:  -67
-Comments:   121 (6 unresolved)
+Updated:    2026-09-25 06:25:00.000000000
+Patch Set:  24
+Insertions: +1648
+Deletions:  -108
+Comments:   151 (1 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Oleg Drokin, Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: Artem Blagodarenko
 
 --- Commit Message ---
 LU-20611 llapi: run find over a device scan
 
-Add llapi_find_device(), which puts llapi_scan_device()'s records
-through the same checks llapi_find() applies to a namespace walk.  The
-checks are not reimplemented: the record is presented as the
-lov_user_mds_data every find_check_* helper already reads.
+Add llapi_find_device(). It passes the records of llapi_scan_device()
+through the same checks that llapi_find() uses for a namespace walk.
+The checks are not written again: the record is presented as the
+lov_user_mds_data that every find_check_* helper already reads.
 
-A field the scan could not answer for is left out of stx_mask, as
-llite leaves it out when the MDT's answer is not authoritative.  Both
-the layout and the directory-stripe buffers live for the whole scan,
-so an object without one has to say so rather than inherit the last
-one's.
+A field that the scan could not answer is left out of stx_mask, as
+llite does when the MDT's answer is not authoritative. The layout and
+directory-stripe buffers live for the whole scan, so an object without
+one must say so, and not reuse the previous object's.
 
-A search needing something a target scan has not -- a path (-printf),
-a mounted filesystem (--ost, --mdt), an xattr read, or a walk to
-describe (--maxdepth, --threads) -- is refused before the scan starts,
-because afterwards "no matches" and "cannot answer" look alike.  A
-field the inode format has no room for, a project id or a birth time,
-counts as undecided and is reported at the end rather than ending the
-search.  sp_filter is cleared with the other fields the search
-decides: there is no caller data to pair a callback with, since the
-scan carries this function's own state.
+Some searches need something that a target scan does not have. They
+are refused before the scan starts, because afterwards "no matches"
+and "cannot answer" look the same:
+- --xattr needs a mounted filesystem
+- -printf %p needs a path; the check skips the same flags and width as
+  the printer, so "%+5p" and "% 5p" are refused too
+- --maxdepth, --mindepth and --threads describe a walk
+A field that the inode format has no room for, such as a project id or
+a birth time, is counted as undecided and reported at the end.
+lfsp_filter is cleared, because the scan carries this function's own
+state.
 
-The layout is bounded before it is swabbed, not after.
-layout_swab_lov_user_md() walks lcm_entry_count and stores through
-lcme_offset, both read from bytes that came off a target something
-may have been writing, so find_lmm_fits() has to see them first.  It
-reads every field through whichever byte order it found, so running
-ahead of the swab costs it nothing.  That is the order
-llapi_layout_get_by_xattr() uses on the same bytes.
+--ost and --mdt are answered from the target itself. Every object in
+an MDT scan is on that MDT, and every object in an OST scan is on that
+OST. find_tgt_index() matches each name against the label that the
+backend read: a numeric index as given, and a UUID through
+llapi_uuid_match(). A name of another target never matches, so the
+predicate is false for every object, and true for every object under
+"!". This is not an error, so one --ost can be used over many devices.
+When no object on the target can match, the scan is skipped.
 
-A top-level foreign magic in the target's byte order is refused there
-rather than accepted, because layout_swab_lov_user_md() does not swab
-one: accepting it would leave the EA swapped with lmd_lmmsize set, and
---foreign would then miss every HSM-released or PCC file on a big-
-endian host.  Refusing sends it down the no-layout path instead.
+--ost is decided before the scan, removed from the search and put back
+afterwards. check_obd_match() reads the layout, and an OST object has
+none, so it would reject every object of the requested target. --mdt
+uses check_mdt_match(), with fp_file_mdt_index set once from the
+target. --mdt over an OST and --ost over an MDT are refused: an OST
+object names its MDT only through an FLD lookup, which needs a client,
+and --ost over an MDT asks about layouts, not about the target. The
+layout options over an OST are refused for the same reason: an OST
+object has no layout, so they would compare a default never read.
 
-The floor that check starts from is per-magic, not a blanket
-sizeof(lov_user_md_v1).  A foreign layout's is the smaller
-offsetof(lov_foreign_md, lfm_value): llapi_file_create_foreign()
-accepts any non-zero length and lod_verify_striping() checks the
-foreign magic before the 32-byte test that covers the normal ones, so
-`lfs setstripe --foreign=none --xattr=abc` stores a legal 19-byte
-trusted.lov.  A blanket floor refused it before the magic was read,
-sending the file down the no-layout path to be answered off a forged
-default -- so --foreign missed it and --stripe-count answered from the
-forgery, which is the silent wrong answer the SEL and SPECIFIC arms
-below exist to avoid.  Only lmm_magic is read before the switch, and
-every arm carries its own floor.
+find_lmm_fits() checks the layout before layout_swab_lov_user_md()
+uses it, because lcm_entry_count and lcme_offset come from a target
+that may be in the middle of a write. It reads each field in the byte
+order it found, as llapi_layout_get_by_xattr() does.
+- Each magic has its own minimum size. A foreign layout's is smaller
+  than lov_user_md_v1: "lfs setstripe --foreign=none --xattr=abc"
+  stores a legal 19-byte trusted.lov.
+- A top-level foreign magic in the other byte order is refused. The
+  swab does not convert it, so --foreign would miss the file.
+- A composite entry must hold a v1 header, and a V3 or SPECIFIC entry
+  must hold a whole lov_user_md_v3, because
+  llapi_layout_get_by_xattr() reads the pool name of both.
 
-Three shapes only a target scan meets are accepted there.  A
-directory's default layout has lmm_stripe_count set and no
-lmm_objects[] at all -- lod_gen_component_ea() sizes the EA with
-op_count, 0 for a directory -- so `lfs setstripe -c 4 dir` is 32
-bytes claiming four stripes, and
-bounding by the count refused it.  The array is measured by the buffer
-instead, as llapi_layout_objects_in_lum() measures it.  LOV_MAGIC_SEL
-and LOV_USER_MAGIC_SPECIFIC are the other two: lod writes both and
-rewrites neither for a client, so they reached the no-layout path and
-every --stripe-*, --pool and --component-* answer for such an object
-was compared against a forged filesystem default.  Both are given the
-form a client would have been shown, SEL as COMP_V1 and SPECIFIC as
-V3, so the checks below read one shape.
+Some layouts are seen only by a target scan, and are accepted:
+- A directory default layout has a stripe count but no lmm_objects[]
+  ("lfs setstripe -c 4 dir" is 32 bytes). The object array is measured
+  by the buffer, as llapi_layout_objects_in_lum() does.
+- LOV_MAGIC_SEL and LOV_USER_MAGIC_SPECIFIC are written by lod and
+  never rewritten for a client. They are converted to the forms that a
+  client sees, COMP_V1 and V3.
+Otherwise such objects would take the no-layout path and be compared
+against the filesystem default layout.
 
-The linkea side of the diff.  scan_linkea() gains a
-scan_linkea_entry() that indexes into trusted.link rather than always
-reading the first record, exported through lustreapi_internal.h, and
-find_device_prefilter() runs --name against every name the object has.
-A walk meets a hardlinked file once per link and tests the name it
-arrived by; a scan meets the object once, so testing one name would
-answer for a file by whichever link the linkea happened to hold first.
-The object is still reported once.  llapi_find_device.3 says so beside
-the size and time notes, those being the other places a target scan
-answers differently.
+--name is tested against every name in trusted.link. A walk meets a
+hardlinked file once per link, but a scan meets the object once, so it
+must test all names. The object is still reported once.
+scan_linkea_entry() reads any entry, not only the first. A linkea
+whose first entry does not parse no longer sets LLAPI_SCAN_LINKEA. A
+linkea that ends before all its names are read makes the object
+undecided, not a non-match. Before an object is called undecided,
+find_device_prefilter() runs the other predicates, so an OST scan with
+"-name X -type d" does not warn about objects that -type rejected.
+find_prefilter() skips -name for a record with no name, because
+fnmatch() does not accept NULL.
 
-That changes one thing worth naming: a linkea whose header parses but
-whose first entry does not no longer sets LLAPI_SCAN_LINKEA, where it
-used to.  A record claiming a linkea nothing can read is worse than
-one admitting it has none, and --name now has entries beyond the
-first to lose.
+--links on a foreign directory: find_decide() read the lfm_length of a
+foreign LMV as a stripe count. It now tests lmv_is_foreign() first,
+like the --mdt-count, --hash-type and --hash-flag checks.
 
-A torn linkea further in is the same case and is counted the same way.
-leh_reccount is capped by the smallest entry that could fit, so a
-buffer claiming three names can spell one and still report three; the
-loop over the names then ran out partway and fell through to a
-rejection, reporting the object as a non-match on a name list it never
-finished reading.  It asks the other predicates and counts the object
-undecided instead, which is what the no-name case beside it does.
+-printf answers from the record. %LF is the record's FID, the layout
+directives read trusted.lov through llapi_layout_get_by_xattr(), %i is
+the object id on the target, and %LP needs no open.
+printf_format_want() decides the %p refusal and what a format needs to
+read, so "-printf %i" does not read a layout.
 
-find_device_prefilter() asks the other predicates before calling an
-object undecided.  Answering 2 for "no name anywhere" without running
-them would, over an OST target -- where no record has a linkea --
-count every data object undecided for `-name X -type d` even though
--type rejects all of them, and llapi_find_device() would then warn
-that N objects could not be decided for a search whose answer was
-complete.  Every other undecided point sits after the checks that
-precede it, and this one does too.
+Three -printf answers were wrong in a walk too. For a layout that only
+says "the default", the stripe count, size and index printed
+LLAPI_LAYOUT_DEFAULT. They now print nothing. %Lo skips a component
+whose stripe count is not a number of objects (the default, or -1 for
+all OSTs, on a component with no objects yet). Before, it filled the
+buffer with "?," and lost the newline and the later components.
+A device scan has no shard FIDs, so %Lo prints nothing for a striped
+directory. %s, %b and %k print nothing for an object the scan has no
+size or blocks for, rather than 0.
 
-find_prefilter() leaves -name alone for a record with no name, so
-asking it costs nothing and answers exactly the other predicates.  It
-has to: fnmatch() dereferences its string argument, so testing a NULL
-sr_name would fault rather than not match, and an OST data object
-reaches it that way -- the object carries no linkea, and neither do
-the CLS_INTERNAL, CLS_NO_LMA and CLS_AGENT records
-LLAPI_SCAN_F_INTERNAL delivers.
+-btime and -newerXb change in a walk too. An object with no birth
+time (off Lustre, or through the V1 ioctl) used to return
+-EOPNOTSUPP, which ended the walk of the whole subtree. It is now a
+non-match.
 
-A foreign directory answers --links here.  find_decide()'s nlink gate
-reads fp_lmv_md->lum_stripe_count to decide whether a stat is needed,
-and lmv_foreign_md's lfm_length sits at that offset, so a foreign
-LMV's value length was read as a stripe count and asked for one.  A
-walk pays the stat and answers correctly; a scan has neither path nor
-descriptor, so the object went undecided and was dropped out of both
---links N and its negation.  The gate now tests lmv_is_foreign()
-first, as the --mdt-count, --hash-type and --hash-flag arms beside it
-already do.
+When a search only prints, an object without a layout does not get
+the filesystem default layout, and the per-object layout messages are
+quiet on a scan.
 
-llapi_find_device.3 describes an object by its FID, and by its object
-id where there is no FID.  It does not describe one with neither: the
-scan sets the object id on every record, so the second form always
-applies where the first does not.
+An object the scan delivers with no FID is printed as obj:ID: an OST
+object with no LMA (its object id is in the directory entry, not in
+the inode, so there is no IDIF to build), or an MDT object with no LMA
+outside MDT0000. On MDT0000, llapi_scan_device() already gives such an
+object its IGIF. The MDT FID in an OST object's trusted.fid is not
+read yet; that is left for a later change. llapi_find_device.3
+describes how a target scan answers differently.
 
+A foreign LMV larger than the search's buffer grows the buffer, as a
+walk does, so --foreign and the other LMV checks still see it.
+
+A size the scan did not report is undecided for -size and -blocks,
+whatever the layout says: a Data-on-MDT file's stripe count is 0, so
+it would otherwise be decided on a stx_size the scan never reported.
+The fix is Artem Blagodarenko's.
+
+Fixes: 6b8e97b76c47 ("LU-10378 utils: add formatted printf to lfs find")
+Fixes: 186b97e68abb ("LU-11971 utils: Send file creation time to clients")
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: Ibf2dcf71e5444914f306ad37a551262cddd8e1de
 
@@ -908,3 +914,175 @@ Looks good. Three optional items inline for whenever this is next refreshed; non
 Patch Set 19:
 
 (3 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-21 19:26:59.000000000) ---
+Uploaded patch set 20.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-21 19:29:14.000000000) ---
+Patch Set 20:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-21 19:33:58.000000000) ---
+Patch Set 20:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-21 20:07:05.000000000) ---
+Patch Set 20: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132083/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-22 07:47:32.000000000) ---
+Patch Set 20:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the scan/walk split reads well and the layout bounding is careful. One inline concern about the new %Lo bound on the directory side, plus a pre-existing note that could ride along on the same refresh.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:36:04.000000000) ---
+Uploaded patch set 21.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:40:35.000000000) ---
+Patch Set 21:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-22 21:45:41.000000000) ---
+Patch Set 21:
+
+Looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-09-22 21:54:44.000000000) ---
+Uploaded patch set 22: New patch set was added with same tree, parent tree, and commit message as Patch Set 21.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 21:56:48.000000000) ---
+Patch Set 21:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-22 22:03:03.000000000) ---
+Patch Set 22:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-22 22:18:51.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (Artem Blagodarenko, 2026-09-23 14:03:54.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+One finding, from the same conf-sanity run as on 68156; the fix is in https://github.com/TheLustreCollective/lustre/commit/ae5a21241a.
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:04.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-23 18:54:51.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-23 19:02:20.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-23 19:15:14.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-23 19:58:30.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132227/ : SUCCESS
+
+--- Message (Artem Blagodarenko, 2026-09-24 13:15:16.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+One finding from a review of this change mirrored on the TLC GitHub (by the Claude review bot), checked against ps23.
+
+--- Message (Autotest, 2026-09-24 13:59:25.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Autotest, 2026-09-24 14:07:21.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.7-x86_64/ldiskfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-20827.
+
+--- Message (Hiroshi Nishida, 2026-09-24 14:23:20.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-09-24 16:48:27.000000000) ---
+Patch Set 23:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The risky parts hold up: find_lmm_fits() bounds every field a consumer later walks, the linkea cursor cannot run past its buffer, and the new loops all terminate. No defect found, so there is no need to re-spin for the inline items -- they are opportunistic, for whenever this is next refreshed.
+
+One whole-patch point: the walk-only fixes riding along here -- the -printf answers the body calls out, and the btime hunk -- apply to released code and arrive with no test. A sanity case for `lfs find -printf '%Lo\n'` over a PFL file with an uninstantiated `-c -1` component would cover the one that silently truncated the output, and it can run on a mount today, which the rest of this patch cannot until the --device front end lands.
+
+--- Message (Autotest, 2026-09-24 21:25:16.000000000) ---
+Patch Set 23:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_64/zfs servers and clients for build 132227 patch 23. Requested by Hiroshi Nishida because of LU-17891.
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:26:14.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:37:53.000000000) ---
+Patch Set 23:
+
+(9 comments)
+
+--- Message (Hiroshi Nishida, 2026-09-25 01:38:14.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-25 01:38:58.000000000) ---
+Patch Set 24:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 01:43:13.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 02:47:11.000000000) ---
+Patch Set 24: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/132287/ : FAILURE

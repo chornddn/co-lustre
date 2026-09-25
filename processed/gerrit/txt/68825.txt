@@ -1,5 +1,5 @@
 Change:     68825
-Subject:    LU-20107 nrs: one ceiling per CPT for both scheduler heads
+Subject:    LU-20107 nrs: share one ceiling per CPT between both heads
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68825
 Change-Id:  I30fcc8d2ad694983ddc056f1ab8107feda46e3e9
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-09-11 01:16:55.000000000
-Updated:    2026-09-16 03:47:13.000000000
-Patch Set:  5
-Insertions: +577
+Updated:    2026-09-20 08:23:24.000000000
+Patch Set:  6
+Insertions: +574
 Deletions:  -60
-Comments:   47 (5 unresolved)
+Comments:   54 (8 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -22,57 +22,21 @@ Comments:   47 (5 unresolved)
   REVIEWER: Qian Yingjin
 
 --- Commit Message ---
-LU-20107 nrs: one ceiling per CPT for both scheduler heads
+LU-20107 nrs: share one ceiling per CPT between both heads
 
-A global rule divides its rate over the scheduler heads that the start
-command reaches. A command for both queues reaches two heads for each
-CPU partition. The node tier change therefore divides the rate over
-2 * ncpts. The ceiling holds. But the high priority head takes an I/O
-RPC only under a blocking lock callback. Half of the node rate idles
-in the common case.
+A global rule for both queues divides its rate by 2 * ncpts. The high
+priority head gets an I/O RPC only for a blocking callback. Half of
+the node rate then stays idle. A divisor of ncpts is not correct
+either. Each head has its own clock, so a partition can pass twice its
+share.
 
-A divisor of the partition count alone gives the other defect. The two
-heads keep two clocks, so the pair can pass twice the partition share.
-A limit rule must never pass its rate.
+Give the node class one limit clock and one reserved clock for each
+CPU partition. Both heads of the partition use that pair, and the
+divisor is ncpts. The reserved clock keeps the lag bound of mClock.
 
-Give the node class one clock pair for each CPU partition: a limit
-clock and a reserved clock. Both heads of a partition read and
-advance that pair, and the divisor goes back to the partition count.
-The high priority head still wins a tie, because
-ptlrpc_server_allow_high() polls it first. Each pair takes a cache
-line of its own, so one partition does not move the line of another
-partition.
+Add sanityn/test_77xj, and document the node tier in nrs_policies.4.
 
-The reserved clock keeps the lag bound of the mClock reservation. A
-backlogged class still wakes at most NRS_MCLOCK_RESVD_LAG_MAX behind
-the current time. An idle class still wakes at the current time.
-The bound now holds for the head pair, not for each head alone.
-
-A re-key of a shared clock moves the class bucket in its tree. The
-peek of the mClock trees therefore reads the minimum again, and the
-TBF dequeue reads the heap root again. A throttle arms the whole
-head, so it must never read a bucket that the re-key moved.
-
-Add sanityn/test_77xj. The test measures one job under real high
-priority traffic. It bounds the rate of the job by the node rate. It
-also holds that rate to at least 70% of the partition share. A divisor
-of the head count gives half the share and fails the test. The test
-runs the same bounds against a rule that names the node rate as a
-reservation.
-
-The test first runs a plain rule as an environment probe. That rule
-gives each head its own clock, so its rate is not a bar for the global
-rule. A node that cannot reach the ceiling skips the test.
-
-Documentation/man4/nrs_policies.4 gains a section for the node tier
-keys of the classful policies. The section names the "global=1" key,
-the nrs_hsch entry, and the new divisor of the node rate.
-
-A rate change on a global rule uses the same divisor as the start.
-
-This change replaces the 2 * ncpts divisor of the node tier change. It
-stands on its own so that it can be reviewed apart, and can be
-squashed into that change.
+Squash the clock pair into the node tier change after review.
 
 Test-Parameters: trivial testlist=sanityn env=ONLY=77xj,ONLY_REPEAT=3
 Signed-off-by: Chris Horn <chorn@ddn.com>
@@ -270,3 +234,38 @@ Patch Set 5:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The shared-clock charge helper looks like it shifts the class deadline one request-time later than the per-head code it replaces, which would make a global rule undershoot its configured rate rather than just bound it; worth a look before landing. The rest are optional nits that can ride along on the same refresh.
+
+--- Message (Chris Horn, 2026-09-18 19:10:13.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-18 19:17:01.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-18 19:55:10.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-18 21:27:23.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/131978/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-09-20 08:23:24.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Separately, the TBF half of this change is untested: nrs_tbf_clock_blocks(), the shared-clock charge in nrs_req_dequeue_bps() and the clock read-back in nrs_tbf_req_add() only run for a global TBF rule, and 77wa-77wd plus the new 77xj are all mclock. Would a TBF variant of 77xj (same two-mount flow, "tbf jobid global=1" plus an nrs_hsch rate rule) be worth adding so those paths get exercised?
