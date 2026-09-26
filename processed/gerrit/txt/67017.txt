@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-07-01 22:02:45.000000000
-Updated:    2026-09-16 09:19:09.000000000
-Patch Set:  15
-Insertions: +382
+Updated:    2026-09-26 00:02:52.000000000
+Patch Set:  16
+Insertions: +348
 Deletions:  -40
-Comments:   104 (3 unresolved)
+Comments:   110 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Cyril Bordage: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,62 +24,18 @@ Comments:   104 (3 unresolved)
 --- Commit Message ---
 LU-20403 ptlrpc: refresh import conn on primary migration
 
-ptlrpc caches a connection keyed on the peer's primary NID and then
-freezes it. The function ptlrpc_connection_get() resolves the primary
-once. A reconnect reuses that connection, and nothing re-resolves it.
-The client import reply ME (ptl_send_rpc) keys on that frozen NID.
-LNet's primary for the peer can later migrate, which happens for any
-unlocked peer. The reply then carries the new primary and no longer
-matches. It takes the costly lnet_try_match_md() same-peer fallback,
-or LNet drops it, and the import stays stuck in CONNECTING.
+ptlrpc keys a connection on the primary NID of the peer. It never
+resolves the primary NID again. LNet can later migrate the primary
+of an unlocked peer. The client reply ME then keys on the old NID.
+The reply does not match, and the import stays in CONNECTING.
 
-Add LNetPrimaryNIDNoWait(), a non-blocking primary lookup that
-neither discovers nor allocates, and detect a migration on every
-send. It wraps lnet_peer_primary_nid_locked(), the helper that
-lnet_parse() uses to stamp msg_initiator, so detection and stamping
-stay in step. It returns -ENOENT when no peer owns the NID. A NID
-that is already primary and a NID that no peer owns both come back
-unchanged. A caller that must not act on an unverified NID therefore
-needs the return code.
+Add LNetPrimaryNIDNoWait(). It returns the current primary and does
+no discovery. It returns -ENOENT when no peer owns the NID.
+ptl_send_rpc() calls it before it posts the reply ME. On a change,
+the import switches to a connection keyed on the new primary.
 
-ptl_send_rpc() calls ptlrpc_refresh_import_primary() before it posts
-the reply ME. On a change it installs a connection keyed on the
-current primary. It uses import_switch_connection(), which moves a
-forward import's DLM export connection with it. It also re-keys the
-current imp_conn_list entry, so a later reconnect cannot restore the
-stale connection. The function ptlrpc_connection_get_primary()
-resolves the replacement. This variant skips the internal blocking
-primary lookup, so the send never blocks on discovery.
-
-Move the connection swap of import_select_connection() onto the new
-helper. The helper also sets imp_conn_current. That assignment now
-runs before the DLM export step and not after it. A NULL DLM export
-still returns -EINVAL. The field imp_conn_current then names the
-entry that the connect used. The field imp_connection already holds
-the connection of that entry, so the two stay consistent.
-
-A lock callback sends on a reverse import. The refresh therefore
-makes ptl_send_rpc() a second writer of imp_connection for that
-import. The function rev_import_reconnect() swaps the same field.
-It now takes imp_lock around the swap. Without that lock both paths
-can put the same connection reference and make c_refcount underflow.
-
-A reverse import owns no DLM export of its own. The server's DLM
-export for that client is the obd_export the reverse import hangs
-off. The function import_switch_connection() therefore skips the DLM
-export step for an IMPF_DLM_FAKE import. Without that skip every
-reverse import reports -EINVAL after a connection swap that
-succeeded.
-
-The lookup takes a per-CPT lnet_net_lock and does one peer-table
-lookup. This lookup is the same work that lnet_select_pathway()
-already does for the send that follows. Connections stay in the hash
-until module unload, so the connection swaps are safe.
-
-Add conf-sanity test_73g. It migrates the servers' primary NIDs under
-a live client. It then checks that the client imports recover. It
-also checks that the OSC connection is re-keyed on the server's
-current primary NID.
+A reverse import now has two writers of imp_connection. Thus
+rev_import_reconnect() takes imp_lock, or c_refcount can underflow.
 
 Assisted-by: Claude:claude-opus-4.8
 Fixes: b38eb0b6c483 ("LU-7734 lnet: set primary NID in ptlrpc_connection_get()")
@@ -890,3 +846,49 @@ Onyx Autotest retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/z
 
 --- Message (Cyril Bordage, 2026-09-16 09:19:09.000000000) ---
 Patch Set 15: Code-Review+1
+
+--- Message (Chris Horn, 2026-09-25 10:02:42.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-25 10:03:15.000000000) ---
+Patch Set 16:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-09-25 10:06:48.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-25 10:08:36.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-25 10:35:59.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132309/ : SUCCESS
+
+--- Message (Autotest, 2026-09-25 16:27:18.000000000) ---
+Patch Set 16:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 132309 patch 16. Requested by Chris Horn because of LU-20276.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-25 22:50:57.000000000) ---
+Patch Set 16:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional comment-accuracy nits inline for whenever the patch is next refreshed. No need to re-spin for them.
