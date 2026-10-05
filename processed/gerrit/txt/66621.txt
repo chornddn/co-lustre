@@ -7,69 +7,47 @@ Branch:     master
 Status:     NEW
 Owner:      Jinshan Xiong
 Created:    2026-06-12 06:07:27.000000000
-Updated:    2026-09-21 07:52:39.000000000
-Patch Set:  31
-Insertions: +774
+Updated:    2026-10-05 09:03:59.000000000
+Patch Set:  32
+Insertions: +653
 Deletions:  -105
-Comments:   497 (4 unresolved)
-Hashtags:   master-next
+Comments:   503 (7 unresolved)
 
 --- Labels ---
-  Code-Review: James Simmons: +1; Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Qian Yingjin, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, Alex Zhuravlev, James Simmons, Gerrit Gatekeeper, Timothy Day, Robert Read
+  REVIEWER: Oleg Drokin, Andreas Dilger, Alex Zhuravlev, James Simmons, Gerrit Gatekeeper, Timothy Day, Robert Read
 
 --- Commit Message ---
 LU-20357 obdclass: clear idle NID statistics on server
 
-Introduce configurable nid_stats_idle_time per target device to
-automatically garbage collect stale NID statistics structures that
-remain idle with no active exports, preventing memory and debugfs
-bloat in high-churn cloud environments.
+Per-NID stats on MDTs and OSTs are kept forever after a client goes
+away, so with high client churn they keep growing in memory and in
+debugfs. Add nid_stats_idle_time (default 3600s, 0 disables) to free
+them once no export has used them for that long.
 
-High-Level Design:
-- **Idle NID Stats Tracking**: When a client disconnects, its export
-  is cleaned up. If no other exports are using the same NID, the
-  corresponding NID statistics structure (`nid_stat`) is marked as
-  "idle" and moved to an idle list.
-- **Background Purging**: The ping evictor thread
-  (ping_evictor_main()) periodically scans the idle list. The thread's
-  wait loop is converted from wait_event_idle() to a 60-second timed
-  wait to trigger periodic scans. If an entry has been idle for longer
-  than the configurable `nid_stats_idle_time` timeout, it is evicted
-  from the hash table and freed, along with its associated debugfs
-  files.
-
-Key Implementation Details:
-- Added `obt_nid_stats_idle_time` configuration parameter per target.
-- Added `nid_last_idle` timestamp to `struct nid_stat` to track idle
-  duration.
-- Idle entries are moved to `obd_nid_stats_idle` list during export
-  cleanup.
-- Target devices are marked in `obd_devs` xarray for efficient
-  scanning by the ping evictor thread.
-- Reimplemented the `exports.clear` debugfs interface to clear active
-  stats and immediately evict idle stats.
-- Added `idle_seconds` output to `exports/*/export` debugfs files to
-  show how long the NID has been idle.
-- Renamed `obd_nid_stats_get()/obd_nid_stats_put()` to
-  `obd_nid_stats_insert()/obd_nid_stats_remove()` to better reflect
-  their hash table operations.
-- Fixed a potential Use-After-Free by moving NID stats hash
-  destruction from class_cleanup() to class_free_dev().
-- Fixed a race causing EEXIST on debugfs creation by destroying the
-  debugfs entry before removing the nid_stat from the hash table in
-  obd_nid_stats_remove().
-- Fixed a bug where obd_nid_stats_insert() could sleep under RCU read
-  lock when retrying by releasing the RCU lock before sleeping.
-- Free `nid_stat` with OBD_FREE_RCU(), as entries are now freed while
-  clients may be traversing the hash table, and a reader must not walk
-  into reclaimed memory.
-- Added `mdt.exports.clear`/`obdfilter.exports.clear` man pages for
-  the pre-existing `exports.clear` interface reimplemented here.
+- When the last export of a NID goes away, its nid_stat is stamped
+  with nid_last_idle and moved to the time-ordered obd_nid_stats_idle
+  list. A reconnect from that NID takes it back.
+- The ping evictor now also wakes every 60s and frees expired entries
+  on every MDT and OST, found through a new xarray mark on obd_devs.
+- An entry being freed is marked NID_STATS_DISPOSE, and a connect that
+  finds it waits for the free to finish. Debugfs is removed before the
+  entry leaves the hash, so the new entry does not hit -EEXIST.
+- nid_stat is freed with RCU since hash readers may still see it, and
+  obd_nid_stats_hash is now destroyed in class_free_dev().
+- class_cleanup() waits for in-flight frees via
+  obd_nid_stats_inprogress.
+- exports.clear now clears active stats and frees all idle ones, and
+  exports/<nid>/export reports idle_seconds for an idle NID.
+- Rename obd_nid_stats_get/put() to obd_nid_stats_insert/remove().
+- The MGS is not covered: its per-NID stats are of no use and should
+  be removed instead.
+- Add man pages for nid_stats_idle_time and exports.clear, and
+  sanity test_921.
 
 Signed-off-by: Jinshan Xiong <jinshanx@google.com>
 Change-Id: I511de0c1205105708e9aa89fe9f1cff915dbe2b8
@@ -1445,3 +1423,60 @@ Patch Set 31:
 
 --- Message (Marc Vef, 2026-09-21 07:52:39.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Oleg Drokin, 2026-09-28 20:02:47.000000000) ---
+Patch Set 31: Code-Review-1
+
+(1 comment)
+
+--- Message (Jinshan Xiong, 2026-09-28 22:18:57.000000000) ---
+Patch Set 31:
+
+(1 comment)
+
+--- Message (Marc Vef, 2026-09-29 09:50:20.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-09-29 09:50:21.000000000) ---
+Patch Set 31:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-09-29 09:50:22.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Jinshan Xiong, 2026-10-03 01:00:49.000000000) ---
+Uploaded patch set 32.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-03 01:03:44.000000000) ---
+Patch Set 32:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-03 01:15:41.000000000) ---
+Patch Set 32:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-03 01:26:12.000000000) ---
+Patch Set 32: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132767/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 09:03:59.000000000) ---
+Patch Set 32:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional items inline for whenever the patch is next refreshed, no need to re-spin for them. test_921 only checks that the stats disappear. A short check that exports.<nid>.export reports idle_seconds after umount, and that a remount picks up the same idle entry again (the obd_nid_stats_insert() path that moves it back to obd_nid_stats), would cover the rest of the new behavior.

@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-05-16 02:27:33.000000000
-Updated:    2026-09-22 21:20:03.000000000
-Patch Set:  21
-Insertions: +1998
-Deletions:  -85
-Comments:   482 (4 unresolved)
+Updated:    2026-10-05 09:19:44.000000000
+Patch Set:  23
+Insertions: +2341
+Deletions:  -86
+Comments:   496 (2 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
@@ -19,7 +19,7 @@ Hashtags:   pt_ecro
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Max Dilger, Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Zhenyu Xu, Andreas Dilger
 
 --- Commit Message ---
@@ -27,58 +27,59 @@ LU-19548 lfs: mirror extend support for EC
 
 Add three EC modes to 'lfs mirror extend':
 
---mirror-id N --ec D+P   attach a parity mirror to data mirror N
--N [K] --ec D+P          add K data+parity mirror pairs (default 1)
---ec D+P                 attach parity to the file's lone data mirror;
-                         2+ mirrors need --mirror-id or -N
+--mirror-id N --ec D+P: attach parity to data mirror N.
+-N [K] --ec D+P: add K data+parity pairs (default 1).
+--ec D+P: attach parity to the file's lone data mirror;
+files with 2+ mirrors need --mirror-id or -N.
 
-As with a regular extend, the new mirrors are in sync on return. Data
-mirrors are copied before the merge. A parity mirror has nothing to
-copy, so it is merged stale (LL_LEASE_ALLOW_STALE, LU-18746) and the
-resync computes it in place. An interrupted extend therefore leaves a
-stale parity mirror for a later resync, never an up-to-date one with
-no parity. The stale merge needs OBD_CONNECT2_FLR_EC negotiated with
-the MDT, else the extend fails with EOPNOTSUPP. A stale data mirror is
-refused, as (for now) are a nosync one and a second parity geometry on
-one data mirror (LU-20616).
+As with a regular extend, new mirrors are in sync on
+success. Populate new data mirrors before merging them.
+Merge parity stale with LL_LEASE_ALLOW_STALE (LU-18746),
+then compute it through resync. An interrupted parity
+computation leaves stale components for a later resync.
+Reject known invalid -N --ec geometry before adding data
+mirrors; if parity fails before its merge, attempt to remove
+the data mirror just added.
 
-A parity mirror is merged as a layout of parity components only, built
-by the new llapi_layout_comp_add_parity_only() and accepted by layout
-sanity. lod_declare_layout_merge() stamps the data component with the
-parity mirror id so 'lfs mirror split' sees the pair, and refuses a
-dangling or already-used link. lod_comp_prep_create() sizes such a
-parity from the data stripe count the client sends and leaves it
-uninstantiated, as its data component is not in the volatile file;
-the resync then allocates it against the full layout, where
-lod_check_and_reserve_ost() keeps it off the OSTs of its own data
-component on every pass and treats unrelated mirrors as a first-pass
-preference only. sanity-ec test_8j asserts this with the QoS
-allocator, as round-robin hides it.
+Refuse stale or nosync targets and a second parity geometry
+on one data mirror (LU-20616). Validate --ec and -f per
+mirror so they cannot be combined on the same mirror,
+including before a later -N, but can be used on separate
+mirrors in either order.
 
-lod_verify_striping() and lod_comp_prep_create() reject k == 0 and
-m == 0, which the k + m bound alone let through to a divide by zero
-and an LASSERT.
+Add llapi_layout_comp_add_parity_only() and accept
+parity-only layouts. Defer their allocation until resync has
+the full destination layout. In the round-robin allocator,
+always exclude data OSTs in the same RAID Set while allowing
+avoidance of unrelated mirrors to relax on later passes.
+Test 8j checks deferred allocation with QoS, whose
+data-conflict check already existed.
 
-The new subtests are gated on MDS > 2.17.57, as an older MDS refuses
-a parity-only create buffer.
+Bind the data and parity mirrors in both directions and
+record the EC geometry on the data components. Clear that
+geometry when parity is removed so later writes and resync
+can instantiate the unlinked data tail. Preserve the pair
+when splitting both mirrors together. Also reject zero EC
+stripe counts to prevent division by zero and an LASSERT.
 
-The stale merge needs OBD_CONNECT2_FLR_EC negotiated with the MDT,
-which test-framework has meant to switch on at both ends since
-LU-12187 with the llite_enable_flr_ec=1 and mdt_enable_flr_ec=1
-module options. Neither reached CI. load_module() names the option
-variable after the module basename, MODOPTS_LUSTRE for llite/lustre,
-so MODOPTS_LLITE never reached lustre.ko. And load_modules() only
-passes options to the nodes it runs on, so with LOAD_MODULES_REMOTE
-unset a remote MDS loads mdt.ko from the target mount with the
-default of 0 and masks the flag at connect. Set MODOPTS_LUSTRE, and
-have mount_facet() enable mdt_enable_flr_ec on the MDT's node once
-the target is up and before the clients mount, so the extend no
-longer fails with EOPNOTSUPP in CI.
+The stale merge requires OBD_CONNECT2_FLR_EC. Pass the
+client module option through MODOPTS_LUSTRE instead of
+MODOPTS_LLITE, and enable mdt_enable_flr_ec on the MDT's
+node before clients mount. This also covers remote MDTs
+whose modules are loaded by mounting the target rather than
+by load_modules().
+
+Gate the new sanity-ec subtests on MDS > 2.17.57, as older
+servers reject parity-only create buffers. Cover attach
+modes, option ordering, and writes and resync after parity
+deletion.
 
 Fixes: 8c5f5d3ec9b1 ("LU-12668 lod: bind ec mirror to data mirror during creation")
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Assisted-by: ClaudeCode:Fable-5.1 llm_code_and_review_tools
+Assisted-by: Codex:GPT-6
+Assisted-by: Codex:gpt-6-astra
 Change-Id: I8d670f0558521063af425e2c75a56b00cdd294d7
 
 --- Review History ---
@@ -973,3 +974,94 @@ Patch Set 21:
 Patch Set 21:
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-09-28 00:31:04.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+--- Message (Maximilian Dilger, 2026-09-28 20:46:01.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+--- Message (Maximilian Dilger, 2026-09-28 22:21:39.000000000) ---
+Patch Set 21:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-09-29 06:41:57.000000000) ---
+Patch Set 21: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Marc Vef, 2026-09-29 12:46:19.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Marc Vef, 2026-09-29 12:48:01.000000000) ---
+Patch Set 22:
+
+(3 comments)
+
+--- Message (jenkins, 2026-09-29 12:48:09.000000000) ---
+Patch Set 22:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-29 12:49:46.000000000) ---
+Patch Set 22:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-29 12:49:53.000000000) ---
+Patch Set 22:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Maximilian Dilger, 2026-09-30 20:31:04.000000000) ---
+Uploaded patch set 23.
+
+--- Message (Maximilian Dilger, 2026-09-30 20:31:31.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-30 20:34:13.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-09-30 20:43:11.000000000) ---
+Patch Set 23:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-30 20:54:19.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132612/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-01 12:57:21.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 09:19:44.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The server-side parity deferral looks reachable for ordinary files as well as the extend volatile, which would justify a refresh; the -f/--mirror-id point is minor and can go in the same cycle.

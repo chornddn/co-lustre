@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Chakshu Kansal
 Created:    2026-07-14 10:32:37.000000000
-Updated:    2026-09-16 09:27:36.000000000
-Patch Set:  9
-Insertions: +1356
-Deletions:  -97
-Comments:   254 (73 unresolved)
+Updated:    2026-10-05 08:50:24.000000000
+Patch Set:  10
+Insertions: +1397
+Deletions:  -114
+Comments:   375 (40 unresolved)
 
 --- Labels ---
   Code-Review: Andreas Dilger: -1
@@ -24,95 +24,132 @@ Comments:   254 (73 unresolved)
 --- Commit Message ---
 LU-17957 mdd: POSIX interface for non-root immutable files
 
-Allow a non-root file owner to make their own file immutable,
-without CAP_LINUX_IMMUTABLE or root, by setting the file's atime
-at least 24 hours into the future and removing all write
-permissions from the file.
+Allow a non-root file owner to make their own file immutable, without
+CAP_LINUX_IMMUTABLE or root, by setting the file's atime at least
+mdd.posix_immutable_min_atime_delta seconds into the future and removing
+all write permissions from the file.
 
-When mdd.posix_immutable is enabled and both conditions are met,
-the MDS sets LUSTRE_IMMUTABLE_FL automatically. A new LMA compat
-flag, LMAC_RETENTION (wire flag LUSTRE_RETENTION_FL), marks the
-file as auto-set this way, distinguishing it from a plain
-chattr +i file, which must never auto-clear.
+When mdd.posix_immutable is enabled and both conditions are met, the MDS
+auto-sets LUSTRE_IMMUTABLE_FL. A new LMA compat flag, LMAC_RETENTION
+(wire flag LUSTRE_RETENTION_FL), marks the file as auto-set this way,
+distinguishing it from a plain chattr +i file, whose IMMUTABLE_FL is
+never auto-cleared. mdd.posix_immutable defaults to off, and only the
+auto-set behavior is gated on it. Enforcement, reply masking and LMA
+flag handling are unconditional and apply to plain chattr +i files too.
+
+mdd.posix_immutable_min_atime_delta defaults to 86400 (24h) and rejects
+values below 30 seconds with -EINVAL, keeping the window comfortably
+above the client's internal re-check interval and large enough that a
+recent, unrelated atime update cannot be mistaken for an intentionally
+future-dated one.
 
 Expiry and authorization
 -------------------------
-A file is expired when it has both IMMUTABLE_FL and RETENTION_FL,
-no write bits, and atime <= now. This is checked by
-lu_posix_immutable_expired(), and combined with an owner-or-cap
-check in lu_posix_immutable_owner_or_cap(), both in md_object.h.
+A file is expired when it has both IMMUTABLE_FL and RETENTION_FL, is a
+regular file with no write bits, and atime <= now. This is checked by
+lu_posix_immutable_expired() in md_object.h.
 
-lu_immutable_access_check() uses these to build one authorization
-rule. Without expiry, only CAP_LINUX_IMMUTABLE can clear the flag
-directly via chattr -i, as before, and the operation must wait until
-the flag is cleared. Once expired, the owner or a CAP_LINUX_IMMUTABLE
-holder may perform the operation directly, without first clearing
-the flag. This rule is now enforced at every place LUSTRE_IMMUTABLE_FL
-is checked, including setattr, unlink, rename, migrate, open for
-write/trunc/append, layout merge/split, layout swap, layout change,
-and mirror/component add. Enforcement itself is unconditional and
-applies to plain chattr +i files too. Only mdd_layout_change()'s
-MD_LAYOUT_WRITE case is gated on mdd.posix_immutable, since it only
-guards a TOCTOU race that is unique to the auto-expiry feature.
+lu_immutable_relocate_check(), also in md_object.h, permits layout swap
+and migration of an immutable file when the caller holds
+CAP_LINUX_IMMUTABLE, regardless of expiry; otherwise it denies with
+-EPERM while IMMUTABLE_FL is set. A caller without CAP_LINUX_IMMUTABLE
+is let through once retention has expired, because the flag is cleared
+before the check.
 
-Whoever bypasses the check on an expired file also clears the flags
-on disk via mdd_clear_expired_posix_immutable(), in the same
-transaction. mdt_getattr_internal() additionally hides
-IMMUTABLE_FL and RETENTION_FL from the reply to the owner or a
-CAP_LINUX_IMMUTABLE holder once expired, without persisting anything,
-so getattr stays read-only. Other callers still see the real flags.
+mdd_clear_expired_posix_immutable() drops IMMUTABLE_FL|RETENTION_FL on
+disk in its own transaction and emits CL_SETATTR. It is called before the
+corresponding sanity check in mdd_open(), mdd_unlink(), mdd_rename(),
+mdd_link(), mdd_xattr_set()/mdd_xattr_del() (layout merge/split),
+mdd_migrate(), mdd_swap_layouts() and mdd_layout_change()'s
+MD_LAYOUT_WRITE case. It must not be called while mdd_write_lock() is
+held. The clear is lazy, done by the operation that needs the file to be
+writable again, so an expired file that is never changed or removed
+keeps its flags in the LMA, where they are MDS-internal state only.
+
+Enforcement is a check of the on-disk IMMUTABLE_FL at each site that
+checks it, mdd_permission_internal() (open for write/trunc/append),
+mdd_fix_attr() (setattr), mdd_may_delete() (unlink/rename),
+mdd_link_sanity_check() (hardlink), mdd_xattr_sanity_check(),
+mdd_layout_swap_allowed(), mdd_migrate_sanity_check() and
+mdd_layout_change(). mdd_permission_internal() lets an expired file
+through, because the MDT permission pre-checks (mdt_swap_layouts(),
+mdt_layout_change(), mdt_cross_open(), mdt_close_handle_layouts()) run
+before the flags have been dropped on disk. Only mdd_layout_change()'s
+MD_LAYOUT_WRITE case is gated on mdd.posix_immutable, since it guards a
+TOCTOU race unique to the auto-expiry feature.
+
+mdd_fix_attr() implements the auto-set via mdd_try_set_posix_immutable(),
+on an explicit chmod a-w of a regular file whose effective atime is at
+least mdd.posix_immutable_min_atime_delta in the future, when the caller
+is the owner or holds CAP_LINUX_IMMUTABLE and RBAC immutable_flags allows
+it, it adds IMMUTABLE_FL|RETENTION_FL to the setattr. chattr +i/-i sets
+IMMUTABLE_FL only, and clears RETENTION_FL when it changes IMMUTABLE_FL.
+
+mdt_pack_attr2body() strips RETENTION_FL from every mdt_body reply and
+masks IMMUTABLE_FL as well once the file is expired, covering getattr,
+open, lookup and setattr replies in one place so a client cannot cache a
+stale immutable flag.
 
 Client side
 -----------
-llite gains LLIF_POSIX_IMMUTABLE and ll_refresh_posix_immutable(),
-called from ll_revalidate_dentry(), before the VFS IS_IMMUTABLE()
-check, and from do_file_write_iter(), to re-fetch flags from the MDS
-and drop S_IMMUTABLE once IMMUTABLE_FL is gone. The file stays
-mode a-w, so writes still fail with EACCES until write permission
-is restored. Only the immutability is lifted. Refresh RPCs are
-rate-limited to 5 per second per client and only triggered for
-LLIF_POSIX_IMMUTABLE files, so plain chattr +i files see no change.
+ll_update_inode_flags() arms lli_immutable_expiry for an immutable file
+whose atime is in the future. When the atime passes,
+ll_revalidate_dentry() forces one lookup via ll_immutable_recheck(), the
+MDS reports the file as writable and the client drops the flag, the
+operation then reaches the MDS, which clears it on disk. The re-check is
+retried every LL_IMMUTABLE_RECHECK_SECS (5s) until the MDS releases the
+file, so a client whose clock runs ahead of the MDS's cannot get stuck.
+The MDS stays the sole authority on expiry, the client only decides when
+to re-ask.
 
-fileattr_get() is refactored to share ll_md_getattr_flags() with the
-revalidation path, and hides LUSTRE_RETENTION_FL from userspace so
-chattr -i is not rejected as an unrecognized flag. RETENTION_FL is
-otherwise safe for old clients to ignore, since it travels in
-lma_compat, and ll_ext_to_inode_flags() already uses an explicit
-flag whitelist, so an old client simply drops any bit it does not
-recognize.
+A held fd pins the inode and never walks the path, so that lookup
+re-check cannot reach it and the inode cannot be evicted and re-read
+either. ll_immutable_work_arm() therefore also schedules a work item for
+the deadline, but only while an fd is open, it refreshes the flags from
+the MDS and is dropped once the last fd closes. That is what makes
+fchmod()/fchown()/futimens() on a descriptor opened before expiry work
+after it. The work item is allocated on first use, so ordinary inodes
+carry nothing.
 
-hsm_swap_layouts() gains a SWAP_LAYOUTS_MDS_RELEASE bypass in
-mdd_layout_swap_allowed(), and calls ll_refresh_posix_immutable()
-before the swap, so root-driven HSM restore and lfs migrate work
-again once retention has expired.
+ll_file_ioctl() lets a CAP_LINUX_IMMUTABLE caller swap layouts with a
+read-only file descriptor, and ll_check_swap_layouts_validity() skips the
+local inode_permission() MAY_WRITE check for such callers via
+ll_may_write_swap(), the MDS performs the final authorization. The
+lfs migrate tool retries the source open read-only on EPERM/EACCES, since
+the source is only read during the copy.
+
+mdt_close_handle_layouts() skips its MAY_WRITE check for callers holding
+CAP_LINUX_IMMUTABLE (the HSM release path already passes
+SWAP_LAYOUTS_MDS_RELEASE to the layout swap), so root-driven HSM restore
+and lfs migrate work on immutable files without tripping the uid/gid or
+immutability checks.
 
 Storage layer
 -------------
-osd-ldiskfs and osd-zfs osd_attr_set() are reworked from a one-way
-OR of LMA flags to a compute-and-diff set/clear update, since
-RETENTION_FL, unlike ORPHAN/ENCRYPT, must be clearable.
+osd-ldiskfs and osd-zfs osd_attr_set() compute the new lma_incompat and
+lma_compat values and write them only when they differ from the on-disk
+values, so RETENTION_FL can be set and cleared (ORPHAN/ENCRYPT stay
+sticky). osd_attr_get() surfaces RETENTION_FL, and
+lma_compat_to_lustre_flags()/lustre_to_lma_compat_flags() in obd_support.h
+map it to and from LMAC_RETENTION.
 
-While la_atime is in the future, normal access never moves it
-backwards, so atime-based retention/purge scans will treat the file
-as recently accessed and skip it. This is harmless, since the file
-is immutable and cannot be removed until it becomes writable again.
+While la_atime is in the future, normal access never moves it backwards,
+so atime-based retention/purge scans treat the file as recently accessed
+and skip it. This is harmless, since the file is immutable and cannot be
+removed until it becomes writable again.
 
 Testing
 -------
-mdd.posix_immutable defaults to off. Only the auto-set behavior is
-gated by it, everything else, enforcement, client refresh, and LMA
-flag handling, is unconditional and unchanged for plain chattr +i
-files.
+mdd.posix_immutable defaults to off. sanityn.sh test_106d covers the
+disabled path, flag set, reverse order not setting the flag, retention
+expiry and mode-only failure after expiry, chattr +i not auto-expiring,
+and root/owner/non-owner delete and write rules. test_106e covers lfs
+migrate denied to the owner before expiry (rejected client-side), allowed
+to a CAP_LINUX_IMMUTABLE holder before expiry (flag remains set), and
+allowed to the owner after expiry.
 
-sanityn.sh test_106d covers flag set, retention expiry, mode-only
-failure after expiry, root denied and allowed before and after
-expiry, and owner delete after expiry. test_106e covers lfs migrate
-by the owner and by a CAP_LINUX_IMMUTABLE holder after expiry.
-test_106f covers write and unlink denied to a non-owner,
-non-privileged caller on an expired but not yet cleared file.
-
-Test-Parameters: testlist=sanityn serverversion=2.15.6
-Test-Parameters: testlist=sanityn clientversion=2.15.6
+Test-Parameters: testlist=sanityn serverversion=2.17
+Test-Parameters: testlist=sanityn clientversion=2.17
 
 Signed-off-by: Chakshu Kansal <ckansal@ddn.com>
 Change-Id: Iab9c0f69dd8152a7eaa48e8454120af469ea4d63
@@ -503,3 +540,55 @@ Patch Set 9:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The main one is that the layout merge/split enforcement the commit message describes cannot be reached, so that part of the feature does not work. The mdt_coordinator.c change also widens an existing HSM restore check further than the stated goal needs.
+
+--- Message (wc-checkpatch, 2026-09-28 22:43:41.000000000) ---
+Patch Set 9: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Chakshu Kansal, 2026-10-01 16:03:14.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chakshu Kansal, 2026-10-01 16:03:52.000000000) ---
+Patch Set 10:
+
+(72 comments)
+
+--- Message (wc-checkpatch, 2026-10-01 16:04:17.000000000) ---
+Patch Set 10:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-01 16:06:27.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-01 16:27:25.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132660/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-04 10:49:27.000000000) ---
+Patch Set 10: Code-Review-1
+
+(31 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:50:24.000000000) ---
+Patch Set 10:
+
+(10 comments)
+
+AI code review results below, please doublecheck
+
+Problematic, see inline comments. Main concerns: a race on the client retention work item can leave a queued work item pointing at a freed inode; plain chattr +i files can be polled every 5s indefinitely; MDT migration drops the retention marker; and the separate clear transaction breaks reply reconstruction for operations that then fail.

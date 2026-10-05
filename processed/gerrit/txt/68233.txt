@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Aboo Valappil
 Created:    2026-08-23 20:48:03.000000000
-Updated:    2026-09-24 00:33:35.000000000
-Patch Set:  23
-Insertions: +422
-Deletions:  -2
-Comments:   157 (3 unresolved)
+Updated:    2026-10-05 08:17:00.000000000
+Patch Set:  24
+Insertions: +419
+Deletions:  -6
+Comments:   163 (8 unresolved)
 
 --- Labels ---
-  Code-Review: Serguei Smirnov: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -29,32 +29,28 @@ discovery GET. Its response MD then remains PING_SENT until response
 expiry, preventing prompt rediscovery after a connection reset.
 
 Cancel an outstanding discovery Ping when an LND reports the peer
-down, but only if no other peer NI is cached UP. A repeated DOWN
-notification can be Old news to peer-NI state handling even though a
-requeued discovery Ping is outstanding. Retain a peer reference for
-cancellation before that return.
+down, but only if no other peer NI is cached UP. After
+lnd_notify_peer_down() returns, re-read lpni's peer and its cached
+NIs before deciding to cancel. This handles peer reassignment while
+locks were dropped, repeated DOWN notifications that otherwise look
+like Old news, and multi-rail peers with another usable NI.
+
+lnet_peer_send_ping() keeps the new Ping-MD handle local while
+lnet_send_ping() binds it, then publishes it under lp_lock only while
+PING_SENT remains set. If peer-down clears PING_SENT first, the
+sender unlinks its private handle. Its terminal UNLINK event requeues
+discovery, preventing another Ping from starting while an event from
+the canceled MD is still pending.
 
 This does not cancel an in-flight Push or a Ping that may use another
 cached-UP multi-rail path.
-
-Requeue cancellation cleanup under LNET_LOCK_EX while discovery is
-running. Wake the thread after moving it to the request queue. These
-operations serialize global discovery-queue updates and clear the
-failed Ping state promptly; a subsequent discovery request can retry.
-
-lnet_peer_send_ping() invalidates the stored Ping-MD handle first and
-keeps the new handle local while lnet_send_ping() binds it. It
-publishes that handle under lp_lock only while PING_SENT remains set.
-If peer-down cleared PING_SENT first, the sender unlinks its local
-handle. This prevents cancellation from seeing a stale handle and
-leaving a newly bound response MD untracked.
 
 Add a sanity-lnet case that holds a discovery GET in PING_SENT by
 dropping it at the remote peer. The test then injects one local-error
 GET with CFS_FAIL_SOCK_CONN, causing SockLND to close the connection
 and report peer-down to LNet. It requires that notification to cancel
-PING_SENT before response expiry, then verifies that a fresh discovery
-succeeds.
+PING_SENT before response expiry, then verifies that a fresh
+discovery succeeds.
 
 Tested with an OST HA failover and with the sanity-lnet case after a
 SockLND local error.
@@ -925,3 +921,46 @@ Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el9.8-x86_64
 Patch Set 23: Code-Review-1
 
 (3 comments)
+
+--- Message (Aboo Valappil, 2026-10-04 11:01:43.000000000) ---
+Uploaded patch set 24.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-04 11:10:38.000000000) ---
+Patch Set 24:
+
+Looks good to me.
+
+--- Message (Aboo Valappil, 2026-10-04 11:17:48.000000000) ---
+Patch Set 24:
+
+Addressed Serguei comments from patch set 23 in patch set 24. The peer-down path no longer directly requeues discovery: a published Ping MD remains PING_SENT until its terminal LNET_EVENT_UNLINK, so a replacement Ping cannot start while an event from the canceled MD is pending. If cancellation wins before publication, the shared helper clears PING_SENT and sets FORCE_PING; lnet_peer_send_ping() then unlinks its private MD, and that terminal event serializes the retry. The pre-publication handshake is shared by lnet_peer_cancel_discovery() and lnet_peer_cancel_ping(), so a bound MD cannot be left untracked. The cancellation decision is also now made after lnd_notify_peer_down() returns: it re-reads the peer through lpni and rechecks all peer NIs, covering peer reassignment while locks were dropped, repeated DOWN notifications that are otherwise Old news, and multi-rail peers with another usable NI.
+
+--- Message (jenkins, 2026-10-04 11:29:28.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132787/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-05 01:39:12.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-05 06:10:34.000000000) ---
+Patch Set 24:
+
+Code-wise looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:17:00.000000000) ---
+Patch Set 24:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The sender-side unlink in lnet_peer_send_ping() can race with a successful REPLY. The other items are minor and can be picked up in the same refresh.

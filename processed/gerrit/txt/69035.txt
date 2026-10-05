@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-18 09:23:11.000000000
-Updated:    2026-09-22 20:42:28.000000000
-Patch Set:  3
+Updated:    2026-10-05 07:32:04.000000000
+Patch Set:  4
 Insertions: +39
 Deletions:  -32
-Comments:   10 (2 unresolved)
+Comments:   14 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -19,6 +19,7 @@ Comments:   10 (2 unresolved)
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Sergey Cheremencev
 
 --- Commit Message ---
 LU-19699 quota: release grant via DQACQ on qunit shrink
@@ -29,7 +30,7 @@ QSD never learns if the master fails to apply that release in
 qmt_lvbo_update(), then the master keeps more grant accounted
 than the slave owns, and the leak eventually causes a bogus
 -EDQUOT. OBD_FAIL_QUOTA_PREACQ (fail_loc=0xa06) triggers this
-and cause test_80 in sanity-quota.sh to fail intermittently.
+and causes test_80 in sanity-quota.sh to fail intermittently.
 
 Only report the surplus in lvb_id_may_rel and let the regular
 DQACQ release path return it, then it will be transactional
@@ -38,13 +39,18 @@ and retried on failure, so the two sides cannot diverge.
 The master still handles lvb_id_rel in qmt_lvbo_update() so
 that older slaves keep working during a rolling upgrade.
 
+A patched slave talking to an unpatched master still releases
+via DQACQ, but the old master only waits QMT_REBA_TIMEOUT (2s)
+from lqe_revoke_time before setting edquot, so a transient
+-EDQUOT is possible in that mixed-version window.
+
 qmt_adjust_edquot() is now the only thing holding edquot off
 until the DQACQ arrives: anchor its grace period to the reply
 that claimed the release (lqe_may_rel_time) rather than to
 "lqe_revoke_time", which may be much older, and also raise
 "QMT_REBA_TIMEOUT" to 10s to cover the extra round trip and
 the QSD update thread scheduling, otherwise the master sets
-edquot firstly and clients see a transient -EDQUOT.
+edquot first and clients see a transient -EDQUOT.
 
 Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=10
 Fixes: 318fd8d197 ("LU-1842 quota: qsd lock")
@@ -147,3 +153,40 @@ Patch Set 3:
 AI code review results below, please doublecheck
 
 Looks good; the accounting rework holds up - the slave keeps its grant until the master answers a transactional DQACQ, and qsd_calc_adjust() step 2 always computes a release whenever qsd_id_glimpse_ast() reported a surplus, with qsd_req_completion() re-scheduling it on failure. Only optional nits inline for whenever this is next refreshed - no need to re-spin for them.
+
+--- Message (Hongchao Zhang, 2026-09-29 10:14:39.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-09-29 10:14:47.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-09-29 10:15:17.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-29 10:28:48.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-09-29 11:33:12.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132516/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 07:32:04.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The switch to a DQACQ-driven release looks right for keeping master and slave accounting in sync, but the edquot hold-off that now replaces the inline release covers only the global lqe, and it never ends early once the release has landed.

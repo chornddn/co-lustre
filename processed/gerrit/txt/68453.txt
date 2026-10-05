@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Zhenyu Xu
 Created:    2026-08-28 12:04:27.000000000
-Updated:    2026-09-25 05:46:10.000000000
-Patch Set:  13
-Insertions: +780
-Deletions:  -58
-Comments:   272 (5 unresolved)
+Updated:    2026-10-05 08:01:00.000000000
+Patch Set:  15
+Insertions: +899
+Deletions:  -68
+Comments:   305 (13 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -30,14 +30,27 @@ pages stay cached and Uptodate across reads instead of being
 discarded after each read.  The ldlm_lock is granted locally without
 an RPC and attached to the osc_lock via osc_lock_granted.
 
+A stripe is converted only while its target is inactive
+(OBDF_INACTIVE).  If the target is already active, an LSS_READ_ERR
+recorded before it recovered is stale: lov_lock_sub_init() clears the
+flag and enqueues a normal sub-lock instead of publishing a
+placeholder for a healthy target, keeping the creation trigger and
+the import-level cleanup consistent.
+
 osc_lock_cancel() only detaches the ldlm_lock (osc_lock_detach)
 without cancelling it, so the ldlm_lock survives the EC read loop and
 keeps pages cached for concurrent readers.  When the OST recovers,
-osc_import_event(IMP_EVENT_ACTIVE) calls
-ldlm_cli_cancel_unused_async(LCF_LOCAL | LCF_PLACEHOLDER), which
-cancels placeholder locks with 0 readers/writers via the blocking-AST
-path (osc_ldlm_blocking_ast -> __osc_dlm_blocking_ast ->
-osc_lock_flush), flushing stale pages.
+osc_import_event(IMP_EVENT_ACTIVE) cancels the placeholders with
+ldlm_cli_cancel_unused_async(LCF_LOCAL | LCF_PLACEHOLDER): every
+unreferenced placeholder is queued for the blocking-AST path
+(osc_ldlm_blocking_ast -> __osc_dlm_blocking_ast -> osc_lock_flush),
+flushing its stale pages.  A placeholder still referenced by an
+in-flight EC read cannot be cancelled yet, so
+ldlm_prepare_resource_list() marks it LDLM_FL_CBPENDING instead: the
+last ldlm_lock_decref() (osc_lock_detach() at cl_io_unlock()) then
+queues the same flush, and lock_matches() refuses to hand the
+CBPENDING placeholder to a new referencing lookup meanwhile, so no
+reader can extend its lifetime.
 
 The async variant is used because IMP_EVENT_ACTIVE runs from the
 import RPC reply-interpret context (ptlrpc_connect_interpret() ->
@@ -51,16 +64,30 @@ ldlm_cancel_resource_local()) and hands them to the ldlm blocking
 threads (ldlm_bl_to_thread_list()), where the cancel and blocking AST
 run.
 
+Placeholder creation is fenced against the activation sweep so an EC
+read that started before or during recovery cannot publish a
+placeholder after the sweep has passed its resource.  Add
+cl_ec_placeholder_sem and cl_ec_placeholder_gen to client_obd:
+osc_lock_init() records the current generation for CIT_EC_RD locks;
+osc_lock_to_placeholder() takes the read side of the rwsem and refuses
+with -EAGAIN if the generation is odd (an activation is in progress)
+or has advanced since the lock was initialized; and
+osc_import_event(IMP_EVENT_ACTIVE) holds the write side across gen++,
+the cancel scan and OBD_NOTIFY_ACTIVE, then gen++ again.  A refused
+conversion leaves the sub-lock normal, and its enqueue failure is
+tolerated as an unprotected recovery.
+
 There is deliberately no per-stripe flush from lov_lock_enqueue().  A
 successful sub-lock enqueue proves the lock path (LDLM) works, not the
 data path: under a BRW-only failure such as OBD_FAIL_OST_BRW_READ_BULK
 lock RPCs keep succeeding while the stripe's data path is still
 broken, so flushing there tears down a placeholder whose reconstructed
-pages are still needed.  No signal available at the lock layer can
-tell the two apart, so the flush is driven solely by the import-level
-IMP_EVENT_ACTIVE path above; covering the transient case where the
-import stays FULL needs data-path evidence or the server-side
-registration design.
+pages are still needed.  A successful enqueue therefore never converts
+a stripe, and the flush is driven solely by the import-level
+IMP_EVENT_ACTIVE path above.  Conversely, a sub-lock enqueue that
+actually fails is data-path evidence, and lov_lock_enqueue() does
+retry the conversion on that failure -- which is what covers the
+transient case where the import stays FULL.
 
 Placeholders are normal LRU citizens: once detached with no readers
 they are added to the LRU, so reclaim (cancel_lru_locks, the shrinker,
@@ -74,15 +101,18 @@ to hold reconstructed pages, so counting it as coverage makes the
 flush skip exactly the pages it is meant to discard.
 
 That lookup must also be able to see the placeholder it is flushing:
-ldlm_prepare_resource_list() marks the lock CBPENDING before the
-blocking AST runs, and lock_matches() rejects a CBPENDING lock with 0
-readers/writers.  The placeholder would be invisible, so only a real
-lock granted concurrently by a racing read -- after the OST recovered
-but before the bl thread flushed -- would be found and the
-reconstructed page kept, as if that lock vouched for data
-reconstructed before it existed.  lock_matches() therefore exempts
-placeholders from that filter; real CBPENDING locks stay unmatched, so
-the ordinary lock-cancel flush is unaffected.
+ldlm_prepare_resource_list() and ldlm_cli_cancel_local() mark the lock
+CBPENDING before the blocking AST runs, and lock_matches() rejects a
+CBPENDING lock with 0 readers/writers.  The placeholder would be
+invisible, so only a real lock granted concurrently by a racing read
+- after the OST recovered but before the bl thread flushed -- would
+be found and the reconstructed page kept, as if that lock vouched for
+data reconstructed before it existed.  lock_matches() therefore lets
+LDLM_FL_TEST_LOCK probes observe CBPENDING placeholders, and hides
+them from every ordinary (referencing) lookup -- which also stops a
+new reader from attaching to a placeholder whose flush is already
+pending.  Real CBPENDING locks stay unmatched, so the ordinary
+lock-cancel flush is unaffected.
 
 Placeholder locks must not satisfy a normal request: a placeholder is
 client-only, so a request reusing one would believe it holds a
@@ -127,8 +157,11 @@ also cancelled.
 Placeholder locks are client-only with no LVB data (lvb_len 0), so
 prune only needs to clear l_ast_data.
 
-Add a test_49a second-read and OST-reactivation check to verify pages
-stay cached and are invalidated when the OST comes back.
+Add test_49a checks: a second read of the degraded file must not touch
+the OSTs (the reconstructed pages stay cached), reactivating an OST
+must invalidate those pages, and a stripe whose stale LSS_READ_ERR
+outlives recovery must not leave stale reconstructed pages behind
+after a second mount rewrites the file.
 
 Assisted-by: Augment Agent:DeepSeek V4.1 Flash
 Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
@@ -669,3 +702,75 @@ Patch Set 13:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The lock_matches() exemption looks like it can crash a client, and a placeholder held by a reader when the OST comes back is never flushed. The minor comment fixes can ride along with the refresh.
+
+--- Message (Zhenyu Xu, 2026-09-28 11:59:47.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-09-28 12:02:49.000000000) ---
+Patch Set 14:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-28 12:25:38.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132434/ : SUCCESS
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-28 15:51:29.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Zhenyu Xu, 2026-09-29 07:25:30.000000000) ---
+Uploaded patch set 15: Patch Set 14 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-29 07:29:03.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-09-29 07:41:05.000000000) ---
+Patch Set 15:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-09-29 07:58:58.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132492/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-01 12:11:03.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-05 08:01:00.000000000) ---
+Patch Set 15:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments; the generation-fence race needs a refresh, the rest are optional. The latest reviewer comment says this change has been replaced by 69350 — if that patch carries the same lov_lock_sub_init() logic, the first comment applies there too.

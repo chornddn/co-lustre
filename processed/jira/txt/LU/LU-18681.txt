@@ -8,7 +8,7 @@ Resolution: Fixed
 Assignee:   Andreas Dilger
 Reporter:   Andreas Dilger
 Created:    Tue, 28 Jan 2025 21:17:42 +0000
-Updated:    Mon, 31 Aug 2026 09:41:27 +0000
+Updated:    Fri, 2 Oct 2026 17:54:55 +0000
 Resolved:   Wed, 19 Aug 2026 13:14:50 +0000
 Labels:     debug, fast_recovery, medium
 Links:      Related: is related to  LU-19199; Related: is related to  LU-14834; Related: is related to LU-20135
@@ -176,3 +176,71 @@ I am thinking about scenarios where if there was potentially a "longer" failover
 
 --- Comment (JIRAUSER19463, Wed, 26 Aug 2026 05:19:15 +0000) ---
 crusan I'm not sure I understand the question. Can you point the code out for me?
+
+--- Comment (JIRAUSER19463, Thu, 1 Oct 2026 19:46:29 +0000) ---
+I did the test over with a 200 clients cluster, and this is a typical result with peer_credits setting to 128:
+
+obdfilter.testfs-OST001a.recovery_histogram=
+recovery_start:    1790882023
+req_replay_start:  1790882173
+lock_replay_start: 1790882206
+recovery_finish:   1790882206
+recovery_time:     183
+reconnect_delay_seconds_samples: 87
+client_reconnect_histogram:
+- { phase_sec:   1, clients:   11, pct:  12, cum_pct:  12 }
+- { phase_sec:   2, clients:    6, pct:   6, cum_pct:  19 }
+- { phase_sec:   4, clients:   18, pct:  20, cum_pct:  40 }
+- { phase_sec:   8, clients:   36, pct:  41, cum_pct:  81 }
+- { phase_sec:  16, clients:   16, pct:  18, cum_pct: 100 }
+req_replay_delay_seconds_samples: 87
+client_req_replay_histogram:
+- { phase_sec:   1, clients:   52, pct:  59, cum_pct:  59 }
+- { phase_sec:   2, clients:    2, pct:   2, cum_pct:  62 }
+- { phase_sec:  16, clients:    1, pct:   1, cum_pct:  63 }
+- { phase_sec:  32, clients:   16, pct:  18, cum_pct:  81 }
+- { phase_sec:  64, clients:   16, pct:  18, cum_pct: 100 }
+lock_replay_delay_seconds_samples: 87
+client_lock_replay_histogram:
+- { phase_sec:   1, clients:   87, pct: 100, cum_pct: 100 }
+
+For this OST, it has 87 clients connected and doing IO before recovery, RPC replaying took substantial amount of time. Reconnecting is slow probably due to socklnd_timeout.
+
+I will use mdtest to generate metadata operations and see how lock replay affects recovery time on the MDT.
+
+--- Comment (JIRAUSER19463, Fri, 2 Oct 2026 17:50:26 +0000) ---
+I performed the mdtest and killed a MDS to understand how much time it would take to replay locks. It won't take too much time as it shown below:
+
+# lctl get_param mdt.*.recovery_histogram
+mdt.testfs-MDT0000.recovery_histogram=
+recovery_start:    1790894843
+req_replay_start:  1790894884
+lock_replay_start: 1790894934
+recovery_finish:   1790894934
+recovery_time:     91
+reconnect_delay_seconds_samples: 201
+client_reconnect_histogram:
+- { phase_sec:   1, clients:    2, pct:   0, cum_pct:   0 }
+- { phase_sec:   2, clients:    1, pct:   0, cum_pct:   1 }
+- { phase_sec:   8, clients:   94, pct:  46, cum_pct:  48 }
+- { phase_sec:  64, clients:  104, pct:  51, cum_pct: 100 }
+req_replay_delay_seconds_samples: 201
+client_req_replay_histogram:
+- { phase_sec:   1, clients:    1, pct:   0, cum_pct:   0 }
+- { phase_sec:  64, clients:  200, pct:  99, cum_pct: 100 }
+lock_replay_delay_seconds_samples: 201
+client_lock_replay_histogram:
+- { phase_sec:   1, clients:  201, pct: 100, cum_pct: 100 }
+
+I ran this command over 200 clients and waited for the locks on the MDT0 to reach 10M before killing it:
+
+ 
+
+$ mpirun -ppn 32 -f ${HOME}/hostfile -map-by node \	/opt/bin/mdtest -d ${dir} \	-F -u -L -T -C -r -W 300 -i 3 -n 1000000 -N 1 -x ${dir}/mdtest-easy-status
+ 
+
+ 
+
+I guess the effort of clients cancelling unused locks before replaying works really well therefore there is not much locks to replay.
+
+adilger do you have anything else for me to collect while I still have the testing env?

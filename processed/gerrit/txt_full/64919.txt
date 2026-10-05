@@ -1,5 +1,5 @@
 Change:     64919
-Subject:    LU-12668 lov: proactive dead-OST detection for degraded reads
+Subject:    LU-12669 lov: slow and dead OST detection for degraded reads
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64919
 Change-Id:  I0913e1ee977c9850193c92835edb185b0aedc6d4
 Project:    fs/lustre-release
@@ -7,69 +7,93 @@ Branch:     master
 Status:     NEW
 Owner:      Maximilian Dilger
 Created:    2026-03-26 17:09:22.000000000
-Updated:    2026-08-20 00:58:57.000000000
-Patch Set:  47
-Insertions: +167
-Deletions:  -9
-Comments:   111 (1 unresolved)
+Updated:    2026-10-05 13:20:31.000000000
+Patch Set:  50
+Insertions: +2325
+Deletions:  -79
+Comments:   192 (4 unresolved)
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell, Marc Vef, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Patrick Farrell, Marc Vef, Abdul Halim, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Andreas Dilger
 
 --- Commit Message ---
-LU-12668 lov: proactive dead-OST detection for degraded reads
+LU-12669 lov: slow and dead OST detection for degraded reads
 
-Instead of letting a read proceed to an inactive OST and fail deep in
-the BRW/lock path, detect dead imports during mirror selection and
-route to the EC recovery path.
+A read of an EC file whose data stripe is on a dead OST waits for
+the RPC's adaptive timeout, 7 s in production, before it is
+reconstructed from parity; a slow OSS extends that with early
+replies, and even a dead import costs the FLR retry rounds first.
 
-- lov_io_mirror_init() rejects a candidate mirror that has a data
-  stripe on a deactivated or invalid import, so FLR rotation can still
-  pick an intact mirror.  Only when no mirror is intact does it set
-  ci_switch_ec_io, which also skips the FLR backoff sleep -- we
-  already know the OSTs are dead.  The scan covers the whole mirror
-  rather than just the stripes the I/O touches: see the comment on
-  lov_ec_has_inactive_stripe() for why bounding it to the I/O extent
-  is not safe until the size path handles unreachable stripes.
-- lov_ecio_add_data_sub() marks such stripes errored up front, so the
-  recovery loop reconstructs them instead of building a sub-IO that
-  cl_io_iter_init() or the lock enqueue would reject.
+Give such reads a soft deadline and route around the OST.  A
+request past it fails with -ETIMEDOUT without failing the import or
+touching the adaptive timeout.  Each OSC keeps a smoothed OST_READ
+latency and deviation per RPC size, as for the TCP retransmission
+timer, and a top-level no-delay read of an EC or mirrored file gets
+a deadline, counted from its send, of the largest of
+osc.*.slow_read_pct (default 300) percent of the smoothed latency,
+that latency plus four deviations, and osc.*.slow_read_min_ms
+(default 250 ms for a non-rotational OST, 2 s otherwise).  An
+abandoned read marks the import slow for four times its deadline;
+each further soft timeout before a successful read doubles the
+deadline and the mark, up to the adaptive timeout.
 
-lov_io_set_range() rounded the CIT_EC_RD range end up to a raid-set
-boundary using the geometry of the component holding the read end, but
-that rounded value can land past the component.  The next component
-anchors its raid sets at its own e_start, so the end fell mid-raid-set
-there: lov_io_ec_rd_iter_init() cut the cycle short at it while
-lov_io_ec_rd_start() still read a whole recovery group, leaving pages
-outside the lock lov_io_lock() had enqueued.  osc_req_attr_set() then
-LBUGged ("uncovered page!") from brw_queue_work and panicked the
-client.  Clamp the rounded end at the component boundary; the read
-cannot need data past it, since the request itself ended inside that
-component and each component is erasure coded independently.
-Reproduced with a -E 4M -c 3 --ec 2+1, -E -1 -c 5 --ec 4+1 layout.
+LOV treats a deactivated, invalid, disconnected or slow-marked import
+as unavailable, but not one reconnecting from idle.  A read of a dead
+stripe is reconstructed at once when its raid set's own parity covers
+its dead stripes, and of a slow-marked one only when it covers all of
+its unavailable stripes; otherwise the read waits for them, e.g.
+until an OSS failover completes.  With no in-sync parity the file
+reads like a plain mirror.  A read of part of a raid set, whose
+reconstruction reads many times its size, gets no soft deadline and is
+not reconstructed around a slow stripe when most of the set's other
+stripes are on OSTs running at over twice their median latency since
+mount and over an eighth of slow_read_min_ms.  A plain mirror's
+buffered reads get the same deadline and rotate mirrors on expiry,
+unless no other mirror can serve the read.  An EC read skips the lock
+and read of a stripe it reconstructs by having no sub-IO for it,
+rather than through the lso_status shared with other readers.
+osc.*.slow_read_stats shows the estimates and counters.
 
-ll_readahead_handle_work() leaked its ra_cur_pages reservation when
-cl_io_rw_init() failed.  That exit is rare today but becomes routine
-once a dead import can fail an EC read at init, and ll_ra_count_put()
-is the counter's only decrement, so readahead would stop for the whole
-mount and never recover.  Release the reservation from a single exit
-label that every path past ll_ra_count_get() reaches, and call
-cl_io_fini() on the failed init, which cl_io_init() requires no matter
-what it returned.
+A 1MiB read of stripe 0 of a 4+2 EC file on an 8-OST VM, with one
+30s stall of its OST (OBD_FAIL_OST_BRW_PAUSE_BULK), then 200 1MiB
+direct and 200 4KiB buffered random reads while 4 writers load all
+OSTs:
 
-Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+  slow_read_pct            0 (off)    300 (default)
+  direct read, stall       30053ms    2069ms
+  buffered read, stall     30055ms    2048ms
+  reads under load: 0 soft timeouts, no extra parity or survivor reads
+
+Also fix lov_io_set_range() rounding the reconstruction range end
+past its component, which LBUGged "uncovered page!"; the
+ra_cur_pages leak in ll_readahead_handle_work() when
+cl_io_rw_init() fails, which stopped readahead for the mount; and
+do_file_read_iter() never clearing via_hybrid_switched, which ran
+later O_DIRECT AIO reads on the same lu_env synchronously.  Also fix
+ll_readahead_handle_work() passing a page index and count to
+cl_io_rw_init() as bytes, which routed async readahead of FLR and EC
+files by the wrong extent, and the client io_latency_stats arrays
+being one size short for a maximum-size RPC.
+
+Add sanity-ec 77a-77j, and change test_29a to check that a read with
+more stripes lost than parity waits for their OSTs.
+
 Test-Parameters: testlist=sanity-ec ostcount=8
 Test-Parameters: testlist=sanity-ec ostcount=8 fstype=zfs
-Test-Parameters: testlist=sanity ostcount=8
+Test-Parameters: testlist=sanity,sanity-flr ostcount=8
 Fixes: c2791674260b ("LU-12043 llite: improve single-thread read performance")
+Fixes: 3fc4243da7ef ("LU-13802 llite: tag switched hybrid IOs")
+Fixes: 783c13bb0b8f ("LU-12669 ec: recover data from parity")
+Fixes: d67cf23fb18a ("LU-18993 osc: Add IO RPC latency statistics by size")
 Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
-Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I0913e1ee977c9850193c92835edb185b0aedc6d4
 
 --- Review History ---
@@ -6364,3 +6388,930 @@ Patch Set 47:
 Patch Set 47:
 
 (11 comments)
+
+--- Message (Maximilian Dilger, 2026-09-26 17:51:56.000000000) ---
+Uploaded patch set 48.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-09-26 17:55:22.000000000) ---
+Patch Set 48:
+
+Code-wise looks good to me.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-26 17:55:32.000000000) ---
+Patch Set 48:
+
+Builds for x86_64 rocky8.10,rocky9.6 successful
+Job output URL: https://testing.whamcloud.com/gerrit-janitor/70920/results.html
+
+ Commencing initial testing: runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE
+
+--- Message (wc-checkpatch, 2026-09-26 18:07:05.000000000) ---
+Patch Set 48:
+
+(30 comments)
+
+30 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Lustre Gerrit Janitor, 2026-09-26 18:13:35.000000000) ---
+Patch Set 48:
+
+Initial testing succeeded.
+
+Succeeded:
+- runtests@ldiskfs+DNE runtests-ssk@ldiskfs+SharedKey runtests@zfs sanity-ec@ldiskfs+DNE sanity-ec@ldiskfs+DNE sanity-ec-special1@ldiskfs+DNE sanity-ec-special1@ldiskfs sanity-ec-special2@ldiskfs+DNE sanity-ec-special2@ldiskfs sanity-ec-special3@ldiskfs+DNE sanity-ec-special3@ldiskfs sanity-ec-special4@ldiskfs+DNE sanity-ec-special4@ldiskfs sanity-ec-special5@ldiskfs+DNE sanity-ec-special5@ldiskfs sanity-ec-special6@ldiskfs+DNE sanity-ec-special6@ldiskfs sanity-ec-special7@ldiskfs+DNE sanity-ec-special7@ldiskfs sanity-ec-special8@ldiskfs+DNE sanity-ec-special8@ldiskfs sanity-ec-special9@ldiskfs+DNE sanity-ec-special9@ldiskfs sanity-ec-special10@ldiskfs+DNE sanity-ec-special10@ldiskfs sanity-ec@zfs sanity-ec@zfs sanity-ec-special1@zfs sanity-ec-special1@zfs+DNE sanity-ec-special2@zfs sanity-ec-special2@zfs+DNE sanity-ec-special3@zfs sanity-ec-special3@zfs+DNE sanity-ec-special4@zfs sanity-ec-special4@zfs+DNE sanity-ec-special5@zfs sanity-ec-special5@zfs+DNE sanity-ec-special6@zfs sanity-ec-special6@zfs+DNE sanity-ec-special7@zfs sanity-ec-special7@zfs+DNE sanity-ec-special8@zfs sanity-ec-special8@zfs+DNE sanity-ec-special9@zfs sanity-ec-special9@zfs+DNE sanity-ec-special10@zfs sanity-ec-special10@zfs+DNE 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70920/results.html
+Commencing standard testing: 
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs
+
+--- Message (jenkins, 2026-09-26 18:15:44.000000000) ---
+Patch Set 48: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132355/ : SUCCESS
+
+--- Message (Maloo, 2026-09-26 18:17:31.000000000) ---
+Patch Set 48:
+
+#### The following sessions will be run for Build 132355 (patch #48):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132355&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132355#redirect
+
+--- Message (Maloo, 2026-09-26 19:02:12.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-selinux-ssk-part-1 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm61: https://testing.whamcloud.com/test_sessions/d926750c-050d-4155-910f-0553e5d77f8f ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-09-26 20:36:26.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-selinux-ssk-part-2 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm24: https://testing.whamcloud.com/test_sessions/82105757-c112-4b3c-bd63-3f74879902de ran 5 tests.  3 tests failed: sanity-selinux, sanity-sec, recovery-small.
+
+--- Message (Lustre Gerrit Janitor, 2026-09-26 20:58:21.000000000) ---
+Patch Set 48:
+
+Testing has completed Successfully
+
+Succeeded:
+- conf-sanity1@ldiskfs+DNE conf-sanity2@ldiskfs+DNE conf-sanity3@ldiskfs+DNE conf-sanity4@ldiskfs+DNE conf-sanity-slow@ldiskfs+DNE conf-sanity-slow-106@ldiskfs+DNE conf-sanity1@zfs conf-sanity2@zfs conf-sanity3@zfs conf-sanity4@zfs conf-sanity-slow@zfs conf-sanity-slow-106@zfs insanity@ldiskfs+DNE insanity@zfs lnet-selftest@zfs lustre-rsync-test@ldiskfs+DNE lustre-rsync-test@zfs ost-pools@ldiskfs+DNE ost-pools@zfs pjdfstest@ldiskfs+DNE pjdfstest@zfs racer@ldiskfs+DNE racer@zfs recovery-small@ldiskfs+DNE recovery-small@zfs replay-dual@ldiskfs+DNE replay-dual@zfs replay-ost-single@ldiskfs+DNE replay-ost-single@zfs replay-single1@ldiskfs+DNE replay-single2@ldiskfs+DNE replay-single1@zfs replay-single2@zfs replay-vbr@ldiskfs+DNE replay-vbr@zfs sanity1@ldiskfs+DNE sanity2@ldiskfs+DNE sanity3@ldiskfs+DNE sanity-slow@ldiskfs+DNE sanity1@zfs sanity2@zfs sanity3@zfs sanity-slow@zfs sanity-benchmark@ldiskfs+DNE sanity-benchmark@zfs sanity-dom@ldiskfs+DNE sanity-dom@zfs sanity-flr@ldiskfs+DNE sanity-flr@zfs sanity-hsm@ldiskfs+DNE sanity-hsm@zfs sanity-lfsck@ldiskfs+DNE sanity-lfsck@zfs sanity-lnet@zfs sanity-pcc@ldiskfs+DNE sanity-pcc@zfs sanity-pfl@ldiskfs+DNE sanity-pfl@zfs sanity-quota@ldiskfs+DNE sanity-quota@zfs sanity-scrub@ldiskfs+DNE sanity-scrub@zfs sanity-sec@ldiskfs+DNE sanity-sec@zfs sanityn@ldiskfs+DNE sanityn@zfs 
+
+(rocky8.10)All results and logs: https://testing.whamcloud.com/gerrit-janitor/70920/results.html
+
+--- Message (Maloo, 2026-09-26 22:22:20.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm66: https://testing.whamcloud.com/test_sessions/381edd12-5bab-4693-88cb-a142e8b8febb ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-09-26 23:58:22.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-part-2 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm6: https://testing.whamcloud.com/test_sessions/d8d17b93-7f6d-4b7a-9b71-c336d5fd85a3 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-27 00:39:46.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm55: https://testing.whamcloud.com/test_sessions/4d9f18b5-dbcc-4d97-9409-dcf9f6184b28 ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-09-27 00:45:40.000000000) ---
+Patch Set 48:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm69: https://testing.whamcloud.com/test_sessions/bb96c008-4b52-4dc5-ba4c-75fb62b5056a ran 6 tests.  1 tests failed: sanity-sec.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-09-27 01:01:44.000000000) ---
+Patch Set 48:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm37: https://testing.whamcloud.com/test_sessions/be9b4b3a-3917-4134-b4a9-e57eff33dbf1 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-09-27 06:21:29.000000000) ---
+Patch Set 48: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm21: https://testing.whamcloud.com/test_sessions/1d297a7e-73ae-422c-8ec8-62b9ce2196b2 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-09-27 06:38:19.000000000) ---
+Patch Set 48:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Separately: the ll_readahead_handle_work() reservation leak and the via_hybrid_switched reset are llite fixes unrelated to EC, each with its own Fixes: tag. Putting them in their own patches would let them land and be backported without waiting for this feature.
+
+--- Message (Andreas Dilger, 2026-10-01 05:44:01.000000000) ---
+Patch Set 48:
+
+(14 comments)
+
+--- Message (Andreas Dilger, 2026-10-02 09:18:36.000000000) ---
+Patch Set 48:
+
+(5 comments)
+
+Looking at the case where an OST dies or turns slow while reads are in flight.  An OST that is already known to be down (import DISCONN/inactive) is handled well by the early imp_unreachable() check.  The in-flight case depends entirely on the soft deadline, which is off by default, has no deadline until this OSC has an average for the RPC size, and is measured against the OST's own history so a persistently slow OST stops tripping it.  Comments inline, mostly about the trigger; the ptlrpc soft deadline plumbing and the routing of known-dead OSTs look like the right base to build the raidset-relative deadline on.
+
+There are no numbers yet for the expected improvement.  Before this is enabled by default it needs a measurement of read latency with one OST stopped mid-read, and of the extra parity/survivor read traffic (and soft timeout count) for EC reads under a background load that raises latency on all OSTs, to show the false positive rate.
+
+--- Message (Andreas Dilger, 2026-10-05 04:51:00.000000000) ---
+Uploaded patch set 49.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-05 04:52:12.000000000) ---
+Patch Set 49:
+
+(21 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 04:53:23.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-05 05:18:13.000000000) ---
+Patch Set 49: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132803/ : SUCCESS
+
+--- Message (Maloo, 2026-10-05 05:18:54.000000000) ---
+Patch Set 49:
+
+#### The following sessions will be run for Build 132803 (patch #49):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132803&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132803#redirect
+
+--- Message (Andreas Dilger, 2026-10-05 05:33:14.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-05 05:38:01.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-05 06:02:11.000000000) ---
+Uploaded patch set 50.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-05 06:02:19.000000000) ---
+Patch Set 50:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-05 06:09:30.000000000) ---
+Patch Set 50:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-05 06:13:45.000000000) ---
+Patch Set 50: Code-Review+1
+
+--- Message (jenkins, 2026-10-05 06:27:02.000000000) ---
+Patch Set 50: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132805/ : SUCCESS
+
+--- Message (Autotest, 2026-10-05 06:27:16.000000000) ---
+Patch Set 49:
+
+Trevis Autotest is abandoning the following sessions because: later build 132805 found
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-5 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-7 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.8-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-5 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-7 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el10.1-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-3 on el10.1-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-5 on el10.1-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-7 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-5 on el10.1-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-7 on el10.1-x86_64/zfs servers and clients
+- Optional review-dne-part-1 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-3 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-5 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-7 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-zfs-part-1 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-3 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-5 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-7 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-part-9 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Optional review-dne-selinux-ssk-part-1 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-selinux-ssk-part-2 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-selinux-ssk-part-1 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-ldiskfs on el8.10-x86_64/ldiskfs servers and el10.2-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Autotest, 2026-10-05 06:27:33.000000000) ---
+Patch Set 49:
+
+Onyx Autotest is abandoning the following sessions because: later build 132805 found
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-5 on el9.7-x86_64/zfs servers and clients
+- Optional review-dne-part-2 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-4 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-ipv6 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-2 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el10.1-x86_64/zfs servers and clients
+- Optional review-dne-ipv6 on el10.1-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-2 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-4 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-6 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-8 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-zfs-part-2 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-4 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-6 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-ipv6 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-9 on el10.2-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+- Optional review-ldiskfs-arm on el9.8-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+- Optional review-dne-selinux-ssk-part-2 on el10.2-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.8-x86_64/ldiskfs clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el10.1-x86_64/ldiskfs clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and sles15sp7-x86_64/ldiskfs clients
+- Optional review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2604-x86_64/ldiskfs clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced review-dne-subtest-change on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-subtest-change on el9.7-x86_64/zfs servers and clients
+- Enforced custom on el9.7-x86_64/ldiskfs servers and clients
+- Enforced custom on el9.7-x86_64/zfs servers and clients
+- Enforced custom on el9.7-x86_64/ldiskfs servers and clients
+
+--- Message (Maloo, 2026-10-05 06:28:22.000000000) ---
+Patch Set 50:
+
+#### The following sessions will be run for Build 132805 (patch #50):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=132805&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=132805#redirect
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-05 06:28:35.000000000) ---
+Patch Set 49:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-05 06:36:17.000000000) ---
+Patch Set 50:
+
+Code-wise looks good to me.
+
+--- Message (Maloo, 2026-10-05 12:18:07.000000000) ---
+Patch Set 50:
+
+Failed optional test review-dne-part-2 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-156vm6: https://testing.whamcloud.com/test_sessions/798ada6c-5b12-41fb-af4f-556ccc338704 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-10-05 12:30:31.000000000) ---
+Patch Set 50:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-155vm26: https://testing.whamcloud.com/test_sessions/8264c49f-8925-44b4-8009-758fe4b3a7c0 ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-10-05 12:35:41.000000000) ---
+Patch Set 50:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest from onyx-156vm41: https://testing.whamcloud.com/test_sessions/42f6bca5-2d0e-4045-a623-9a2b5caeea2b ran 9 tests.  2 tests failed: racer, parallel-scale.
+
+--- Message (Maloo, 2026-10-05 13:10:42.000000000) ---
+Patch Set 50:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest from onyx-157vm66: https://testing.whamcloud.com/test_sessions/beacf39d-8d1e-4533-b2da-a7ad87d9c0e9 ran 6 tests.  1 tests failed: sanity-sec.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-10-05 13:20:31.000000000) ---
+Patch Set 50:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Onyx Autotest from onyx-155vm50: https://testing.whamcloud.com/test_sessions/023b6730-b45a-4ddf-841d-7ab3814395d9 ran 11 tests.  1 tests failed: sanity-lfsck.
