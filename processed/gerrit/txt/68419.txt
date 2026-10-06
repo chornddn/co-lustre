@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-09-12 01:03:27.000000000
-Patch Set:  12
-Insertions: +708
+Updated:    2026-10-06 12:11:35.000000000
+Patch Set:  13
+Insertions: +824
 Deletions:  -36
-Comments:   73 (4 unresolved)
+Comments:   78 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -46,6 +46,13 @@ matches on stdout with no cookie written, and the next run would
 repeat them.  An MDT with no anchor is not probed at all -- 0 has
 nothing to be stale against, and that is every MDT of a first run.
 
+An anchor past the end of a log that holds records is refused too.
+Indexes restart at 1 when an MDT's last changelog user is deregistered
+and the MDT is remounted, and a run from the old anchor would skip
+every record in the new log.  A second one-record scan from the
+anchor finds nothing in that case.  Once the new log grows past the
+anchor, indexes alone cannot show the restart.
+
 Zero is reserved for "the log is empty", which is why a record that
 arrives without an index is reported rather than recorded as index 0.
 Changelog indexes start at 1, so storing 0 for a record that has one
@@ -75,16 +82,16 @@ value that does the indexing.
 --since and --since-cookie are two ways to say where to start, so
 giving both is refused rather than one of them silently winning.  More
 than one path is refused for a related reason: lfs find runs the
-search once per path and every run advances the anchors, so the second
-path started past the end of the log, printed nothing, and left the
-records it should have matched behind the anchor for good.
+search once per path and every run advances the anchors, so a second
+path would start past the end of the log, print nothing, and leave the
+records it should match behind the anchor for good.
 
 The cookie is proved writable in the same pre-pass that proves the
 anchors are not stale, and for the same reason -- a cookie that cannot
 be written leaves the matches on stdout and the next run repeating
 them.  A missing directory component reads as ENOENT, which
-find_cookie_read() takes for a first run, so the typo was not noticed
-until every log had been scanned.
+find_cookie_read() takes for a first run, so a typo would not be
+noticed until every log had been scanned.
 
 The temporary file is fsync()ed before the rename, and the directory
 after it.  The rename makes the replacement atomic against another
@@ -92,12 +99,25 @@ process, which is not the same as durable: after a host crash the
 rename can be on disk while the contents are not, and an empty cookie
 parses as no anchors at all.
 
-The pre-pass probes the temporary name the write will use rather than
-the cookie itself, because the write creates "<cookie>.new" and
+The pre-pass probes by creating a temporary beside the cookie rather
+than opening the cookie itself, because the write creates one and
 renames over: what it needs is permission on the directory, which
 opening an existing cookie for append does not test.  A cookie owned
-by the job user in a root-owned directory passed and then failed
-EACCES with every match already printed.
+by the job user in a root-owned directory would pass that and then
+fail EACCES with every match already printed.
+
+The temporary is private to the run, "<cookie>.<pid>.<n>.new" created
+O_EXCL.  One fixed name would let an overlapping run -- a cron job
+that outlasts its interval -- truncate or unlink the other's copy
+between its write and its rename, and an empty cookie reads as no
+anchors at all.  O_EXCL rather than mkstemp() keeps the umask's mode
+for a first run's cookie.
+
+Matches that could not be written hold the anchors too.  They go to
+stdout through llapi_printf(), which reports nothing, so stdout is
+flushed and its error flag read before the rewrite; otherwise
+"lfs find --since-cookie ck > out" on a full filesystem would lose
+the matches, advance past their records and exit 0.
 
 The anchors are left where they were when a run did not finish.  A
 resolve failure that is not "this object has no name" drops matches,
@@ -110,90 +130,57 @@ number having been refused for the same reason: "%llu" negates, so
 "-2" would anchor a run at 0xfffffffffffffffe, match nothing, and
 write that value back.
 
-find_device_supported() refuses --since-cookie along with --since:
-the option table is compiled into lfind too, so it parses there, and
-llapi_find_device() never reads it -- a target scan would have
-printed every object the other predicates kept and exited 0, without
-even reading or writing the cookie it was given.
+find_device_supported() refuses --since-cookie along with --since: lfs
+find parses it for a target scan too, and llapi_find_device() never
+reads it -- a target scan would have printed every object the other
+predicates kept and exited 0, without even reading or writing the
+cookie it was given.
 
 ONLY=56 is the regression check that the shared paths still answer as
 they did; --since-cookie's own subtests are in the tests patch at the
 end of this series.
 
 The cookie names the search as well as the filesystem, and a
-mismatch is refused the way a wrong fsname already was.  The anchors
-say how far each log was read, not how far a subtree was: a record is
-counted before the FID and the subtree are tested, so a run over one
-subtree carries every anchor to the end of the log and a second
-subtree sharing the cookie starts past its own changes and prints
-nothing.  That is the collision lfs_find() refuses when two paths are
-given to one command, reached by running the command twice.  A cookie
-written before this carries no root and is still accepted.
+mismatch is refused the way a wrong fsname is.  The anchors say how
+far each log was read, not how far a subtree was: a record is counted
+before the FID and the subtree are tested, so a run over one subtree
+carries every anchor to the end of the log, and a second subtree
+sharing the cookie would start past its own changes and print nothing.
+That is the collision lfs_find() refuses when two paths are given to
+one command, reached by running the command twice.  A header with no
+root is accepted.
 
-A cookie that exists and is not a regular file is refused up front.
-The probe settles the containing directory, not the name: the write
-ends in rename(), which answers EISDIR over a directory, while the
-read succeeds and returns no anchors -- so naming a directory scanned
-every log to the end, printed every match, and only then said it
-could not rewrite.  An empty name is refused with it.
+A cookie that exists and is not a regular file is refused when it is
+read, and again before the search for one swapped in since: the write
+ends in rename(), which answers EISDIR over a directory, so it would
+otherwise be found only after every log had been scanned and every
+match printed.  An empty name is refused with it.
 
-The comment on the file format said a comment or a blank line costs
-nothing.  It costs the read nothing; the rewrite emits the header and
-the anchors and nothing else, so it does not survive the run.  Said
-so, the sentence otherwise reading as an invitation to annotate the
-file.
-
-The documentation for fp_since_cookie arrives here rather than in the
-previous patch, which described the field, its -EINVAL and its
--ESTALE before any of them existed.
-
-The root is the rest of the header line rather than a field.  A
-pathname can hold a space and %s cuts it at the first one, so a search
-under "/mnt/lustre/my data" was recorded whole and read back as
-"/mnt/lustre/my": the comparison then failed for every run after the
-first, and the message named a path the caller never gave.  The root
-is whatever realpath() returned for the caller's path, so a directory
-with a space in it was enough to reach it.
-
-And the root is escaped rather than written raw, because the rest of a
-line still cannot hold a newline.  Only '/' and NUL are excluded from
-a name, so "/mnt/lustre/anb" was written whole, read back as
-"/mnt/lustre/a", and refused for every run after the first naming a
-path the caller never gave -- the space case one character further
-out, with the remainder becoming its own line and being dropped.  Both
+The root is the rest of the header line rather than a field, because
+a pathname can hold a space and %s cuts at the first one.  It is
+whatever realpath() returned for the caller's path.  And it is escaped
+rather than written raw, because a name can hold a newline, which the
+rest of a line cannot: only '/' and NUL are excluded from a name.  Both
 sides escape and the reader compares the escaped forms, so nothing
 decodes: the mapping only has to be injective for a comparison, which
 is also why backslash is escaped.  The refusal names both sides in
 that spelling, or a newline would break the line meant to name it.
 
-find_cookie_check()'s two other refusals say so as well.  An empty
---since-cookie and a name too long to append ".new" to both returned
-the errno alone, beside a "is not a regular file" case that reports
-itself, so the run ended at the caller's "failed for '<path>': Invalid
-argument" with nothing naming the argument at fault.
-
-Two diagnostics that this patch makes reachable are corrected with it.
-The refusal of --resolve without --changelog said "--since already
-reads the object", which names an option the caller need not have
-given once --since-cookie exists; it names both anchored spellings
-now.  And a cookie refused for its filesystem or its root was reported
-twice, the second line saying "cannot read" over a file that read
-perfectly well -- find_cookie_read() has already named which refusal
-it was, so the wrapper is left with what fopen() passed up.
+Every refusal in find_cookie_check() names the argument at fault, so a
+run does not end at the caller's "failed for '<path>': Invalid
+argument".  The refusal of --resolve without --changelog names both
+anchored spellings, since --since-cookie reaches it too.  A cookie
+refused for its filesystem or its root is reported once:
+find_cookie_read() names the refusal, and the wrapper adds nothing.
 
 The MDT number is exactly the four hex digits find_cookie_write()
 emits.  %4x converts the leading digits and ignores what follows, so
-"<fsname>-MDT00001" and "<fsname>-MDT0000_UUID" both anchored MDT0000
-at an index never written for it -- the short answer with nothing said
-that the stale check exists to catch, from a file this function's own
-comment says it ignores anything but "<mdtname> <index>" in.  The span
-refuses the sign as well, so the separate test for it goes.
+without the span "<fsname>-MDT00001" and "<fsname>-MDT0000_UUID"
+would both anchor MDT0000 at an index never written for it -- the
+short answer with nothing said that the stale check exists to catch.
+The span refuses a sign as well.
 
-ERRORS gains -ESTALE, which the previous patch dropped on the
-understanding it would arrive with the cookie and which the kernel-doc
-Return: block has listed since.  It is the error the whole option is
-built around, and the man page was the one place a caller of the API
-could not find it.
+ERRORS lists -ESTALE, the error the whole option is built around.
 
 Test-Parameters: testlist=sanity env=ONLY=56
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
@@ -659,3 +646,34 @@ Patch Set 12:
 AI code review results below, please doublecheck
 
 Looks good; the cookie machinery itself reads correct -- the anchors, the stale pre-pass, the bounds on the parsed MDT number and the write-then-rename all check out. A few optional notes inline for whenever it is next refreshed; none of them is a reason to re-spin.
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:12.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-05 23:41:57.000000000) ---
+Patch Set 13:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-10-05 23:46:35.000000000) ---
+Patch Set 13:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 00:05:38.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 01:31:36.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132897/ : SUCCESS
