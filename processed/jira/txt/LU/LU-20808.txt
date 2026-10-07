@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Di Wang
 Created:    Wed, 23 Sep 2026 03:40:59 +0000
-Updated:    Tue, 6 Oct 2026 08:11:58 +0000
-Links:      Related: is related to  LU-19189; Related: is related to  LU-19038; Related: is related to  LU-7427; Related: is related to  LU-7426; Related: is related to LU-10938; Related: is related to LU-20831
+Updated:    Wed, 7 Oct 2026 03:05:51 +0000
+Links:      Related: is related to  LU-19189; Related: is related to  LU-19038; Related: is related to  LU-7427; Related: is related to  LU-7426; Related: is related to LU-20879; Related: is related to LU-10938; Related: is related to LU-20831
 Attachments: Lustre wire struct protocol review.pdf, Reduce DNE Cross-MDT Metadata RPC.pdf
 
 --- Description ---
@@ -644,3 +644,569 @@ Commit: 9d36f90edaf0d383bef2e08ad320e5bece48f0c4
 For the WBC/OUT overlap, it isn't just a question of whether this patch collides with the WBC code, but whether it semantically will overlap with it or be replaced by it in the future?  While it means a bit more work now to investigate and implement this, it could save code, protocol complexity, and development effort in the future, so I want to make sure we are asking the LLM the right questions. 
 
 The whole WBC prototype patch series is available for review, so it is worthwhile to ask if this patch can be implemented in a manner that will facilitate WBC in the future?  Can Alex's patch to simplify the OUT packing help enough that it is attractive to also use it for this patch and in a unified way. We have the LLM credits to run such queries (though not easily from my phone in the middle of the night), so let's look a bit forward instead of taking the first working solution that isn't looking at the bigger picture.
+
+--- Comment (JIRAUSER24000, Tue, 6 Oct 2026 19:21:56 +0000) ---
+>For the WBC/OUT overlap, it isn't just a question of whether this patch collides with the WBC code, but whether it semantically will overlap with it or be replaced by it in the future? While it means a bit more work now to investigate and implement this, it could save code, protocol complexity, and development effort in the future, so I want to make sure we are asking the LLM the right questions.
+
+I checked the WBC patches, which seems sending its updates in a batched RPC (MDS_BATCH). Each sub-request is packed as its own lustre_msg with its own format (BUT_CREATE_EXLOCK, BUT_CREATE_LOCKLESS, BUT_SETATTR_EXLOCK, BUT_SETATTR_LOCKLESS and BUT_EXLOCK_ONLY). Though these are mostly used to flush cached changes to the MDT. I did not find any case where the WBC client fetches the full state (attributes and xattrs) of an existing directory yet, probably because WBC currently caches only new directories. If WBC later caches existing directories (I assume it will ?), it could reuse the name-keyed xattr format from this patch. Let me update the patch a bit.
+
+ 
+
+Can Alex's patch to simplify the OUT packing help enough that it is attractive to also use it for this patch and in a unified way
+
+I checked Alex's patch, and it could save some bytes indeed. But I can't use it directly. Its optimization is part of the OUT update format, negotiated with OBD_CONNECT_OBDOPACK and a per-request UPDATE_FL_COMPACT flag, while this patch packs the attributes and xattrs in an LDLM intent reply, though Its pack/unpack helpers could be shared indeed.
+
+--- Comment (gerrit, Tue, 6 Oct 2026 19:42:19 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69463
+
+Subject: LU-20808 ptlrpc: RFC carry IT_MDT_TO_MDT_READ as OUT reads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 000bdfa2fe3cc50e8b21d048c2a73654b40d4a4c
+
+--- Comment (adilger, Tue, 6 Oct 2026 19:48:18 +0000) ---
+[Claude] Di, here is the WBC/OUT analysis, with a prototype to check the numbers. The full write-up follows in the next comment.
+
+	WBC does not replace this intent. WBC flushes permission-checked namespace operations through MDS_BATCH, with each cached subtree on one MDT. A flush that crosses MDTs still reaches a coordinator MDT that needs remote locks, reads and OUT updates. OUT_UPDATE and MDS_BATCH are separate protocols today, but their containers are parallel (but_update_header has the fields of out_update_header plus a count, and the same inline-or-bulk scheme). So the container code and the "directory state" read set could be shared in future, while the payloads stay separate. One real conflict: WBC's IT_SETATTR in patch https://review.whamcloud.com/37137 ("LU-13021 wbc: add aging keep cache flush mode for WBC") already uses 0x00010000.
+
+	I prototyped option B in patch https://review.whamcloud.com/69463 ("LU-20808 ptlrpc: RFC carry IT_MDT_TO_MDT_READ as OUT reads"), on top of 69269 PS4, for review of the data structures only. The intent carries an object_update_request of read-only OUT updates of the locked FID (lookup, attr_get, xattr_get by name), and the reply is an object_update_reply. The owner runs the existing OUT handlers under your try-lock, and OSP seeds its cache from the same results an OUT_UPDATE returns. Your call sites, try-lock and cache rules are unchanged. If accepted, it should be merged into 69254, 69256, 69257, 69259 and 69447, with 69255 dropped, as its commit message lists.
+	
+		Same RPC counts and same throughput (A/B within +/-2%).
+
+		313 fewer lines of non-test code; wire definitions drop from 330 to 44 lines; no new structs, RMF fields or swabbers.
+
+		Statuses become network errnos, and adding a read (linkEA, encryption context) needs no format change.
+
+	
+	
+
+	A value that does not fit comes back as its size, and OSP caches that size, so a large default layout costs one read instead of LOD's three. This also fixes test_1000e failing on the first run after a mount (5 OUT RPCs > 4), which happens with PS4 too.
+
+	Other items, posted inline on the patches where not already flagged:
+	
+		The intent inside an MDS_BATCH sub-request hits the LASSERT in __req_capsule_offset().
+
+		LOHA_EXISTS is not set when attributes are seeded.
+
+		An owner rejection, e.g. from MDT_READ_XATTRS_MAX, fails the whole operation with -EIO.
+
+		The obd_connect_names[] index is wrong in 69320.
+
+		The pre-lock attr_get left in mkdir comes from mdt_check_enc(), for clients that are not encryption-aware.
+
+	
+	
+
+	Measured on a 3-VM cluster (MDT0 and MDT1 on different nodes): mkdir under a remote parent goes from 187 to 426/s with one process. With 8-16 processes it levels off near 740/s while both MDS VMs stay about 50% idle, which points at the single ordered OUT sender per MDT pair (LU-7426) as the next limit.
+
+--- Comment (adilger, Tue, 6 Oct 2026 19:48:21 +0000) ---
+[Claude] Full write-up of the protocol review summarised in the previous comment.
+
+OUT protocol unification: LU-20808 design review
+
+2026-10-06. Prototype: patch https://review.whamcloud.com/69463 ("LU-20808 ptlrpc: RFC carry IT_MDT_TO_MDT_READ as OUT reads"), RFC and fortestonly, on 69269 PS4.
+
+This reviews the network protocol of LU-20808 against three neighbours:
+
+	the OUT object-update protocol;
+
+	the OUT optimisation work in LU-4215, LU-7426 and LU-7427, including patch https://review.whamcloud.com/15336 ("LU-4215 out: few optimization to the protocol");
+
+	the Metadata Writeback Cache series under LU-10938, starting at patch https://review.whamcloud.com/36924 ("LU-13047 wbc: foundation framework for WBC").
+
+It proposes one layered protocol for MDT-to-MDT reads and updates, and reports a prototype of its first step on top of Di's series, measured on local VMs.
+
+Answers
+
+	Carry the LU-20808 reads as OUT read updates inside the intent, now.
+	
+		What changes: the intent's request is an object_update_request of read-only OUT updates of the locked object, and its reply is an object_update_reply. The owner runs them with the existing OUT handlers, and OSP seeds its cache from the same results an OUT_UPDATE returns.
+
+		What stays: Di's call sites, try-lock, security gate and cache rules.
+
+		Measured: the same RPC counts and the same throughput (A/B within 2%, inside run-to-run noise), with 313 fewer lines of non-test code, 87% less wire-definition code, and no new wire structs.
+
+		Open review items it closes: network errnos; per-read room with a needed-size hint; any further read (linkEA, encryption context, LMA) without a format change.
+
+	
+	
+
+	WBC complements LU-20808 and will not replace it.
+	
+		Why: WBC flushes permission-checked namespace operations through MDS_BATCH, with each cached subtree on one MDT. Rename, link and contention take the normal path. A cross-MDT flush still reaches a coordinator MDT that needs remote locks, reads and OUT updates.
+
+		Worth sharing in future: the container code, the "directory state" read set, and the partial-execution rules. OUT_UPDATE and MDS_BATCH are separate protocols today, with their own opcodes, structs and handlers, but their containers are parallel: the batch header has the OUT header's fields plus a count, and the same inline-or-bulk scheme. The payloads should stay separate.
+
+		One real conflict: WBC's IT_SETATTR already uses 0x00010000, the value of IT_MDT_TO_MDT_READ.
+
+	
+	
+
+	15336 cannot be used as it is. Its request-side compaction has been inert since PS58, its update flag collides with UPDATE_FL_IGNORE_QUOTA, and the 2018 protocol review (a wire-defined name table, a max-known-id exchange at connect) was never answered. Its ideas belong in a later compact-encoding step, which an intent that carries OUT updates gets for free.
+
+	The next bottleneck is the ordered update sender (LU-7426). On a 3-VM cluster LU-20808 takes single-process cross-MDT mkdir from 187 to 425 ops/s. With 8 or 16 client processes it levels off at about 740 ops/s while both MDS VMs stay about 50% idle and no thread saturates. That fits the single osp_up thread per MDT pair, which sends update-log-writing RPCs one at a time.
+
+	Proposed plan: five steps on one OUT operation vocabulary:
+	
+		the read set on the enqueue (LU-20808, prototyped);
+
+		independent per-update status and right-sized replies in OUT_UPDATE;
+
+		a compact encoding under one negotiated capability;
+
+		target-owned update logs (LU-7426, LU-7427);
+
+		compound MDT-to-MDT requests, sharing the batch container with WBC.
+
+	
+	
+
+Round trips on the critical path
+
+One mkdir whose parent is on another MDT, as seen by the coordinating MDT. Master and LU-20808 are measured (OSP stats and object_update_request_dump() traces); the last two rows are the targets of the proposed steps.
+
+Build
+Synchronous round trips
+Count
+
+master
+attr, lookup, PDO enqueue, hash enqueue, attr, lookup, lookup, default ACL, pin, default LOV, transaction
+11
+
+LU-20808, either format
+attr, PDO enqueue, hash enqueue with reads, transaction
+4
+
+plus encryption check after the lock
+PDO enqueue, hash enqueue with reads, transaction
+3
+
+plus compound enqueue (step 5)
+PDO and hash enqueue with reads, transaction
+2
+
+The update-log cancel follows each operation off the critical path. The remaining pre-lock attr read is mdt_check_enc(), which reads the parent for every client that is not encryption-aware (the VM clients are not). It costs an RPC each time because mdt_save_remote_lock() drops the parent's OSP cache whenever a remote UPDATE lock is released.
+
+What each protocol does today
+
+Aspect
+OUT_UPDATE
+LDLM intent
+MDS_BATCH
+LU-20808 PS4
+WBC series
+
+Peers
+MDT to MDT, MDT to OST
+client to MDT, MDT to MDT
+client to MDT
+MDT to MDT only
+client to MDT only
+
+Container
+out_update_header and object_update_request, inline below 4 KB, else bulk
+enqueue, ldlm_intent.opc, per-intent buffers
+but_update_header (its own struct and magic: the OUT header's fields plus a count) and full lustre_msg sub-requests
+enqueue, mdt_read_req, name, xattr-name list
+no new RPC: intents, MDS_REINT, MDS_BATCH sub-ops
+
+Element
+object_update: 40-byte header (type, params, result size, flags, batchid, FID) and 8-aligned params
+one intent per enqueue
+RQF-typed sub-request; only BUT_GETATTR (an intent enqueue) in master
+bitmask: name lookup, attrs (obdo), named xattrs
+BUT_CREATE_EXLOCK/LOCKLESS, BUT_SETATTR_*, BUT_EXLOCK_ONLY, new IT_SETATTR
+
+Execution
+OSD, in order; same batchid is one transaction; the first error stops the rest
+intent policy before the grant
+each sub-request through the normal MDT handler
+try-lock, then MDD/LOD reads
+MDT reint paths, some lockless
+
+Trust
+peer, no credentials
+client credentials checked
+client credentials checked
+peer; MDS_MDS, flag and GSS checked
+client; lockless bias not verified
+
+Recovery
+update llogs on every participant
+lock replay, op replay
+per-sub-request lrd_batch_idx
+read-only, never replayed
+open issues (LU-15621, LU-13577)
+
+Reply size
+at least 4 KB on the wire, never shrunk
+shrunk
+grown or shrunk
+shrunk
+n/a
+
+All three MDT-to-MDT paths (OUT_UPDATE, MDT-to-MDT enqueues, and until patch https://review.whamcloud.com/69436 ("LU-20879 ptlrpc: send batched RPCs to the MDS request portal") client MDS_BATCH) land on OUT_PORTAL, so their handlers share the mdt_out threads and must never block on another target or on a lock grant.
+
+Review of the LU-20808 wire protocol
+
+Design-level comments on the PS4 protocol, which 69254 defines and 69256, 69257, 69259 and 69447 implement. The credential-free "read under lock" model is right: it answers the main points of the 2026-09-24 review (no waiting in mdt_out, no permission logic on the owner, explicit fallback). What remains is mostly about format, reuse and scope.
+
+	R1, design: the new format duplicates OUT at both ends. The owner re-implements OUT_ATTR_GET, OUT_XATTR_GET and OUT_INDEX_LOOKUP through MDD and LOD, and needs a new raw-xattr accessor stack (69255) only to get back the bytes OUT already returns; its replies mix MDD-view attributes with OSD-view xattrs. The requester re-implements reply parsing and caching next to osp_attr_get(), osp_xattr_get() and their async interpreters. The stated reason for not embedding OUT, "to avoid running OUT handlers inside the intent policy", does not hold up: the read handlers are short, local and take only dt_read_lock(); they already run in the same mdt_out threads, and with LOC_F_LOCAL (69446) they cannot reach another target. The prototype runs them unchanged.
+
+	R2, wire: statuses are host errnos. mdrp_status and mdrx_status freeze the host errno ABI; every other wire status goes through ptlrpc_status_hton(), as OUT results already do.
+
+	R3, wire: an owner rejection fails the whole operation. MDT_READ_XATTRS_MAX is a wire constant that only the owner enforces, with -EPROTO, which osp_md_object_lock() turns into -EIO for the user's operation; raising it later would break operations against older owners. An unknown item or a malformed name should cost that item, not the enqueue. The prototype answers an unknown read type with -EOPNOTSUPP, and a read of another object with -EINVAL, in that read's own result, and declines (grants without reading) an intent with more reads than the owner runs.
+
+	R4, performance: the needed size on -ERANGE is returned but not used. The first create under a parent with a large default layout makes LOD try its 64-byte per-thread buffer, probe the size, then read: three OUT RPCs. This is why sanity test_1000e fails on the first run after a mount with PS4 as well (5 OUT RPCs against a budget of 4); it passes on reruns, once the buffer has grown. In the prototype a value that does not fit comes back as its size without the value (what OUT_XATTR_GET already does for an empty buffer), and OSP caches that size, so the probe and the -ERANGE are answered locally: one read, and 1000e passes on the first run with 3 OUT RPCs.
+
+	R5, bug: the intent inside an MDS_BATCH sub-request asserts. mdt_intent_dne_read() asks for RMF_MDT_READ_REQ on a RQF_BUT_GETATTR sub-capsule and hits the LASSERTF in __req_capsule_offset(). Only an export that negotiated MDS_MDS and the flag gets that far. Refuse it when mti_batch_env is set.
+
+	R6, bug: LOHA_EXISTS is not set when attributes are seeded (osp_attr_get() sets it; the aireview comment on 69257 is still open).
+
+	R7, design: lock coverage is implicit. The intent rides the name-hash lock; the attributes and xattrs it returns are protected by the PDO CW lock taken just before it. The IDL comment should say that the requester must already hold, or be granted by this enqueue, a lock covering everything it reads. The seeded state does not outlive the lock: mdt_save_remote_lock() calls mo_invalidate() when a remote UPDATE or XATTR lock is released.
+
+	R8, design: one object per enqueue. The target parent, the target, ancestors and the root default layout are not covered, and the looked-up child FID comes back without attributes, so instantiating a remote child still costs an osp_object_init() attr_get. With OUT reads, a later step can add reads of other objects on the owner MDT without a format change, once a lock rule for them is agreed.
+
+	R9, design: two serial enqueues remain. Every remote-parent operation pays the PDO and name-hash enqueues one after the other (unlink a third, rename a fourth); with the reads gone, they are most of the remaining round trips (step 5).
+
+	R10, design: the contended fallback is the slowest path. When the try-lock fails, the requester falls back to one RPC per read. The same read set could instead go in one OUT_UPDATE after the grant, given independent per-update status (step 2).
+
+	R11, no wire change: the pre-lock read for clients that are not encryption-aware. Caching the encrypt flag on the mdt_object (as LOHA_FSCRYPT_MD is), or checking after the parent lock, saves one RPC per create.
+
+	R12, compat: connect flag name and IT bit. 69320 puts "dne_lock_intent" at the wrong index of obd_connect_names[]. IT_MDT_TO_MDT_READ = 0x00010000 collides with WBC's IT_SETATTR (37137); settle the value now.
+
+	R13, operations: no tunable and no counters for intents sent, executed, declined and rejected, as asked in the 2026-09-24 review.
+
+WBC: overlap or replacement?
+
+The WBC series (64 changes, not landed; the main chain is based on 2.14.56 and the foundation on 2.15.64) adds no new RPC and no MDT-to-MDT protocol. On the wire it uses:
+
+	async intents: IT_CREAT and a new IT_SETATTR with LDLM_FL_INTENT_PARENT_LOCKED or LDLM_FL_INTENT_EXLOCK_UPDATE, the parent's EX handle in lock_handle[1];
+
+	MDS_REINT with a MDS_WBC_LOCKLESS bias, under which the MDT takes no locks;
+
+	MDS_BATCH sub-operations for create, setattr and lock re-acquire.
+
+Only directories the client created become cache roots; the EX grant returns mdt_body, the LMV and the default LMV, but no ACL, pin or default LOV. Children are made in client memory with client-allocated FIDs, and the MDT applies inheritance at flush time. Flush order is the client's job (one directory at a time, top-down; a batch stops at the first failure). Rename and link first flush both sides, then run as normal operations.
+
+Where it meets LU-20808: a lockless flush that creates a child on a different MDT from its parent makes the coordinator read the parent with unlocked OSP getattr and getxattr. These are the reads the intent batches, but with no enqueue to carry them, since the client's EX lock covers the parent. With OUT reads the same read set goes in one plain OUT_UPDATE; a typed intent buffer cannot be reused there.
+
+Conclusion: the two are complementary. Worth unifying: the container code (today OUT_UPDATE and MDS_BATCH are separate protocols, and mdt_batch() was written from out_handle() and duplicates its header and bulk handling, so the proposal is one shared implementation of that part); the "directory state needed to create a child" read set; the rules (grant at once or skip the work; partial execution, the same problem in LU-7319 and LU-15550; network errnos; needed-size hints). Keep the payloads separate: clients send namespace operations that need permission checks and inheritance, and must never send object updates. Settle these collisions before either lands: the IT bit; WBC's LDLM_FL_INTENT_PARENT_LOCKED, which is master's LDLM_FL_CONTENTION bit; and MDS_WBC_LOCKLESS, which has collided with a master bias bit after each rebase.
+
+OUT optimisation history
+
+Work
+Status
+What to take from it
+
+LU-4215 OUT improvements
+Closed, Not a Bug, with 15336 still open
+"Continue after a failed update" moved to LU-7319, still open; the hard part there is reply reconstruction.
+
+15336 (LU-4215 OUT protocol compaction), PS62
+no human review since 2018; does not merge
+Variable-size lu_attr (12-88 bytes instead of a 208-byte obdo; CREATE 264 to 96 bytes, ATTR_SET 248 to 80), one-byte codes for 10 xattr names. Defects: request side inert since PS58, flag 0x10 collides, weak bounds check, missing swabs, LA bits passed without data, name table not on the wire.
+
+LU-7426 remote update llog
+In Progress; 57261 (LU-7426 indexed llog) PS75
+The coordinator appends to the peer's llog with raw {{OUT_WRITE}}s whose header, bitmap and offset it computes when packing, which forces ordered, one-at-a-time sending per MDT pair. 57261's own TODO lists the remote part.
+
+LU-7427 several BATCHID slots
+Open, no patch
+Cancels stop at the first uncommitted transaction (update_trans.c:1545); LU-8714 saw 80-100K leftover records per MDT and over 4 hours of recovery.
+
+50522 (LU-16554 exact OUT reply size)
+NEW
+Every OUT reply is at least 4320 bytes on the wire; on o2ib that is past the 4 KB immediate-message size, so each reply needs an RDMA rendezvous. Old OSPs dereference a short reply, so shrinking needs a connect flag.
+
+68928 (LU-19672 batch destroy over OUT), 16785 (LU-2533 OUT batch MDS-OST sync)
+NEW
+Both want "record rc and continue"; update flag 0x10 has now been claimed by CONTINUE, COMPACT and the landed IGNORE_QUOTA. 68928 caps a batch at 50 destroys because of the 40-byte update header.
+
+LU-19189, LU-11854
+Open
+Sync-on-cancel and COS commits cost about 5x on ZFS remote mkdir; striped mkdir cannot be fixed without changing DNE recovery.
+
+Proposed design
+
+Principles:
+
+	One vocabulary of object operations (enum update_type) for every MDT-to-MDT read and write.
+
+	Several transports carry that same encoding: OUT_UPDATE, the read-under-lock intent, and later a compound request; one reply format and one requester path (OSP's interpreters and cache).
+
+	Every handler reachable through OUT_PORTAL is non-blocking: it never waits for a lock grant and never calls another target.
+
+	One capability negotiation covers the whole OUT generation, instead of one connect flag per feature.
+
+	Clients never send object updates; WBC shares the container code and the execution rules, not the payload.
+
+Step 1 (LU-20808, prototyped): the read set on the enqueue.
+
+LDLM_ENQUEUE to OUT_PORTAL, ldlm_intent.opc = IT_MDT_TO_MDT_READ
+ request: PTLRPC_BODY | DLM_REQ | LDLM_INTENT | OUT_UPDATE_HEADER
+   out_update_header      { magic, count = 1, inline_length, reply_size }
+   object_update_request  { UPDATE_REQUEST_MAGIC_V2, count }
+     OUT_INDEX_LOOKUP  fid = locked dir  "name"                     room 16
+     OUT_ATTR_GET      fid = locked dir                             room 208
+     OUT_XATTR_GET     fid = locked dir  "system.posix_acl_access"  room = shared budget
+     OUT_XATTR_GET     ...  default ACL, pin, LMV, default LMV, LOV
+ reply:   PTLRPC_BODY | DLM_REP (DISP_IT_EXECD) | OUT_UPDATE_REPLY
+   object_update_reply    { magic, count, lens[] }, then { rc, datalen, data } per read
+
+	Reads only (OUT_ATTR_GET, OUT_XATTR_GET, OUT_XATTR_LIST, OUT_INDEX_LOOKUP) of the locked FID; anything else gets its own -EOPNOTSUPP or -EINVAL result, so a newer requester can ask for more without a new flag.
+
+	The owner takes the lock bits as try bits, all or nothing, then out_reads_run() runs the existing OUT handlers on the OSD object (located with LOC_F_LOCAL) and grants the lock. A failed read does not stop the next one. If the lock is not free, or the enqueue is a resend, nothing runs and the lock is granted the normal way, without DISP_IT_EXECD.
+
+	Values share the reply budget in order; one that does not fit comes back as its size without the value, and OSP caches the size.
+
+	A lookup in a striped directory master is answered -EREMOTE; a missing locked object is -ESTALE, never -ENOENT, so that -ENOENT from a lookup always means "the name does not exist", which is authoritative under the name-hash lock.
+
+	The requester must hold, or be granted by this enqueue, locks covering everything it reads.
+
+	Gate: OBD_CONNECT_MDS_MDS plus the connect flag, MDT authentication under GSS, never inside an MDS_BATCH sub-request.
+
+Step 2 (LU-7319, LU-16554, no new structs): independent updates and right-sized replies in OUT_UPDATE.
+
+	One update flag, value agreed once, for "record rc and continue". It serves the contended LU-20808 fallback (the same read set in one OUT_UPDATE after the grant), WBC's lockless remote-parent reads, rename's pre-lock linkEA and LMV reads, batched destroys (68928), and LFSCK reads across objects. Reads re-execute on resend; only idempotent updates may carry the flag.
+
+	Exact reply sizes (50522), with a shrunk reply when the peer advertises it can take one.
+
+	Read-back in the transaction RPC: an OUT_ATTR_GET after an OUT_ATTR_SET in the same RPC already works, because out_handle() closes the transaction before a read; it keeps the coordinator's cache valid after its own update.
+
+Step 3 (LU-4215 redone, one capability): compact encoding.
+
+	Request magic UPDATE_REQUEST_MAGIC_V3 with a shorter update header: batchid and flags per request instead of per update, a "same FID as the previous update" bit, no result size on mutations. It replaces 15336's in-band guess from the parameter size.
+
+	A variable-size lu_attr carrying every LA_* field it marks valid (including btime, rdev and dirent count, and rejecting unknown bits explicitly), for OUT_CREATE, OUT_ATTR_SET, OUT_ATTR_GET, update-llog records and intent replies.
+
+	Xattr name codes defined in lustre_idl.h and wiretest, with a by-name fallback; add trusted.pin, trusted.som and the encryption context.
+
+	One OBD_CONNECT2 flag plus an OUT capability word in a spare obd_connect_data field (highest update type, LA_* mask, xattr-code table version, short replies, independent updates, target-side append). The 2018 max-known-id agreement fits here.
+
+	Value: bytes and batch density (setattr 256 to 72 bytes, so 15 to 56 per inline RPC), requests under the 4 KB inline and IB-immediate limits, smaller update llogs. It saves no round trips.
+
+Step 4 (LU-7426, LU-7427, largest throughput gain): target-owned update logs.
+
+	An OUT "append record" operation: the target appends the record to its own update log and returns the cookie (Di's 2015 option 2), or finish 57261's remote-llog TODOs. Either way the coordinator no longer computes the peer's header, bitmap and offset, nothing forces the per-pair sending order, and several distributed transactions can be in flight between two MDTs.
+
+	Send each record once: today a remote MDT receives its updates and then the whole record again, through about 296 bytes of header writes plus the record. The target could execute the operations for its local FIDs from the record itself, with the executor recovery already uses (update_recovery_exec()).
+
+	Range and batchid cancels with several batchid slots (LU-7427, LU-8714) replace one cancel transaction per record per participant.
+
+Step 5 (shared with WBC): compound MDT-to-MDT requests.
+
+	Use the MDS_BATCH container between MDTs for several enqueues, each with its read set, plus an OUT request, in one RPC; run in order and stop at the first enqueue that cannot be granted at once. For mkdir under a remote parent, the PDO and name-hash locks and the reads then take one round trip.
+
+	Prerequisites: client MDS_BATCH moved off OUT_PORTAL (69436), the batch-intent capsule fix (R5), and a sub-request status that says "not executed, resend".
+
+	Reserve a per-element "acting under lock handle" field now. WBC's LDLM_FL_INTENT_PARENT_LOCKED needs it when a flush spans MDTs; without it, a coordinator's enqueue on a parent the client holds in EX would de-root the client in the middle of the flush.
+
+Prototype and measurements
+
+69463 sits on top of 69269 PS4 (the top of Di's series) and keeps IT_MDT_TO_MDT_READ. It redefines RQF_LDLM_INTENT_MDT_READ on the existing OUT fields and removes struct mdt_read_req/rep/xattr, six RMF_MDT_READ_* fields, three swabbers and their wiretest entries, and the raw-xattr accessor stack. The owner gets out_reads_check() and out_reads_run() in out_handler.c, and mdt_intent_dne_read() becomes a gate, a try-lock and a call. OSP packs the reads straight into the enqueue and seeds its cache from the OUT results, including size-only xattr entries. MDT call sites are unchanged.
+
+Correctness, 2 MDTs on one VM: sanity 1000a-i (run twice from a fresh mount) and 24* pass, 41/41; sanity 300* passes apart from 300l, which fails identically on master in this VM (LU-20697). checkpatch is clean; three local lreview rounds (two opus, one fable) found only minor items, fixed, including a pre-existing OUT bug (out_xattr_list() writes its result into slot 0).
+
+Code size against master, non-test code (lines added / removed):
+
+Area
+69269 PS4 (typed)
+69463 (OUT reads)
+
+All non-test code
+1954 / 73 (27 files)
+1643 / 75 (25 files)
+
+Wire definitions (uapi, layout, swab, wirecheck, wiretest)
+330 / 1
+44 / 1
+
+MDT
+1049 / 60
+798 / 60
+
+OSP
+379 / 1
+451 / 2
+
+target (OUT): reusable read executor
+6 / 2
+214 / 3
+
+LOD and MDD
+73 / 9
+45 / 9
+
+New wire structs, RMF fields, swabbers
+3, 6, 3
+0, 0, 0
+
+On the wire, the create read set is about 530 request bytes as OUT updates against about 150 in the typed format; replies are within 30 bytes. Both are one small inline message and the A/B shows no measurable cost; step 3's header and name codes would bring the OUT form to about 190 bytes.
+
+One VM, 2 MDTs, one client process, ops/s (mean and standard deviation; 2000 ops for master, 3000 for the intent builds, 3 runs per deploy, typed and OUT builds alternated twice). Client, MDTs and OST share a 2-vCPU VM, so this run is CPU-bound:
+
+Operation, parent on MDT0
+master
+typed (PS4)
+OUT reads
+OUT RPCs per op, master to intent
+enqueues per op
+
+mkdir, child on MDT1
+2259 (177)
+3550 (77)
+3541 (76)
+10.0 to 2.9
+2
+
+rmdir
+2285 (12)
+2714 (153)
+2660 (182)
+3.0 to 1.1
+3
+
+file rename into an MDT1 dir
+1479 (29)
+1792 (113)
+1765 (74)
+10.0 to 6.0
+4
+
+unlink, parent on MDT1
+2257 (28)
+2486 (106)
+2451 (49)
+3.0 to 1.4
+3
+
+stat of MDT1 dirs (control)
+5625 (67)
+5787 (50)
+5830 (114)
+1.0 to 1.0
+0
+
+local create (control)
+6901 (22)
+6962 (80)
+6999 (123)
+0
+0
+
+Three VMs, MDT0 and MDT1 on different nodes (node 1: MGS, MDT0, OST; node 2: MDT1; node 3: client; VM-to-VM ping 0.4-1.2 ms), ops/s:
+
+Operation
+master, 1 proc
+typed, 1 proc
+OUT reads, 1 proc
+change
+master, 8 procs
+OUT reads, 8 procs
+
+mkdir, remote parent
+187 (5.33 ms)
+420
+426 (2.35 ms)
+127%
+448
+753
+
+rmdir
+280
+364
+364
+30%
+671
+792
+
+cross-MDT file rename
+141
+188
+188
+33%
+135
+173
+
+unlink, remote parent
+280
+347
+350
+25%
+653
+758
+
+stat (control)
+882
+885
+887
+0%
+2696
+2690
+
+	Master's mkdir works out to about 0.43 ms per MDT-to-MDT round trip.
+
+	With 8 processes, mkdir under both intent builds reaches about 760 ops/s; with 16 it is 742 ops/s. Both MDS VMs were about 50% idle and the busiest threads were the socklnd threads at 15-17%. Splitting the processes so that half create in each direction raised the total by 26%. This points at the per-pair ordered sender (step 4) as the next limit but does not prove it; a 4-MDT run would separate per-pair from per-node limits.
+
+	Rename does not scale with processes on any build, because cross-directory renames take the filesystem-wide rename lock.
+
+Plan for the LU-20808 series
+
+Change
+Proposal
+
+69320 (connect flag)
+Keep; fix the obd_connect_names[] index, or fold it into the OUT capability flag of step 3 if that is agreed first.
+
+69253 (intent batch flag), 69446 (OUT never waits on another MDT)
+Keep; independent fixes that could land first.
+
+69254 (wire format)
+Replace with the OUT-based definition: IT bit, comment, RQF_LDLM_INTENT_MDT_READ on RMF_OUT_UPDATE_HEADER/RMF_OUT_UPDATE_REPLY (about 40 lines). Settle the IT bit against WBC first.
+
+69255 (raw xattr accessor)
+Drop.
+
+69256 and 69257 (OSP intent enqueue, cache seeding)
+Rework as in 69463: in-memory md_lock_intent, OUT packing, result parsing, size-only entries, LOHA_EXISTS.
+
+69259, 69447 and 69260 (owner handler, xattrs, striped dirs)
+Fold into one change: out_reads_check()/out_reads_run() in target, and a short mdt_intent_dne_read().
+
+69258, 69261-69267, 69448 (call sites)
+Keep; only the field names change (MDR_ to MLI_).
+
+69268 and 69269 (tests)
+Keep; 1000e becomes deterministic with the size hint.
+
+New, no wire change
+Cache the encrypt flag, or check after the lock (R11); add a tunable and hit/decline counters (R13).
+
+Open questions
+
+	Should the owner be allowed to read objects other than the locked one, e.g. the looked-up child when it is on the same MDT, which would save the osp_object_init() read? That needs a rule for which lock covers it, perhaps "attributes only, nothing cached past the operation".
+
+	One "OUT v3" capability for steps 2 and 3, or separate connect flags? The update-flag collisions argue for one.
+
+	Who owns the IT bit and LDLM flag allocations between LU-20808 and the WBC series? The lustre_idl.h comment asks for coordination, but nothing records it.
+
+	Is step 4 better done as an OUT append operation, or by finishing the indexed llog's remote handling? Both remove the coordinator-side header state that forces ordering.
+
+Sources: code at master 4a7bddaf15ce and the Gerrit changes named above, the Jira tickets named above and their attachments, and the WBC documents linked from LU-10938. Measurements come from ltvm VMs (rocky9, 5.14.0-611 kernel) and are not representative of production hardware; relative changes and RPC counts are the point.
+
+--- Comment (adilger, Wed, 7 Oct 2026 03:05:51 +0000) ---
+Q1. Fetching uncached attributes without a lock seems reasonable, if they are revalidated afterward?  I guess it depends on which attributes are needed, and whether they can change?
+
+Q2. I think the "OUT v3" compatibility can go under the OBD_CONNECT2_DNE_INTENT feature if they land in the same release.
+
+Q3. It wouldn't be terrible to deconflict with IT_SETATTR from the WBC patch series.  I don't think there is any reason not to do this, even though WBC has not landed.
+
+Q4. I think this can be decided separately under LU-7426, LU-7427 when we get through this initial set of optimizations.  I don't think we can get them into 2.18 (new feature cutoff was months ago), but there are definitely things that can land such as fixing related bugs, code cleanup, etc.
+
+Note I updated patch https://review.whamcloud.com/50522 ("LU-16554 osp: right-size and check OUT update replies") that reduces the OUT reply size, and patch https://review.whamcloud.com/69467 ("LU-20879 target: filter OUT update protocol for MDS") to address some issues I found along the way.

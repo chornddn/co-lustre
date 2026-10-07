@@ -1,5 +1,5 @@
 Change:     68929
-Subject:    LU-20539 - changed.py: unchanged subtests marked as changed
+Subject:    LU-20539 - changed.py: rewrite subtest change detection
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68929
 Change-Id:  Id93b1b3c2fc1695a48b2d258e8697d1ad287e3d4
 Project:    fs/lustre-release
@@ -7,40 +7,76 @@ Branch:     master
 Status:     NEW
 Owner:      Charlie Olmstead
 Created:    2026-09-15 16:54:09.000000000
-Updated:    2026-10-06 06:24:34.000000000
-Patch Set:  2
-Insertions: +161
-Deletions:  -173
-Comments:   5 (4 unresolved)
+Updated:    2026-10-06 23:06:40.000000000
+Patch Set:  3
+Insertions: +166
+Deletions:  -172
+Comments:   9 (7 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20539 - changed.py: unchanged subtests marked as changed
+LU-20539 - changed.py: rewrite subtest change detection
 
-The changed script does not update its function context when methods are
-added. In the example below the script would report 153a as changed and
-now it does not:
+Rewrite changed.py to analyze the commit from the repository instead of
+parsing the output of git format-patch. The script now takes
+"[-C repo_dir] [rev]" (default: cwd, FETCH_HEAD), reads the pre- and
+post-image suite files with git show, locates the changes with git diff
+-U0 and lists affected paths with git diff-tree. It reports VERSION 3
+via --version so callers can detect which invocation to use.
 
---- a/lustre/tests/conf-sanity.sh
-+++ b/lustre/tests/conf-sanity.sh
-@@ -10157,6 +10157,169 @@ test_153a() {
- }
- run_test 153a "bypass invalid NIDs quickly"
+A subtest spans from its column 0 test_N() definition to its column 0
+"run_test N" line. Removed lines are attributed by the pre-image ranges
+and added lines by the post-image ranges; lines outside any range
+(suite setup, helpers defined between tests, test_* functions with no
+run_test) are not attributed to a subtest. A subtest is only reported
+when the post-image still has its run_test line.
 
-+cleanup_200() {
-+	local modopts=$1
-+	stopall -f
-+	MODOPTS_LIBCFS=$modopts
-+	load_modules_local libcfs
-+}
+Problems with the patch-only parser that this fixes:
 
-Test-Parameters: forjanitoronly
+- Duplicate subtests. The "+run_test N" path appended to updated_tests
+  without checking for an existing entry, so a test whose body changed
+  and whose run_test line was also in the diff was listed twice. Tests
+  are now collected in a set.
+
+- Wrong function attribution. The enclosing function was taken from
+  the "@@ ... @@ context" hunk header, which git fills with the
+  nearest preceding column-0 word: often a helper, a run_test line, a
+  variable assignment or the previous test. Changes were attributed
+  to whichever name happened to be there, or dropped. Every changed
+  line is now matched to the test range that contains it.
+
+- Context-line tracking only worked when a "test_N()" line fell inside
+  the three context lines of a hunk, so changes deep in a function
+  body were attributed to the hunk-header name instead.
+
+- Removed and renamed tests were reported. A "-run_test N" line or a
+  deleted body produced test_N even though the post-image no longer
+  runs it, and the session then failed to find the subtest. When two
+  tests shared a name and one was renamed, the old shared name was
+  reported as well. The post-image run_test filter drops these.
+
+- test_* helpers that are not subtests (test_dom in sanity-quota,
+  pjdfstest's test_()) were reported because they start with
+  "test_". They have no run_test line so they are no longer attributed
+  or reported.
+
+- Changing only a run_test description, or only the test_N()
+  definition line, was reported as a subtest change. Those lines no
+  longer count as changes; new tests are still detected through their
+  new run_test line.
+
+affected_files is now taken from git diff-tree --no-renames
+--name-status rather than parsed from "diff --git" headers.
+
+Preserved: blank and comment-only changes are ignored, IGNORED_TESTS
+(test_sanity, test_sanityn), the parallel-scale-nfs to nfsv3/nfsv4
+expansion, and the SkipTesting path rules.
 
 Change-Id: Id93b1b3c2fc1695a48b2d258e8697d1ad287e3d4
 Signed-off-by: Charlie Olmstead <charlie@whamcloud.com>
@@ -108,3 +144,45 @@ https://build.whamcloud.com/job/lustre-reviews/132873/ : FAILURE
 Patch Set 2:
 
 (1 comment)
+
+--- Message (Charlie Olmstead, 2026-10-06 19:47:59.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Charlie Olmstead, 2026-10-06 22:36:32.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-06 22:36:58.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-06 22:39:42.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-06 22:59:25.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/132976/ : SUCCESS
+
+--- Message (Maloo, 2026-10-06 23:00:49.000000000) ---
+Patch Set 3: Verified+1
+
+#### Build 132976 (patch #3) will not be tested because: changed.py returned SkipTesting=true
+
+--- Message (Gerrit AI review for Lustre, 2026-10-06 23:06:40.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new range-based attribution is a clear improvement (over the last 400 commits touching lustre/tests it drops many wrongly attributed neighbouring tests), but the script now crashes on commits that touch binary files in lustre/tests/, and the --version detection that the commit message promises to callers is not there.
