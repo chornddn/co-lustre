@@ -1,0 +1,316 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20903] BUG: unable to handle page fault for address: 0000000000080003. Non-root lctl get_param triggers out-of-bounds write in lustre_stats_dump() and MDS crash (2.17.0)</title>
+                <link>https://jira.whamcloud.com/browse/LU-20903</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Dear Whamcloud team,&lt;/p&gt;
+
+&lt;p&gt;We would like to report a bug in Lustre 2.17.0. It appears that collecting Lustre stats as a non-root user using &lt;tt&gt;lctl get_param&lt;/tt&gt; might trigger an out-of-bounds (OOB) memory write, which can lead to a kernel crash. Example affected commands are as follows:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lctl get_param &lt;span class="code-quote"&gt;"mdt.*MDT*.exports.*@*.stats"&lt;/span&gt;
+lctl get_param obdfilter.*OST*.exports.*@*.stats &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;While crashes are frequently observed on MDS VMs, we have not yet observed any OSS VMs crash with this OOB. To reproduce the crash:&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Create a clean VM running the Lustre server kernel 5.14.0-611.13.1_lustre.el9.x86_64. (single Lustre server deployment)&lt;/li&gt;
+	&lt;li&gt;Download and install &lt;tt&gt;Lustre 2.17.0&lt;/tt&gt; （&lt;a href="https://downloads.whamcloud.com/public/lustre/lustre-2.17.0/el9.7/server/" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://downloads.whamcloud.com/public/lustre/lustre-2.17.0/el9.7/server/&lt;/a&gt;）&lt;/li&gt;
+	&lt;li&gt;Format the MDT with the following flags:&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype needs_recovery extent mmp flex_bg ea_inode dirdata large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
+Filesystem flags:         signed_directory_hash track_trim&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;       4. Format the OST with the following flags:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Filesystem features:      has_journal ext_attr dir_index filetype needs_recovery meta_bg extent 64bit mmp flex_bg large_dir sparse_super large_file huge_file uninit_bg dir_nlink quota project
+Filesystem flags:         signed_directory_hash track_trim&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;       5. Mount the MGT/MDT/OST&lt;/p&gt;
+
+&lt;p&gt;       6. Use a &lt;tt&gt;non-root&lt;/tt&gt; user to execute the vulnerable command as follows:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[root@lustre-mdsvm1 ~]# sudo -u testuser bash -c '  
+     &lt;span class="code-keyword"&gt;for&lt;/span&gt; i in $(seq 1 200); &lt;span class="code-keyword"&gt;do&lt;/span&gt;    
+            lctl get_param &lt;span class="code-quote"&gt;"mdt.*MDT*.exports.*@*.stats"&lt;/span&gt; &amp;gt;/dev/&lt;span class="code-keyword"&gt;null&lt;/span&gt; 2&amp;gt;&amp;amp;1    
+            echo &lt;span class="code-quote"&gt;"$(date +%T) loop $i/200"&lt;/span&gt;  
+     done
+'
+12:45:30 loop 1/200
+12:45:30 loop 2/200
+...&amp;lt;Reduced &lt;span class="code-keyword"&gt;for&lt;/span&gt; readability&amp;gt;...
+12:45:30 loop 10/200
+12:45:30 loop 11/200
+client_loop: send disconnect: Broken pipe
+(the SSH session dropped because the node crashed)&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The crash typically occurs within 10-20 loops. The following memory access error appears in the vmcore:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[root@lustre-mdsvm1 ~]# grep -E &lt;span class="code-quote"&gt;"BUG:|Oops:|Comm:|RIP:|R13:|CR2:|refill_obj_stock|memcg_slab_free|kmem_cache_free"&lt;/span&gt;  /&lt;span class="code-keyword"&gt;var&lt;/span&gt;/crash/127.0.0.1-2026-10-07-12:45:33/vmcore-dmesg.txt
+[ 2271.041217] BUG: unable to handle page fault &lt;span class="code-keyword"&gt;for&lt;/span&gt; address: 0000000000080003
+[ 2271.041248] Oops: 0000 [#1] PREEMPT SMP NOPTI
+[ 2271.041257] CPU: 10 PID: 45876 Comm: lctl Kdump: loaded Tainted: G           OE      ------  ---  5.14.0-611.13.1_lustre.el9.x86_64 #1
+[ 2271.041263] RIP: 0010:refill_obj_stock+0x3e/0x160
+[ 2271.041311] R13: 0000000000080003 R14: ff3b4df686a7bdc0 R15: 0000000000080003
+[ 2271.041316] CR2: 0000000000080003 CR3: 000000010957a003 CR4: 0000000000773ef0 &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;To the best of our knowledge, the issue is limited to Lustre stats collection. Any application that collects Lustre stats with the affected commands as a &lt;tt&gt;non-root&lt;/tt&gt; user may be affected. In contrast, running the above affected commands as &lt;tt&gt;root&lt;/tt&gt; does not cause any crashes.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Kernel Crash and Out-of-Bounds Memory Access.&lt;/b&gt;  The page fault at &lt;tt&gt;0x80003&lt;/tt&gt; appears to be a downstream effect of this issue. Using KASAN, we identified its source as an out-of-bounds write to a buffer in &lt;tt&gt;lustre_stats_dump()&lt;/tt&gt; (&lt;tt&gt;lustre/obdclass/kernelcomm.c&lt;/tt&gt;, v2_17_0), allocated at line &lt;tt&gt;891&lt;/tt&gt; and freed at line &lt;tt&gt;923&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;The error was captured on the same Lustre version with a debug build of the same kernel (5.14.0-611.13.1_lustre.el9.x86_64), rebuilt with the RHEL debug configuration and KASAN enabled (&lt;tt&gt;CONFIG_KASAN=y&lt;/tt&gt;, &lt;tt&gt;CONFIG_KASAN_GENERIC=y&lt;/tt&gt;, &lt;tt&gt;CONFIG_KASAN_INLINE=y&lt;/tt&gt;, &lt;tt&gt;CONFIG_KASAN_VMALLOC=y&lt;/tt&gt;). The resulting kernel reports itself as &lt;tt&gt;5.14.0-611.13.1.kasan.el9.x86_64+debug&lt;/tt&gt;. It was booted with &lt;tt&gt;kasan.fault=panic&lt;/tt&gt; so that the first KASAN report triggers a panic and is preserved in the &lt;tt&gt;vmcore&lt;/tt&gt; by &lt;tt&gt;kdump&lt;/tt&gt;. The KASAN report extracted from the &lt;tt&gt;vmcore&lt;/tt&gt; is as follows:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[root@lustre-mdsvm1 ~]# grep -E &lt;span class="code-quote"&gt;"BUG: KASAN|Write of size|Read of size|Allocated by|located .* to the right|region \ [|kmalloc-512|lustre_stats_dump \+0xc75|Comm: lctl"&lt;/span&gt; /&lt;span class="code-keyword"&gt;var&lt;/span&gt;/crash/127.0.0.1-2026-10-07-13:39:46/vmcore-dmesg.txt
+[  132.839772] BUG: KASAN: slab-out-of-bounds in lustre_stats_dump+0x1bee/0x2570 [obdclass][  132.839921] Write of size 16 at addr ff110006918d09f8 by task lctl/3087
+[  132.839926] CPU: 4 PID: 3087 Comm: lctl Kdump: loaded Tainted: G        W  OE      ------  ---  5.14.0-611.13.1.kasan.el9.x86_64+debug #1
+[  132.841596] Allocated by task 3087:
+[  132.841615]  lustre_stats_dump+0xc75/0x2570 [obdclass] which belongs to the cache kmalloc-512 of size 512
+[  132.841762] The buggy address is located 0 bytes to the right of allocated 504-&lt;span class="code-object"&gt;byte&lt;/span&gt; region [ff110006918d0800, ff110006918d09f8) &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Key findings:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;lustre_stats_dump()&lt;/tt&gt; allocated a &lt;tt&gt;504&lt;/tt&gt;-byte buffer at &lt;tt&gt;lustre_stats_dump+0xc75&lt;/tt&gt; (see "Allocated by task 3087").&lt;/li&gt;
+	&lt;li&gt;The same task (3087) then wrote 16 bytes just after the end of this buffer. The buffer is [ff110006918d0800 , ff110006918d09f8), and the write starts at &lt;tt&gt;ff110006918d09f8&lt;/tt&gt;, causing OOB memory access.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Source-Level Analysis.&lt;/b&gt; Analyzing the crash at the source-code level yields the same conclusion. Because &lt;tt&gt;lustre_stats_dump()&lt;/tt&gt; is part of the &lt;tt&gt;obdclass.ko&lt;/tt&gt; module, the faulting address lies in module space, so we loaded the module's debug symbols in crash to resolve it. The backtrace shows the faulting instruction at address &lt;tt&gt;0xffffffffc30a548e&lt;/tt&gt;.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+crash&amp;gt; bt                                                                
+PID: 3087     TASK: ff11000773860000  CPU: 4    COMMAND: &lt;span class="code-quote"&gt;"lctl"&lt;/span&gt;          
+... &amp;lt;Reduced &lt;span class="code-keyword"&gt;for&lt;/span&gt; readability&amp;gt;...
+#5 [ffa000000da6f038] lustre_stats_dump at ffffffffc30a548e [obdclass]  &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Disassembling this instruction maps it to the following source line:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+crash&amp;gt; dis -s ffffffffc30a548e | head -7
+FILE: /&lt;span class="code-keyword"&gt;var&lt;/span&gt;/lib/dkms/lustre-all/2.17.0/build/lustre/obdclass/kernelcomm.c
+LINE: 901
+  896                           }
+  897                           *start = stats_list; &lt;span class="code-comment"&gt;/* Set initial values */&lt;/span&gt;
+  898                           start-&amp;gt;lkl_maxattr += stats-&amp;gt;ls_num;
+  899                           &lt;span class="code-keyword"&gt;for&lt;/span&gt; (i = LUSTRE_STATS_ATTR_MAX + 1;
+  900                                i &amp;lt;= start-&amp;gt;lkl_maxattr; i++)
+* 901                                   start-&amp;gt;lkl_list[i] =
+  902                                           stats_list.lkl_list[LUSTRE_STATS_ATTR_DATASET]; &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;To understand how and why OOB occurs, we explain our understanding regarding how Lustre 2.17.0 prepares the vulnerable &lt;tt&gt;start&lt;/tt&gt; buffer. The following code prepares the &lt;tt&gt;start&lt;/tt&gt; pointer in Lustre 2.17.0:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-comment"&gt;/* In lustre-release/lnet/include/uapi/linux/lnet/lnet-nl.h at b2_17 */&lt;/span&gt;
+...
+struct ln_key_props {              
+  &lt;span class="code-object"&gt;char&lt;/span&gt;                                   *lkp_value;              __u16                                lkp_key_format;              __u16                                lkp_data_type;
+};
+struct ln_key_list {              
+__u16                                lkl_maxattr;              
+struct ln_key_props            lkl_list[];
+}; &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-comment"&gt;/* In lustre-release/lustre/obdclass/kernelcomm.c at b2_17 */&lt;/span&gt;
+size_t len = sizeof(struct ln_key_list);
+...
+struct ln_key_list *start;
+...
+count = LUSTRE_STATS_ATTR_MAX + stats-&amp;gt;ls_num - 1;
+len += sizeof(struct ln_key_props) * count;
+OBD_ALLOC(start, len);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The size of the region allocated for &lt;tt&gt;start&lt;/tt&gt; is &lt;tt&gt;len&lt;/tt&gt;, computed as:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+len = sizeof(struct ln_key_list) + sizeof(struct ln_key_props) * count &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Without memory padding, the struct sizes would be:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;struct ln_key_props&lt;/tt&gt;: 12 bytes (8 bytes for the &lt;tt&gt;char *lkp_value&lt;/tt&gt; pointer, 2 bytes for &lt;tt&gt;_&lt;em&gt;u16 __ lkp_key_format&lt;/tt&gt;&lt;/em&gt;,{_} and 2 bytes __ for __ &lt;tt&gt;_u16 lkp_data_type&lt;/tt&gt;).&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;struct ln_key_list&lt;/tt&gt;: 2 bytes (the &lt;tt&gt;__u16 lkl_maxattr }}field). The flexible array member {{lkl_list[]&lt;/tt&gt; adds no size, but it does impose the 8-byte alignment of its element type.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;This would give &lt;tt&gt;len = 2 + 12 * count&lt;/tt&gt;. However, &lt;tt&gt;pahole&lt;/tt&gt; shows the actual layouts include padding:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[root@lustre-mdsvm1 ~]# pahole -C ln_key_props $(modinfo -n obdclass)
+struct ln_key_props {
+        &lt;span class="code-object"&gt;char&lt;/span&gt; *                     lkp_value;            &lt;span class="code-comment"&gt;/*     0     8 */&lt;/span&gt;
+        __u16                      lkp_key_format;       &lt;span class="code-comment"&gt;/*     8     2 */&lt;/span&gt;
+        __u16                      lkp_data_type;        &lt;span class="code-comment"&gt;/*    10     2 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* size: 16, cachelines: 1, members: 3 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* padding: 4 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* last cacheline: 16 bytes */&lt;/span&gt;
+};
+[root@lustre-mdsvm1 ~]# pahole -C ln_key_list $(modinfo -n obdclass)
+struct ln_key_list {
+        __u16                      lkl_maxattr;          &lt;span class="code-comment"&gt;/*     0     2 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* XXX 6 bytes hole, &lt;span class="code-keyword"&gt;try&lt;/span&gt; to pack */&lt;/span&gt;
+        struct ln_key_props        lkl_list[];           &lt;span class="code-comment"&gt;/*     8     0 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* size: 8, cachelines: 1, members: 2 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* sum members: 2, holes: 1, sum holes: 6 */&lt;/span&gt;
+        &lt;span class="code-comment"&gt;/* last cacheline: 8 bytes */&lt;/span&gt;
+}; &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;&lt;tt&gt;struct ln_key_list&lt;/tt&gt; is padded from 2 to 8 bytes (6 bytes after &lt;tt&gt;lkl_maxattr&lt;/tt&gt;), and &lt;tt&gt;struct ln_key_props&lt;/tt&gt; is padded from 12 to 16 bytes (4 bytes of tail padding). The effective size is therefore &lt;tt&gt;len = 8 + 16 * count&lt;/tt&gt;. Conversely, &lt;tt&gt;count = (len − 8) / 16&lt;/tt&gt;. For the 504-byte buffer in the KASAN report, this gives &lt;tt&gt;count = (504 − 8) / 16 = 31&lt;/tt&gt;. We then examined the &lt;tt&gt;lustre_stats_dump()&lt;/tt&gt; stack frame in the &lt;tt&gt;vmcore&lt;/tt&gt; at the time of the crash:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+[root@lustre-mdsvm1 ~]# drgn -c /&lt;span class="code-keyword"&gt;var&lt;/span&gt;/crash/127.0.0.1-2026-10-07-13\:39\:46/vmcore \
+     -s /usr/lib/debug/lib/modules/5.14.0-611.13.1.kasan.el9.x86_64+debug/vmlinux \
+     -s obdclass.ko...
+&amp;gt;&amp;gt;&amp;gt; trace = prog.crashed_thread().stack_trace()
+&amp;gt;&amp;gt;&amp;gt; f = next(fr &lt;span class="code-keyword"&gt;for&lt;/span&gt; fr in trace &lt;span class="code-keyword"&gt;if&lt;/span&gt; fr.name == &lt;span class="code-quote"&gt;"lustre_stats_dump"&lt;/span&gt;)
+&amp;gt;&amp;gt;&amp;gt; print(f)
+#6 at 0xffffffffc30a548e (lustre_stats_dump+0x1bee/0x2562) in lustre_stats_dump at /&lt;span class="code-keyword"&gt;var&lt;/span&gt;/lib/dkms/lustre-all/2.17.0/build/lustre/obdclass/kernelcomm.c:901:24
+&amp;gt;&amp;gt;&amp;gt; f[&lt;span class="code-quote"&gt;"i"&lt;/span&gt;]
+(&lt;span class="code-object"&gt;int&lt;/span&gt;)31
+&amp;gt;&amp;gt;&amp;gt; f[&lt;span class="code-quote"&gt;"len"&lt;/span&gt;]
+(size_t)504
+# recompute count, the size of the start-&amp;gt;lkl_list list
+&amp;gt;&amp;gt;&amp;gt; (f[&lt;span class="code-quote"&gt;"len"&lt;/span&gt;] - sizeof(prog.type(&lt;span class="code-quote"&gt;"struct ln_key_list"&lt;/span&gt;))) / sizeof(prog.type(&lt;span class="code-quote"&gt;"struct ln_key_props"&lt;/span&gt;))
+(size_t)31 &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Key findings:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;len&lt;/tt&gt; is 504, so, as derived above, &lt;tt&gt;start-&amp;gt;lkl_list&lt;/tt&gt; holds &lt;tt&gt;count = 31&lt;/tt&gt; elements, with valid indices &lt;tt&gt;0&lt;/tt&gt; through &lt;tt&gt;30&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;At the time of the crash, the loop index &lt;tt&gt;i&lt;/tt&gt; is &lt;tt&gt;31&lt;/tt&gt;, and the code writes to &lt;tt&gt;start-&amp;gt;lkl_list&lt;span class="error"&gt;&amp;#91;31&amp;#93;&lt;/span&gt;&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;Index &lt;tt&gt;31&lt;/tt&gt; is one past the end of the array. This 16-byte write is the out-of-bounds write.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Triggering the Vulnerable Path as a Non-Root User.&lt;/b&gt; Analyzing the runtime call graph leading to &lt;tt&gt;lustre_stats_dump()&lt;/tt&gt; reveals the execution path that produces the out-of-bounds write. When a &lt;tt&gt;non-root&lt;/tt&gt; user queries Lustre statistics with the affected command:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+sudo -u testuser lctl get_param mdt.*MDT*.exports.*@*.stats &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Lustre chooses how to read the data based on the requesting user's privileges. It first tries to open the file path with the user's privileges. If the user is not root and the parameter files are not found (&lt;tt&gt;-ENOENT&lt;/tt&gt;), Lustre falls back to &lt;tt&gt;llapi_param_display_value()&lt;/tt&gt;:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+# Code in lustre/utils/lustre_param.c{...
+# Try to open file as current user privilege
+  rc2 = do_param_op(&amp;amp;popt, path, NULL, GET_PARAM, NULL);
+  &lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc2 &amp;lt; 0) {
+   &lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc == 0)
+    rc = rc2;
+
+   &lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc2 == -ENOENT &amp;amp;&amp;amp; getuid() != 0)
+# &lt;span class="code-keyword"&gt;if&lt;/span&gt; user is not root and cannot read the file, use &lt;span class="code-keyword"&gt;this&lt;/span&gt; function
+    rc2 = llapi_param_display_value(path, version, flags, stdout);
+   &lt;span class="code-keyword"&gt;continue&lt;/span&gt;;
+  }
+ } &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Following &lt;tt&gt;llapi_param_display_value()&lt;/tt&gt; in user space leads, via &lt;tt&gt;netlink&lt;/tt&gt;, to the vulnerable kernel function &lt;tt&gt;lustre_stats_dump&lt;/tt&gt;():&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+# perf record  --call-graph dwarf sudo -u testuser lctl get_param mdt.*MDT*.exports.*@*.stats
+# perf report --stdio -G
+3.67%     0.00%  lctl         libc.so.6               [.] __libc_start_main@@GLIBC_2.34
+            |
+            ---__libc_start_main@@GLIBC_2.34
+               __libc_start_call_main
+               |
+               |--2.44%--0x557fc2ee6a29
+               |          cfs_parser
+               |          0x557fc2eec686
+               |          llapi_param_display_value
+               |          |
+               |          |--1.22%--0x7f5d75ce2f2f
+               |          |          yaml_parser_initialize
+               |          |
+               |           --1.21%--0x7f5d75ce31a1
+               |                     yaml_emitter_emit
+... &amp;lt;Reduced &lt;span class="code-keyword"&gt;for&lt;/span&gt; readability&amp;gt;
+               |                     netlink_dump
+               |                     genl_dumpit
+               |                     lustre_stats_dump
+... &amp;lt;Reduced &lt;span class="code-keyword"&gt;for&lt;/span&gt; readability&amp;gt;&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Because root can read the file path directly, it never takes this fallback path, which explains why the crash does not occur when the affected commands are run as &lt;tt&gt;root&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;Our analysis indicates that statistics collection for OSTs and MDTs shares the same execution path. Although we have not observed crashes on OSS VMs running the standard kernel, KASAN reports the same out-of-bounds write on OSS VMs, so we believe OSS nodes are also affected.&lt;/p&gt;
+
+&lt;p&gt;We look forward to your reply&lt;/p&gt;
+
+&lt;p&gt;Best regards,&lt;/p&gt;
+
+&lt;p&gt;Minh&lt;/p&gt;
+
+&lt;p&gt;HPC Research Engineer, Core Micro System, JP&lt;/p&gt;</description>
+                <environment>5.14.0-611.13.1_lustre.el9</environment>
+        <key id="99716">LU-20903</key>
+            <summary>BUG: unable to handle page fault for address: 0000000000080003. Non-root lctl get_param triggers out-of-bounds write in lustre_stats_dump() and MDS crash (2.17.0)</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="minhnh">Nguyen Hoang Minh</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 8 Oct 2026 09:14:35 +0000</created>
+                <updated>Thu, 8 Oct 2026 09:14:35 +0000</updated>
+                                            <version>Lustre 2.17.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10040" key="com.atlassian.jira.plugin.system.customfieldtypes:labels">
+                        <customfieldname>Epic</customfieldname>
+                        <customfieldvalues>
+                                        <label>metadata</label>
+            <label>server</label>
+    
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10030" key="com.atlassian.jira.plugin.system.customfieldtypes:labels">
+                        <customfieldname>Epic/Theme</customfieldname>
+                        <customfieldvalues>
+                                        <label>Lustre-2.17.0</label>
+    
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0712v:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

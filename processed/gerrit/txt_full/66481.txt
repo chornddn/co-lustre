@@ -7,17 +7,17 @@ Branch:     master
 Status:     NEW
 Owner:      Zhenyu Xu
 Created:    2026-06-05 11:17:59.000000000
-Updated:    2026-09-18 20:44:45.000000000
-Patch Set:  22
-Insertions: +640
-Deletions:  -14
-Comments:   418 (7 unresolved)
+Updated:    2026-10-08 03:40:59.000000000
+Patch Set:  23
+Insertions: +283
+Deletions:  -4
+Comments:   434 (0 unresolved)
 Topic:      ec2
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1; Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -26,40 +26,29 @@ Hashtags:   pt_ecro
 --- Commit Message ---
 LU-12669 ec: fix EC recovery read for encrypted files
 
-During mirror resync with O_CIPHERTEXT flag for encrypted files:
-- Parity data is generated from encrypted file data
-- The parity is stored in encrypted form on the OST
+The parity of an encrypted file is computed from its data as stored
+on the OSTs, but an EC recovery read rebuilds a stripe from data
+pages that OSC has already decrypted, together with the parity as
+stored, and returns garbage.
 
-During EC recovery read:
-- Data pages read from OSC are decrypted by the OSC layer
-- Parity pages read from OST are still encrypted
-- EC recovery (`lov_ec_recover_page()`) tries to recover using
-  mismatched data:
-- Decrypted data pages + Encrypted parity pages = WRONG recovery
+Rebuild the stripe from the data as stored instead: have OSC leave
+the data pages read for the recovery encrypted, rebuild the missing
+pages from them and the parity, then decrypt the pages read and
+rebuilt, leaving an all-zero block (a hole) as OSC does.  A data
+page already in the page cache holds the plaintext, so read the
+stripe again from the OST for the positions being rebuilt, rather
+than encrypting the plaintext, which cannot recreate the stored
+data of a hole.  Without the key, leave the pages encrypted, as a
+normal read does.
 
-In this patch, we fix EC recovery read for encrypted files as follows:
+Add sanity-ec test_56a to recover an encrypted file with a hole in
+a surviving stripe, both from the OSTs and with that stripe cached.
 
-1. Before reading data pages from OSC, we allocate bounce pages for
-   encrypted files.
-
-2. OSC will save the encrypted data to these bounce pages before
-   decryption.
-
-3. LOV will use these bounce pages for EC recovery instead of
-   decrypted pages.
-   - Pass encrypted data + encrypted parity to `lov_ec_recover_page()`
-   - This produces encrypted recovered data
-
-4. After EC recovery, we decrypt the recovered pages in-place
-   - The recovered data is in encrypted form
-   - Decrypt it in-place so it can be used by the read operation
-
-And if bounce page allocation fails, we will encrypt the decrypted
-data pages in-place before EC recovery.
-
+Fixes: 783c13bb0b8f ("LU-12669 ec: recover data from parity")
 Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: Ida4722d05d79bcbee4e680e75e94b005579adcac
-Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
 
 --- Review History ---
 
@@ -3100,3 +3089,215 @@ Patch Set 22: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2026-10-07 20:12:57.000000000) ---
+Patch Set 22:
+
+(4 comments)
+
+Beyond the inline comments, there is no test for any of this, so there is no way to know how much of this code works. It needs a sanity-ec test that creates an EC file in an encrypted directory (test_dummy_encryption is enough), resyncs it, stops a data OST and compares checksums: a cold read, a read with surviving stripe pages already cached, and a sparse file with a hole in a surviving stripe.
+
+A simpler and more robust design: do the reconstruction entirely in ciphertext, as the parity was computed. Set cp_skip_decrypt on every data page the EC read submits (as this patch already does for parity), so the OSC leaves the OST's ciphertext in those pages; they are owned, locked and not yet uptodate, so no reader can see them. Rebuild the missing stripes from that data and the parity, then decrypt every page the EC read filled or rebuilt in place (leaving all-zero blocks alone, as osc_brw_fini_request() does) before marking it uptodate. A surviving page already in cache is read again from the OST into a transient page, like the parity pages, rather than re-encrypted. That removes cp_bounce_page, cp_bounce_filled, the OSC copy, the in-place encryption and its rollback, and the encrypt/replace helpers.
+
+--- Message (Andreas Dilger, 2026-10-07 20:12:58.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-08 01:57:04.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-08 02:00:58.000000000) ---
+Patch Set 23:
+
+(9 comments)
+
+--- Message (Andreas Dilger, 2026-10-08 02:01:10.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-08 02:06:10.000000000) ---
+Patch Set 23:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 02:07:52.000000000) ---
+Patch Set 23:
+
+Code-wise looks good to me.
+
+--- Message (Andreas Dilger, 2026-10-08 02:13:38.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+--- Message (jenkins, 2026-10-08 03:37:20.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133106/ : SUCCESS
+
+--- Message (Maloo, 2026-10-08 03:40:59.000000000) ---
+Patch Set 23:
+
+#### The following sessions will be run for Build 133106 (patch #23):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133106&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133106#redirect

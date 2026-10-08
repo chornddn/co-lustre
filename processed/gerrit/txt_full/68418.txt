@@ -1,5 +1,5 @@
 Change:     68418
-Subject:    LU-20650 lfs: find --changelog, the log as source
+Subject:    LU-20650 lfs: add find --changelog, the log as source
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68418
 Change-Id:  If9ead118b5fc1dee86cfac6646106e982841d8e2
 Project:    fs/lustre-release
@@ -7,21 +7,21 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-26 16:04:40.000000000
-Updated:    2026-10-07 14:15:01.000000000
-Patch Set:  14
-Insertions: +1012
-Deletions:  -93
-Comments:   82 (1 unresolved)
+Updated:    2026-10-08 07:40:11.000000000
+Patch Set:  15
+Insertions: +1031
+Deletions:  -96
+Comments:   83 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20650 lfs: find --changelog, the log as source
+LU-20650 lfs: add find --changelog, the log as source
 
 --since treats the changelog as a candidate set and verifies each hit
 against the live object, so it answers as it is now.  --changelog
@@ -38,10 +38,10 @@ index being paired with the log it came from.
 Every predicate a record cannot answer is refused naming itself,
 rather than answered from a zero.  Without --resolve that is -size,
 -blocks, -perm, -links, --attrs, --xattr, the layout options, -projid,
--printf, --mdt-count and --mdt-hash; --xattr was the loud one,
-reaching llistxattr(NULL, ...) once per object, and the rest were
-quiet and worse, "--perm 644" matching nothing and its negation
-everything.  -uid and -gid are refused for a different reason and at
+-printf, --mdt-count and --mdt-hash; answered from the record,
+--xattr would reach llistxattr(NULL, ...) once per object, and
+"--perm 644" would match nothing and its negation everything.  -uid
+and -gid are refused for a different reason and at
 every setting short of --resolve: a changelog records who caused an
 event, from the acting client's credentials, which is not who owns the
 object.  An object time is refused without --resolve, a record
@@ -106,98 +106,28 @@ The first resolve failure that is not "this object has no name"
 decides the exit status, as it already does for a target scan, so a
 run that could resolve nothing cannot report itself complete.
 
-fc_d is set only for a directory, as find_since_rec_cb() already had
-it.  printf_format_lustre() reads d == -1 as "not a directory", and
-lfsr_fd is not always -1 for a regular file: under -printf the gather
-widens, scan_rec_gather() opens the object for the MDT index and
-leaves that descriptor in lfsr_fd.  Passing it through sent every
-striped file down the directory branch and onto an lmv buffer
-find_rec_to_lmv() had just zeroed, so %Lc and %Li printed 0, %Lo
-[0] and %Lp nothing.
+The --since code this shares changes with it:
 
--name is answered against the recorded name under --changelog.
-find_since_pick() walks the object's other links to place it in the
-subtree, and was substituting each link's basename into the record
-before testing: right for --since, which asks what the object is now,
-and wrong here, where the record is the answer.  The alternate path
-still settles the subtree; only the name stays as recorded.
-
-The pathname a match prints goes through the caller's spelling
-whichever way it was composed.  Without --resolve it comes from
-llapi_scan_rec_path(), which builds an absolute name from the mount,
-so "lfs find ." answered /mnt/lustre/sub/f there and ./sub/f
-everywhere else.  find_since_respell() splits into a find_respell()
-taking the two roots, and the print site uses it.
-
-The demand mask -printf widens is the one handed to llapi_scan_fid():
-find_want() builds fss_want with the -printf flag set and the resolve
-passes it as sp_want.  llapi_scan_changelog()'s own sc_want is a
-separate literal and does not depend on -printf.  What the two sources
-share is fss_want, which is why --since and --changelog widen
-together.
-The comment above it claimed %s, %b and %LP as the reason; those come
-from find_decide()'s own stat and find_get_projid(), gated on
-fc_gather_all, and find_want() clears LLAPI_SCAN_PROJID on its way
-out regardless.  What the widening actually buys is LLAPI_SCAN_LMV,
-for %Lc and its neighbours on a directory.
-
-The cookie is not mentioned any more.  fp_since_cookie arrives with
---since-cookie in the next patch, and this one documented it in
-llapi_find_since()'s Return: block and in llapi_find_since.3 --
-an -EINVAL for giving both an anchor and a cookie, and an -ESTALE,
-neither of which exists here.  -ENOTSUP does exist and was missing
-from both.
-
-A CL_MARK is dropped rather than delivered.
-mdd_changelog_write_header() writes the marker flags into the union
-with cr_tfid, so cr_tfid.f_seq would read back as CLM_ON|CLM_START,
-0x10001, which fid_seq_is_igif() accepts.  llapi_scan_changelog()
-already clears LLAPI_SCAN_FID for a mark, so the FID gate drops it;
-the type test is defence in depth over that.
-
-No such record can arrive today, so this is a guard and not a fix for
-an observed answer: CHANGELOG_MINMASK is BIT(CL_MARK) and
-mdd_changelog_mask_seq_write() hands it to cfs_str2mask() as the
-floor, so CL_MARK cannot be masked out -- and
-mdd_changelog_write_header() returns early whenever CL_MARK is in the
-current mask, so no marker record is ever written.  Asking for "creat
-mkdir" gives back "MARK CREAT MKDIR", and deregistering every user and
-re-registering leaves an empty log.  The guard costs one test per
-record and stops the flags being read as a FID if that ever changes.
-
-It sits at the top of find_since_cand_cb(), above the FID gate.  The
-anchor is not taken there but in find_since_filter_cb(), which runs
-first on every record the log delivered, marks included: it has to see
-them, or it lags the end of the log by whatever trailing run of them
-the scan finished on.
-
--printf's widening now reaches --since.  find_want() clears
-LLAPI_SCAN_PROJID on its way out and find_decide() gates
-find_get_projid() and the OST glimpse on fc_gather_all rather than on
-the demand mask, so a flag this patch sets for --changelog and not for
---since meant "--since -printf %LP" answered DEFAULT_PROJID for every
-object where a walk answered the real one, and %s/%b answered from the
-MDT instead of a glimpse.
-
-The comment on the nameless case said cr_namelen is 0 for a MARK.  It
-is not: mdd_changelog_write_header() sets it to strlen(obd->obd_name)
-and copies the device name in, so a mark arrives named
-"lustre-MDT0000".  A data event on a FID whose name the log never held
-is the real case, and the sentence now says only that.
-
-The undecided warning names no cause.  find_since_cand_cb() counts an
-object undecided when its record cannot answer, and also when it has
-gone and the search needed a lookup or named a subtree, where the
-record did answer and the object is what is missing.
-
-LLAPI_SCAN_CL_F_ONCE is set for --since and not for --changelog.  Once
-means once per scan, which is what "as it is now" wants; a source
-answering as it was recorded has a second burst to report, so an
-object touched in two of them prints twice.  The man page says so.
-
-The dropped-objects warning names what the count is of -- "%llu of
-%llu changed objects could not be read" -- rather than leaving a bare
-number beside the errno it belongs to.
+- A printed pathname takes the caller's spelling whichever way it was
+  composed: find_since_respell() becomes find_respell(), taking the
+  two roots, and the print site uses it.
+- -printf widens fss_want, the mask handed to llapi_scan_fid(), so
+  --since and --changelog widen together; it buys LLAPI_SCAN_LMV for
+  %Lc and its neighbours.  find_since_rec_cb() sets fc_gather_all
+  under -printf, which gates find_get_projid() and the OST glimpse, so
+  %LP, %s and %b answer as a walk does.
+- find_since_pick() puts a link's basename into the record only for
+  --since.  Under --changelog the recorded name stays, and the link
+  only places the object in the subtree.
+- A CL_MARK is dropped at the top of find_since_cand_cb().
+  mdd_changelog_write_header() writes the marker flags into the union
+  with cr_tfid, where CLM_ON|CLM_START reads as an IGIF sequence.  No
+  marker is written today -- with CL_MARK in the mask, which
+  CHANGELOG_MINMASK forces, the header write returns early -- so this
+  is a guard.
+- LLAPI_SCAN_CL_F_ONCE is set for --since and not for --changelog: a
+  source answering as it was recorded has a second burst to report, so
+  an object touched in two bursts prints twice.  The man page says so.
 
 Test-Parameters: testlist=sanity env=ONLY=56
 Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
@@ -3249,3 +3179,194 @@ Patch Set 14:
 AI code review results below, please doublecheck
 
 Looks good. One optional documentation nit inline; no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:07.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-08 00:06:19.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-08 00:15:12.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 00:34:36.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-08 02:00:36.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133085/ : SUCCESS
+
+--- Message (Maloo, 2026-10-08 02:01:42.000000000) ---
+Patch Set 15:
+
+#### The following sessions will be run for Build 133085 (patch #15):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133085&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133085#redirect
+
+--- Message (Maloo, 2026-10-08 07:40:11.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-158vm63: https://testing.whamcloud.com/test_sessions/c9aa7ba1-ea59-4f5a-ab62-bb717e80ebdd ran 5 tests.  1 tests failed: sanityn.
+%% THIS TEST SESSION CRASHED %%

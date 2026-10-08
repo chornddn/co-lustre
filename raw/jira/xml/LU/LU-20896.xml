@@ -1,0 +1,152 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20896] O_DIRECT write &gt;1MiB of encrypted file with key loaded corrupts data</title>
+                <link>https://jira.whamcloud.com/browse/LU-20896</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;"lfs migrate" of an encrypted file by a process that has the encryption key loaded corrupts file data beyond about the first 1MiB.  Files up to 1MiB migrate intact, which is why sanity-sec test_52 (9000-byte file) passes.&lt;/p&gt;
+
+&lt;p&gt;Reproducer on master (2.17.59-1-g4a7bdda, single-node VM with client crypto enabled, mounted with test_dummy_encryption):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mkdir /mnt/lustre/dm
+for sz in 9000 65536 1048576 3145728; do
+	f=/mnt/lustre/dm/m$sz
+	head -c $sz /dev/urandom &amp;gt; /tmp/src; cp /tmp/src $f; sync
+	lfs migrate -c 2 $f
+	lctl set_param -n ldlm.namespaces.*osc*.lru_size=clear
+	cmp -s /tmp/src $f &amp;amp;&amp;amp; echo "$sz ok" || echo "$sz CORRUPT"
+done
+9000 ok
+65536 ok
+1048576 ok
+3145728 CORRUPT
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;In the 3MiB file, pages 276-767 (offset 1104KiB to EOF) differ from the source; pages 0-275 are intact.  The source and the volatile file are both opened with O_CIPHERTEXT|O_DIRECT, but with the key loaded the direct read returns plaintext and the direct write encrypts it with the volatile file's own encryption context, before the layout swap gives the data to the original inode.  "lfs mirror extend" of a 3MiB file with the key loaded likewise gave a new mirror whose content (read via "lfs mirror read -N 2") differs from the file.&lt;/p&gt;
+
+&lt;p&gt;The root cause is not yet known; the boundary not being a multiple of the RPC size suggests something like the encryption page pool when a direct write spans several RPCs.  A related change is planned to make O_CIPHERTEXT direct IO always transfer the raw ciphertext, even when the key is loaded, which is also what encrypted file backup/restore (&lt;a href="https://jira.whamcloud.com/browse/LU-16374" title="Implement backup/restore of encrypted files" class="issue-link" data-issue-key="LU-16374"&gt;LU-16374&lt;/a&gt;) and EC parity resync need; with that, migrate/mirror would copy ciphertext and no longer re-encrypt.  sanity-sec test_52 should also be extended to use a multi-MiB file.&lt;/p&gt;</description>
+                <environment />
+        <key id="99708">LU-20896</key>
+            <summary>O_DIRECT write &gt;1MiB of encrypted file with key loaded corrupts data</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="adilger">Andreas Dilger</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 7 Oct 2026 21:31:34 +0000</created>
+                <updated>Thu, 8 Oct 2026 01:57:19 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>4</watches>
+                                                                            <comments>
+                            <comment id="503013" author="adilger" created="Wed, 7 Oct 2026 23:40:41 +0000">&lt;p&gt;&lt;span class="error"&gt;&amp;#91;Claude&amp;#93;&lt;/span&gt; The corruption is not specific to migrate: any O_DIRECT write larger than 1MiB to an encrypted file with the key loaded corrupts data, on unpatched master (2.17.59-1-g4a7bdda, test_dummy_encryption mount):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mkdir /mnt/lustre/dio
+for sz in 1048576 2097152 3145728; do
+	head -c $sz /dev/urandom &amp;gt; /tmp/src
+	dd if=/tmp/src of=/mnt/lustre/dio/f$sz bs=4M oflag=direct
+	lctl set_param -n ldlm.namespaces.*osc*.lru_size=clear
+	cmp /tmp/src /mnt/lustre/dio/f$sz
+done
+1048576: identical
+2097152: differ: byte 1273857
+3145728: differ: byte 1974273
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The first differing offset varies between runs.  A buffered read shows the same corruption as a direct read, so the data stored on the OST is wrong, i.e. the encrypted direct write path.  "lfs migrate" and "lfs mirror extend" hit it because their O_CIPHERTEXT direct IO decrypts and re-encrypts the data when the key is loaded.&lt;/p&gt;</comment>
+                            <comment id="503021" author="gerrit" created="Thu, 8 Oct 2026 01:54:33 +0000">&lt;p&gt;"Andreas Dilger &amp;lt;adilger@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69505" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69505&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20896" title="O_DIRECT write &amp;gt;1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896"&gt;LU-20896&lt;/a&gt; osc: encrypt direct IO pages at their own file index&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 547779100345a82240e115837b7feac8816c7300&lt;/p&gt;</comment>
+                            <comment id="503022" author="gerrit" created="Thu, 8 Oct 2026 01:57:07 +0000">&lt;p&gt;"Andreas Dilger &amp;lt;adilger@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69506" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69506&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20896" title="O_DIRECT write &amp;gt;1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896"&gt;LU-20896&lt;/a&gt; llite: transfer ciphertext for O_CIPHERTEXT DIO&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: c0cca9da8d01686c39a56cd9c52b7f4e78adc071&lt;/p&gt;</comment>
+                            <comment id="503023" author="adilger" created="Thu, 8 Oct 2026 01:57:19 +0000">&lt;p&gt;&lt;span class="error"&gt;&amp;#91;Claude&amp;#93;&lt;/span&gt; Summary of the root cause and fixes:&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Root cause:&lt;/b&gt; OSC encrypted a direct IO page by pointing the user buffer's folio at the file mapping and setting the folio index to the page's file index, then computing the encryption block number as the folio index plus the page's offset within the folio.  When the user buffer is backed by a transparent huge page, that offset is not zero, so the page was encrypted with the IV of another page of the file, while a direct read decrypts it at its own index.  Pages of one large folio can also be in different RPCs prepared concurrently, all changing the same folio index.  This came in with 59d84ec3ffb8 ("&lt;a href="https://jira.whamcloud.com/browse/LU-19249" title="Support for kernel 6.16" class="issue-link" data-issue-key="LU-19249"&gt;&lt;del&gt;LU-19249&lt;/del&gt;&lt;/a&gt; build: Compatibility updates for kernel v6.16").  The corruption starts where the direct IO buffer first crosses a 2MiB huge page boundary, which is why the offset varied and files up to about 1MiB were usually intact.&lt;/p&gt;
+
+&lt;p&gt;8MiB direct write with the key loaded, 4MiB buffer, 15 runs:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;transparent huge pages&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;always&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;never&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;without the fix&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;15/15 corrupt&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0/15 corrupt&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;with the fix&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0/15 corrupt&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0/15 corrupt&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;&lt;b&gt;Fixes:&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;patch &lt;a href="https://review.whamcloud.com/69505" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69505&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-20896" title="O_DIRECT write &amp;gt;1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896"&gt;LU-20896&lt;/a&gt; osc: encrypt direct IO pages at their own file index") passes the page's file index to the encryption instead of modifying the user folio.  This alone fixes the plain O_DIRECT, "lfs migrate" and "lfs mirror extend" corruption.  Adds sanity-sec test_67.&lt;/li&gt;
+	&lt;li&gt;patch &lt;a href="https://review.whamcloud.com/69506" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69506&lt;/a&gt; ("&lt;a href="https://jira.whamcloud.com/browse/LU-20896" title="O_DIRECT write &amp;gt;1MiB of encrypted file with key loaded corrupts data" class="issue-link" data-issue-key="LU-20896"&gt;LU-20896&lt;/a&gt; llite: transfer ciphertext for O_CIPHERTEXT DIO") makes O_CIPHERTEXT direct IO transfer the ciphertext as stored on the OSTs even when the key is loaded, as it already did without the key, so migrate, mirror resync and EC parity resync copy the stored data rather than decrypting and re-encrypting it.  EC parity is then always computed from the stored ciphertext, as encrypted EC recovery (patch &lt;a href="https://review.whamcloud.com/66481" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/66481&lt;/a&gt;) and encrypted backup/restore (&lt;a href="https://jira.whamcloud.com/browse/LU-16374" title="Implement backup/restore of encrypted files" class="issue-link" data-issue-key="LU-16374"&gt;LU-16374&lt;/a&gt;) need.  Adds sanity-sec test_66.&lt;/li&gt;
+&lt;/ul&gt;
+</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="73530">LU-16374</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="91566">LU-19249</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="64115">LU-14677</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i07113:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -1,5 +1,5 @@
 Change:     68361
-Subject:    LU-20690 ec: like-RAID10 parity layout so p may exceed k
+Subject:    LU-20690 ec: like-RAID10 parity layout
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68361
 Change-Id:  I9574df44969ddd40776f028b3c326d150ea08eb5
 Project:    fs/lustre-release
@@ -7,30 +7,31 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-08-26 09:56:30.000000000
-Updated:    2026-09-24 00:35:47.000000000
-Patch Set:  11
-Insertions: +1554
-Deletions:  -566
-Comments:   104 (14 unresolved)
+Updated:    2026-10-08 13:17:24.000000000
+Patch Set:  13
+Insertions: +1604
+Deletions:  -504
+Comments:   106 (14 unresolved)
 Topic:      ec2
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Marc Vef, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Ronnie Sahlberg
 
 --- Commit Message ---
-LU-20690 ec: like-RAID10 parity layout so p may exceed k
+LU-20690 ec: like-RAID10 parity layout
 
 The k >= p restriction is not a Cauchy/ISA-L limit. It comes from
 storing parity as RAID0|PARITY: the p parity objects of a raidset are
 concatenated along the file offset, so raidset_count * p * stripe_size
 does not fit in a finite PFL extent when p > k (for example
---ec 2+3 -E 2M).
+--ec 2+3 -E 2M). This patch changes the parity layout; the p <= k
+checks in lfs and llapi stay until a following patch removes them.
 
 Store EC parity as LOV_PATTERN_PARITY instead. A raidset is an EC
 split of the stripe set, and the layout is like RAID10 in that it has
@@ -41,8 +42,18 @@ the same two axes:
   - within one raidset: like RAID1, the p parity stripes share one
     file offset (the same object_off).
 
-Unlike RAID1 the p parities are not replicas, each one holds a
-different parity. The file extent still matches the data component:
+The RAID1 axis comes from recovery. A raidset of k data and p parity
+stripes survives the loss of any p of its k + p stripes, just as a
+RAID1 of p + 1 copies survives the loss of any p copies. RAID1 is the
+k == 1 case, where each parity is a copy of the data (--ec 1+N). The
+p parities protect the same data, so they share its offset: the
+offset says which data is protected, the parity index says which
+redundancy unit it is.
+
+What differs from RAID1 is I/O, not the role. For k > 1 the parities
+are not replicas: each holds a different parity, and a lost stripe is
+rebuilt from any k survivors rather than copied from one. The file
+extent still matches the data component:
 
   ec_off(stripeset, raidset) = e_start
       + stripeset * raidset_count * stripe_size
@@ -51,9 +62,26 @@ different parity. The file extent still matches the data component:
 I/O mapping keys off LCME_FL_PARITY, not the pattern. Within a
 raidset, resync/verify must pick one parity via LL_IOC_SET_IO_SCOPE
 STRIPE / llapi_mirror_{read,write}_stripe(): the parities differ, so a
-RAID1-style fan-out would be wrong. Punch and truncate still hit
-every parity object. mmap/CIT_FAULT does not inherit that pin: fault
-fills the page cache with user-visible data.
+RAID1-style fan-out would be wrong. STRIPE was reserved by LU-20797
+and is implemented here. Punch and truncate still hit every parity
+object. mmap/CIT_FAULT does not inherit that pin: fault fills the page
+cache with user-visible data.
+
+SEEK_DATA/SEEK_HOLE merge by slot, because the p parity objects of a
+raidset share file offsets. Data if any stripe has data (the minimum);
+a hole only if all are holes (the maximum). When the p results
+disagree, the maximum is a lower bound: ll_lseek() confirms it with
+SEEK_DATA and, if data is still there, seeks the hole again from that
+offset. A hole mapped past the component end is not adopted; the
+component end is kept and used only when no later component returns a
+result.
+
+lov_object_fiemap() skips parity components. They are not part of
+the file logical map.
+
+lfs mirror read of a parity mirror still dumps every parity object in
+RAID0 order, through llapi_mirror_read_parity(). lfs mirror write
+refuses a parity mirror; lfs mirror resync rebuilds it.
 
 Example: -E 128M -c 11 -S 1M --ec 4+2
 
@@ -73,28 +101,31 @@ Example: -E 128M -c 11 -S 1M --ec 4+2
   1         2       [19M, 22M)  5M      10M     4,5
 
 The concat column is what RAID0|PARITY would have used, and is what
-overflows a finite extent. When raidset_count == 1 (e.g. --ec 2+3) a
-single raidset still fits p > k in a finite PFL extent. With
---ec 1+N, parity offsets align with each data stripe.
+overflows a finite extent when p > k. With --ec 1+N, parity offsets
+align with each data stripe.
 
 This changes how a parity component is encoded, so
 lov_pattern_supported() and lov_pattern_available() now accept
 LOV_PATTERN_PARITY on its own in place of RAID0|PARITY, and
 lov_entry_type() dispatches on the PARITY bit. EC has not shipped, so
 the old combination is not kept. Finite-extent stripe-count shrinking
-is skipped for parity components. The p <= k checks in lfs and llapi
-are removed; k+p <= 256 and p <= 15 remain. lod_verify_striping()
-also rejects p == 0 and an instantiated stripe_count that is not a
-positive multiple of p, so raidset_count cannot be 0.
+is skipped for parity components. lod_verify_striping() also rejects
+p == 0 and an instantiated stripe_count that is not a positive
+multiple of p, so raidset_count cannot be 0.
 
-Tests: sanity-ec 4a and 10 accept p > k; test_300 covers PFL -E 2M
---ec 2+3 create/resync/verify; 12c/34c cover holes and multi-raidset
-offsets (34c asserts striping into raidset 1); llapi_layout_test
-test47 allows 3+4 and asserts the component pattern is
-LOV_PATTERN_PARITY.
+Tests: sanity-ec 12c/12d/34c cover holes and multi-raidset offsets
+(34c asserts striping into raidset 1), 30d and 31b-31e check the
+parity dump size, 301 covers an e_start that stripe_size does not
+divide, 310 checks that FIEMAP skips parity, and 311 truncates at
+raidset and component boundaries. sanity-flr test_213 covers the
+STRIPE scope checks. llapi_layout_test asserts the component pattern
+is LOV_PATTERN_PARITY.
 
-Test-Parameters: trivial testlist=sanity-quota
-Assisted-by: Cursor:Grok-4.6 llm_code_and_review_tools
+Test-Parameters: testlist=sanity-ec
+Test-Parameters: testlist=sanity-flr
+Test-Parameters: testlist=sanity
+Test-Parameters: testlist=llapi_layout_test
+Assisted-by: Cursor:Grok-4.7/Opus5.5 llm_code_and_review_tools
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: I9574df44969ddd40776f028b3c326d150ea08eb5
 
@@ -537,3 +568,34 @@ Patch Set 11:
 AI code review results below, please doublecheck
 
 Looks good. I re-derived the new parity offset mapping (stripe_width()/lov_stripe_offset()/lov_size_to_stripe()/lov_stripe_size()/lov_stripe_number()) against an independent model over many geometries, including PFL components whose e_start is not a multiple of the component stripe size, and round-trip plus lov_stripe_intersects() agreed everywhere; the LU-14128 trunc "prev" handling also works out per raidset. Only optional nits inline - no need to re-spin for them.
+
+--- Message (Keguang Xu, 2026-10-08 01:37:08.000000000) ---
+Uploaded patch set 12.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Keguang Xu, 2026-10-08 01:39:11.000000000) ---
+Uploaded patch set 13: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 01:40:58.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 01:44:27.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-08 01:48:48.000000000) ---
+Patch Set 13:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Keguang Xu, 2026-10-08 13:17:24.000000000) ---
+Set Work In Progress
