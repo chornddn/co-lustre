@@ -7,61 +7,73 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2025-11-05 20:07:03.000000000
-Updated:    2026-10-08 12:09:41.000000000
-Patch Set:  16
-Insertions: +468
-Deletions:  -117
-Comments:   169 (2 unresolved)
+Updated:    2026-10-09 07:08:17.000000000
+Patch Set:  18
+Insertions: +743
+Deletions:  -149
+Comments:   185 (0 unresolved)
 Topic:      ec2
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Andreas Dilger: +1
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell
+  CC: Patrick Farrell, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Lai Siyao, Andreas Dilger, Patrick Farrell, Marc Vef
 
 --- Commit Message ---
 LU-19566 lustre: add layout flags to lfsck
 
-EC parity mirror components hold parity, not file data,
-so LFSCK must restore them as parity components when it
-rebuilds a layout from orphan OST objects. It restored
-each component with only LCME_FL_INIT, losing the parity
-flag and any other component flags.
+EC parity mirror components hold parity, not file data, so
+LFSCK must restore them as parity components when it
+rebuilds a layout from orphan OST objects. It restored each
+component with only LCME_FL_INIT, losing the parity flag,
+the EC geometry and the link between the data and parity
+mirrors, so a rebuilt EC file could not use its parity.
 
-Store the long-lived component flags (prefer, nosync,
-parity, nocompr) in a new ff_comp_flags field at the end
-of filter_fid. The client sends them in the obdo field
-that was o_uid_h, now o_comp_flags, under the unused
-OBD_MD_FLCOMPFLAGS bit, and the OST passes them to the
-MDT in the orphan record, so LFSCK restores them. A
-rebuilt parity component also gets the parity pattern,
-which clients use to keep reads off it, and LFSCK now
-accepts that pattern when it checks a layout, so it can
-add further orphans to such a file and checks EC files
-rather than skipping them. The EC geometry and mirror
-link are not in filter_fid and stay unset.
+For EC components, store the long-lived component flags
+(prefer, nosync, parity, nocompr), the EC data and code
+stripe counts and the mirror link id at the end of
+filter_fid. The client sends them on writes and setattr in
+the obdo fields that were o_uid_h and o_gid_h, never used,
+flagged by the never-used 0x00200000 valid bit (formerly
+OBD_MD_FLQOS), now OBD_MD_FLCOMPFLAGS, and the OST passes
+them to the MDT in the orphan record, so LFSCK restores
+them. The objects only get them from a write or setattr, so
+a change of flags is stored once the file is next written. A
+rebuilt parity component also gets the parity pattern, which
+clients use to keep reads off it, and LFSCK accepts that
+pattern when it adds further orphans to such a file. When
+LFSCK adds a component to an EC file its parity is marked
+stale, since the objects do not show whether the parity was
+current, so it is only used again after a resync. LFSCK
+scans still skip EC files: repairing a missing parity object
+there would need the parity regenerated or marked stale.
 
 STALE is not stored: resync writes an object while its
-mirror is still stale, so a stored STALE is backward and
-can rebuild a layout whose mirrors are all stale, which
-LBUGs the MDS when it loads that layout.
+mirror is still stale, so a stored STALE is backward and can
+rebuild a layout whose mirrors are all stale, which LBUGs
+the MDS when it loads that layout.
 
-filter_fid stays 52 bytes when no flag is set, so that
-older tools still read it. Servers without this change
-do not handle the 56-byte form: their LFSCK and MDT
-migration get -ERANGE reading it, and an OST keeping the
-parent FID in LMA (256-byte inodes) refuses to have it
-written. Such an OST has no room for the flags, and with
-this change it does not store them.
+Other components keep the 52-byte filter_fid, so that
+servers before this change and older tools still read it,
+and only EC files, which need the new servers anyway, get
+the 60-byte form. Servers without this change do not handle
+it: their LFSCK and MDT migration get -ERANGE reading it,
+and an OST keeping the parent FID in LMA (256-byte inodes)
+refuses to have it written, unless they have "lfsck: read a
+filter_fid longer than ours", which this patch is based on.
+An OST keeping the parent FID in LMA has no room for these
+fields, and does not store them.
 
-sanity-lfsck test_46, test_47 and test_48 cover prefer,
-mirrors after resync and EC parity. test_45 now waits
-for LFSCK to finish on every target, not only on the OST
-it checks, so that the next test can start LFSCK.
+sanity-lfsck test_47 and test_48 cover mirrors after resync
+and EC files; test_48 checks the rebuilt EC geometry and,
+after a resync, reads the file with a data OST failing.
+test_45 now waits for LFSCK to finish on every target, not
+only on the OST it checks, so that the next test can start
+LFSCK.
 
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
 Assisted-by: ClaudeCode:claude-opus-5-5
@@ -1824,3 +1836,262 @@ Patch Set 16:
 Patch Set 16:
 
 Failed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-140vm3: https://testing.whamcloud.com/test_sessions/b6f5d335-29d6-45b7-82c7-6b7ad86688f1 ran 9 tests.  1 tests failed: sanity-hsm.
+
+--- Message (Maloo, 2026-10-08 16:38:49.000000000) ---
+Patch Set 16: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-154vm1: https://testing.whamcloud.com/test_sessions/cc5df583-8a75-4549-9f0f-6e744920bb75 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-08 16:52:36.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The concerns are about mixed-version and downgrade behaviour of the 56-byte filter_fid; see inline. None of them needs a re-spin on its own, but please consider them if the patch is refreshed for the open k+m question.
+
+--- Message (Patrick Farrell, 2026-10-08 22:55:21.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-10-08 22:56:22.000000000) ---
+Patch Set 17:
+
+(5 comments)
+
+--- Message (Patrick Farrell, 2026-10-08 22:56:30.000000000) ---
+Patch Set 17:
+
+PS17:
+
+- For EC components, filter_fid now also stores the EC data and code stripe counts (k and p) and the mirror link id, 60 bytes in all; every other component keeps the 52-byte filter_fid, so a mixed or downgraded system only meets the larger form on EC files, which need the new servers anyway. The client sends these on writes and setattr, the OST passes them up in the orphan record, and LFSCK writes them back into the rebuilt component, so the raidset split comes out as before even when the data stripe count is not a multiple of k. When LFSCK adds a component to an EC file its parity is marked stale, since the objects cannot show whether it was current, so it is used again only after a resync. sanity-lfsck test_48 rebuilds a 2+1 file, resyncs it, checks the layout matches the original, and reads it back with a data OST failing. Prefer, nosync and nocompr on non-EC mirrors are no longer kept.
+
+- The read-side tolerance Andreas suggested at PS7 is now its own patch under this one, with backports:
+  master: https://review.whamcloud.com/69536
+  b2_17:  https://review.whamcloud.com/69537
+  b2_15:  https://review.whamcloud.com/69538
+  LFSCK and LOD read filter_fid with FILTER_FID_EXTRA_SIZE (32 bytes) of slack, the OST orphan iterator no longer takes -ERANGE for a length (it rebuilt such an orphan under a new FID), and an OST keeping the PFID in LMA keeps the start of a longer filter_fid. Its sanity-lfsck test_46 passed 37 of 38 runs across master, b2_17 and b2_15 in VMs; the one failure, on b2_15, found no trusted.fid on an object it had just written and has not reproduced.
+
+- This is also stacked on https://review.whamcloud.com/69508 (LU-20897), which fixes the slave PFID repair argument order on its own.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 22:59:48.000000000) ---
+Patch Set 17:
+
+(3 comments)
+
+3 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-10-08 23:03:23.000000000) ---
+Patch Set 17:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (patrick bot, 2026-10-09 01:28:52.000000000) ---
+Uploaded patch set 18.
+
+--- Message (jenkins, 2026-10-09 01:28:54.000000000) ---
+Patch Set 17:
+
+No Builds Executed
+
+--- Message (patrick bot, 2026-10-09 01:29:02.000000000) ---
+Patch Set 18:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 01:32:04.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 01:36:06.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-09 03:47:12.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133242/ : SUCCESS
+
+--- Message (Maloo, 2026-10-09 03:48:17.000000000) ---
+Patch Set 18:
+
+#### The following sessions will be run for Build 133242 (patch #18):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133242&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133242#redirect
+
+--- Message (Andreas Dilger, 2026-10-09 07:08:17.000000000) ---
+Patch Set 18: Code-Review+1

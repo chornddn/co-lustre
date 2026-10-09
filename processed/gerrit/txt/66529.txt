@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Lai Siyao
 Created:    2026-06-08 13:57:46.000000000
-Updated:    2026-09-22 19:19:14.000000000
-Patch Set:  40
-Insertions: +465
-Deletions:  -117
-Comments:   557 (92 unresolved)
+Updated:    2026-10-09 11:53:13.000000000
+Patch Set:  43
+Insertions: +510
+Deletions:  -136
+Comments:   602 (92 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -28,32 +28,39 @@ Enable fault tolerant MGS on the client: the client MGC can connect to
 any server running an MGS follower, and it learns about those servers
 on its own.
 
-. the client mount command takes a list of MGS NIDs, shuffled so that
-  clients spread the MGS load; a server MGC still tries the primary
-  MGS first, in the order given.  mount.lustre(8) says so now
-. the imperative recovery log adds every server NID to the client MGC
+. a client MGC still tries the first MGS node on the mount line first,
+  since with no follower running only the MGS answers, but takes the
+  other nodes in a random order, so that clients spread the load
+  across the followers there; a server MGC keeps the order given.
+  mount.lustre(8) says so now
+. the imperative recovery log adds the NIDs of every server that runs
+  an MGS, by the LDD_F_SV_TYPE_MGS bit of its entry, to the client MGC
   import at the tail, so this works with no configuration while the
   NIDs from the mount line stay preferred.  That is independent of
   mgc.*.dynamic_nids, which covers the target imports
 . the server MGC device is renamed "mgc<NID>", since it only ever
   connects to the primary MGS, while the client MGC stays "MGC<NID>".
   Userspace and the tests name the one they mean, and it is now what
-  "lctl dl" and "lctl get_param mgc.*" show on a server
+  "lctl dl" and "lctl get_param mgc.*" show on a server.  A target no
+  longer reuses a client's MGC, so it has no OBD_CONNECT_FTM to drop
 . a client MGC pings at max(PING_INTERVAL_SHORT, obd_timeout / 20),
   capped at PING_INTERVAL, so it notices a dead MGS in time to not
   miss an IR update.  At the default obd_timeout that is 7s rather
-  than 25s, on client MGC imports that negotiated OBD_CONNECT_FTM
+  than 25s, only once followers have run (the IR log has named an MGS
+  other than the one it is connected to) and while the client is
+  connected to an MGS other than the primary one.  While MGS0 is down
+  there are no IR updates to miss, and MGS0 on its primary node does
+  not see the faster pings of every client
 . a follower builds the fsdb on the first MGS_CONFIG_READ when the
   filesystem is in its CONFIGS directory, and serves the nidtbl it
-  has.  An MGS whose nidtbl is still empty answers -EAGAIN, on the
-  leader too: the version is persisted but the target list is not, so
-  an empty table would claim a version the client never got entries
-  for, and -ENOENT would make the client stop asking for good
+  has.  A follower whose nidtbl is still empty answers -EAGAIN: its
+  entries carry the leader's versions, so an empty table would claim
+  a version the client never got entries for.  So does a follower
+  that does not have the filesystem, since -ENOENT would make the
+  client stop asking for good
 . the IR log parser reports why it stops instead of breaking silently.
   Its "datalen < 0" test after the subtraction goes, the bound just
-  above it already covers that, and the revoke that ends the log drops
-  its IS_SERVER() guard because the rename leaves a client MGC unable
-  to carry an observer at all
+  above it already covers that
 . a mount line names at most MGC_MGS_NODES_MAX MGS nodes, where it had
   no bound before; mount.lustre(8) says so and the rest are dropped
   with a console warning
@@ -63,25 +70,26 @@ on its own.
   An old client running its own recovery-small test_141 against a new
   server is the other way round and is excepted: its "*MGC*" globs
   match no server MGC namespace any more
-. conf-sanity test_163 is new; test_160, test_161 and recovery-small
+. conf-sanity test_163 is new, and checks that a client MGC moves to
+  a follower when the MGS stops; test_160, test_161 and recovery-small
   set_ir_status() are adjusted for a node that can run both an MGS
   follower and a client MGC
 . conf-sanity test_73e waits for the targets to re-register after it
   restarts the MGS, and needs LU-19692 on the server to do so: the
   client now mounts as soon as an MGS answers, so it no longer waits
   out the whole reconnect and would otherwise get an empty OSC import
-. conf-sanity test_250 updates the MDS version check to match the
+. conf-sanity test_250 updates the MGS version check to match the
   actual version in which the test and functionality landed
 
 Test-Parameters: mdtcount=4 testlist=conf-sanity serverversion=2.17
 Test-Parameters: mdtcount=4 testlist=conf-sanity clientversion=2.17
 Test-Parameters: mdtcount=4 testlist=recovery-small serverversion=2.17
 Test-Parameters: mdtcount=4 testlist=recovery-small clientversion=2.17
-Fixes: 86904ef943 ("LU-19740 utils: Restrict {tunefs,mkfs}.lustre to one device")
-Fixes: f5e198dc68 ("LU-18951 utils: lctl lcfg_erase erase fsname params")
+Fixes: f5e198dc687a ("LU-18951 utils: lctl lcfg_erase erase fsname params")
 Signed-off-by: Lai Siyao <lai.siyao@whamcloud.com>
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: Ib6d2b1ff6bce8d1a51a54982356c859448cf7f05
 
 --- Review History ---
@@ -1564,3 +1572,78 @@ Patch Set 40:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The main one is that the client side of the MGS-capability bit that LU-19916 just added to mgs_nidtbl_entry is not wired up here, so the wire field ends up with no consumer.
+
+--- Message (Andreas Dilger, 2026-10-08 20:51:40.000000000) ---
+Uploaded patch set 41.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-08 20:59:24.000000000) ---
+Patch Set 41:
+
+(15 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 21:12:10.000000000) ---
+Patch Set 41:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 02:27:53.000000000) ---
+Patch Set 41: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133229/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-10-09 10:17:24.000000000) ---
+Uploaded patch set 42.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 10:29:13.000000000) ---
+Patch Set 42:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 10:31:44.000000000) ---
+Patch Set 42:
+
+(15 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-09 11:08:28.000000000) ---
+Uploaded patch set 43: Patch Set 42 was rebased.
+
+--- Message (jenkins, 2026-10-09 11:08:30.000000000) ---
+Patch Set 42: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133265/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 11:17:22.000000000) ---
+Patch Set 43:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 11:18:41.000000000) ---
+Patch Set 43:
+
+(15 comments)
+
+15 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-09 11:53:13.000000000) ---
+Patch Set 43: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133271/ : FAILURE

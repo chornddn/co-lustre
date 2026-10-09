@@ -1,5 +1,5 @@
 Change:     64203
-Subject:    LU-19917 mgs: MGS follower IR support
+Subject:    LU-19917 mgs: add MGS follower IR support
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64203
 Change-Id:  I44dd044575d525a13c5a11b5d514b0c44e23b485
 Project:    fs/lustre-release
@@ -7,70 +7,61 @@ Branch:     master
 Status:     NEW
 Owner:      Lai Siyao
 Created:    2026-02-24 03:41:41.000000000
-Updated:    2026-09-22 19:19:17.000000000
-Patch Set:  25
-Insertions: +438
-Deletions:  -35
-Comments:   113 (13 unresolved)
+Updated:    2026-10-09 11:41:27.000000000
+Patch Set:  28
+Insertions: +529
+Deletions:  -59
+Comments:   119 (13 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: -1
 
 --- Reviewers ---
   CC: Janitor Bot, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Oleg Drokin, Andreas Dilger, Mikhail Pershin, Hongchao Zhang, Xinxia Qu
 
 --- Commit Message ---
-LU-19917 mgs: MGS follower IR support
+LU-19917 mgs: add MGS follower IR support
 
-Let an MGS follower serve imperative recovery.  The target MGC that
-feeds the follower forwards every nidtbl entry it applies, so that the
-follower keeps its own nidtbl and can notify the clients attached to
-it.
+Let an MGS follower serve imperative recovery (IR).  The follower
+keeps its own nidtbl, fed from MGS0's IR log, and notifies the
+clients attached to it when that changes.
 
-. mgc_apply_recover_logs() sends OBD_NOTIFY_IR_UPDATE per entry, and
-  mgs_follower_ir_update()/mgs_follower_nidtbl_update() rebuild the
-  follower nidtbl from it, keeping the targets sorted by version
-. OSTs get a recover cld as well, so a follower running on an OST is
-  fed too; the OST itself does not apply the entries
-. mgc_process_recover_log() sends OBD_NOTIFY_CFG_REVOKE so that the
-  follower wakes its IR notify thread, and only for a read that
-  delivered entries: a requeue that finds nothing new would otherwise
-  have every client of that follower re-read an unchanged nidtbl
+. when a follower attaches to the node's MGC, the MGC starts one
+  recover cld of its own for the follower's filesystem, which reads
+  <fsname>-mdtir from the start and updates no import, and stops it
+  when the follower detaches.  Only that cld feeds the follower, so
+  feeding it costs one read per IR event on the node however many
+  targets it has, and OSTs still read no IR log for their own imports
+. mgc_apply_recover_logs() hands the follower the validated entries of
+  each page in one OBD_NOTIFY_IR_UPDATE, and mgs_follower_ir_update()
+  applies them under one fsdb lookup, keeping the targets sorted by
+  version.  It wakes the IR notify thread only when the nidtbl changed
 . mgc_process_log() returns the enqueue error for a recover cld
   directly rather than falling through to mgc_process_cfg_log(), which
   on a combined MGS/MDT went on to parse <fsname>-mdtir as a config
   log
-. a log a follower is fed from that runs out of memory part way
-  through re-reads from the start, since cfg_last_idx already covers
-  the whole read and the MGS only re-sends an entry when that target's
-  version changes.  A verdict on an entry - -EPROTO from the nidtbl
-  update, or the entry validation - is not re-read, since it would
-  only be repeated
-. a target mounted read-only does not start a follower, because
-  mgs_fs_setup() has to create the follower's CONFIGS and
-  NIDTBL_VERSIONS directories
-. only a failover umount (the default style) wakes the requeue thread
-  to hand the follower to another target.  "umount -f" of the hosting
-  target does not, and the thread waits without a timeout, so that
-  node has no follower until something else revokes a config lock
-. a follower started once the MGC has already read the recover logs
-  re-reads them all from the start, so its nidtbls are not left empty.
-  Both paths that attach one do this - the requeue thread and a target
-  mount - since the MGC is shared and may already have read the logs
-  of another filesystem served on this node to the end
+. a follower IR log whose entries the follower cannot apply re-reads
+  from the start, since cfg_last_idx already covers the whole read
+  and the MGS only re-sends an entry when that target's version
+  changes.  A verdict on an entry - -EPROTO from the nidtbl update, or
+  the entry validation - is not re-read, since it would only be
+  repeated
 . a follower does not read or write the persisted nidtbl version: it
   allocates no versions of its own and rebuilds the target list by
   replaying the log, so a restored version would claim coverage of
   entries it has not been given
 . an entry whose NID size is larger than struct lnet_nid is skipped
   without failing the whole log
+. conf-sanity test_166c checks that a follower's nidtbl follows MGS0's
+  after a target restart
 
 Test-Parameters: mdtcount=4 testlist=recovery-small clientversion=2.17
 Signed-off-by: Lai Siyao <lai.siyao@whamcloud.com>
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
-Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I44dd044575d525a13c5a11b5d514b0c44e23b485
 
 --- Review History ---
@@ -989,3 +980,81 @@ AI code review results below, please doublecheck
 Some concerns, see inline comments. The follower the requeue thread attaches looks like it never re-reads the recover logs, so its nidtbl stays incomplete - the commit message says both attach paths do re-read.
 
 Nothing added here exercises a client attached to a follower actually receiving an IR notification; recovery-small gives the follower no part to play. Would a conf-sanity or replay-single case that restarts a target and checks the client bound to a follower be worth adding?
+
+--- Message (Andreas Dilger, 2026-10-08 20:51:40.000000000) ---
+Uploaded patch set 26.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-08 20:59:36.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 21:12:03.000000000) ---
+Patch Set 26:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-09 02:20:27.000000000) ---
+Patch Set 26: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133228/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-10-09 10:17:24.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 10:29:08.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 10:31:56.000000000) ---
+Patch Set 27:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-09 10:52:55.000000000) ---
+Patch Set 27: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133264/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-10-09 11:08:28.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 11:17:16.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 11:18:52.000000000) ---
+Patch Set 28:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-09 11:41:27.000000000) ---
+Patch Set 28: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133270/ : FAILURE

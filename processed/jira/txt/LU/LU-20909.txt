@@ -1,0 +1,61 @@
+Key:        LU-20909
+Summary:    16KiB PAGE_SIZE aarch64 client issues (macOS Apple Silicon VMs)
+Link:       https://jira.whamcloud.com/browse/LU-20909
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Thu, 8 Oct 2026 20:55:30 +0000
+Updated:    Fri, 9 Oct 2026 07:54:32 +0000
+Links:      Related: is related to  LU-18877; Related: is related to  LU-20910
+
+--- Description ---
+Track client-side issues with a 16KiB PAGE_SIZE aarch64 client (CONFIG_ARM64_16K_PAGES), usually against 4KiB PAGE_SIZE servers.
+
+Apple Silicon (M-series) CPUs implement only the 4KiB and 16KiB translation granules, so a 64KiB-page kernel (RHEL kernel-64k) cannot boot under the macOS Hypervisor.framework (HVF) and needs slow TCG emulation.  A 16KiB-page Rocky 10.2 (6.12.0-211.47.1.el10_2) kernel runs at full speed there, and gives cheap local coverage of most PAGE_SIZE > 4KiB issues that otherwise only show up on aarch64+64k or ppc64le.  The ltvm test VM tool has a rocky10-16k target for this.
+
+Individual fixes may get their own ticket, link to an existing one, or use this ticket for small fixes.
+
+Issues found so far (code review, not all verified by test yet):
+
+	llite: ll_dir_finish_open() copies PAGE_SIZE bytes per folio from a dir read-on-open reply of only rep_size bytes (often one 4KiB lu_dirpage), reading past the reply buffer.  A folio allocation failure partway also leaves lu_pgs unconsumed and trips the LASSERT in mdc_adjust_dirpages().
+
+	ptlrpc (latent): IOP_LEN(len) in __ptlrpc_prep_bulk_page() ignores the in-page offset, so bd_iop_len differs between peers for a fragment that both starts and ends inside a 4KiB unit and crosses a 4KiB boundary (e.g. [2KiB, 6KiB)).  Current IO paths only produce such fragments in single-page RPCs, far below LNET_MTU, so the MD boundaries still agree; IOP_LEN((pageoffset & 4095) + len) would make this robust.
+
+	osc/llite/pcc: the encrypted-file decrypt loops stop at the first all-zero 4KiB unit in a page, so a page with a hole before written data returns ciphertext (e.g. write 4KiB at offset 8KiB of a new encrypted file, then re-read).
+
+	osc: the partial-last-page lost-grant correction runs only without OBD_CONNECT_GRANT_PARAM, so a 16KiB client and a 4KiB OST may disagree on grant for partial pages.
+
+	gss: krb5p/skpi privacy pads each fragment to the cipher block size, so the ciphertext layout depends on where pages split; also the "bv_offset & blocksize" alignment checks should use (blocksize - 1).
+
+	rw26: 4KiB-aligned O_DIRECT is treated as unaligned on a 16KiB client; STATX_DIOALIGN is not reported.
+
+	tests: several tests hard-code 4096 for O_DIRECT sizes or page-based counters (sanity 64j, 77n, 119n, 119r, 224c; sanityn 16b, 20, 95a and the 0x1e1 OST thread test; recovery-small 148; sanity-ec 12c-12f via test_parity_read.c).
+
+--- Comment (gerrit, Fri, 9 Oct 2026 07:54:20 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69543
+
+Subject: LU-20909 llite: copy only reply bytes for dir read-on-open
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: e93007ed5accc20f252bb06e049e8720cbad8fd8
+
+--- Comment (gerrit, Fri, 9 Oct 2026 07:54:32 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69544
+
+Subject: LU-20909 sec: decrypt units after a hole in a large page
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a8050c65a2d9d47b12563df3d8c1825ef8905231

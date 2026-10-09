@@ -7,88 +7,123 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-09-28 06:52:21.000000000
-Updated:    2026-10-05 06:57:37.000000000
-Patch Set:  1
-Insertions: +1811
-Deletions:  -38
-Comments:   43 (15 unresolved)
+Updated:    2026-10-09 01:23:31.000000000
+Patch Set:  3
+Insertions: +2213
+Deletions:  -46
+Comments:   113 (8 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Gerrit AI review for Lustre
+  CC: Chris Horn, Gerrit AI review for Lustre
 
 --- Commit Message ---
 LU-20107 nrs: add the GDNRS coordinator and node agent
 
 All the targets of one server node share the PtlRPC services and the
-per-CPT NRS schedulers of the node, so a QoS setting is a setting of
-the node, not of a target. Today an administrator writes the same
-command to the nrs_policies file of every OSS and MDS by hand, and
-the nodes drift apart when one write is missed.
+per-CPT NRS schedulers of the node. Thus a QoS setting is a setting
+of the node, not of a target. Today an administrator writes the same
+command to the nrs_policies file of every OSS and MDS. The nodes
+drift apart when the administrator misses one write.
 
-Add the Global Distributed NRS (GDNRS). A coordinator runs on MDT0
+Add the Global Distributed NRS (GDNRS). A coordinator runs on MDT0,
 and one agent runs on every server node. The coordinator takes a
-command through the debugfs file gdnrs.cdtor.$FSNAME.conf in the
+command through the debugfs file gdnrs.cdtor.$FSNAME.conf, in the
 form of the nrs_policies file:
 
   lctl set_param gdnrs.cdtor.$FSNAME.conf=
     "<tbf|mclock> [reg|hp] [<class type>] [key=value ...] [service=]"
     "<fifo|crrn|orr|trr|delay> [reg|hp] [service=]"
 
-A classful policy name is a scheduler start command; any other policy
-name is a scheduler stop command that names the policy to start in
-place of the classful scheduler, and a policy the service of an agent
-does not know fails there. The service= key names the PtlRPC service
-of the command, ost_io when absent; [reg|hp] and queue= select one
-NRS head instead of both. gdnrs_parse_cmd() reuses nrs_parse_cmd()
-with NRS_TYPE_FLAG_DYNAMIC, so the coordinator needs no knowledge of
-the class type of the schedulers on the agents, and converts the
-parsed nrs_cmd to the wire struct gdnrs_cmd. The scheduler type bits
-and the NRS head bits ride in gc_confl.
+A classful policy name gives a scheduler start command. A start
+command with no class type starts the generic class type. Any other
+policy name gives a scheduler stop command. That command names the
+policy that replaces the classful scheduler. A policy that the
+service of an agent does not know fails on that agent.
 
-The command goes down MDT0 -> MDD -> LOD -> OSP as a new GDNRS_CONF
-RPC (RQF_GDNRS_CONF, RMF_GDNRS_CONF, swabbed in pack_server.c) to one
-target of every node. Targets of one node share a struct lu_svr_qos,
-so LOD sends one RPC per lsq_id of the OST descs and of the MDT
-descs. LOD holds no OSP for the local MDT, so the node of MDT0 only
-gets a metadata command through another MDT it hosts; LOD checks the
-peer NIDs against the local NIDs with LNetGetId() and applies the
-command through the local agent when no target of the descs is here,
-so the node is neither skipped nor configured twice. Every node gets
-the command even if an earlier one failed and the first error goes
-back to lctl set_param. OSP sends the command to an OST on
-OST_CREATE_PORTAL, as osp_statfs_update() does, so the command does
-not queue in the ost service whose scheduler it may be replacing,
-and to an MDT on OUT_PORTAL.
+The coordinator also takes a rule command through the debugfs file
+gdnrs.cdtor.$FSNAME.rule. The command has the form of the
+nrs_policies rule files:
+
+  lctl set_param gdnrs.cdtor.$FSNAME.rule=
+    "start <name> {conds} [key=value ...] [service=] [type=]"
+    "change <name> key=value ... [service=] [type=]"
+    "stop <name> [service=] [type=]"
+
+The type= key names the scheduler of a rule command. The coordinator
+converts a rule start, change or stop command to the wire. The agent
+converts it back. The agent does not start a rule yet: a rule start
+returns -EOPNOTSUPP.
+
+The service= key names the PtlRPC service of the command, ost_io
+when absent. The [reg|hp] token and the queue= key select one NRS
+head instead of both. Only the coordinator accepts the service=,
+type= and queue= keys. nrs_parse_cmd() refuses them on the local
+nrs_policies and rule files.
+
+The coordinator parses the command with nrs_parse_cmd() and
+NRS_TYPE_FLAG_DYNAMIC. Thus the coordinator does not need the class
+type of the schedulers on the agents. It then converts the command
+to the wire struct gdnrs_cmd. The struct has a fixed layout in
+lustre_idl.h, with checks in wirecheck.c and wiretest.c. The rate
+fields of a rule go on the wire as struct gdnrs_ratecfg. The wire
+values of the command types must not change. The same rule applies
+to the NRS_CONF_FL_* bits and the NRS_TYPE_FLAG_* bits.
+
+The command goes to one target of every node as a new GDNRS_CONF
+RPC. Its path is MDT0, MDD, LOD and then OSP. LOD sends one RPC per
+peer NID of the current connection of its targets. Thus a target
+that fails over to its partner node gives that node an RPC of its
+own. LOD holds no OSP for the local MDT. LOD compares the peer NIDs
+with the local NIDs. If no target of the MDT descs is on the node of
+MDT0, the local agent applies a metadata command. Every node gets
+the command, even after a failure on an earlier node. lctl set_param
+returns the first error. OSP sends the command to an OST on
+OST_CREATE_PORTAL, as osp_statfs_update() does. Thus the command
+does not wait in the ost service whose scheduler it can replace. OSP
+sends the command to an MDT on OUT_PORTAL.
 
 The agent handler tgt_gdnrs_handlers is in the slice tables of OFD
-and MDT, so any service of the node takes the RPC. It finds the
-ptlrpc_service of the portal of the command and runs
-ptlrpc_nrs_policy_control() on the heads the command names, like the
-nrs_policies write path. The start parameters of a policy become
-struct nrs_params: np_arg is the argument string of the lprocfs path
-and np_data the parsed command of the agent, so op_policy_start()
-takes struct nrs_params instead of a char *, and a parsed command
-always restarts the policy. The head bits of the command only pick
-the NRS heads; gdnrs_cmd_to_nrs_cmd() strips them with the type bits
-before the scheduler checks nc_confl against its supported flags,
-otherwise "tbf hp nid" fails with -EINVAL on every agent.
+and MDT. The handler accepts the RPC only from the export of an MDT.
+It returns -EPERM to any other export. The agent checks the count of
+allowed types from the wire. A count above NRS_ALLOWED_TYPES_MAX
+gives -EPROTO. A wire name with no NUL byte also gives -EPROTO.
+The agent finds the ptlrpc_service of the portal of the command. It
+then runs ptlrpc_nrs_policy_control() on the heads that the command
+names, like the nrs_policies write path.
 
-Add sanityn 77wm, which switches ost_io between tbf, mclock and fifo
-from the coordinator and checks the primary policy on every OSS,
-77wn, which switches ost_io to crrn, orr and trr, 77wo, which
-selects the reg or hp head of the default service, 77wp, which
-configures the mdt and mdt_io services, and 77wq, which writes
-malformed and unknown commands and checks that the coordinator
-rejects them and the schedulers stay.
+The start parameters of a policy become struct nrs_params. The field
+np_arg is the argument string of the lprocfs path. The field np_data
+is the parsed command of the agent. Thus op_policy_start() takes
+struct nrs_params instead of a char pointer. A parsed command always
+restarts the policy. The agent sets np_arg to "gdnrs:<class type>".
+Thus a later local write of the same class type restarts the policy.
+
+The function gdnrs_cmd_to_nrs_cmd() removes the head bits and the
+type bits from nc_confl before the scheduler checks nc_confl.
+Otherwise "tbf hp nid" fails with -EINVAL on every agent.
+
+The coordinator is optional. When it cannot start, MDT0 logs a
+warning and mounts without it.
+
+Add sanityn tests:
+- 77wm switches ost_io between tbf, mclock and fifo from the
+  coordinator, and checks the primary policy on every OSS.
+- 77wn switches ost_io to crrn, orr and trr.
+- 77wo selects the reg or hp head of the default service.
+- 77wp configures the mdt and mdt_io services.
+- 77wq writes malformed and unknown commands. The coordinator must
+  refuse them, and the schedulers must stay. A local nrs_policies
+  write with service= must fail.
 
 Test-Parameters: trivial testlist=sanityn
-Change-Id: I16007d047f9f0ca2f1116ebf74055a1d2404c06f
 Signed-off-by: Yingjin Qian <qian@ddn.com>
-Assisted-by: Augment: Claude Fabel 5.1
+Assisted-by: Augment:Claude-Fable-5.1
+Assisted-by: ClaudeCode:claude-opus-5-5
+Change-Id: I16007d047f9f0ca2f1116ebf74055a1d2404c06f
 
 --- Review History ---
 
@@ -216,3 +251,145 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The agent trusts the wire command too much (allowed-type count, sender), the MDT setup error paths leave the coordinator or quota master behind, and the GDNRS_CONF wire format has no wiretest coverage and no interop gating. Needs a refresh for those; the minor items inline can ride along.
+
+--- Message (Chris Horn, 2026-10-08 20:23:18.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-08 20:24:38.000000000) ---
+Patch Set 2:
+
+(26 comments)
+
+34 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-10-08 20:28:02.000000000) ---
+Uploaded patch set 3.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 20:31:13.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+3 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Chris Horn, 2026-10-08 20:35:50.000000000) ---
+Patch Set 3:
+
+(15 comments)
+
+--- Message (wc-checkpatch, 2026-10-08 20:41:50.000000000) ---
+Patch Set 3:
+
+(23 comments)
+
+31 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-08 20:53:17.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+3 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-10-08 23:50:13.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133209/ : SUCCESS
+
+--- Message (Maloo, 2026-10-08 23:51:17.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 133209 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133209&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133209#redirect
+
+--- Message (jenkins, 2026-10-09 01:22:39.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133220/ : SUCCESS
+
+--- Message (Maloo, 2026-10-09 01:23:31.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 133220 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133220&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133220#redirect
