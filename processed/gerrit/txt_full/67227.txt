@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chakshu Kansal
 Created:    2026-07-14 10:32:37.000000000
-Updated:    2026-10-05 08:50:24.000000000
-Patch Set:  10
-Insertions: +1397
-Deletions:  -114
-Comments:   375 (40 unresolved)
+Updated:    2026-10-12 14:14:14.000000000
+Patch Set:  11
+Insertions: +1278
+Deletions:  -118
+Comments:   422 (4 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Vitaly Oratovsky, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -24,131 +24,52 @@ Comments:   375 (40 unresolved)
 --- Commit Message ---
 LU-17957 mdd: POSIX interface for non-root immutable files
 
-Allow a non-root file owner to make their own file immutable, without
-CAP_LINUX_IMMUTABLE or root, by setting the file's atime at least
-mdd.posix_immutable_min_atime_delta seconds into the future and removing
-all write permissions from the file.
+Allow a non-root file owner to make their own file immutable using
+POSIX tools, without CAP_LINUX_IMMUTABLE or root: set the file's
+atime to at least mdd.posix_immutable_min_atime_delta seconds in the
+future, then remove all write permission (chmod a-w). When
+mdd.posix_immutable is enabled (default off) and both conditions are
+met, the MDS sets IMMUTABLE_FL automatically.
 
-When mdd.posix_immutable is enabled and both conditions are met, the MDS
-auto-sets LUSTRE_IMMUTABLE_FL. A new LMA compat flag, LMAC_RETENTION
-(wire flag LUSTRE_RETENTION_FL), marks the file as auto-set this way,
-distinguishing it from a plain chattr +i file, whose IMMUTABLE_FL is
-never auto-cleared. mdd.posix_immutable defaults to off, and only the
-auto-set behavior is gated on it. Enforcement, reply masking and LMA
-flag handling are unconditional and apply to plain chattr +i files too.
+A new on-disk LMA flag, RETENTION_FL (LMAC_RETENTION), marks files
+made immutable this way, as opposed to plain "chattr +i", whose
+IMMUTABLE_FL never auto-clears. A file is "expired" once its atime
+has passed. Expiry lazily clears IMMUTABLE_FL|RETENTION_FL on the
+next operation that needs the file writable, so files that are never
+touched again keep the flags as MDS-internal bookkeeping only.
+RETENTION_FL is always stripped from client-visible replies, and
+IMMUTABLE_FL is masked once a file is expired, so a client can never
+observe or cache a stale immutable state.
 
-mdd.posix_immutable_min_atime_delta defaults to 86400 (24h) and rejects
-values below 30 seconds with -EINVAL, keeping the window comfortably
-above the client's internal re-check interval and large enough that a
-recent, unrelated atime update cannot be mistaken for an intentionally
-future-dated one.
+mdd.posix_immutable_min_atime_delta (default 24h, minimum 30s)
+bounds how far in the future the atime must be set, to keep the
+window comfortably larger than the client's own re-check interval
+and avoid confusing an incidental atime update with an intentional
+retention request.
 
-Expiry and authorization
--------------------------
-A file is expired when it has both IMMUTABLE_FL and RETENTION_FL, is a
-regular file with no write bits, and atime <= now. This is checked by
-lu_posix_immutable_expired() in md_object.h.
+A caller with CAP_LINUX_IMMUTABLE (e.g. root, or an HSM restore) may
+migrate an immutable file or swap its layout at any time, regardless
+of retention/expiry. A caller without it (e.g. the owner) must wait
+for expiry first. This requires relaxing a few MAY_WRITE checks
+(layout swap, migration, HSM release) specifically for
+CAP_LINUX_IMMUTABLE callers, since the standard VFS write-permission
+check always rejects immutable files outright, even for root. The
+capability check needs the request's ucred, which the standalone
+swap_layouts RPC handler did not previously set up, so it now
+initializes and releases ucred around the permission check.
+lfs migrate retries its read-only source open after EPERM, since
+copying a file only needs read access.
 
-lu_immutable_relocate_check(), also in md_object.h, permits layout swap
-and migration of an immutable file when the caller holds
-CAP_LINUX_IMMUTABLE, regardless of expiry; otherwise it denies with
--EPERM while IMMUTABLE_FL is set. A caller without CAP_LINUX_IMMUTABLE
-is let through once retention has expired, because the flag is cleared
-before the check.
+On the client, since IMMUTABLE_FL is time-based rather than fixed, a
+cached dentry must not keep the VFS from reaching the MDS once atime
+has passed: ll_revalidate_dentry() forces a fresh lookup whenever the
+cached inode is IS_IMMUTABLE and its atime is already in the past, so
+open/unlink/rename after expiry reach the MDS for the authoritative
+check instead of being rejected locally on stale cached flags. It is
+re-checked on the next operation that triggers a lookup or MDS round
+trip (e.g. close and reopen, stat, unlink, or rename).
 
-mdd_clear_expired_posix_immutable() drops IMMUTABLE_FL|RETENTION_FL on
-disk in its own transaction and emits CL_SETATTR. It is called before the
-corresponding sanity check in mdd_open(), mdd_unlink(), mdd_rename(),
-mdd_link(), mdd_xattr_set()/mdd_xattr_del() (layout merge/split),
-mdd_migrate(), mdd_swap_layouts() and mdd_layout_change()'s
-MD_LAYOUT_WRITE case. It must not be called while mdd_write_lock() is
-held. The clear is lazy, done by the operation that needs the file to be
-writable again, so an expired file that is never changed or removed
-keeps its flags in the LMA, where they are MDS-internal state only.
-
-Enforcement is a check of the on-disk IMMUTABLE_FL at each site that
-checks it, mdd_permission_internal() (open for write/trunc/append),
-mdd_fix_attr() (setattr), mdd_may_delete() (unlink/rename),
-mdd_link_sanity_check() (hardlink), mdd_xattr_sanity_check(),
-mdd_layout_swap_allowed(), mdd_migrate_sanity_check() and
-mdd_layout_change(). mdd_permission_internal() lets an expired file
-through, because the MDT permission pre-checks (mdt_swap_layouts(),
-mdt_layout_change(), mdt_cross_open(), mdt_close_handle_layouts()) run
-before the flags have been dropped on disk. Only mdd_layout_change()'s
-MD_LAYOUT_WRITE case is gated on mdd.posix_immutable, since it guards a
-TOCTOU race unique to the auto-expiry feature.
-
-mdd_fix_attr() implements the auto-set via mdd_try_set_posix_immutable(),
-on an explicit chmod a-w of a regular file whose effective atime is at
-least mdd.posix_immutable_min_atime_delta in the future, when the caller
-is the owner or holds CAP_LINUX_IMMUTABLE and RBAC immutable_flags allows
-it, it adds IMMUTABLE_FL|RETENTION_FL to the setattr. chattr +i/-i sets
-IMMUTABLE_FL only, and clears RETENTION_FL when it changes IMMUTABLE_FL.
-
-mdt_pack_attr2body() strips RETENTION_FL from every mdt_body reply and
-masks IMMUTABLE_FL as well once the file is expired, covering getattr,
-open, lookup and setattr replies in one place so a client cannot cache a
-stale immutable flag.
-
-Client side
------------
-ll_update_inode_flags() arms lli_immutable_expiry for an immutable file
-whose atime is in the future. When the atime passes,
-ll_revalidate_dentry() forces one lookup via ll_immutable_recheck(), the
-MDS reports the file as writable and the client drops the flag, the
-operation then reaches the MDS, which clears it on disk. The re-check is
-retried every LL_IMMUTABLE_RECHECK_SECS (5s) until the MDS releases the
-file, so a client whose clock runs ahead of the MDS's cannot get stuck.
-The MDS stays the sole authority on expiry, the client only decides when
-to re-ask.
-
-A held fd pins the inode and never walks the path, so that lookup
-re-check cannot reach it and the inode cannot be evicted and re-read
-either. ll_immutable_work_arm() therefore also schedules a work item for
-the deadline, but only while an fd is open, it refreshes the flags from
-the MDS and is dropped once the last fd closes. That is what makes
-fchmod()/fchown()/futimens() on a descriptor opened before expiry work
-after it. The work item is allocated on first use, so ordinary inodes
-carry nothing.
-
-ll_file_ioctl() lets a CAP_LINUX_IMMUTABLE caller swap layouts with a
-read-only file descriptor, and ll_check_swap_layouts_validity() skips the
-local inode_permission() MAY_WRITE check for such callers via
-ll_may_write_swap(), the MDS performs the final authorization. The
-lfs migrate tool retries the source open read-only on EPERM/EACCES, since
-the source is only read during the copy.
-
-mdt_close_handle_layouts() skips its MAY_WRITE check for callers holding
-CAP_LINUX_IMMUTABLE (the HSM release path already passes
-SWAP_LAYOUTS_MDS_RELEASE to the layout swap), so root-driven HSM restore
-and lfs migrate work on immutable files without tripping the uid/gid or
-immutability checks.
-
-Storage layer
--------------
-osd-ldiskfs and osd-zfs osd_attr_set() compute the new lma_incompat and
-lma_compat values and write them only when they differ from the on-disk
-values, so RETENTION_FL can be set and cleared (ORPHAN/ENCRYPT stay
-sticky). osd_attr_get() surfaces RETENTION_FL, and
-lma_compat_to_lustre_flags()/lustre_to_lma_compat_flags() in obd_support.h
-map it to and from LMAC_RETENTION.
-
-While la_atime is in the future, normal access never moves it backwards,
-so atime-based retention/purge scans treat the file as recently accessed
-and skip it. This is harmless, since the file is immutable and cannot be
-removed until it becomes writable again.
-
-Testing
--------
-mdd.posix_immutable defaults to off. sanityn.sh test_106d covers the
-disabled path, flag set, reverse order not setting the flag, retention
-expiry and mode-only failure after expiry, chattr +i not auto-expiring,
-and root/owner/non-owner delete and write rules. test_106e covers lfs
-migrate denied to the owner before expiry (rejected client-side), allowed
-to a CAP_LINUX_IMMUTABLE holder before expiry (flag remains set), and
-allowed to the owner after expiry.
-
-Test-Parameters: testlist=sanityn serverversion=2.17
+Test-Parameters: testlist=sanityn serverversion=2.17 env=SANITYN_EXCEPT=32b
 Test-Parameters: testlist=sanityn clientversion=2.17
 
 Signed-off-by: Chakshu Kansal <ckansal@ddn.com>
@@ -2812,3 +2733,205 @@ Patch Set 10:
 AI code review results below, please doublecheck
 
 Problematic, see inline comments. Main concerns: a race on the client retention work item can leave a queued work item pointing at a freed inode; plain chattr +i files can be polled every 5s indefinitely; MDT migration drops the retention marker; and the separate clear transaction breaks reply reconstruction for operations that then fail.
+
+--- Message (Chakshu Kansal, 2026-10-12 13:48:56.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chakshu Kansal, 2026-10-12 13:49:29.000000000) ---
+Patch Set 11:
+
+(39 comments)
+
+--- Message (wc-checkpatch, 2026-10-12 13:52:08.000000000) ---
+Patch Set 11:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 13:52:23.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-10-12 14:12:01.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133457/ : SUCCESS
+
+--- Message (Maloo, 2026-10-12 14:14:14.000000000) ---
+Patch Set 11:
+
+#### The following sessions will be run for Build 133457 (patch #11):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133457&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133457#redirect

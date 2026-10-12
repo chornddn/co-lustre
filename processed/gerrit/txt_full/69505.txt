@@ -7,39 +7,56 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-08 01:54:30.000000000
-Updated:    2026-10-09 13:09:49.000000000
-Patch Set:  3
-Insertions: +51
-Deletions:  -16
-Comments:   22 (0 unresolved)
+Updated:    2026-10-12 15:20:26.000000000
+Patch Set:  6
+Insertions: +105
+Deletions:  -20
+Comments:   34 (0 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Artem Blagodarenko: +1
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Artem Blagodarenko, Gerrit AI review for Lustre
-  REVIEWER: Sebastien Buisson, Shaun Tancheff
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Artem Blagodarenko, Sebastien Buisson, Shaun Tancheff
 
 --- Commit Message ---
 LU-20896 osc: encrypt direct IO pages at their own file index
 
 A direct write larger than about 1MiB to an encrypted file with the
 key loaded stores data that does not decrypt back to what was
-written. OSC encrypts a direct IO page by pointing its folio at the
+written.  OSC encrypts a direct IO page by pointing its folio at the
 file mapping and setting the folio index to the page's file index,
 then computing the block number as the folio index plus the page's
-offset within the folio. When the user buffer is backed by a
+offset within the folio.  When the user buffer is backed by a
 transparent huge page, that offset is not zero, so the page is
 encrypted as another page of the file, while a direct read decrypts
-it at its own index. The pages of one large folio can also be in
+it at its own index.  The pages of one large folio can also be in
 different RPCs that are prepared concurrently, which all change the
 same folio index.
 
 Pass the inode and file index of the page to
 osc_encrypt_pagecache_blocks() instead, and leave the folio of a
-direct IO page alone. "lfs migrate" and "lfs
-mirror extend" with the key loaded no longer corrupt the file.
+direct IO page alone.  "lfs migrate" and "lfs mirror extend" with
+the key loaded no longer corrupt the file.
+
+The fact that pages can be prepared at the same time by different
+threads also poses a lock contention issue. Each thread calls
+folio_trylock() on the same folio before encrypting its page. When the
+trylock fails, the folio is assumed to stay locked during encryption,
+which only holds for a page cache folio locked by vvp_page_assume()
+waiting for this RPC. For a direct IO folio, the other thread unlocks
+it as soon as its own page is encrypted, so the WARN_ON_ONCE() in
+osc_encrypt_pagecache_blocks() fires and osc_brw_prep_request() fails
+the write with -EINVAL.
+
+A direct IO folio is part of the user buffer, not of the page
+cache of the file. It is only read to encrypt it into a bounce
+folio, at the inode and file index given by the caller, so the
+folio lock does not protect anything. With embedded llcrypt, skip
+the folio_trylock() of a direct IO folio, and the lock check in
+osc_encrypt_pagecache_blocks().
 
 8MiB direct write with the key loaded, 4MiB buffer, 15 runs:
 
@@ -48,7 +65,9 @@ mirror extend" with the key loaded no longer corrupt the file.
   with the fix              0/15    0/15 corrupt
 
 Add sanity-sec test_66a to write and read an encrypted file with
-direct IO from a huge page buffer.
+direct IO from a huge page buffer. Also exercise locking concurrency
+by running 4 parallel 32MiB direct writes to files overstriped twice
+on each OST with 64KiB stripes.
 
 Fixes: 59d84ec3ffb8 ("LU-19249 build: Compatibility updates for kernel v6.16")
 Fixes: 51de594ed75a ("LU-17916 osc: switch to struct folio")
@@ -721,3 +740,471 @@ Patch Set 3:
 Patch Set 3:
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 21:13:33.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-09 21:28:47.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-09 21:33:13.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-09 21:38:31.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-09 21:53:22.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133311/ : SUCCESS
+
+--- Message (Maloo, 2026-10-09 21:54:15.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 133311 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133311&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133311#redirect
+
+--- Message (Maloo, 2026-10-10 10:23:24.000000000) ---
+Patch Set 4:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-154vm276: https://testing.whamcloud.com/test_sessions/36c73c13-6e8c-4ac2-b080-df6c00b03a56 ran 6 tests.  1 tests failed: sanity-scrub.
+
+--- Message (Maloo, 2026-10-10 11:52:05.000000000) ---
+Patch Set 4:
+
+Failed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-153vm167: https://testing.whamcloud.com/test_sessions/fd22bad1-a384-4e90-b28b-5bb775923298 ran 8 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2026-10-10 11:56:19.000000000) ---
+Patch Set 4:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-152vm13: https://testing.whamcloud.com/test_sessions/9cf12628-ad00-4497-9548-7d2643c9600d ran 3 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Andreas Dilger, 2026-10-10 16:55:22.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-10 16:56:37.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Autotest, 2026-10-10 17:32:20.000000000) ---
+Patch Set 4:
+
+Onyx Autotest retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 133311 patch 4. Requested by Patrickbot because of LU-20230.
+
+--- Message (Maloo, 2026-10-10 18:39:54.000000000) ---
+Patch Set 4: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-153vm97: https://testing.whamcloud.com/test_sessions/194d480b-c076-434a-a9a6-a2040ac36682 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-10 18:47:51.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. Two optional nits inline that can go in whenever the patch is next refreshed; no need to re-spin for them.
+
+--- Message (Autotest, 2026-10-10 18:49:51.000000000) ---
+Patch Set 4:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-7 session on el9.8-x86_64/zfs servers and clients for build 133311 patch 4. Requested by Patrickbot because of LU-20277.
+
+--- Message (Autotest, 2026-10-10 18:59:37.000000000) ---
+Patch Set 4:
+
+Trevis Autotest retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 133311 patch 4. Requested by Patrickbot because of LU-20230.
+
+--- Message (Maloo, 2026-10-10 21:30:59.000000000) ---
+Patch Set 4:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-159vm12: https://testing.whamcloud.com/test_sessions/61745af2-791b-4f93-93ad-1cd34d3e771d ran 6 tests.
+
+--- Message (Maloo, 2026-10-10 22:05:58.000000000) ---
+Patch Set 4:
+
+Passed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm86: https://testing.whamcloud.com/test_sessions/98166c37-ae68-4150-bf87-b0d089b34d69 ran 8 tests.
+
+--- Message (Maloo, 2026-10-10 23:25:15.000000000) ---
+Patch Set 4:
+
+Passed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest from trevis-152vm39: https://testing.whamcloud.com/test_sessions/53d2fa42-f1a7-4c23-94de-0167c29f227d ran 8 tests.
+
+--- Message (Sebastien Buisson, 2026-10-12 14:13:31.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 14:16:58.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Sebastien Buisson, 2026-10-12 14:17:09.000000000) ---
+Uploaded patch set 6.
+
+--- Message (jenkins, 2026-10-12 14:17:16.000000000) ---
+Patch Set 5: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133458/ : ABORTED
+
+--- Message (Sebastien Buisson, 2026-10-12 14:18:33.000000000) ---
+Patch Set 6:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 14:20:30.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-12 14:22:48.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-12 14:44:10.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133459/ : SUCCESS
+
+--- Message (Maloo, 2026-10-12 14:45:23.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 133459 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133459&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133459#redirect
+
+--- Message (Artem Blagodarenko, 2026-10-12 15:20:26.000000000) ---
+Patch Set 6: Code-Review+1

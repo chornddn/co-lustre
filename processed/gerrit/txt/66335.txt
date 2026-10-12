@@ -1,5 +1,5 @@
 Change:     66335
-Subject:    LU-19955 osd-ldiskfs: folio dirty in osd_write_commit
+Subject:    LU-19955 osd-ldiskfs: write out a dirty folio before IO
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66335
 Change-Id:  I31d6a4b0009d35e0dd0a3464683bfc566d950bd8
 Project:    fs/lustre-release
@@ -7,27 +7,42 @@ Branch:     master
 Status:     NEW
 Owner:      Shaun Tancheff
 Created:    2026-05-30 05:20:17.000000000
-Updated:    2026-05-30 21:13:08.000000000
-Patch Set:  3
-Insertions: +17
-Deletions:  -7
-Comments:   9 (0 unresolved)
+Updated:    2026-10-11 16:30:52.000000000
+Patch Set:  4
+Insertions: +58
+Deletions:  -10
+Comments:   14 (3 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Janitor Bot
+  CC: Janitor Bot, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Patrick Farrell
 
 --- Commit Message ---
-LU-19955 osd-ldiskfs: folio dirty in osd_write_commit
+LU-19955 osd-ldiskfs: write out a dirty folio before IO
 
-Try to wait for the PG_dirty flag to clear and dump some
-details on the dirty folio.
+osd_write_commit() asserts that no page it is handed is
+dirty, because an IO reuses the page cache page when there
+is one rather than a private page.  ldiskfs can leave such a
+page dirty with data that is not on disk yet, such as a
+partial block it zeroed.  The cases found in fallocate are
+fixed, but any other one LBUGs the server, and before that
+the read or write prep can read the block from disk over
+the data the page holds.
 
-Test-Parameters: clientdistro=el10.1 serverdistro=el10.1 testlist=sanity-benchmark
+When the page cache folio for an IO is dirty, write it out
+and wait before using it, with a rate limited warning so
+that any remaining source of such pages is still seen.  If
+the folio is still dirty after that, fail the IO with -EIO.
+
+Test-Parameters: clientdistro=el10.1 serverdistro=el10.1 testlist=sanity-benchmark,sanity-dom
+Test-Parameters: clientdistro=el9.8 serverdistro=el9.8 testlist=sanity-benchmark,sanity-dom
 Signed-off-by: Shaun Tancheff <shaun.tancheff@hpe.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 Change-Id: I31d6a4b0009d35e0dd0a3464683bfc566d950bd8
 
 --- Review History ---
@@ -158,3 +173,43 @@ Patch Set 3: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/125832/ : SUCCESS
+
+--- Message (patrick bot, 2026-10-11 05:04:12.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-10-11 05:04:40.000000000) ---
+Patch Set 4:
+
+Patrick-Bot: I'm updating this patch: rebased onto current master and addressed the review findings, since LU-19955 is a blocker for 2.18. Shaun, you can of course take it back over if you want. In patch set 4, a dirty page cache folio is written out before the IO uses it, instead of waiting for PG_dirty to clear: nothing wakes that wait while the folio is locked, and it hung the OSS in the patch set 3 sanity-benchmark run.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-11 05:06:56.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-11 05:12:05.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-11 05:27:32.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133378/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-11 16:30:52.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The writeout-and-retry approach looks right, but the new error return can still end in an assertion for multi-niobuf DIO requests.

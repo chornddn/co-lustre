@@ -1,5 +1,5 @@
 Change:     67700
-Subject:    LU-20354 quota: add per-slave DT usage cache and DQACQ warming
+Subject:    LU-20354 quota: cache per-slave DT usage on QMT
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67700
 Change-Id:  I9acd2b938c45ba9c62d5a2c03ba86af24ddbe90d
 Project:    fs/lustre-release
@@ -7,59 +7,61 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-08-03 09:49:57.000000000
-Updated:    2026-10-05 12:27:07.000000000
-Patch Set:  15
-Insertions: +1214
-Deletions:  -25
-Comments:   503 (8 unresolved)
+Updated:    2026-10-12 09:15:28.000000000
+Patch Set:  16
+Insertions: +754
+Deletions:  -11
+Comments:   508 (8 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Shuichi Ihara, kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Hongchao Zhang, Sergey Cheremencev
 
 --- Commit Message ---
-LU-20354 quota: add per-slave DT usage cache and DQACQ warming
+LU-20354 quota: cache per-slave DT usage on QMT
 
-Build an in-memory per-slave DT usage cache on QMT so the
-master can track block usage from slaves. Cache warming and
-pool membership sync land here; MDT/OSP refresh and serving
-aggregated usage on GETQUOTA stay in a follow-on.
+Build an in-memory per-slave DT usage cache on the global
+pool lqe so QMT can track block usage reported by slaves.
+Named pools do not keep their own slots; qmt_sum_lqe_usg()
+sums the global entries for the pool's current sarr members.
+LQA and MD are not cached. Refresh from MDT/OSP and serving
+the sum on GETQUOTA stay in a follow-on.
 
-For one uid the per-lqe cache is filled as follows:
+DQACQ and REL piggyback on-disk usage in qb_usage with
+QUOTA_DQACQ_FL_USAGE, set by qsd_qbody_set_usage(). REPORT
+already carries that usage and is left unchanged. qmt_dqacq0()
+drops the lqe write lock, then qmt_update_lqe_usg_entry()
+stores the value on the global lqe. A missing slot is
+created there. The slot stores the update time; a ttl of 0
+always misses.
 
-  * qmt_setup_lqe_usg() takes a one-shot membership snapshot
-    from the current sarr (primary + DOM) when
-    qmt_sum_lqe_usg() first sees an unset/uninited cache.
-    Empty slots stay expire=0 until a slave reports.
-    Inverse of slave-connect extend. LQA shares an lqe and
-    is not cached.
-  * DQACQ/REL with qb_usage (QUOTA_DQACQ_FL_USAGE), and
-    REPORT which already carries on-disk usage, call
-    qmt_update_lqe_usg_entry() for that slave only;
-    lqu_inited stays false until setup. QSD piggybacks
-    usage via qsd_qbody_set_usage().
-  * A later OST or DOM MDT connect extends lqes already in
-    the hash with an empty slot via qmt_usg_extend_sites().
-    Pool add/rem keeps slots aligned with membership.
+The sum holds op_rw_sem (read) across each member array.
+Slot fields are written with WRITE_ONCE and read with
+READ_ONCE, with no second lock. Callers must not hold
+lqe_sem: the recalc thread takes op_rw_sem and then
+lqe_sem, so the other order deadlocks with a queued pool
+writer. A missing or expired member, or a pool with no
+members, returns -ESTALE. An all-zero fresh sum is a valid
+idle ID.
 
-DOM MDT slots exist only on the global DT pool; named/LQA
-leave tgts[MDT] unused.
+DOM MDTs are recorded only in the global DT pool tgts[MDT]
+and stay out of lgd and recalc. A slave connect adds the
+target once; disconnect does not remove it.
 
-Expose qmt.*.usage_cache_ttl (seconds; 0 means always
-stale so each lookup misses). Usage-cache lifetime
-follows the lqe.
+qmt.*.usage_cache_ttl is in seconds (default 3600, max one
+day). Zero makes every lookup miss. The cache is freed
+with the lqe.
 
-Loadable qmt_usg_test covers add/del/sum, sarr snapshot
-and DQACQ merge, TTL expiry, ttl=0 always-miss, and del
-waiting on lqu_fetching without MDT/OSP refresh.
-sanity-quota/305 loads it on the MDS.
+qmt_usg_test covers update and sum by pool sarr, a named
+pool sharing the global cache, and TTL. sanity-quota/305
+loads it on the MDS. It does not exercise MDT/OSP refresh.
 
-Test-Parameters: testlist=sanity-quota
-Assisted-by: Cursor:Grok4.6 llm_code_and_review_tools
+Test-Parameters: testlist=sanity-quota serverversion=2.16.0
+Assisted-by: Cursor:Grok-4.7/Opus5.5 llm_code_and_review_tools
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: I9acd2b938c45ba9c62d5a2c03ba86af24ddbe90d
 
@@ -730,3 +732,39 @@ Patch Set 15:
 AI code review results below, please doublecheck
 
 Some concerns, see inline. The DQACQ warming can race with pool_remove and leave a slot for an OST that is no longer in the pool. The other two comments are comment-accuracy nits that can go into the same refresh.
+
+--- Message (Andreas Dilger, 2026-10-11 05:22:35.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Hongchao Zhang, 2026-10-12 04:10:45.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Keguang Xu, 2026-10-12 07:33:19.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-12 07:36:14.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-12 07:46:27.000000000) ---
+Patch Set 16:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-12 09:13:23.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133447/ : SUCCESS
