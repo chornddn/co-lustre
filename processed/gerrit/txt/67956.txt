@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-08-13 05:55:40.000000000
-Updated:    2026-10-12 17:10:23.000000000
-Patch Set:  3
-Insertions: +234
+Updated:    2026-10-14 07:38:36.000000000
+Patch Set:  4
+Insertions: +223
 Deletions:  -46
-Comments:   28 (0 unresolved)
+Comments:   42 (1 unresolved)
 Hashtags:   testfix
 
 --- Labels ---
@@ -20,144 +20,38 @@ Hashtags:   testfix
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, patrick bot
+  REVIEWER: Andreas Dilger, Mikhail Pershin, Alex Zhuravlev, Alexander Boyko, patrick bot
 
 --- Commit Message ---
 LU-20522 obdclass: keep llog record swabs inside the record
 
-lustre_swab_llog_rec() has the same defect the previous
-patch fixed for the log header, still live for every other
-record type.  It swabs lrh_len out of untrusted bytes and
-every variable-length case then locates its tail from it:
+lustre_swab_llog_rec() locates a variable-length record's
+tail from its own lrh_len before llog_verify_record()
+checks it, so a corrupt length swabs past the buffer, up to
+eight bytes for most types and, for UPDATE_REC, as far as
+its untrusted op counts walk. A foreign-endian peer reaches
+this over the network through llog_client_next_block().
 
-  CHANGELOG_REC, CHANGELOG_USER_REC, CHANGELOG_USER_REC2
-	tail = (char *)rec + rec->lrh_len - sizeof(*tail)
-  UPDATE_REC
-	tail = (char *)record + update_records_size(record)
+Pass the swabber the number of bytes actually readable
+at the record and bound every case, and the tail it
+locates, inside them. UPDATE_REC's ops are walked against
+the record's own end instead of trusting the counts,
+and its tail now comes from lrh_len like every other
+variable-length record, so the separate op walk once
+used to find it is gone.
 
-so __swab32s(&tail->lrt_len) writes eight bytes up to 4GB
-past the chunk buffer.  Both readers swab before they
-validate:
-
-  llog_process_thread()		llog.c: swab, llog_verify_record() later
-  llog_osd_next_block()		llog_osd.c: swab, llog_verify_record() later
-
-and a foreign-endian peer reaches it over the network,
-because llog_client_next_block() copies the reply into the
-chunk buffer and leaves the records to be swabbed during
-processing.
-
-UPDATE_REC is worse than an eight byte write.
-ur_update_count and each op's uop_param_count are untrusted,
-and update_op is variable-length, so
-lustre_swab_update_ops() walks and writes for as long as
-those counts say.  update_records_size() walks the same
-counts to place the tail.
-
-Pass the number of bytes readable at the record to
-lustre_swab_llog_rec() and reject an lrh_len that does not
-place the tail inside them; every case is then bounded by
-the record's own extent, which that check has just proved
-lies within the buffer.  Each case also needs the length its
-fixed fields actually occupy, which is not always the size
-of the struct it casts to: llog_changelog_rec ends in a
-for_sizeof_only llog_rec_tail and the fields swabbed there
-stop where that tail begins.  That also has to be the bound,
-because mdd_changelog_write_header() writes CL_MARK records
-with an lrh_len of 80, short of the 88 byte struct.  A v1
-CHANGELOG_USER_REC is likewise half the size of the v2
-struct its case uses.
-
-MDS_SETATTR64_REC picked its v2 layout on lrh_len >
-sizeof(the v1 struct), so an lrh_len between the two sizes
-put the tail at offset 80, past the record and on top of
-whatever followed it in the chunk.  It now takes the v2
-layout only when the v2 struct fits.
-
-Walk the update ops against the end of the record and give
-up if they run past it, and locate the UPDATE_REC tail from
-lrh_len like every other variable-length record:
-llog_update_record_size() puts it at the very end, so the
-two agree for any record that is well formed and the walk is
-no longer needed to find it.
-
-The ops walk now steps with update_op_next_op() instead of
-indexing uops_op[] by a fixed stride.  That is required to
-know where an op ends, and it also matches how
-update_ops_size() has always walked them.
-
-A record too short for its own type is left with just its
-llog_rec_hdr swabbed, and one whose lrh_len puts the tail
-outside the buffer keeps its body but not its tail.  Neither
-is handed to a callback in a state llog_verify_record() will
-always catch, so this is hardening of the memory access
-rather than of the record contents.
-
-Two callers can hand the swabber a record that has already
-left the buffer, so they now bail out instead:
-llog_reverse_process() advances by an lrh_len it has not
-checked, and llog_osd_next_block() derives last_rec by
-subtracting an untrusted tail length from a pointer, which
-can land on either side of the block.
-llog_reverse_process()'s own forward walk and tail lookup
-are equally unchecked, and a changelog log legitimately
-holds a record-sized hole of zeroes, left by a write that
-failed after mdd_changelog_write_rec() consumed the index:
-the walk used to assume lrh_len always advances across such
-a hole, which instead leaves rec in place while idx catches
-up to index, so it arrives at the hole with rec->lrh_len ==
-0 and, until now, located the tail at rec - sizeof(*tail)
-inside the previous record instead of the one being sought.
-It now finds each record with llog_skip_gap(), the same
-helper llog_process_thread() already uses to step over
-exactly this shape of hole.  A hole found short of the
-target index leaves the loop's own index alone rather than
-adopting the found record's on-disk lrh_index.
-llog_prev_block() only checks that its target falls between
-a chunk's first and last record index and does not require a
-record at that exact index to exist, so a single corrupt-
-but-plausible lrh_index inside a chunk could get adopted,
-sent straight to llog_is_index_skipable() -> test_bit_le()
-against the header bitmap hundreds of MB past the header
-allocation, and then send this same walk right back over the
-same chunk on the next llog_prev_block() call, forever. Left
-alone, index keeps the strictly decreasing property the walk
-relies on to terminate.  The bitmap lookup uses the found
-record index when it is within the header bitmap bounds.
-The final tail lookup also now requires lrh_len to be at
-least LLOG_MIN_REC_SIZE rather than only checking where it
-places the tail, which keeps the located tail strictly
-inside the chunk: a first record whose lrh_len happened to
-equal sizeof(*tail) used to place the tail on buf itself,
-and the walk below only runs while the tail is above buf, so
-that record was silently skipped and the caller re-read the
-same chunk at the same index forever.
-
-There is no new test for lustre_swab_llog_rec() itself.
-Those swabbers only run when the data is in the opposite
-byte order, so a same-endian cluster reaches them solely
-through corruption that happens to set
-LLOG_REC_HDR_NEEDS_SWABBING().  The update log catalog this
-bound was written against is still empty in recovery-small,
-so processing there stops on the header before any
-UPDATE_REC gets corrupted and swabbed.  A test that plants
-one anyway passes with or without this patch, which is worse
-than none.  A changelog catalog, unlike the update log one,
-does hold both a valid header and live records by the time
-recovery-small runs, and corrupt_update_llog_hdr() already
-has the offline-edit plumbing to reach one; planting a byte-
-swapped CHANGELOG_REC there was not tried for this patch and
-is left as a follow-up rather than asserted here as
-untestable.
-
-The llog.c and llog_osd.c hunks are not endianness-gated the
-same way: llog_reverse_process()'s walk and
-llog_osd_next_block()'s last_rec bound both run on every
-cluster regardless of byte order, and recovery-small
-test_163 now remounts the MDT after inducing a record-sized
-zero hole with OBD_FAIL_MDS_CHANGELOG_FAIL_WRITE.  OSP also
-requires a complete v2 setattr record before reading its
-extra fields, matching the swabber's length check.
+llog_reverse_process() and llog_osd_next_block() could
+already hand the swabber a record outside the buffer,
+from an lrh_len or tail length neither had checked; both
+now bound it first.  The same checks close a hang in
+llog_reverse_process(): a corrupt on-disk index, or the
+zero-filled hole a failed changelog write can leave, could
+send the reverse walk back over the same chunk forever.
+recovery-small test_163 now remounts the MDT to exercise
+this path; OSP's setattr record read gets the matching v2
+length check. The UPDATE_REC path itself has no new test,
+since recovery-small's update catalog is still empty when
+it runs.
 
 Fixes: cb1290768df9 ("LU-18218 mdd: changelog specific write function")
 Fixes: 4f53536d002c ("LU-3540 lod: update recovery thread")
@@ -299,3 +193,49 @@ Patch Set 3: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/133463/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-13 18:37:28.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comment. The swab bounding itself looks right; the reverse-walk hole handling still misses one case (a hole at the start of a chunk that is before the target chunk).
+
+--- Message (Alexander Boyko, 2026-10-14 06:54:38.000000000) ---
+Patch Set 3: Code-Review-1
+
+(4 comments)
+
+--- Message (patrick bot, 2026-10-14 07:07:02.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+--- Message (patrick bot, 2026-10-14 07:07:37.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-14 07:09:43.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+6 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 07:10:52.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 07:37:49.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133646/ : SUCCESS

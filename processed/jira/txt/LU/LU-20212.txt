@@ -8,9 +8,9 @@ Resolution: Unresolved
 Assignee:   Keguang Xu
 Reporter:   Andreas Dilger
 Created:    Fri, 1 May 2026 05:28:18 +0000
-Updated:    Thu, 11 Jun 2026 01:30:25 +0000
+Updated:    Wed, 14 Oct 2026 11:51:34 +0000
 Labels:     FLR-EC, FLR-EC-RO, FLR-EC-backlog
-Links:      Related: is related to  LU-10911; Related: is related to  LU-17820; Related: is related to  LU-20200; Related: is related to  LU-20211; Related: is related to  LU-20287; Related: is related to  LU-15419; Related: is related to  LU-11962; Related: is related to LU-20354
+Links:      Related: is related to  LU-20718; Related: is related to  LU-20885; Related: is related to  LU-20958; Related: is related to  LU-20959; Related: is related to  LU-20960; Related: is related to  LU-20961; Related: is related to  LU-20962; Related: is related to  LU-20963; Related: is related to  LU-10911; Related: is related to  LU-20708; Related: is related to  LU-17820; Related: is related to  LU-20200; Related: is related to  LU-20211; Related: is related to  LU-20287; Related: is related to  LU-15419; Related: is related to  LU-11962; Related: is related to LU-20354
 
 --- Description ---
 The goal of FLR-EC is to allow a file to be accessible for reads when a file's OST object is inaccessible (for whatever reason), by reconstructing data from a parity object on another OST.
@@ -75,3 +75,71 @@ Commit: 927d0cf1679f51449c2e8c3371924eb583bdbb8b
 
 --- Comment (adilger, Thu, 11 Jun 2026 01:29:30 +0000) ---
 The "lfs quota" operations will also be affected when an OST is offline.  I see this regularly with my home Lustre system where the OSTs are on HDDs that have spun down to save energy.  AFAICS, "lfs quota"  currently fetches the quota usage information from each MDT and OST directly upon request, and there is no cache of the usage information on the QMT, since the command does not return until the HDDs are spun up.  I've filed LU-20354 to track this issue
+
+--- Comment (JIRAUSER24100, Tue, 13 Oct 2026 20:02:52 +0000) ---
+Moving fix version to 2.19 as part of 2.18 release preparation.  If you feel this patch is urgent for 2.18, you can put this back. Note this doesn't stop it landing if ready: if the patch is ready and reviewed, it can still land for 2.18.
+
+--- Comment (adilger, Wed, 14 Oct 2026 11:51:34 +0000) ---
+[Claude] Results of an OST outage test of read-mostly EC files, to find which operations still block.
+
+Setup: single-node VM, 4 MDTs, 8 OSTs, client tree = master + 64919 PS50 (LU-12669 slow/dead OST detection) and the local EC hedge follow-on + 66882 PS34 (LU-20211) + 64086 PS44 (LU-12668).  Directory default -S 1M -c 4 --ec 4+2, 820 files (8x48MiB, 64 medium, 32 to be modified, 4 fio files, a git tree), all resynced to RDONLY before the test.  Client locks and page cache were dropped, then one OST was unmounted for 60s (3 runs) or 300s (1 run) and remounted.  Each operation ran in its own process under strace -tttT on files with a data stripe on that OST, in waves at T0+5s, +25s, +45s and 5s after the remount; kernel stacks of the blocked tasks were sampled.  The same test with a plain -E -1 -c 4 layout was the baseline.
+
+Works on EC files (all  open(), buffered read() and O_DIRECT read() (rebuilt from parity; fio O_DIRECT 4KiB random and 1MiB sequential reads at 50 IOPS stayed below 12ms through the outage), stat()/fstat()/ls -l/du of RDONLY files, lseek(SEEK_END), tar, cp, rename(), link(), unlink(), setxattr()/getxattr(), mkdir(), statfs()/df (lazystatfs).  With the plain layout every one of these that touches the down OST blocks until it returns.  After the remount the blocked operations finished within 1.5-2.5s (recovery took 1s, no evictions).
+
+Still blocks until the OST returns (60s or 300s, then succeeds):
+
+operation
+blocked in
+ticket
+
+mmap read / page fault (e.g. git status, git grep)
+__ll_fault()>cl_io_lock()>osc_lock_enqueue(), and vvp_io_fault_start()>vvp_prep_size()>cl_glimpse_lock()
+LU-20708
+
+lseek(SEEK_DATA/SEEK_HOLE)
+ll_lseek() CIT_LSEEK osc_lock_enqueue()
+LU-20958
+
+fsync() of an unmodified file
+cl_sync_file_range()->osc_io_fsync_end()
+LU-20959
+
+FIEMAP (filefrag)
+lov_object_fiemap()->osc_object_fiemap()
+LU-20960
+
+lfs data_version
+ll_ioc_data_version()->osc_io_data_version_end()
+LU-20961
+
+chmod(), utimes()/touch
+ll_setattr_raw()->cl_setattr_ost() (chmod reaches the OSTs because of ATTR_CTIME)
+LU-20962
+
+chown()
+cl_setattr_ost()
+LU-20287
+
+truncate()/ftruncate()/open(O_TRUNC) to 0, smaller or larger size
+cl_setattr_ost() OST lock enqueue
+LU-20211
+
+lfs df
+osc_statfs()
+LU-20200
+
+write(), append, read of a file whose parity is stale
+expected for ECRO
+ 
+
+Errors returned to applications:
+
+	stat() of an EC file with stale parity (after any write or truncate) returns -EAGAIN: the glimpse loops over the one usable mirror 8 times in ~65ms (lov_io_mirror_init() "move mirror from 0 to 0") and __cl_glimpse_size() returns -EAGAIN once ci_tried_all_mirrors is set.  ls, du and lfs mirror resync of such files fail the same way.  69479 (LU-20885) makes this glimpse block instead, which matches the expectation in this ticket that a file without valid SOM waits for the OST.
+
+	open(O_CREAT|O_APPEND) of a new file under a directory with an EC default layout fails with -EINVAL (git fails to write its reflog), and after an EC default has been parsed every create under a plain v1 directory default handled by the same MDT thread fails with -EINVAL (stale llc_dstripe_count).  Both are fixed by 68932 (LU-20718).
+
+Other findings:
+
+	A file created in the first seconds after the OST went down was allocated a precreated object on it in 2 of 4 runs, and its writes then blocked for the whole outage: LU-20963.
+
+	The LU-20211 trunc(0) layout replace did not trigger when the OST was unmounted, only when the OSP was also deactivated (comment in LU-20211).

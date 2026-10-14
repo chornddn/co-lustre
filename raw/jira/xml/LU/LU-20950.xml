@@ -1,0 +1,112 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20950] lnet: netlink fault command oopses before LNet is configured</title>
+                <link>https://jira.whamcloud.com/browse/LU-20950</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h3&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h3&gt;
+
+&lt;p&gt;&lt;tt&gt;lnetctl fault delay del --all&lt;/tt&gt; causes a kernel oops after insmod of lnet.ko and before the first &lt;tt&gt;lnetctl lnet configure&lt;/tt&gt;. The oops is a NULL pointer dereference in &lt;tt&gt;lnet_delay_rule_del()&lt;/tt&gt;. The oopsed thread holds &lt;tt&gt;delay_dd.dd_mutex&lt;/tt&gt; and &lt;tt&gt;LNET_LOCK_EX&lt;/tt&gt;. After the oops, &lt;tt&gt;lnetctl lnet unconfigure&lt;/tt&gt; stays in D state, LNet cannot unload, and the node needs a reboot.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h3&gt;
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;master at 4a7bddaf15, plus the unlanded &lt;a href="https://jira.whamcloud.com/browse/LU-15909" title="Track Peer/Network credits at peer net/net level - use for path selection" class="issue-link" data-issue-key="LU-15909"&gt;LU-15909&lt;/a&gt; patches. These patches do not change the fault code.&lt;/li&gt;
+	&lt;li&gt;Ubuntu 22.04, kernel 5.15.0-47-generic, x86_64, MLNX_OFED 23.10. Modules loaded with insmod from the build tree.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h3&gt;
+
+&lt;p&gt;This sequence happened during a lab test. We did not run it again as a standalone reproducer.&lt;/p&gt;
+
+&lt;p&gt;1. Load libcfs.ko and lnet.ko with insmod.&lt;br/&gt;
+2. Do not run &lt;tt&gt;lnetctl lnet configure&lt;/tt&gt;.&lt;br/&gt;
+3. Run &lt;tt&gt;lnetctl fault delay del --all&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h3&gt;
+
+&lt;p&gt;The console log:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;BUG: kernel NULL pointer dereference, address: 0000000000000000
+Oops: 0000 [#1] SMP NOPTI
+CPU: 6 PID: 1335053 Comm: lnetctl Tainted: G           OE     5.15.0-47-generic #51-Ubuntu
+RIP: 0010:lnet_delay_rule_del+0x92/0x610 [lnet]
+RSI: 00000000ffffffff RBX: 0000000000000000
+Call Trace:
+ lnet_fault_cmd+0x25a/0xc50 [lnet]
+ genl_family_rcv_msg_doit+0xe7/0x150
+ genl_rcv_msg+0xe2/0x1f0
+ netlink_rcv_skb+0x55/0x100
+ genl_rcv+0x29/0x40
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;tt&gt;lnet_delay_rule_del()&lt;/tt&gt; takes &lt;tt&gt;delay_dd.dd_mutex&lt;/tt&gt; and &lt;tt&gt;lnet_net_lock(LNET_LOCK_EX)&lt;/tt&gt; (RSI = -1). It then walks &lt;tt&gt;the_lnet.ln_delay_rules&lt;/tt&gt;. Only &lt;tt&gt;lnet_prepare()&lt;/tt&gt; initializes that list head, in &lt;tt&gt;LNetNIInit()&lt;/tt&gt;. Before the first &lt;tt&gt;lnet configure&lt;/tt&gt;, the list head is zero, so the walk reads address 0 (RBX = 0).&lt;/p&gt;
+
+&lt;p&gt;The ioctl path does not have this problem. &lt;tt&gt;lnet_ioctl()&lt;/tt&gt; calls &lt;tt&gt;LNetNIInit()&lt;/tt&gt; before &lt;tt&gt;LNetCtl()&lt;/tt&gt;, so &lt;tt&gt;lctl net_delay_del&lt;/tt&gt; initializes LNet first. The netlink handler &lt;tt&gt;lnet_fault_cmd()&lt;/tt&gt; calls the rule functions directly, and it does not check &lt;tt&gt;the_lnet.ln_refcount&lt;/tt&gt;. Other netlink handlers in api-ni.c check &lt;tt&gt;ln_refcount&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;This paragraph is an inference from the source. We did not test it. The other fault operations have the same problem. The functions &lt;tt&gt;lnet_drop_rule_del()&lt;/tt&gt;, &lt;tt&gt;lnet_drop_rule_reset()&lt;/tt&gt; and &lt;tt&gt;lnet_delay_rule_reset()&lt;/tt&gt; walk an uninitialized list. The functions &lt;tt&gt;lnet_drop_rule_add()&lt;/tt&gt; and &lt;tt&gt;lnet_delay_rule_add()&lt;/tt&gt; add a rule to an uninitialized list head.&lt;/p&gt;
+
+&lt;p&gt;The netlink path came from commit f1c66236c6 ("&lt;a href="https://jira.whamcloud.com/browse/LU-10391" title="LNET: Support IPv6" class="issue-link" data-issue-key="LU-10391"&gt;&lt;del&gt;LU-10391&lt;/del&gt;&lt;/a&gt; lnet: Fault injection add/del ioctls to netlink").&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h3&gt;
+
+&lt;p&gt;In &lt;tt&gt;lnet_fault_cmd()&lt;/tt&gt;, take &lt;tt&gt;the_lnet.ln_api_mutex&lt;/tt&gt; and return -ENETDOWN when &lt;tt&gt;the_lnet.ln_refcount&lt;/tt&gt; is 0, as the other netlink handlers do. Add a sanity-lnet test that loads the lnet module, runs each fault command before &lt;tt&gt;lnetctl lnet configure&lt;/tt&gt;, and checks for an error.&lt;/p&gt;</description>
+                <environment />
+        <key id="99890">LU-20950</key>
+            <summary>lnet: netlink fault command oopses before LNet is configured</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="3" iconUrl="https://jira.whamcloud.com/images/icons/statuses/inprogress.png" description="This issue is being actively worked on at the moment by the assignee.">In Progress</status>
+                    <statusCategory id="4" key="indeterminate" colorName="inprogress" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 13 Oct 2026 19:36:11 +0000</created>
+                <updated>Tue, 13 Oct 2026 19:57:54 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="503445" author="gerrit" created="Tue, 13 Oct 2026 19:55:00 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69664" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69664&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20950" title="lnet: netlink fault command oopses before LNet is configured" class="issue-link" data-issue-key="LU-20950"&gt;LU-20950&lt;/a&gt; lnet: reject fault commands before LNet is up&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 069be64bb779c1963de1e2ad6d125ed7bead096a&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071en:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

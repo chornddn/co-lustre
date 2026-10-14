@@ -148,7 +148,7 @@ RHEL 8.8 </environment>
                             <label>ldiskfs</label>
                     </labels>
                 <created>Mon, 12 Oct 2026 21:16:15 +0000</created>
-                <updated>Tue, 13 Oct 2026 10:40:40 +0000</updated>
+                <updated>Wed, 14 Oct 2026 09:22:00 +0000</updated>
                                             <version>Lustre 2.15.8</version>
                                                         <due />
                             <votes>0</votes>
@@ -156,6 +156,136 @@ RHEL 8.8 </environment>
                                                                             <comments>
                             <comment id="503363" author="sebastien" created="Tue, 13 Oct 2026 09:58:47 +0000">&lt;p&gt;Hi &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=eaujames" class="user-hover" rel="eaujames"&gt;eaujames&lt;/a&gt;, thanks for the detailed analysis. Do you plan on investigating further and push a tentative patch, or do you need an ldiskfs expert's eyes?&lt;/p&gt;</comment>
                             <comment id="503368" author="eaujames" created="Tue, 13 Oct 2026 10:40:40 +0000">&lt;p&gt;I have some ideas but I need to discuss about it&lt;/p&gt;</comment>
+                            <comment id="503396" author="eaujames" created="Tue, 13 Oct 2026 14:27:59 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=adilger" class="user-hover" rel="adilger"&gt;adilger&lt;/a&gt;, &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=ablagodarenko" class="user-hover" rel="ablagodarenko"&gt;ablagodarenko&lt;/a&gt; and &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt; can you comment about this?&lt;/p&gt;
+
+&lt;p&gt;For now, I see 2 way to workaround this issue:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;Do we need to keep ldiskfs inodes in kernel LRU cache after the osd objects died? If not, we can mark the inode to be dropped with the preallocation space:
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;void&lt;/span&gt;&lt;/span&gt; iput_final(&lt;span class="code-keyword"&gt;struct&lt;/span&gt; inode *inode) 
+{
+        &lt;span class="code-keyword"&gt;struct&lt;/span&gt; super_block *sb = inode-&amp;gt;i_sb;
+        &lt;span class="code-keyword"&gt;const&lt;/span&gt; &lt;span class="code-keyword"&gt;struct&lt;/span&gt; super_operations *op = inode-&amp;gt;i_sb-&amp;gt;s_op;
+        &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;int&lt;/span&gt;&lt;/span&gt; drop;
+                
+        WARN_ON(inode-&amp;gt;i_state &amp;amp; I_NEW);
+
+        if (op-&amp;gt;drop_inode)
+                drop = op-&amp;gt;drop_inode(inode);
+        &lt;span class="code-keyword"&gt;else&lt;/span&gt;
+                drop = generic_drop_inode(inode);
+
+        if (!drop &amp;amp;&amp;amp;
+            !(inode-&amp;gt;i_state &amp;amp; I_DONTCACHE) &amp;amp;&amp;amp;           &amp;lt;----
+            (sb-&amp;gt;s_flags &amp;amp; SB_ACTIVE)) {
+                inode_add_lru(inode);
+                spin_unlock(&amp;amp;inode-&amp;gt;i_lock); 
+                &lt;span class="code-keyword"&gt;return&lt;/span&gt;;
+        }
+
+        if (!drop) {
+                inode-&amp;gt;i_state |= I_WILL_FREE;
+                spin_unlock(&amp;amp;inode-&amp;gt;i_lock);
+                write_inode_now(inode, 1);
+                spin_lock(&amp;amp;inode-&amp;gt;i_lock);
+                WARN_ON(inode-&amp;gt;i_state &amp;amp; I_NEW);
+                inode-&amp;gt;i_state &amp;amp;= ~I_WILL_FREE;
+        }
+
+        inode-&amp;gt;i_state |= I_FREEING;
+        if (!list_empty(&amp;amp;inode-&amp;gt;i_lru))
+                inode_lru_list_del(inode);
+        spin_unlock(&amp;amp;inode-&amp;gt;i_lock);
+
+        evict(inode);
+}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;We could set the I_DONTCACHE flag to force the inode to be freed .&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+&lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;void&lt;/span&gt;&lt;/span&gt; d_mark_dontcache(&lt;span class="code-keyword"&gt;struct&lt;/span&gt; inode *inode)
+{       
+        &lt;span class="code-keyword"&gt;struct&lt;/span&gt; dentry *de;      
+        
+        spin_lock(&amp;amp;inode-&amp;gt;i_lock);
+        hlist_for_each_entry(de, &amp;amp;inode-&amp;gt;i_dentry, d_u.d_alias) {
+                spin_lock(&amp;amp;de-&amp;gt;d_lock); 
+                de-&amp;gt;d_flags |= DCACHE_DONTCACHE;
+                spin_unlock(&amp;amp;de-&amp;gt;d_lock);
+        }
+        inode-&amp;gt;i_state |= I_DONTCACHE;
+        spin_unlock(&amp;amp;inode-&amp;gt;i_lock);
+}
+EXPORT_SYMBOL(d_mark_dontcache);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;I know that &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=delbaryg" class="user-hover" rel="delbaryg"&gt;delbaryg&lt;/a&gt; ran into issues benchmarking MDS with mdtest: the kswapd kernel threads couldn't keep up with the Lustre threads, and direct reclaim operations were slowing everything down. He had to tune the cache pressure and use tbf to make it work.&lt;/p&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;Dropping the per-inode preallocation space is not efficient on HDD: it causes random I/O across the entire surface of the target volume.&lt;br/&gt;
+Before unmounting the target, we can use ldiskfs_mb_discard_preallocations() to discard preallocations group by group. So we can take advantage of the volume readahead cache (even with flex_bg, the group bitmap are packed by 16).&lt;/li&gt;
+&lt;/ul&gt;
+</comment>
+                            <comment id="503401" author="bzzz" created="Tue, 13 Oct 2026 14:37:39 +0000">&lt;p&gt;if this is umount, then it's safe to discard preallocation and do not mark bitmaps at all:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+void generic_shutdown_super(struct super_block *sb)
+{
+	&lt;span class="code-keyword"&gt;const&lt;/span&gt; struct super_operations *sop = sb-&amp;gt;s_op;
+
+	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (sb-&amp;gt;s_root) {
+		shrink_dcache_for_umount(sb);
+		sync_filesystem(sb);
+		sb-&amp;gt;s_flags &amp;amp;= ~SB_ACTIVE;
+
+		cgroup_writeback_umount();
+
+		&lt;span class="code-comment"&gt;/* Evict all inodes with zero refcount. */&lt;/span&gt;
+		evict_inodes(sb);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;so SB_ACTIVE has been cleared and we can check that in ldiskfs_discard_preallocations()&lt;/p&gt;</comment>
+                            <comment id="503415" author="bzzz" created="Tue, 13 Oct 2026 16:48:55 +0000">&lt;p&gt;just checked and this code seems to pass simple tests:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+--- ../head1/ldiskfs/mballoc.c	2026-10-02 17:15:07.088743878 +0300
++++ ldiskfs/mballoc.c	2026-10-13 19:47:09.496665241 +0300
+@@ -5920,6 +5920,17 @@ repeat:
+ 	}
+ 	write_unlock(&amp;amp;ei-&amp;gt;i_prealloc_lock);
+ 
++	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (!(sb-&amp;gt;s_flags &amp;amp; SB_ACTIVE)) {
++		list_for_each_entry_safe(pa, tmp, &amp;amp;list, u.pa_tmp_list) {
++			ldiskfs_lock_group(sb, group);
++			list_del(&amp;amp;pa-&amp;gt;pa_group_list);
++			ldiskfs_unlock_group(sb, group);
++			list_del(&amp;amp;pa-&amp;gt;u.pa_tmp_list);
++			ldiskfs_mb_pa_free(pa);
++		}
++		&lt;span class="code-keyword"&gt;return&lt;/span&gt;;
++	}
++
+ 	list_for_each_entry_safe(pa, tmp, &amp;amp;list, u.pa_tmp_list) {
+ 		BUG_ON(pa-&amp;gt;pa_type != MB_INODE_PA);
+ 		group = ldiskfs_get_group_number(sb, pa-&amp;gt;pa_pstart);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</comment>
+                            <comment id="503607" author="eaujames" created="Wed, 14 Oct 2026 08:57:13 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt; thanks, your fix seems fine.&lt;/p&gt;
+
+&lt;p&gt;I have misunderstood the code. I was thinking the preallocations was written on-disk bitmaps. But actually, these are written in buddy RAM "file" bitmaps. In our case, the buddy bitmap pages of the group get evicted, so it needs to be reconstructed: it get the on-disk bitmap copy and then re-register block preallocations on it (ext4_mb_generate_from_pa()). But here on umount, we don't care about updating the buddy bitmaps.&lt;/p&gt;
+
+&lt;p&gt;What do you think about dropping the ldiskfs_inode when an osd object is evicted from memory?&lt;br/&gt;
+ # By default the object cache is unlimited, so the kernel shrinker needs scan 2 times to free an ldiskfs_inode. 1 to free the object and 1 to free the ldiskfs inode (referenced by osd object).&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Keep the inode preallocation for unreferenced ldiskfs inode does not make sense. Ext4 cleans the preallocation when the file get released (last close). This have an overhead to reconstruct the buddy page. And this will slowly consume space: if there are no more spaces on the OST, ldiskfs needs to direclty free some preallocations to allocate new blocks.&lt;br/&gt;
+Actually, this would make sense to clear the inode preallocations when the osd_object is not referenced anymore (client LDLM locks get cancelled?).&lt;/li&gt;
+&lt;/ol&gt;
+</comment>
                     </comments>
                     <attachments>
                     </attachments>

@@ -1,0 +1,79 @@
+Key:        LU-20952
+Summary:    Autotest: MPI tests fail when client VMs are on different hosts (UCX Destination is unreachable)
+Link:       https://jira.whamcloud.com/browse/LU-20952
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Charlie Olmstead
+Reporter:   Patrick Bot
+Created:    Tue, 13 Oct 2026 23:20:38 +0000
+Updated:    Tue, 13 Oct 2026 23:21:14 +0000
+Links:      Related: is related to  LU-16658; Related: is related to LU-19659
+
+--- Description ---
+MPI jobs in Autotest sessions fail to start when the two client VMs are on different physical hosts. OpenMPI uses the UCX PML, and the UCX TCP connections between the MPI processes on the two clients time out:
+
+[onyx-140vm20:2804353:0] sock.c:334 UCX ERROR connect(fd=37, dest_addr=10.240.26.129:51651) failed: Connection timed out
+[onyx-140vm20.onyx.whamcloud.com:2804352] pml_ucx.c:419 Error: ucp_ep_create(proc=2) failed: Destination is unreachable
+[onyx-140vm20.onyx.whamcloud.com:2804352] pml_ucx.c:472 Error: Failed to resolve UCX endpoint for rank 2
+[onyx-140vm20:2804353] *** An error occurred in MPI_Comm_split_type
+[onyx-140vm20:2804353] *** MPI_ERRORS_ARE_FATAL (processes in this communicator will now abort,
+
+The test program never runs, so the test fails as "ior failed! 1", "metabench failed! 1" and so on, and every MPI test in the session fails the same way. Most of these are currently linked to LU-19659, whose own symptom (wrong data from ior over NFS) is a different failure.
+
+The mpirun options the tests pass, "--mca btl tcp,self --mca btl_tcp_if_include eth0", do not constrain this: they configure the TCP BTL, and UCX is not the BTL. The connects go to both the 10.240.x (eth0) and the 172.16.x addresses of the other client.
+
+Placement is the cause. Every one of the 9 UCX failures of parallel-scale-nfsv3 test_iorssf between 2026-08-15 and 2026-09-19 had its two clients on different physical hosts:
+
+date
+test set
+clients
+
+ 2026-09-19 
+ https://testing.whamcloud.com/test_sets/392d085c-4a1a-45d6-9652-c167676d6ccb 
+ onyx-144vm31, onyx-69vm3 
+
+ 2026-09-01 
+ https://testing.whamcloud.com/test_sets/25ead903-f3e1-4d2f-9a7f-2c990f6bfbc9 
+ onyx-140vm20, onyx-77vm14 
+
+ 2026-08-31 
+ https://testing.whamcloud.com/test_sets/77b81385-bd94-4037-bf6f-078dda10c9d4 
+ onyx-158vm116, onyx-159vm79 
+
+ 2026-08-31 
+ https://testing.whamcloud.com/test_sets/adc01a80-4b3e-41a5-bc58-8d57d8f49ea3 
+ onyx-158vm62, onyx-159vm20 
+
+ 2026-08-29 
+ https://testing.whamcloud.com/test_sets/abead7ab-827e-43b8-83d9-8ff439079859 
+ onyx-159vm54, onyx-75vm2 
+
+ 2026-08-27 
+ https://testing.whamcloud.com/test_sets/a63f85a9-b27a-49c7-854e-2b524164ba26 
+ onyx-140vm34, onyx-69vm12 
+
+ 2026-08-25 
+ https://testing.whamcloud.com/test_sets/59d28123-67bb-4b8e-8c09-cd271641ae40 
+ onyx-158vm201, onyx-159vm48 
+
+ 2026-08-23 
+ https://testing.whamcloud.com/test_sets/bedca1fc-7b5a-42e4-8357-0317ab2f361e 
+ onyx-158vm217, onyx-159vm119 
+
+ 2026-08-15 
+ https://testing.whamcloud.com/test_sets/2e66882f-b17c-45df-a73a-7796af1935b9 
+ onyx-144vm40, onyx-69vm9 
+
+All 34 passing runs of the same test on lustre-master over the last 60 days had both clients on the same host (onyx-145vm1 and onyx-145vm2, trevis-152vm24 and trevis-152vm9, and so on). So MPI across hosts appears to fail every time; it shows up as a rare failure only because the two clients are usually placed together. LNet between nodes on different hosts works in the same sessions (the servers are on other hosts), so it is the MPI processes' connections to ephemeral ports that do not get through.
+
+Possible fixes, in Autotest rather than Lustre:
+
+	keep the client VMs of a session on one physical host, or
+
+	allow the inter-host traffic the client VMs need (ephemeral TCP ports between clients), or
+
+	restrict UCX to a working interface (UCX_NET_DEVICES=eth0) or select the TCP BTL (--mca pml ob1) in MPIRUN_OPTIONS. Not tested; if ephemeral ports between hosts are blocked, the TCP BTL may hit the same wall.
+
+Related: LU-16658 (2023, performance-sanity, UCX "Destination is unreachable"; resolved by disabling the test).

@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Hongchao Zhang
 Reporter:   Oleg Drokin
 Created:    Mon, 12 May 2025 07:03:15 +0000
-Updated:    Wed, 20 May 2026 23:30:17 +0000
+Updated:    Tue, 13 Oct 2026 20:02:21 +0000
 Labels:     easy, smatch
 Links:      Related: is related to  LU-18212; Related: is related to  LU-2681
 
@@ -44,26 +44,35 @@ For example:
 
 With the saving grace here being that all values are actually then explicitly compared.
 
---- Comment (gerrit, Wed, 20 May 2026 23:30:17 +0000) ---
-"Sonia Sharma " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66042
+--- Comment (adilger, Tue, 13 May 2025 23:32:35 +0000) ---
+Overall these values are definet as if they are the bits in a bitmask, but are never used as such which makes everything super confusing, so probably ripe for some rework?
 
-Subject: LU-19004 target: fix LL_IOC_FID2MDTIDX MDT range check
+#define LU_SEQ_RANGE_MDT        0x0
+#define LU_SEQ_RANGE_OST        0x1
+#define LU_SEQ_RANGE_ANY        0x3
+#define LU_SEQ_RANGE_MASK       0x3
 
-Project: fs/lustre-release
+These constants are in lustre_idl.h so they form part of the on-disk format and/or network protocol, so they cannot just be changed.  It looks like the check should be changed to use the existing helper functions that implement this correctly (which I found after I had proposed an almost identical helper function to implement this check):
 
-Branch: master
+                if (fld_range_is_mdt(&u.range))
+                        err = u.range.lsr_index;
 
-Current Patch Set: 1
+--- Comment (adilger, Tue, 13 May 2025 23:36:11 +0000) ---
+Note, it appears that this is the only similar misuse of LU_SEQ_RANGE_MDT as a mask.  All other users either set or check equivalence to either LU_SEQ_RANGE_MDT or LU_SEQ_RANGE_OST.
 
-Commit: 926baefe586df6547968003a7fa3ed2b83de18a0
+--- Comment (green, Wed, 14 May 2025 01:40:25 +0000) ---
+yes, misuse is just one place, but it's facilitated by very unfortunate and confusing naming of these defines and surrounding functions.
 
---- Comment (bzzz, Mon, 18 May 2026 07:46:32 +0000) ---
-fld_range_is_mdt(&u.range) looks clear, short and self-explaining to me.
+So we have to address that as well or more similar breakage would appear.
 
---- Comment (green, Sun, 17 May 2026 06:44:30 +0000) ---
-I have no strong opinion and suspect we should drop the MASK and go to comparisons.
+E.g. I think the whole "MASK" thing could be removed and all users revisited"
 
-Was hoping to get a bit of a comment from bzzz
+--- Comment (green, Wed, 14 May 2025 02:14:37 +0000) ---
+soundslike the only user of the _MASK is fld_range_type
+
+And the only user of fld_range_type outside of fld_range_is_xxx is fld_local_lookup.
+
+I wonder what stops us from dropping fld_range_type completely and replace it with just using hte range value directly in all cases?
 
 --- Comment (JIRAUSER19573, Sat, 16 May 2026 20:05:47 +0000) ---
 Oleg - I happened to look at this and thinking if we drop the fld_range_type() and thus also LU_SEQ_RANGE_MASK then we will compare range->lsr_flags directly with the assumption that it will always have bits that are defined in the types (I do see everywhere else, the code is actually doing that)
@@ -87,32 +96,26 @@ static inline void fld_range_set_type(struct lu_seq_range *range, unsigned flags
      range->lsr_flags |= flags & LU_SEQ_RANGE_MASK;
 }
 
---- Comment (green, Wed, 14 May 2025 02:14:37 +0000) ---
-soundslike the only user of the _MASK is fld_range_type
+--- Comment (green, Sun, 17 May 2026 06:44:30 +0000) ---
+I have no strong opinion and suspect we should drop the MASK and go to comparisons.
 
-And the only user of fld_range_type outside of fld_range_is_xxx is fld_local_lookup.
+Was hoping to get a bit of a comment from bzzz
 
-I wonder what stops us from dropping fld_range_type completely and replace it with just using hte range value directly in all cases?
+--- Comment (bzzz, Mon, 18 May 2026 07:46:32 +0000) ---
+fld_range_is_mdt(&u.range) looks clear, short and self-explaining to me.
 
---- Comment (green, Wed, 14 May 2025 01:40:25 +0000) ---
-yes, misuse is just one place, but it's facilitated by very unfortunate and confusing naming of these defines and surrounding functions.
+--- Comment (gerrit, Wed, 20 May 2026 23:30:17 +0000) ---
+"Sonia Sharma " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/66042
 
-So we have to address that as well or more similar breakage would appear.
+Subject: LU-19004 target: fix LL_IOC_FID2MDTIDX MDT range check
 
-E.g. I think the whole "MASK" thing could be removed and all users revisited"
+Project: fs/lustre-release
 
---- Comment (adilger, Tue, 13 May 2025 23:36:11 +0000) ---
-Note, it appears that this is the only similar misuse of LU_SEQ_RANGE_MDT as a mask.  All other users either set or check equivalence to either LU_SEQ_RANGE_MDT or LU_SEQ_RANGE_OST.
+Branch: master
 
---- Comment (adilger, Tue, 13 May 2025 23:32:35 +0000) ---
-Overall these values are definet as if they are the bits in a bitmask, but are never used as such which makes everything super confusing, so probably ripe for some rework?
+Current Patch Set: 1
 
-#define LU_SEQ_RANGE_MDT        0x0
-#define LU_SEQ_RANGE_OST        0x1
-#define LU_SEQ_RANGE_ANY        0x3
-#define LU_SEQ_RANGE_MASK       0x3
+Commit: 926baefe586df6547968003a7fa3ed2b83de18a0
 
-These constants are in lustre_idl.h so they form part of the on-disk format and/or network protocol, so they cannot just be changed.  It looks like the check should be changed to use the existing helper functions that implement this correctly (which I found after I had proposed an almost identical helper function to implement this check):
-
-                if (fld_range_is_mdt(&u.range))
-                        err = u.range.lsr_index;
+--- Comment (JIRAUSER24100, Tue, 13 Oct 2026 20:02:21 +0000) ---
+Moving fix version to 2.19 as part of 2.18 release preparation.  If you feel this patch is urgent for 2.18, you can put this back. Note this doesn't stop it landing if ready: if the patch is ready and reviewed, it can still land for 2.18.
