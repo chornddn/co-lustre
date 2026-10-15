@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-09-09 03:23:05.000000000
-Updated:    2026-09-24 20:03:12.000000000
-Patch Set:  3
-Insertions: +1256
-Deletions:  -1
-Comments:   17 (1 unresolved)
+Updated:    2026-10-15 07:40:29.000000000
+Patch Set:  5
+Insertions: +1373
+Deletions:  -2
+Comments:   18 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -50,21 +50,24 @@ after every record produced before it has been handed out, so the
 batches before it are whole; a close on a running scan stops it, and
 that is not an error.
 
-A handle belongs to one consumer thread, and that is enforced rather
-than only stated: llapi_scan_next() and llapi_scan_close() refuse a
-second caller with -EBUSY.  Without it a second consumer resets the
-batch the first is still reading and installs one whose sb_count is
-already sb_cap, and the next append writes past the end of sb_recs --
-reproduced under ASan on the unfixed build, five runs out of five, and
-gone on the fixed one, which serves every object once.  It is the
-opposite of the callback API's rule, where the callback runs on every
-scan thread at once, so it is said in the header and the man page too.
+A handle belongs to one consumer thread, and that is enforced:
+llapi_scan_next() and llapi_scan_close() refuse a second caller with
+-EBUSY.  A second consumer would reset the batch the first is still
+reading, and the next append would write past the end of sb_recs.
+This is the opposite of the callback API's rule, where the callback
+runs on every scan thread at once, so the header and the man page say
+it too.
 
-The arena keeps every chunk across a reset rather than the largest.
-A batch needing two chunks -- about 320 bytes of payload per record at
-the 1024 default, which a path plus an 8-stripe layout reaches --
-otherwise malloc'd and freed the second on every batch, which is what
-the comment said it did not do.
+The arena keeps all its chunks across a reset, so a scan in steady
+state allocates nothing per batch, even when a batch needs more than
+one chunk (about 320 bytes per record at the 1024 default, which a
+path and an 8-stripe layout reach).
+
+llapi_scan_close() stops the scan even when lfsp_filter is rejecting
+every object.  A rejected object never reaches the callback, where
+the stop is checked, so the filter wrapper checks it too.  Without
+that, a search that takes the first match and closes waits for the
+rest of the tree to be read.
 
 Measured on a 20k-object tree off Lustre, where per-object work is a
 cached lstat() and the copy is at its largest share: a batch of 1024
@@ -73,9 +76,9 @@ at one (+5%); a batch of 1 costs 2-4 us, the lock round trip per
 record.  On a scan whose per-object work is an ioctl the same copy is
 a fraction of a percent, which the man page says.
 
-test16 rides along: it asks llapi_scan_namespace() what lfsp_got
-reports, which is the callback API and not this one, and belongs with
-whichever change lands lfsp_got.
+test16 is not about batches.  It checks that lfsp_got, which landed
+with llapi_scan_namespace() without a test of its own, drops the
+fields a namespace walk cannot answer.
 
 llapi_scan_next.3 says when a batch stops being the consumer's, not
 only that it does.  The release happens at the top of the following
@@ -83,14 +86,13 @@ llapi_scan_next(), before that call waits for the scan rather than
 when it returns, so a consumer that hands a batch to another thread
 and calls again to overlap the next fill has released what that thread
 is reading -- and the -EBUSY that refuses a second caller does not
-refuse a reader racing one.  The arena is rewound rather than freed,
-which is what makes a steady-state scan allocate nothing per batch, so
-that reader finds the following batch's bytes and not a fault.
+refuse a reader racing one.  What that reader sees is undefined: it
+may read a mix of two records or crash.
 
 The -EBUSY case is made rather than waited for.  A second consumer is
 refused only while the first is inside llapi_scan_next(), and a test
 that calls from between two of them never reaches the guard it is
-about -- the ASan overflow above cannot fail it.  A filter that sleeps
+about -- the overflow above cannot fail it.  A filter that sleeps
 holds the scan back so the third call blocks; two calls come first,
 the layer filling one batch ahead and the consumer not blocking until
 it has drained that.  The overlap is then measured, not assumed: a
@@ -209,3 +211,54 @@ Patch Set 3:
 Patch Set 3:
 
 PS3 is out of date. I will refresh it after the patches below it land.
+
+--- Message (Hiroshi Nishida, 2026-10-14 23:22:38.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-10-14 23:22:50.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 23:25:52.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-14 23:26:32.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-15 02:11:18.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133714/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-10-15 04:29:30.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-15 04:36:37.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-15 05:02:45.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-15 07:39:20.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133741/ : SUCCESS

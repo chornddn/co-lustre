@@ -1,5 +1,5 @@
 Change:     64086
-Subject:    LU-12668 lov: handle ESHUTDOWN for LSEEK on EC files
+Subject:    LU-20958 lov: report unavailable EC stripes as data for lseek
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64086
 Change-Id:  I5cce4e0ea51c68b0c6fda1d83b694af19cad57bd
 Project:    fs/lustre-release
@@ -7,51 +7,52 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-02-17 16:47:13.000000000
-Updated:    2026-08-19 23:24:40.000000000
-Patch Set:  44
-Insertions: +46
-Deletions:  -0
-Comments:   34 (16 unresolved)
+Updated:    2026-10-14 21:57:36.000000000
+Patch Set:  45
+Insertions: +164
+Deletions:  -9
+Comments:   35 (16 unresolved)
 Topic:      ec2
 Hashtags:   pt_ecro
 
 --- Labels ---
-  Code-Review: Marc Vef: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Patrick Farrell, kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Zhenyu Xu, Marc Vef
+  CC: Patrick Farrell, kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Zhenyu Xu, Andreas Dilger, Marc Vef
 
 --- Commit Message ---
-LU-12668 lov: handle ESHUTDOWN for LSEEK on EC files
+LU-20958 lov: report unavailable EC stripes as data for lseek
 
-When an OST hosting a data stripe of an EC file is
-deactivated, SEEK_DATA/SEEK_HOLE fails with ESHUTDOWN
-because the error propagates through the LOV layer
-during sub-lock enqueue.
+SEEK_DATA/SEEK_HOLE on an EC file with a data stripe on an OST that
+is deactivated fails with -ESHUTDOWN, and with an OST that is down,
+e.g. during an OSS failover, the lseek waits for the OST to return,
+although reads of the file are rebuilt from parity at once.
 
-Fix this by marking the degraded stripe LSS_READ_ERR
-in lov_lock_enqueue (same mechanism used by CIT_EC_RD
-for parity recovery), then skipping those stripes in
-lov_io_call and lov_io_lseek_end.  This avoids
-ESHUTDOWN leaking through three independent paths:
-sub-lock enqueue, sub-IO function dispatch, and
-sub-IO ci_result propagation during unlock.
+Do the lseek with no-delay lock enqueues, as reads do.  When the
+sub-lock enqueue of a stripe in an EC data component fails, mark it
+in this IO's lov_io_sub::sub_ec_err, do not start its sub-IO, and
+report the stripe as data from where the IO starts in it, with no
+hole before its end.  That is always a correct answer: a seek must
+not skip data, but may report a hole as data.  Retry with blocking
+enqueues once every mirror has been tried.  The unavailable stripe
+leaves its size out of the merged stripe attributes, so take EOF from
+the strict SOM size from the MDS instead, as stat() does.  Without
+one, wait for the OST, or return -EIO if it stays unavailable, rather
+than miss data past a smaller EOF.  Since
+such a stripe has no hole at its end, report the hole at EOF for
+SEEK_HOLE if nothing before it is found, and -ENXIO for SEEK_DATA at
+EOF.  A stripe whose extent lock is still cached is locked locally,
+so its OST_SEEK still waits for the OST.
 
-Add lov_lsm_has_parity() helper to check if any
-layout entry has parity, needed because CIT_LSEEK
-locks the data component while parity lives in a
-separate entry.
+Add sanity-ec test_79a, which stops the OST of a stripe.
 
-This fixes lfs mirror verify failing on EC files
-when any data OST is deactivated.
-
-Generated with Claude Code + Tools
-
-Test-Parameters: testlist=sanity-ec
-Test-Parameters: testlist=sanity-ec fstype=zfs
-Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Test-Parameters: testlist=sanity-ec ostcount=8
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
 Change-Id: I5cce4e0ea51c68b0c6fda1d83b694af19cad57bd
 
 --- Review History ---
@@ -1109,3 +1110,44 @@ Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.1-x86_6
 Patch Set 44: Code-Review-1
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-10-14 18:44:17.000000000) ---
+Patch Set 44:
+
+Agreed with the PS40/PS42 comments that skipping the degraded stripe can report a hole over data that read() would return, so cp/tar may silently drop it.  This was also hit in the LU-20212 outage testing (LU-20958), where an OST that is down rather than deactivated makes lseek wait for the whole outage.
+
+I am reworking this locally: lseek uses no-delay lock enqueues like reads, a stripe in an EC data component whose sub-lock enqueue fails is marked only in this IO (lov_io_sub::sub_ec_err from 69346, LU-12669 EC per-IO errors, instead of the shared lso_status that is never cleared) and is reported as data from where the IO starts in it with no hole before its end.  It then sits on 69346 instead of 65219, which it does not depend on, and adds sanity-ec test_79a, which stops the OST.  I will upload it once it has been reviewed locally.
+
+--- Message (Andreas Dilger, 2026-10-14 21:34:21.000000000) ---
+Uploaded patch set 45.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-14 21:34:34.000000000) ---
+Patch Set 45:
+
+@patrick-bot@mulberrytree.us watch level retest
+
+--- Message (wc-checkpatch, 2026-10-14 21:34:36.000000000) ---
+Patch Set 45:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-10-14 21:35:36.000000000) ---
+Patch Set 45:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-14 21:38:37.000000000) ---
+Patch Set 45:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-14 21:56:36.000000000) ---
+Patch Set 45: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133691/ : SUCCESS

@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   Artem Blagodarenko
 Reporter:   Artem Blagodarenko
 Created:    Sat, 26 Sep 2026 15:53:51 +0000
-Updated:    Tue, 13 Oct 2026 09:58:44 +0000
-Links:      Related: is related to  LU-8980; Related: is related to  LU-19410
+Updated:    Thu, 15 Oct 2026 14:52:35 +0000
+Links:      Related: is related to  LU-8980; Related: is related to  LU-19410; Related: is related to  LU-20966
 
 --- Description ---
 The libcfs debug log (lctl debug / dk) is reliable and always
@@ -118,3 +118,27 @@ The patch moves the function out of line into tracefile.c; nothing else changes.
 I reproduced your error with gcc 8.5.0 against el8 4.18 kernel headers with CONFIG_OPTIMIZE_INLINING turned off, and the build passes there with the patch. It also builds with the stock el8 config and on 6.12, where sanity test_60k passes.
 
 I am assuming your kernel has that option off. Could you confirm (grep OPTIMIZE_INLINING in the kernel .config) and check that the patch fixes the build for you?
+
+--- Comment (adilger, Thu, 15 Oct 2026 10:57:19 +0000) ---
+[Claude] Since https://review.whamcloud.com/69231 landed (commit dbaef8ffa680), master fails to build for RHEL 8.10 on aarch64 (kernel 4.18.0-553.155.1.el8_10, el8 gcc 8.5), in libcfs:
+
+libcfs/include/trace/events/lustre_debug.h:43: error: function 'lustre_debug_vlen' can never be inlined because it uses variable argument lists
+
+lustre_debug_vlen() is a static inline that calls va_copy()/va_end() on vaf->va. On aarch64 va_list is a structure, and gcc 8 refuses to inline any function that uses the va_* builtins. Plain master at ee61b3f6dd57 fails the same way. With dbaef8ffa680 reverted, the same tree builds on rhel8.10.
+
+Not checked: rhel8.10 x86_64.
+
+Possible fixes: make lustre_debug_vlen() an out-of-line function in libcfs (exported if modules need it), mark it noinline, or move the va_copy() into the tracepoint's TP_fast_assign() caller.
+
+Artem, could you please take a look?
+
+--- Comment (JIRAUSER18021, Thu, 15 Oct 2026 14:52:35 +0000) ---
+Andreas, the fix is in https://review.whamcloud.com/c/fs/lustre-release/+/69643 (it already has master-next). ee61b3f6dd57 is its parent, so the tree you tested didn't have it yet.
+
+The cause isn't specific to how aarch64 handles va_list. In 4.18 include/linux/compiler_types.h makes inline into always_inline unless both CONFIG_ARCH_SUPPORTS_OPTIMIZED_INLINING and CONFIG_OPTIMIZE_INLINING are set. gcc refuses always_inline for a function that uses va_copy(). In 4.18 only x86 selects ARCH_SUPPORTS_OPTIMIZED_INLINING, so every el8 aarch64 kernel hits this. On x86_64 it only shows up when CONFIG_OPTIMIZE_INLINING is off, which is what Alex had. The patch moves lustre_debug_vlen() out of line into tracefile.c, its only user, so no inline is involved on any arch.
+
+I built both trees natively on aarch64 (Rocky 8.10 chroot, gcc 8.5.0, kernel-devel 4.18.0-553.173.1.el8_10, --disable-server):
+
+	ee61b3f6dd57: fails with the same error (lustre_debug.h:43:19: error: function 'lustre_debug_vlen' can never be inlined because it uses variable argument lists)
+
+	ee61b3f6dd57 + 69643: builds, all 24 modules

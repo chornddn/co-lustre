@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Alexander Zarochentsev
 Reporter:   Alexander Zarochentsev
 Created:    Fri, 21 Mar 2025 19:37:29 +0000
-Updated:    Tue, 13 Oct 2026 22:40:29 +0000
+Updated:    Wed, 14 Oct 2026 21:48:16 +0000
 Links:      Related: is related to  LU-20877; Related: is related to  LU-20831
 
 --- Description ---
@@ -212,3 +212,25 @@ paf0186 I think you had a patch in your rename locking series that fixed this is
 I'd be a little wary of "fixes this issue"; I've found a number of weird race conditions.  They fix bugs that could probably cause this, but I wouldn't want to say for sure they fix this issue entirely.
 
 I'd want to have someone/a bot play with whatever was the reproducer here first before I was sure.
+
+--- Comment (JIRAUSER24100, Wed, 14 Oct 2026 20:36:54 +0000) ---
+Status of the 2.18 blocker here: the duplicate-name fixes (64468, 66833) are merged, but the layout version check they added can LBUG the MDS, and nothing posted so far fixes that. 69430 (LU-20831) does not touch this path.
+
+The crash: LASSERT(S_ISREG(...)) in lod_layout_check(), reached via mdt_layout_version_check() from mdt_reint_open(). Six hits with that stack between 2026-06-05 and 2026-07-10, all in racer. None since, but racer has not run file or directory migration by default since 2026-08-02 (LU-17620), so that proves nothing.
+
+Cause: mdt_reint_open() never checks that the parent exists (mdt_reint_create() does, with mdt_object_exists()). A normal open-create is stopped by its lookup, but a volatile open (lfs migrate, lfs mirror extend) takes LCK_NL and skips both lookups, so a parent that was removed or migrated away reaches lod_layout_check() with no type bits and hits the assertion.
+
+Fix: in mdt_reint_open(), after mdt_object_find() for the parent, return -ENOENT (or -ESTALE, which the client retries) when the parent does not exist, as mdt_reint_create() does; and have lod_layout_check() return an error rather than assert on an object that is neither a directory nor a regular file. A test: a volatile open (lfs migrate of a file) racing rmdir or migration of its directory.
+
+--- Comment (gerrit, Wed, 14 Oct 2026 21:48:16 +0000) ---
+"patrick bot " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69695
+
+Subject: LU-18847 mdt: check open parent exists
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 235a80abe8ed62e06f0db1033e61b18b6b1865eb

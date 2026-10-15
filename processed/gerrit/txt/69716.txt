@@ -1,0 +1,120 @@
+Change:     69716
+Subject:    LU-20924 ldiskfs: allocate hybrid metadata in IOPS groups
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69716
+Change-Id:  I71c2e85f43279f01a507245371b5ed62d53ebbe5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-10-15 10:56:38.000000000
+Updated:    2026-10-15 11:25:00.000000000
+Patch Set:  1
+Insertions: +7153
+Deletions:  -1728
+Comments:   1 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: patrick bot
+
+--- Commit Message ---
+LU-20924 ldiskfs: allocate hybrid metadata in IOPS groups
+
+Previously, on a hybrid ldiskfs with EXT4_BG_IOPS groups on flash,
+directory, xattr and extent index blocks were almost never allocated
+in the IOPS groups.  The goal group and the s_mb_max_linear_groups
+linear scan were tried before the IOPS lists, and the metadata goal
+was in the HDD groups next to the inode.  The IOPS lists were only
+searched at the two fast criteria, and only once a group's buddy was
+loaded, so metadata fell back to HDD whenever those missed.  The data
+fallback into IOPS groups at CR_ANY_FREE was dead code, and with
+mb_enable_iops_data=1 data used IOPS groups as soon as the fast HDD
+lists missed.  Free IOPS space was counted as available for data, so
+with mb_enable_iops_data=0 a full HDD region made delalloc writeback
+loop on ENOSPC, and statfs and OST grants reported space data could
+not use.
+
+Rework all copies of ext4-mballoc-for-hybrid.patch (rhel8, rhel9.4,
+rhel10.0, rhel10.2, linux-6.12) and add it to the 7.0-ml and ubuntu26
+series as linux-7.0, so each allocation has a scan state limiting it
+to one class of groups.  Metadata (no EXT4_MB_HINT_DATA) searches only
+IOPS groups through all criteria, from an IOPS goal mapped from its
+original goal, and falls back to the non-IOPS groups only if that pass
+fails.  Data searches only the non-IOPS groups, and IOPS groups only
+after that and if mb_enable_iops_data is set or the blocks are
+delalloc-reserved.  The class check in ext4_mb_good_group_nolock() and
+ext4_mb_find_by_goal() covers the goal, linear and list scans, and the
+IOPS pass scans linearly only a sorted array of the IOPS groups.  The
+IOPS lists are the upper half of the existing list or xarray arrays,
+replacing the _iops copies of the scan functions.
+
+Track free IOPS clusters in a percpu counter, shown in sysfs file
+mb_iops_free_clusters, and exclude them from the space available for
+data unless mb_enable_iops_data is set, and search IOPS groups last
+for metadata when none are free.  If only some inode tables are in
+IOPS groups (flash appended to the filesystem), place new directory
+inodes in groups whose inode table is in an IOPS group, spreading them
+by name hash, randomly or by a hash of the parent's inode number.  Map
+the data goal of files with inodes in IOPS groups onto the non-IOPS
+groups.  Load the IOPS group buddies at mount and read-write remount.
+Treat EA inode blocks, quota files, the orphan file (not on rhel8) and
+files with the new EXT4_STATE_META_ALLOC inode state as metadata on
+hybrid filesystems, so osd-ldiskfs can place its internal files and
+llog headers in IOPS groups.  In the xarray copies, return after the
+s_mb_max_linear_groups scan if it covered all groups (e.g. exactly
+that many IOPS groups) and moved to the next criteria, which could
+reach the WARN_ON() in ext4_mb_scan_groups() at CR_GOAL_LEN_SLOW.
+
+Add conf-sanity test_170 to check placement, including quota files,
+both fallbacks and the free IOPS cluster count.  Refresh the rhel8.8
+fstrim patch context.
+
+Placement on rhel9.7, 1000MiB dm-linear device, groups 0-3 IOPS:
+                                      master        patched
+  dir blocks in IOPS                  0/124         124/124
+  xattr blocks in IOPS                0/40          40/40
+  extent index blocks in IOPS         0/2           2/2
+  data blocks in IOPS                 0             0
+  dir blocks, IOPS full / freed       0/31 / 0/31   0/31 / 31/31
+  data, HDD fragmented, iops_data=1   256/256       0/256
+  dir inodes, itables in 24-31 IOPS   28/80         80/80
+
+Fixes: 05e487a01b40 ("LU-16750 ldiskfs: optimize metadata allocation for hybrid LUNs")
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
+Change-Id: I71c2e85f43279f01a507245371b5ed62d53ebbe5
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-10-15 10:56:38.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Andreas Dilger, 2026-10-15 10:56:59.000000000) ---
+Patch Set 1:
+
+@patrick-bot@mulberrytree.us watch level retest
+
+--- Message (patrick bot, 2026-10-15 10:57:19.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-15 10:57:20.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-15 11:00:30.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-15 11:24:09.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133764/ : SUCCESS

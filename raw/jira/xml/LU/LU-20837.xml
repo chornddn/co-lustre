@@ -51,10 +51,10 @@ OpenTelemetry pipelines.&lt;/p&gt;</description>
                         <labels>
                     </labels>
                 <created>Sat, 26 Sep 2026 15:53:51 +0000</created>
-                <updated>Tue, 13 Oct 2026 09:58:44 +0000</updated>
+                <updated>Thu, 15 Oct 2026 14:52:35 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>5</watches>
+                                    <watches>6</watches>
                                                                             <comments>
                             <comment id="502193" author="gerrit" created="Sat, 26 Sep 2026 16:32:46 +0000">&lt;p&gt;"Artem Blagodarenko &amp;lt;ablagodarenko@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69231" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69231&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20837" title="libcfs: add tracepoints for Lustre debug messages" class="issue-link" data-issue-key="LU-20837"&gt;LU-20837&lt;/a&gt; libcfs: add tracepoints for Lustre debug messages&lt;br/&gt;
@@ -93,6 +93,30 @@ Commit: 37692d0d9a5ed497cc834175f39b0cf900b4703c&lt;/p&gt;</comment>
 &lt;p&gt;I reproduced your error with gcc 8.5.0 against el8 4.18 kernel headers with &lt;tt&gt;CONFIG_OPTIMIZE_INLINING&lt;/tt&gt; turned off, and the build passes there with the patch. It also builds with the stock el8 config and on 6.12, where sanity test_60k passes.&lt;/p&gt;
 
 &lt;p&gt;I am assuming your kernel has that option off. Could you confirm (&lt;tt&gt;grep OPTIMIZE_INLINING&lt;/tt&gt; in the kernel .config) and check that the patch fixes the build for you?&lt;/p&gt;</comment>
+                            <comment id="503698" author="adilger" created="Thu, 15 Oct 2026 10:57:19 +0000">&lt;p&gt;&lt;span class="error"&gt;&amp;#91;Claude&amp;#93;&lt;/span&gt; Since &lt;a href="https://review.whamcloud.com/69231" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69231&lt;/a&gt; landed (commit dbaef8ffa680), master fails to build for RHEL 8.10 on aarch64 (kernel 4.18.0-553.155.1.el8_10, el8 gcc 8.5), in libcfs:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;libcfs/include/trace/events/lustre_debug.h:43: error: function 'lustre_debug_vlen' can never be inlined because it uses variable argument lists
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;lustre_debug_vlen() is a static inline that calls va_copy()/va_end() on vaf-&amp;gt;va. On aarch64 va_list is a structure, and gcc 8 refuses to inline any function that uses the va_* builtins. Plain master at ee61b3f6dd57 fails the same way. With dbaef8ffa680 reverted, the same tree builds on rhel8.10.&lt;/p&gt;
+
+&lt;p&gt;Not checked: rhel8.10 x86_64.&lt;/p&gt;
+
+&lt;p&gt;Possible fixes: make lustre_debug_vlen() an out-of-line function in libcfs (exported if modules need it), mark it noinline, or move the va_copy() into the tracepoint's TP_fast_assign() caller.&lt;/p&gt;
+
+&lt;p&gt;Artem, could you please take a look?&lt;/p&gt;</comment>
+                            <comment id="503707" author="JIRAUSER18021" created="Thu, 15 Oct 2026 14:52:35 +0000">&lt;p&gt;Andreas, the fix is in &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69643" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69643&lt;/a&gt; (it already has master-next). ee61b3f6dd57 is its parent, so the tree you tested didn't have it yet.&lt;/p&gt;
+
+&lt;p&gt;The cause isn't specific to how aarch64 handles &lt;tt&gt;va_list&lt;/tt&gt;. In 4.18 &lt;tt&gt;include/linux/compiler_types.h&lt;/tt&gt; makes &lt;tt&gt;inline&lt;/tt&gt; into &lt;tt&gt;always_inline&lt;/tt&gt; unless both &lt;tt&gt;CONFIG_ARCH_SUPPORTS_OPTIMIZED_INLINING&lt;/tt&gt; and &lt;tt&gt;CONFIG_OPTIMIZE_INLINING&lt;/tt&gt; are set. gcc refuses always_inline for a function that uses &lt;tt&gt;va_copy()&lt;/tt&gt;. In 4.18 only x86 selects &lt;tt&gt;ARCH_SUPPORTS_OPTIMIZED_INLINING&lt;/tt&gt;, so every el8 aarch64 kernel hits this. On x86_64 it only shows up when &lt;tt&gt;CONFIG_OPTIMIZE_INLINING&lt;/tt&gt; is off, which is what Alex had. The patch moves &lt;tt&gt;lustre_debug_vlen()&lt;/tt&gt; out of line into &lt;tt&gt;tracefile.c&lt;/tt&gt;, its only user, so no &lt;tt&gt;inline&lt;/tt&gt; is involved on any arch.&lt;/p&gt;
+
+&lt;p&gt;I built both trees natively on aarch64 (Rocky 8.10 chroot, gcc 8.5.0, kernel-devel 4.18.0-553.173.1.el8_10, &lt;tt&gt;--disable-server&lt;/tt&gt;):&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;ee61b3f6dd57: fails with the same error (&lt;tt&gt;lustre_debug.h:43:19: error: function 'lustre_debug_vlen' can never be inlined because it uses variable argument lists&lt;/tt&gt;)&lt;/li&gt;
+	&lt;li&gt;ee61b3f6dd57 + 69643: builds, all 24 modules&lt;/li&gt;
+&lt;/ul&gt;
+</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">
@@ -103,6 +127,9 @@ Commit: 37692d0d9a5ed497cc834175f39b0cf900b4703c&lt;/p&gt;</comment>
         </issuelink>
             <issuelink>
             <issuekey id="92410">LU-19410</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="99907">LU-20966</issuekey>
         </issuelink>
                             </outwardlinks>
                                                         </issuelinktype>

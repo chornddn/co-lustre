@@ -1,0 +1,77 @@
+Key:        LU-20967
+Summary:    'failure_domain' file does not create name for itself
+Link:       https://jira.whamcloud.com/browse/LU-20967
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Wed, 14 Oct 2026 18:22:31 +0000
+Updated:    Thu, 15 Oct 2026 00:01:19 +0000
+Labels:     FLR-EC-RO
+Links:      Related: is related to  LU-20139; Related: is related to  LU-19066
+
+--- Description ---
+Newly formatted OSTs return an e2fsck error about unattached inode 88 repeatedly:
+
+e2fsck 1.47.3-wc2 (11-Nov-2025)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Unattached inode 88
+Connect to /lost+found? no
+
+Pass 5: Checking group summary information
+
+myfs-OST0003: ********** WARNING: Filesystem still has errors **********
+
+myfs-OST0003: 629/4294160640 files (0.2% non-contiguous), 537388688/4879024128 blocks
+
+This inode is supposed to point at the failure_domain file which was added in LU-19066. 
+
+Running debugfs shows:
+
+#  debugfs -c -R "ls -l /" /dev/nvme1n10 | cat
+debugfs 1.47.3-wc2 (11-Nov-2025)
+      2   40755 (2)      0      0    4096  7-Oct-2026 16:49 .
+      2   40755 (2)      0      0    4096  7-Oct-2026 16:49 ..
+
+      87  100644 (1)      0      0       0  1-Jan-1970 00:00 health_check
+
+      89  100644 (1)      0      0    8192  1-Jan-1970 00:00 nodemap
+
+and health_check was created immediately before failure_domain in ofd_fs_setup():
+
+        lu_local_obj_fid(&info->fti_fid, OFD_HEALTH_CHECK_OID);
+        memset(&info->fti_attr, 0, sizeof(info->fti_attr));
+        info->fti_attr.la_valid = LA_MODE;
+        info->fti_attr.la_mode = S_IFREG | 0644;
+        info->fti_dof.dof_type = dt_mode_to_dft(S_IFREG);
+
+        fo = dt_find_or_create(env, ofd->ofd_osd, &info->fti_fid,
+                               &info->fti_dof, &info->fti_attr);
+        if (IS_ERR(fo))
+                GOTO(out_seqs, rc = PTR_ERR(fo));
+
+        ofd->ofd_health_check_file = fo;
+
+        lu_local_obj_fid(&info->fti_fid, OFD_FAILURE_DOMAIN_OID);
+        fd = dt_find_or_create(env, ofd->ofd_osd, &info->fti_fid,
+                               &info->fti_dof, &info->fti_attr);
+
+There is no entry for failure_domain in osd_lf_maps[] in osd_scrub.c since no name is defined for failure_domain file. e2fsck pass 4 name linkage treats it as disconnected and will reconnect it in lost+found, which might accidentally be deleted by an admin at some point in the future, and e2fsck errors are always a concern for admins so they should be avoided.
+
+--- Comment (gerrit, Thu, 15 Oct 2026 00:01:19 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69697
+
+Subject: LU-20967 osd-ldiskfs: name the failure_domain local file
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 801688a9cf2e27a9d3cef31a39667e6d320ade44

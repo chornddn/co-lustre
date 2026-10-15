@@ -1,5 +1,5 @@
 Change:     67441
-Subject:    LU-19602 osc: account LRU pages on the page's home OSC
+Subject:    LU-19602 clio: keep mirror DIO tails out of page cache
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67441
 Change-Id:  I939cb69cff3b223073fedfec38ab9a7609a31f22
 Project:    fs/lustre-release
@@ -7,82 +7,61 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-22 04:42:00.000000000
-Updated:    2026-09-21 07:54:08.000000000
-Patch Set:  6
-Insertions: +53
+Updated:    2026-10-15 02:37:46.000000000
+Patch Set:  7
+Insertions: +63
 Deletions:  -10
-Comments:   9 (2 unresolved)
+Comments:   10 (2 unresolved)
+Hashtags:   218_review_priority
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger
+  REVIEWER: Andreas Dilger, Patrick Farrell
 
 --- Commit Message ---
-LU-19602 osc: account LRU pages on the page's home OSC
+LU-19602 clio: keep mirror DIO tails out of page cache
 
-The per-OSC LRU counters (cl_lru_busy/cl_lru_in_list) intermittently
-underflow and LBUG the client in interop configs (master client / b2_15
-server) running FLR fsx workloads. Proven with a per-page accounting
-tracker: at the underflow the page's bucket is correct but it was
-counted on one OSC's client_obd and de-counted on another's.
+A master client against 2.15 servers LBUGs in
+__osc_lru_del() during sanity-flr test_70a, or fsx there
+reads bad data.
 
-osc_lru_del() (page teardown) always operates on the page's home
-osc_object, osc_cli(osc_page_object(opg)) - it is the only object
-reference available at destroy time. But the increment side keyed off
-the *IO's* object instead: osc_page_cache_add() passed the committing
-sub-io's object (cl2osc(ios->cis_obj)) to osc_lru_use(), and
-osc_lru_add_batch() used the finishing extent's object. In normal
-operation these are the page's home. Under a mid-IO FLR layout-version
-change (a b2_15 OSS bounces -EINPROGRESS on OST_PUNCH so the client
-resends and re-resolves the layout; master's ofd_verify_layout_version
-no longer does this since LU-14642) the committing sub-io can target a
-different mirror component than the page's home, so a page is counted on
-component B and removed on its home A: A underflows, B leaks. The damage
-is not only arithmetic: osc_lru_use() unlinked the page from A's
-cl_lru_list while holding B's cl_lru_list_lock, racing A's own shrinker
-over that list.
+I/O to a designated mirror, as "lfs mirror verify" does,
+must be direct: the page cache is shared with normal I/O,
+which takes its pages to belong to the mirror it uses
+itself. Since LU-17525, direct I/O that is not page aligned
+falls back to buffered I/O when a server cannot take
+unaligned DIO, and a verify of a file with an unaligned size
+reads its end with an unaligned length. Against 2.15 servers
+that read leaves pages of the verified mirror in the cache,
+stale ones included. Normal reads then return that data, and
+a write to such a page queues it through the OSC of the
+mirror being written, not the OSC of the page's own object,
+and the LRU accounting split between the two underflows.
 
-Make the increment side use the page's home OSC too, matching the
-decrement side, so a page lives on exactly one OSC's LRU list and its
-counters cannot split. osc_lru_use() and osc_lru_del() derive the home
-internally, leaving no caller able to name an OSC at all;
-osc_lru_add_batch() accounts each page on its home, keeping the batched
-fast path for the common case and handling a cross-OSC page
-individually. That page needs its own shrinker wake-up, since the
-batched one only ever covers the extent's own OSC, and gets a
-rate-limited warning so the mismatch stays visible now that it no longer
-announces itself as an LRU underflow. osc_lru_alloc() already uses the
-home (page-init object).
+For designated mirror I/O to such servers, send an I/O from
+a page aligned file offset into a single page aligned
+buffer, whose only unaligned part is its length, as aligned
+direct I/O, as before unaligned DIO, rather than fall back
+to buffered I/O.
 
-Grant needs no equivalent change: osc_queue_async_io() reserves it on
-the IO's OSC and osc_extent_finish() releases it on that same extent's
-OSC, so it cannot split. The LRU is asymmetric because its release site
-is page destruction, where the IO is gone and the home is the only
-object reference left.
+Also account an LRU page on the OSC of its own object when
+it is used, put back on the LRU and deleted, so a page
+queued through another OSC cannot underflow the counters,
+and warn when one is.
 
-This is EC/parity safe: each osc_page (data or parity) has a single home
-component and is accounted there regardless of which sub-io commits it.
-
-The interop runs below are narrowed to sanity-flr test_70a, the FLR fsx
-workload that reproduces this bug, because the full suite gives no
-usable interop signal: test_0a fails on any master client against a 2.15
-or 2.16 server since LU-19826 moved the mirror-count limit to a
-server-side lod.*.mirror_count_max tunable that exists on neither, and
-the run then dies in test_21 on a bulk-transport failure between the
-master client and the old OSS (server_bulk_callback status -113,
-target_bulk_io rc = -110) after which the OSTs evict the client and the
-write retries forever.
-
-Test-Parameters: testlist=sanity-flr serverversion=2.15 env=ONLY=70a
-Test-Parameters: testlist=sanity-flr serverversion=2.16 env=ONLY=70a
+Test-Parameters: optional testlist=sanity-flr serverversion=2.15 env=ONLY=70a,ONLY_REPEAT=10
+Test-Parameters: optional testlist=sanity-flr serverversion=2.16 env=ONLY=70a
+Fixes: a5546155a87a ("LU-17525 llite: soft fail unaligned dio")
 Fixes: 1d8e1b31d547 ("LU-3321 osc: Adjustment on osc LRU for performance")
 Fixes: 4c98a76dea48 ("LU-13814 osc: remove "osc_page_transfer_add" wrapper")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm,llm_code_and_review_tools
 Change-Id: I939cb69cff3b223073fedfec38ab9a7609a31f22
 
 --- Review History ---
@@ -338,3 +317,37 @@ Patch Set 6:
 
 --- Message (Marc Vef, 2026-09-21 07:54:08.000000000) ---
 Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Patrick Farrell, 2026-10-14 15:46:08.000000000) ---
+Hashtag added: 218_review_priority
+
+--- Message (Patrick Farrell, 2026-10-15 00:23:59.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-10-15 00:24:11.000000000) ---
+Patch Set 7:
+
+Rebased and updated this since LU-19602 is a 2.18 blocker. The root cause is "lfs mirror verify" against 2.15 servers: its unaligned tail read falls back to buffered I/O (LU-17525), leaving pages of the verified, possibly stale, mirror in the page cache, which later writes commit through another OSC. This patchset sends those tail reads as plain DIO and keeps your LRU accounting on the page's own OSC as a backstop. Against 2.15.8 servers locally, unpatched master hits the LBUG or fsx bad data on every test_70a run, and this passed 15 in a row. The interop sessions are optional because LU-20770 times them out until 69145 lands; 69506 changes the same fallback in ll_direct_IO(). Oleg, take it back over if you want.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-15 00:26:42.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-15 00:29:37.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-15 02:35:54.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133717/ : SUCCESS

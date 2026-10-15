@@ -1,0 +1,74 @@
+Key:        LU-20966
+Summary:    Test fixes found by checking what sanity tests actually exercise (dyntest: LLM analysis + eBPF tracing)
+Link:       https://jira.whamcloud.com/browse/LU-20966
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Artem Blagodarenko
+Created:    Wed, 14 Oct 2026 15:52:10 +0000
+Updated:    Wed, 14 Oct 2026 20:15:42 +0000
+Links:      Related: is related to LU-20837; Related: is related to LU-17768
+Attachments: dyntest-sanity-17h-patch93.html
+
+--- Description ---
+A passing test only shows that its assertions held, not that the code the test is named after ran. This ticket collects fixes for tests that pass without exercising what they claim to: the injected fault never fires, the error path is not reached, or an assertion cannot fail.
+
+The fixes come from dyntest, a test-verification harness. It runs the Lustre test suites on ltvm VM clusters that reproduce the Maloo review configurations (RHEL 8.10–10.2, ldiskfs and ZFS, single MDS and DNE). For each subtest it:
+
+	Analyses the test before it runs. An LLM reads the test source, test-framework.sh and the Lustre code involved. It writes down what the test claims to verify, and which kernel functions and fail points should run on the client, MDS and OSS if the test works.
+
+	Traces the run. bpftrace kprobe programs generated from that analysis are loaded on every node before the test starts. They record calls, return values and fail-point hits while the subtest runs.
+
+	Judges coverage. The LLM compares the test result, the test output and the eBPF output with the analysis. It decides whether the claimed functionality was exercised (covered, partial, not covered) and records findings: weak assertions, test bugs, uncovered paths, flaky behaviour.
+
+	Proposes a fix. For a finding with a test-side fix, it writes a patch against the commit under test.
+
+	Validates the fix. The patch is applied, and the same subtest runs again on a fresh cluster with the same configuration and commit, with fresh analysis, eBPF probes and judgement. A last step compares this run with the original one, per problem, and decides whether the patch fixed it. The patch fails validation if, for example, the fault still does not fire, the new check cannot fail, or the patched test fails only because of its own setup. In that case a new revision is written from scratch against the unpatched file, using the original analysis and what each failed attempt showed on the cluster. That revision is validated in turn, up to a fixed number of attempts. Only a revision that passes validation is pushed. If none passes, the problem is reported here without a patch.
+
+Patches touch lustre/tests only and are pushed to Gerrit under this ticket after review by a person. Any Lustre code bug a fixed test exposes gets its own LU ticket.
+
+Status (sanity, master v2_17_59-68-gee61b3f6dd)
+
+	62 distinct subtests verified (119 judged runs): 82 runs covered, 33 partial, 4 not covered.
+
+	Findings: 235 weak assertions (10 high severity), 38 test bugs (5 high), 25 uncovered paths (3 high), 14 flaky.
+
+	126 candidate test patches. Validation has started; the first four are below, and all now pass.
+
+Validated so far
+
+	sanity 17h: before, not covered. It armed fail_loc 0x141 (OBD_FAIL_MDS_LOV_PREP_CREATE), which nothing in the code checks, and it ignored the touch status, so it injected nothing and could not fail. The fix arms 0x128 (OBD_FAIL_MDS_ALLOC_OBDO), still checked in lod_declare_striped_create(). It requires the create to fail and a retry to succeed. Traced: the fault fired once on the MDS serving the create, and -ENOMEM reached the client. After: covered.
+
+	sanity 17m: before, partial. e2fsck ran on the raw device under a live dm-flakey mapping and saw 0 symlinks, and run_e2fsck() hid the exit code. The fix keeps the symlinks on one MDT, checks the real e2fsck status and requires at least 1024 symlinks. After: covered; e2fsck reports 1024 symlinks.
+
+	sanity 24w: before, partial. The read above 4 GiB was served from the client page cache and only the size was compared. The fix drops the client locks before reading and compares the data. Traced: one 58-page read RPC at the 4097 MiB object offset on the OSS. After: covered.
+
+	sanity 24H: before, not covered. The touch in an MDT1 directory is always answered from MDT1's FLD cache, so fld_client_rpc() never runs and OBD_FAIL_FLD_QUERY_REQ (0x1103) is never checked.
+	
+		The first fix only added a check that fail_loc fired. That turned the silent PASS into an honest FAIL, but did not reach the retry path, so it failed validation.
+
+		The second revision, written from scratch, runs lfs fid2path on a sequence routed to MDT1 that MDT1 cannot have cached, so MDT1 must forward the query to MDT0. It asserts that the fail point fired (CFS_FAILED set), the query was resent and answered with -ENOENT, and the 2 s retry delay happened. Traced: one injected -EAGAIN, one 2 s sleep, two requests.
+
+		After: covered.
+
+	
+	
+
+Patch conventions
+
+Each patch has the subject LU-NNNNN tests:  in  . Its commit message says what the test missed, how it was found, and the before and after validation result (verdict and eBPF evidence). It carries Test-Parameters: for the changed tests and a Found-by: dyntest trailer.
+
+--- Comment (gerrit, Wed, 14 Oct 2026 20:05:11 +0000) ---
+"Artem Blagodarenko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69692
+
+Subject: LU-20966 tests: make sanity 17h inject a live create failure
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6a9c88e1142e95376043b6209d7ce3f8239b4a46

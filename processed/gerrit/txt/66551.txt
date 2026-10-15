@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Sohei Koyama
 Created:    2026-06-09 14:19:42.000000000
-Updated:    2026-10-14 08:19:34.000000000
-Patch Set:  9
-Insertions: +1325
-Deletions:  -389
-Comments:   212 (18 unresolved)
+Updated:    2026-10-15 08:31:49.000000000
+Patch Set:  10
+Insertions: +1372
+Deletions:  -392
+Comments:   228 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -32,10 +32,15 @@ carries the same field values through unchanged.
 - sources: inode_get_[amc]time_ns() and ktime_get_real_ns() now
   provide nanoseconds, and the OSD layer reads and writes the
   on-disk inode timespec at nanosecond resolution.  The client
-  superblock sets s_time_gran = 1 so that current_time() keeps
-  the sub-second part for locally generated timestamps, and
-  s_time_min/s_time_max to the s64 nanosecond range so that the
-  VFS clamps out-of-range timestamps.
+  superblock sets s_time_gran = 1 when the MDT negotiated
+  nanosecond timestamps, so that current_time() keeps the
+  sub-second part for locally generated timestamps, and keeps
+  whole seconds against an MDT that did not, and the osc layer
+  generates whole seconds for I/O to an OST that did not, so that
+  a cached time never moves backwards once it is fetched again.
+  It sets s_time_min and
+  s_time_max to the s64 nanosecond range so that the VFS clamps
+  out-of-range timestamps.
 - sinks: the stat/statx paths convert the s64 nanosecond value
   back to a timespec64 with the standard ns_to_timespec64().
 - struct ost_lvb carries full nanoseconds in lvb_[amc]time (s64);
@@ -46,9 +51,12 @@ carries the same field values through unchanged.
 - the ofd and mdd atime-difference thresholds, the mdt ctime age
   limit and the cached llite inode times are kept in nanoseconds
   internally, and the atime_diff tunables accept and print
-  fractional seconds.
+  fractional seconds and reject unit suffixes.
 - the llog object mtime keeps its once-per-second update filter
   and is stored scaled to nanoseconds.
+- the LFSCK lost+found marker ctime stays 1 second on disk, so
+  objects marked before an upgrade are still recognised.
+- mdd.atime_diff.4 and ofd.atime_diff.4 document the tunables.
 
 All timestamp fields and the related interval knobs keep their
 historic names here and gain a _ns suffix in the following patch,
@@ -68,7 +76,11 @@ and other MDTs.  A node converts wire timestamps to seconds when
 sending to a peer that did not negotiate the flag, and back to
 nanoseconds when receiving from such a peer.  The conversion to
 seconds floors (nsec_time_to_sec()), so that it is the exact
-inverse of the scaling on receive, also before 1970.
+inverse of the scaling on receive, also before 1970.  The scaling
+on receive (sec_time_to_nsec()) clamps to the whole seconds that
+fit in s64 nanoseconds, the same range the client superblock
+advertises, so a time beyond year 2262 from such a peer is clamped
+instead of wrapping to a negative value.
 
 Conversion is applied on every path that carries a timestamp:
 the MDT inode times (mdt_pack_attr2body), the setattr, create,
@@ -89,7 +101,7 @@ the getstripe ioctl do the same for the bodies they read
 directly.  Keying on the connection flag is exact and avoids the
 near-epoch and far-future misreads of a magnitude heuristic.
 
-Add sanity-ns.sh, a configuration-aware test suite that verifies
+Add sanity test_435a-435t, configuration-aware tests that verify
 timestamps warm and cold, including near-epoch and boundary values
 (pre-1970 with sub-seconds, y2038, beyond 2262), nanosecond
 precision, per-MDT directory times, Data-on-MDT, FLR, cross-MDT
@@ -97,19 +109,18 @@ operations, MDT/OST failover, setattr replay and cross-client
 coherency.  Each test detects the negotiated nanoseconds_times flag
 per target and asserts exact nanoseconds against a new peer or
 second granularity against a legacy peer, so it is meaningful on
-uniform and mixed-version clusters alike.  It is added to the
-regression test group.
+uniform and mixed-version clusters alike.
 
 Assisted-by: ClaudeCode:Opus-5.5
-Test-Parameters: testlist=sanity-ns
-Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity-ns
-Test-Parameters: ostcount=4 testlist=sanity-ns
-Test-Parameters: fstype=zfs testlist=sanity-ns
-Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanity-ns
-Test-Parameters: clientcount=2 testlist=sanity-ns
-Test-Parameters: serverversion=2.16 testlist=sanity-ns
-Test-Parameters: serverversion=2.15 mdscount=2 mdtcount=4 testlist=sanity-ns
-Test-Parameters: clientcount=2 serverversion=2.16 testlist=sanity-ns
+Test-Parameters: testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: ostcount=4 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: fstype=zfs testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: fstype=zfs mdscount=2 mdtcount=4 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: clientcount=2 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: serverversion=2.16 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: serverversion=2.15 mdscount=2 mdtcount=4 testlist=sanity env=ONLY="36 39 435"
+Test-Parameters: clientcount=2 serverversion=2.16 testlist=sanity env=ONLY="36 39 435"
 Test-Parameters: clientversion=2.16 testlist=sanity env=ONLY="36 39"
 Test-Parameters: clientversion=2.15 mdscount=2 mdtcount=4 testlist=sanity env=ONLY="36 39"
 Signed-off-by: Sohei Koyama <skoyama@ddn.com>
@@ -580,3 +591,32 @@ Patch Set 9:
 
 --- Message (Andreas Dilger, 2026-10-14 08:19:34.000000000) ---
 Patch Set 9: Code-Review-1
+
+--- Message (Sohei Koyama, 2026-10-15 07:07:29.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-15 07:12:55.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-15 07:17:03.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Sohei Koyama, 2026-10-15 07:17:41.000000000) ---
+Patch Set 10:
+
+(16 comments)
+
+--- Message (jenkins, 2026-10-15 08:30:57.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133749/ : SUCCESS
