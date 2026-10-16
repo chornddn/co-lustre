@@ -1,0 +1,59 @@
+Key:        LU-20971
+Summary:    lfs find: buffer overflow in parallel find on deep directory trees
+Link:       https://jira.whamcloud.com/browse/LU-20971
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sebastien Buisson
+Reporter:   Sebastien Buisson
+Created:    Fri, 16 Oct 2026 13:45:58 +0000
+Updated:    Fri, 16 Oct 2026 13:47:49 +0000
+Labels:     patch, utils
+
+--- Description ---
+With parallel find, a deep directory tree makes the worker threads write past the end of a heap buffer. As soon as a directory path is longer than about PATH_MAX - NAME_MAX, the names of its entries are appended past the end of a PATH_MAX + 1 allocation. Note the serial traversal does not have the problem.
+
+Also, a directory path longer than PATH_MAX is silently truncated by the snprintf() in work_unit_create(), while the serial traversal handles such paths (up to 2 * PATH_MAX).
+
+Reproducer, on a client with /mnt/lustre mounted (16 nested directories with 250-character names give a 4035-character directory path, plus a file with a 200-character name inside the deepest one):
+
+B=/mnt/lustre/deep; mkdir -p $B; cd $B
+c=$(printf "c%.0s" $(seq 1 250))
+for i in $(seq 1 16); do mkdir $c && cd $c; done
+touch $(printf "f%.0s" $(seq 1 200))
+cd /
+lfs find $B > /dev/null
+valgrind -q lfs find --threads 4 $B > /dev/null
+
+"lfs find $B" is aborted by glibc:
+
+double free or corruption (!prev)
+
+and valgrind reports the overflow:
+
+Invalid write of size 1
+   at 0x4871880: strcpy (vg_replace_strmem.c:565)
+   by 0x48BD4E3: llapi_semantic_traverse (liblustreapi_pfind.c:3303)
+   by 0x48BD9F3: find_worker (liblustreapi_pfind.c:3442)
+   by 0x4B81E97: start_thread (in /usr/lib64/libc.so.6)
+   by 0x4BEC61B: thread_start (in /usr/lib64/libc.so.6)
+ Address 0x50df3a1 is 0 bytes after a block of size 4,097 alloc'd
+   at 0x48684C8: malloc (vg_replace_malloc.c:447)
+   by 0x48BD283: work_unit_create (liblustreapi_pfind.c:3785)
+   by 0x48BD283: work_unit_create_and_add (liblustreapi_pfind.c:3817)
+   by 0x48BD65B: llapi_semantic_traverse (liblustreapi_pfind.c:3328)
+   by 0x48BD9F3: find_worker (liblustreapi_pfind.c:3442)
+
+--- Comment (gerrit, Fri, 16 Oct 2026 13:47:49 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69744
+
+Subject: LU-20971 utils: fix pfind work unit path buffer overflow
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0744be00058dd4473f10e61b850f96bdfc486ccf

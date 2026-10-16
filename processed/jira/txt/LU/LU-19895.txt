@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Shaun Tancheff
 Reporter:   Andreas Dilger
 Created:    Thu, 19 Feb 2026 19:22:35 +0000
-Updated:    Thu, 3 Sep 2026 20:43:03 +0000
+Updated:    Fri, 16 Oct 2026 02:18:32 +0000
 Links:      Related: is related to  LU-10026; Related: is related to  LU-17916
 
 --- Description ---
@@ -103,3 +103,45 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 857766169ed9204c54e0429db3a65021fb4decd7
+
+--- Comment (gerrit, Fri, 16 Oct 2026 01:03:32 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69731
+
+Subject: LU-19895 osc: account cached folios in base pages
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 14a78fb82b8f7c5d38e2527ea625da3dc076858a
+
+--- Comment (adilger, Fri, 16 Oct 2026 02:18:32 +0000) ---
+EC recovery is not safe with the large page cache folios from 65094 (PS39).
+
+Problem
+
+lov_ec_read_stripe_pages() (lustre/lov/lov_io.c, in master) collects the pages of each surviving data stripe one base page at a time. For each index it calls get_folio_grab(..., FGP_LOCK | FGP_ACCESSED | FGP_CREAT), cl_page_find() and cl_page_assume(), and keeps every folio locked in out_pages[] until the stripe has been read. With 65094 the lookup returns the folio containing the index, with one cl_page per folio, so:
+
+	if a cached folio covers more than one page of the recovery range, the lookup of its second page waits for the folio lock this thread already holds, and the read hangs before anything is submitted;
+
+	if the recovery range starts inside a cached folio, cl_page_find() is called with a tail index and hits the new LASSERTF(folio->index == idx).
+
+Recovery locks the pages of all surviving data stripes over whole raid set rows, so a degraded read of a range that this client wrote before the OST failed is likely to hit this. Only kernels with mapping_set_folio_order_range() (6.12 and later, e.g. el10 clients) are affected; older kernels stay at order 0.
+
+Where large folios come from
+
+Only buffered writes create them (fgf_set_order() in ll_write_begin()). Readahead and page faults create folios at the mapping's minimum order, which is 0 (folio_order_min is read-only), and only reuse large folios already in the cache. LOV splits writes at stripe and component boundaries (lov_io_rw_iter_init()), generic_perform_write() never passes a length beyond that piece, and the kernel creates an order N folio only at a 2^N aligned index. So folios never cross a stripe or component boundary, even with 64KiB or non-power-of-two stripe sizes.
+
+That matters beyond EC: lov_page_init_composite() assigns a whole cl_page, now a whole folio, to the stripe holding its first byte, so a folio crossing a stripe boundary would send data to the wrong OST object. It holds today only because folio_order_min is 0. If that becomes tunable it must be capped at LOV_MIN_STRIPE_SIZE (64KiB), and a check in lov_page_init_composite() that the last page of a folio maps to the same stripe as the first would catch any later violation.
+
+Where to fix it
+
+65094 changes the page cache contract that lov_ec_read_stripe_pages() relies on, so the fix that keeps master working belongs in 65094. It can be small and leave the EC code alone, which 69346, 69349, 69350, 69709 and 69710 are all rewriting now:
+
+	Do not create large folios for files whose layout has EC (parity) components. Buffered write is the only path that creates them, so a per-inode check in fgf_begin_size() and fgf_nowait() is enough. llite needs to know that the layout has parity, e.g. from a cl_layout flag or an lli bit set when the layout is applied. Unlike calling mapping_set_folio_order_range() on a live mapping, which is meant for inode setup and updates mapping->flags without locking, this is safe at runtime. A file that becomes EC gets a new layout, which already prunes its page cache, so no large folios survive the change.
+
+	Add a comment there referencing this ticket.
+
+The EC series will then make recovery folio-aware as a follow-on and remove the check: step the collection loop by folio within each stripe (each folio lies within one stripe chunk, so it is entirely on a live or entirely on a dead stripe), use one cl_page per folio, do the parity math per base page with folio_page(), and handle recovery ranges that start or end inside a folio, either by widening them to folio boundaries or by treating an uptodate folio as already done.

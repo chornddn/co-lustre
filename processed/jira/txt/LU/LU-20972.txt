@@ -1,0 +1,50 @@
+Key:        LU-20972
+Summary:    lfs find: parallel find is OOM-killed on wide directories
+Link:       https://jira.whamcloud.com/browse/LU-20972
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sebastien Buisson
+Reporter:   Sebastien Buisson
+Created:    Fri, 16 Oct 2026 14:48:24 +0000
+Updated:    Fri, 16 Oct 2026 14:56:40 +0000
+Labels:     patch, utils
+
+--- Description ---
+Parallel find memory use grows with the number of directories that are found and not yet processed, without any limit. On a directory with many subdirectories, "lfs find" is killed by the OOM killer, where the serial traversal of the same tree needs a few MB. Memory use is about 75 KB for every queued directory. With "lfs find --xattr", copy_find_param() also copies some xattr name and value buffers for another 128 KB per queued directory.
+
+The work queue has no bound: a directory is queued as soon as its parent's readdir() returns it, and the parent's readdir() loop does not wait for the queue to drain. So a directory with N subdirectories puts N work units, i.e. N * 75 KB, on the queue at once: 1.5 GB for 20000 subdirectories, 7.5 GB for 100000.
+
+A quick reproducer, on a VM client with 1.4 GB of RAM and /mnt/lustre mounted:
+
+D=/mnt/lustre/wide; mkdir -p $D; cd $D
+seq -f "d%g" 1 20000 | xargs mkdir
+cd /
+lfs find --threads 1 $D | wc -l
+lfs find $D | wc -l
+
+Peak RSS read from VmHWM:
+
+lfs find --threads 1: rc=0   entries=20001 peakRSS=3068kB
+lfs find --threads 4: rc=137 entries=1749  peakRSS=888000kB
+lfs find:             rc=137 entries=1630  peakRSS=791256kB
+
+and in the kernel log:
+
+Out of memory: Killed process 8692 (lfs) total-vm:1283828kB, anon-rss:966400kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:2048kB oom_score_adj:0
+
+The same memory usage could be seen for every llapi_find_with_cb() user that sets fp_thread_count > 1, e.g. llapi_scan_namespace() and ltrash_purge.
+
+--- Comment (sebastien, Fri, 16 Oct 2026 14:56:40 +0000) ---
+"Sebastien Buisson " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69745
+
+Subject: LU-20972 utils: bound the memory used by parallel find
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 2
+
+Commit: 944553eca9ef18294aa343f356a965dcc1614def

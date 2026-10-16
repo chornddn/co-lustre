@@ -18,10 +18,10 @@
                         <labels>
                     </labels>
                 <created>Thu, 19 Feb 2026 19:22:35 +0000</created>
-                <updated>Thu, 3 Sep 2026 20:43:03 +0000</updated>
+                <updated>Fri, 16 Oct 2026 02:18:32 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>10</watches>
+                                    <watches>11</watches>
                                                                             <comments>
                             <comment id="488357" author="stancheff" created="Fri, 20 Feb 2026 04:35:08 +0000">&lt;p&gt;folio order is determined in ll_write_begin() so len is limited to the stripe maximum.&lt;/p&gt;
 
@@ -68,6 +68,38 @@ Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
 Commit: 857766169ed9204c54e0429db3a65021fb4decd7&lt;/p&gt;</comment>
+                            <comment id="503725" author="gerrit" created="Fri, 16 Oct 2026 01:03:32 +0000">&lt;p&gt;"Patrick Farrell &amp;lt;patrick@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69731" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69731&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19895" title="implement large folio support" class="issue-link" data-issue-key="LU-19895"&gt;LU-19895&lt;/a&gt; osc: account cached folios in base pages&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 14a78fb82b8f7c5d38e2527ea625da3dc076858a&lt;/p&gt;</comment>
+                            <comment id="503729" author="adilger" created="Fri, 16 Oct 2026 02:18:32 +0000">&lt;p&gt;EC recovery is not safe with the large page cache folios from 65094 (PS39).&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Problem&lt;/b&gt;&lt;br/&gt;
+&lt;tt&gt;lov_ec_read_stripe_pages()&lt;/tt&gt; (lustre/lov/lov_io.c, in master) collects the pages of each surviving data stripe one base page at a time. For each index it calls &lt;tt&gt;get_folio_grab(..., FGP_LOCK | FGP_ACCESSED | FGP_CREAT)&lt;/tt&gt;, &lt;tt&gt;cl_page_find()&lt;/tt&gt; and &lt;tt&gt;cl_page_assume()&lt;/tt&gt;, and keeps every folio locked in &lt;tt&gt;out_pages[]&lt;/tt&gt; until the stripe has been read. With 65094 the lookup returns the folio containing the index, with one &lt;tt&gt;cl_page&lt;/tt&gt; per folio, so:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;if a cached folio covers more than one page of the recovery range, the lookup of its second page waits for the folio lock this thread already holds, and the read hangs before anything is submitted;&lt;/li&gt;
+	&lt;li&gt;if the recovery range starts inside a cached folio, &lt;tt&gt;cl_page_find()&lt;/tt&gt; is called with a tail index and hits the new &lt;tt&gt;LASSERTF(folio-&amp;gt;index == idx)&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Recovery locks the pages of all surviving data stripes over whole raid set rows, so a degraded read of a range that this client wrote before the OST failed is likely to hit this. Only kernels with &lt;tt&gt;mapping_set_folio_order_range()&lt;/tt&gt; (6.12 and later, e.g. el10 clients) are affected; older kernels stay at order 0.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Where large folios come from&lt;/b&gt;&lt;br/&gt;
+Only buffered writes create them (&lt;tt&gt;fgf_set_order()&lt;/tt&gt; in &lt;tt&gt;ll_write_begin()&lt;/tt&gt;). Readahead and page faults create folios at the mapping's minimum order, which is 0 (&lt;tt&gt;folio_order_min&lt;/tt&gt; is read-only), and only reuse large folios already in the cache. LOV splits writes at stripe and component boundaries (&lt;tt&gt;lov_io_rw_iter_init()&lt;/tt&gt;), &lt;tt&gt;generic_perform_write()&lt;/tt&gt; never passes a length beyond that piece, and the kernel creates an order N folio only at a 2^N aligned index. So folios never cross a stripe or component boundary, even with 64KiB or non-power-of-two stripe sizes.&lt;/p&gt;
+
+&lt;p&gt;That matters beyond EC: &lt;tt&gt;lov_page_init_composite()&lt;/tt&gt; assigns a whole &lt;tt&gt;cl_page&lt;/tt&gt;, now a whole folio, to the stripe holding its first byte, so a folio crossing a stripe boundary would send data to the wrong OST object. It holds today only because &lt;tt&gt;folio_order_min&lt;/tt&gt; is 0. If that becomes tunable it must be capped at &lt;tt&gt;LOV_MIN_STRIPE_SIZE&lt;/tt&gt; (64KiB), and a check in &lt;tt&gt;lov_page_init_composite()&lt;/tt&gt; that the last page of a folio maps to the same stripe as the first would catch any later violation.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Where to fix it&lt;/b&gt;&lt;br/&gt;
+65094 changes the page cache contract that &lt;tt&gt;lov_ec_read_stripe_pages()&lt;/tt&gt; relies on, so the fix that keeps master working belongs in 65094. It can be small and leave the EC code alone, which 69346, 69349, 69350, 69709 and 69710 are all rewriting now:&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Do not create large folios for files whose layout has EC (parity) components. Buffered write is the only path that creates them, so a per-inode check in &lt;tt&gt;fgf_begin_size()&lt;/tt&gt; and &lt;tt&gt;fgf_nowait()&lt;/tt&gt; is enough. llite needs to know that the layout has parity, e.g. from a &lt;tt&gt;cl_layout&lt;/tt&gt; flag or an &lt;tt&gt;lli&lt;/tt&gt; bit set when the layout is applied. Unlike calling &lt;tt&gt;mapping_set_folio_order_range()&lt;/tt&gt; on a live mapping, which is meant for inode setup and updates &lt;tt&gt;mapping-&amp;gt;flags&lt;/tt&gt; without locking, this is safe at runtime. A file that becomes EC gets a new layout, which already prunes its page cache, so no large folios survive the change.&lt;/li&gt;
+	&lt;li&gt;Add a comment there referencing this ticket.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The EC series will then make recovery folio-aware as a follow-on and remove the check: step the collection loop by folio within each stripe (each folio lies within one stripe chunk, so it is entirely on a live or entirely on a dead stripe), use one &lt;tt&gt;cl_page&lt;/tt&gt; per folio, do the parity math per base page with &lt;tt&gt;folio_page()&lt;/tt&gt;, and handle recovery ranges that start or end inside a folio, either by widening them to folio boundaries or by treating an uptodate folio as already done.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

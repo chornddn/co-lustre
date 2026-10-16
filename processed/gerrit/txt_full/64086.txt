@@ -1,5 +1,5 @@
 Change:     64086
-Subject:    LU-20958 lov: report unavailable EC stripes as data for lseek
+Subject:    LU-20958 lov: handle unavailable EC stripes in lseek
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/64086
 Change-Id:  I5cce4e0ea51c68b0c6fda1d83b694af19cad57bd
 Project:    fs/lustre-release
@@ -7,24 +7,24 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2026-02-17 16:47:13.000000000
-Updated:    2026-10-14 21:57:36.000000000
-Patch Set:  45
-Insertions: +164
-Deletions:  -9
-Comments:   35 (16 unresolved)
+Updated:    2026-10-16 08:15:11.000000000
+Patch Set:  46
+Insertions: +413
+Deletions:  -12
+Comments:   41 (17 unresolved)
 Topic:      ec2
-Hashtags:   pt_ecro
+Hashtags:   pt_ecro, 218_review_priority
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Andreas Dilger: +1
   Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Patrick Farrell, kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Zhenyu Xu, Andreas Dilger, Marc Vef
+  REVIEWER: Zhenyu Xu, Andreas Dilger, Marc Vef, Keguang Xu
 
 --- Commit Message ---
-LU-20958 lov: report unavailable EC stripes as data for lseek
+LU-20958 lov: handle unavailable EC stripes in lseek
 
 SEEK_DATA/SEEK_HOLE on an EC file with a data stripe on an OST that
 is deactivated fails with -ESHUTDOWN, and with an OST that is down,
@@ -33,21 +33,38 @@ although reads of the file are rebuilt from parity at once.
 
 Do the lseek with no-delay lock enqueues, as reads do.  When the
 sub-lock enqueue of a stripe in an EC data component fails, mark it
-in this IO's lov_io_sub::sub_ec_err, do not start its sub-IO, and
-report the stripe as data from where the IO starts in it, with no
-hole before its end.  That is always a correct answer: a seek must
-not skip data, but may report a hole as data.  Retry with blocking
-enqueues once every mirror has been tried.  The unavailable stripe
-leaves its size out of the merged stripe attributes, so take EOF from
-the strict SOM size from the MDS instead, as stat() does.  Without
-one, wait for the OST, or return -EIO if it stays unavailable, rather
-than miss data past a smaller EOF.  Since
-such a stripe has no hole at its end, report the hole at EOF for
-SEEK_HOLE if nothing before it is found, and -ENXIO for SEEK_DATA at
+in this IO's lov_io_sub::sub_ec_err and do not start its sub-IO.
+Retry with blocking enqueues once every mirror has been tried.  The
+unavailable stripe leaves its size out of the merged stripe
+attributes, so take EOF from the strict SOM size from the MDS
+instead, as stat() does.  Without one, wait for the OST, or return
+-EIO if it stays unavailable, rather than miss data past a smaller
 EOF.  A stripe whose extent lock is still cached is locked locally,
 so its OST_SEEK still waits for the OST.
 
-Add sanity-ec test_79a, which stops the OST of a stripe.
+Resync writes parity only where a data stripe of its raid set has
+data, page aligned, and punches the rest, so a hole in an in-sync
+parity stripe is a hole in every data stripe of the raid set.  Seek
+an available parity stripe of the unavailable stripe's raid set from
+the matching offset, and map the result back.  Each row of a raid set
+holds one stripe_size chunk in every data and parity object, so
+offsets in the two objects advance together.  The result can report
+data where only another stripe of the raid set has data, but never a
+hole where the stripe may have data.  With no parity stripe that can
+answer, report the stripe as data from where the IO starts in it,
+with no hole before its end, which is always correct: a seek must not
+skip data, but may report a hole as data.  Since such a stripe has no
+hole at its end, report the hole at EOF for SEEK_HOLE if nothing
+before it is found, and -ENXIO for SEEK_DATA at EOF.
+
+The parity object is not covered by the lseek lock, so seek it with a
+server lock, and do not trust the LVB size of an unlocked object in
+osc_io_lseek_start().  Seek parity without delay, failing at once if
+its OST is disconnected; an idle import still reconnects for the seek.
+
+Add sanity-ec test_79a, which stops the OST of a stripe, and
+test_79b, which checks holes found from parity, and that the stripe
+is reported as data when the parity OSTs are stopped too.
 
 Test-Parameters: testlist=sanity-ec ostcount=8
 Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
@@ -3353,3 +3370,213 @@ Patch Set 45:
 Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133691&commit=Apply+Filter
 
 Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133691#redirect
+
+--- Message (Andreas Dilger, 2026-10-15 17:30:55.000000000) ---
+Hashtag added: 218_review_priority
+
+--- Message (Andreas Dilger, 2026-10-16 00:34:54.000000000) ---
+Patch Set 45: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-10-16 00:57:39.000000000) ---
+Patch Set 45:
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-10-16 06:46:16.000000000) ---
+Uploaded patch set 46.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-16 06:48:54.000000000) ---
+Patch Set 46:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-16 06:52:04.000000000) ---
+Patch Set 46:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-16 07:10:24.000000000) ---
+Patch Set 46: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133813/ : SUCCESS
+
+--- Message (Maloo, 2026-10-16 07:13:38.000000000) ---
+Patch Set 46:
+
+#### The following sessions will be run for Build 133813 (patch #46):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=133813&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=133813#redirect
+
+--- Message (Andreas Dilger, 2026-10-16 07:42:07.000000000) ---
+Patch Set 46: Code-Review+1
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-10-16 08:15:11.000000000) ---
+Patch Set 46:
+
+(1 comment)

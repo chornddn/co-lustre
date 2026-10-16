@@ -1,0 +1,92 @@
+Change:     69745
+Subject:    LU-20972 utils: bound the memory used by parallel find
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69745
+Change-Id:  I5bb935a26973c08c5b7f61ebd09352edf6abd338
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sebastien Buisson
+Created:    2026-10-16 14:52:54.000000000
+Updated:    2026-10-16 15:48:31.000000000
+Patch Set:  2
+Insertions: +217
+Deletions:  -39
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-20972 utils: bound the memory used by parallel find
+
+Parallel find queues a work unit for every subdirectory it finds, with
+a deep copy of the find_param, and does not limit the number of queued
+units. The copy is about 75 KB per subdirectory: it is OOM-killed on a
+1.4 GB VM for a directory with 20000 subdirectories, while the serial
+traversal needs 3 MB.
+
+These buffers are refilled for every object, so do not copy them
+into the work units. Each worker thread owns one set, sized as
+common_param_init() and xattr_match_info_append() size them, and
+lends it to the work unit it processes, as the serial traversal
+uses a single set. This also fixes a 1-byte heap overflow: the copy
+of xattr_value_buf had XATTR_SIZE_MAX bytes instead of
+XATTR_SIZE_MAX + 1, and find_check_xattrs() writes a '0' after a
+value that is not NUL-terminated.
+
+Also bound the work queue: when FIND_QUEUE_MAX_UNITS work units are
+queued or being processed, a thread traverses the subdirectory it
+finds inline, as the serial code does, instead of queuing it. Making
+the producers wait for room could deadlock, as the producers are the
+worker threads themselves.
+
+A thread that traverses a subdirectory inline keeps open the directory
+it was reading, so its open files grow with the depth it walks inline,
+where a worker used to hold about two. To stay within the soft limit
+of open files, parallel_find() derives from it how many levels each
+thread may walk inline. A thread at that depth queues the
+subdirectory, even if the queue is full.
+
+With these changes, "lfs find" on the 20000 subdirectories peaks at
+7.5 MB, and on a tree of 50000 directories at 7 MB.
+
+Add sanity test 56Em to exercise this.
+
+Fixes: 8f2fb73bc7ff ("LU-17814 utils: Add deep copy of find_param")
+Signed-off-by: Sebastien Buisson <sbuisson@ddn.com>
+Assisted-by: Claude:claude-opus-5-5
+Change-Id: I5bb935a26973c08c5b7f61ebd09352edf6abd338
+
+--- Review History ---
+
+--- Message (Sebastien Buisson, 2026-10-16 14:52:54.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Sebastien Buisson, 2026-10-16 14:54:58.000000000) ---
+Uploaded patch set 2: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-16 14:55:36.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-16 14:59:07.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-16 15:04:01.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-16 15:48:31.000000000) ---
+Patch Set 1: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 2 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133831/ : SUCCESS
