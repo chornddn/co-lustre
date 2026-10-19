@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Shaun Tancheff
 Created:    2026-04-04 14:40:09.000000000
-Updated:    2026-10-16 15:07:43.000000000
-Patch Set:  40
-Insertions: +2460
-Deletions:  -1136
-Comments:   2054 (0 unresolved)
+Updated:    2026-10-19 08:04:04.000000000
+Patch Set:  43
+Insertions: +2579
+Deletions:  -1143
+Comments:   2238 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -29,14 +29,28 @@ later. Track folios and base-page counts through the client
 cache and RPCs. Direct I/O still uses one PAGE_SIZE chunk per
 cl_page.
 
-The large_folios mount parameter enables allocation by default.
-folio_order_max limits newly instantiated inodes to at most
-1 MiB, or 20 - PAGE_SHIFT. Expose folio_order_min and the client
-dirty_pages count, and cap PCC allocations at the backing
-inode's maximum order.
+The llite.*.large_folios tunable, on by default, enables
+allocation. llite.*.folio_order_max limits newly instantiated
+inodes to at most 1 MiB, or 20 - PAGE_SHIFT. Expose
+llite.*.folio_order_min and the client dirty_pages count.
+
+Huge page mmap faults read ahead in folios up to the maximum
+order whatever the layout, so their DLM lock covers the
+largest folio that can hold the faulting page. A folio that
+crosses a stripe or component, does not fit one RPC, or is on
+a file that may not use large folios is dropped and read
+again in base pages. An mmap write to a cached folio that
+no longer fits one RPC drops it and refaults. Files whose
+layout has a parity component keep base pages until EC
+recovery handles folios. On kernels without native
+multi-order folio mapping support, read the inode in the
+same expression as the compat macro to avoid an unused
+variable warning.
 
 Preserve partial folios when punching holes, and drop them
-if the server does not punch. Protect mmap writes against
+if the server does not punch. Keep a tail punch's leading
+valid range in cp_off/cp_len instead of the punched range
+itself. Protect mmap writes against
 filesystem freeze and lock and commit the whole folio.
 Readahead advances by folio size and counts base pages,
 including for random reads. Restore encrypted offsets when
@@ -48,6 +62,9 @@ so its cache accounting check observes the intended state.
 Add sanity/857 for the tunables and buffered and mmap I/O.
 
 Reset the queued count if direct I/O page queuing fails.
+Skip an empty RPC's folio-less placeholder when undoing
+encryption bounce pages on a failed request pack, since it
+has no folio to check.
 
 Dirty a cached folio whole when it is first queued, since a
 later write or mmap store into a queued folio does not queue
@@ -59,10 +76,18 @@ a folio that is not uptodate is retried, so the folio never
 holds unread bytes.
 
 Decrypt skips each empty 4 KiB unit and reports a hole only
-when the whole folio is one. PCC mmap conversion stays
-limited to kernels that export add_to_page_cache_locked(),
-as a folio already on the LRU cannot be added to another
-mapping.
+when the whole folio is one.
+
+Retry a short kernel_write() in the checksum-mismatch page
+dump, so a partial write of one page does not misalign the
+rest of the dump.
+
+Fix sanity/277's injected LRU-unreserve delay to fire once,
+not on every one of the test's 1024 4 KiB writes. Count the
+osc_extent_expand() size against the server's maximum by the
+expanded range, not by the folio's page count, so a large
+folio near that maximum is not refused into a needless new
+extent.
 
 Test-Parameters: optional clientdistro=el10.0
 Test-Parameters: clientdistro=el10.1
@@ -72,7 +97,7 @@ Signed-off-by: Shaun Tancheff <shaun@tancheff.com>
 Change-Id: I5c83d9555a2563c764ef6ec12d227b4890db3f5e
 Assisted-by: Codex:gpt-6.1-sol
 Signed-off-by: Patrickbot <patrick-bot@mulberrytree.us>
-Assisted-by: ClaudeCode:claude-opus-5-5
+Assisted-by: ClaudeCode:claude-sonnet-5
 Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 
 --- Review History ---
@@ -1764,3 +1789,125 @@ Patch Set 40: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/133829/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-18 10:44:24.000000000) ---
+Patch Set 40:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Problematic, see inline comments: there are reachable client LBUGs (huge-page mmap faults on small-stripe or DoM files, and encrypted sync writes that start mid-folio), a lock-cancel path that can keep stale folio tails cached, and grant-accounting underflow on truncate. sanity/857 only covers aligned buffered and plain mmap I/O; an mmap + MADV_HUGEPAGE read on a file with a stripe size below 1 MiB (or a 64 KiB DoM component) would cover the first issue.
+
+--- Message (patrick bot, 2026-10-18 12:08:05.000000000) ---
+Patch Set 40:
+
+(9 comments)
+
+--- Message (patrick bot, 2026-10-18 12:08:11.000000000) ---
+Uploaded patch set 41.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-18 12:15:02.000000000) ---
+Patch Set 41:
+
+(46 comments)
+
+47 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-18 12:15:02.000000000) ---
+Patch Set 41:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (patrick bot, 2026-10-18 12:16:29.000000000) ---
+Patch Set 41:
+
+(2 comments)
+
+--- Message (jenkins, 2026-10-18 12:35:03.000000000) ---
+Patch Set 41: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133917/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-19 01:02:12.000000000) ---
+Patch Set 41:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Problematic, see inline comments. The most serious one is in lov_io_commit_async(): with large folios on a multi-stripe file, it looks like a buffered write can lose all but the first 4 KiB of the last folio in every stripe except the last one, once the data is written back. The new -ERANGE fallback also looks like it can free a folio that is still locked. While refreshing, sanity/857 could check that the data is still correct after the cache is dropped; that would catch the first issue.
+
+--- Message (patrick bot, 2026-10-19 01:53:06.000000000) ---
+Patch Set 41:
+
+(9 comments)
+
+--- Message (patrick bot, 2026-10-19 01:53:16.000000000) ---
+Uploaded patch set 42.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-19 02:03:26.000000000) ---
+Patch Set 42:
+
+(46 comments)
+
+47 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-19 04:41:28.000000000) ---
+Patch Set 42: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133973/ : FAILURE
+
+--- Message (patrick bot, 2026-10-19 06:16:19.000000000) ---
+Uploaded patch set 43.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-10-19 06:18:05.000000000) ---
+Patch Set 42:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-19 06:20:33.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (patrick bot, 2026-10-19 06:23:36.000000000) ---
+Patch Set 43:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-10-19 06:24:07.000000000) ---
+Patch Set 43:
+
+(47 comments)
+
+48 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-19 08:02:18.000000000) ---
+Patch Set 43: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133994/ : SUCCESS

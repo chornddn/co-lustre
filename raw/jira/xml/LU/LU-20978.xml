@@ -1,0 +1,154 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20978] sanity-lnet test_233: o2ib peer aborts a fast reconnect and the lost REPLY expires late</title>
+                <link>https://jira.whamcloud.com/browse/LU-20978</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+&lt;p&gt;On o2ib, sanity-lnet test_233 fails intermittently with "ping failed with rc = 255". The failed &lt;tt&gt;lnetctl ping&lt;/tt&gt; takes about 60 s and returns -EIO. The failure occurs at a step that changes from run to run: local_dropped, local_timeout or local_no_route. At the end, the peer NI is in the recovery queue.&lt;/p&gt;
+
+&lt;p&gt;On tcp, the test passed 134 of 134 times in 30 days. On o2ib, it failed 5 of about 14 times in review sessions of &lt;a href="https://review.whamcloud.com/69652" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69652&lt;/a&gt; to &lt;a href="https://review.whamcloud.com/69657" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69657&lt;/a&gt;. Those changes do not touch the code in the analysis below.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+&lt;ul&gt;
+	&lt;li&gt;Branch: master, at v2_17_57 and later.&lt;/li&gt;
+	&lt;li&gt;Maloo: lustre-reviews custom sessions with &lt;tt&gt;nettype=o2ib testlist=sanity-lnet&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;Example test sets: &lt;a href="https://testing.whamcloud.com/test_sets/7fad76f9-03b6-487a-bcda-e4f74b544338" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/7fad76f9-03b6-487a-bcda-e4f74b544338&lt;/a&gt; and &lt;a href="https://testing.whamcloud.com/test_sets/2161bb2b-2daf-4577-bce0-2ac80009eb6f" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://testing.whamcloud.com/test_sets/2161bb2b-2daf-4577-bce0-2ac80009eb6f&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+&lt;ol&gt;
+	&lt;li&gt;Run sanity-lnet test_233 on o2ib with 2 nodes.&lt;/li&gt;
+	&lt;li&gt;Repeat it. The failure rate on Maloo o2ib was about 1 in 3.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The race window is short. We did not reproduce the failure on Soft-RoCE VMs in 36 runs.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h2&gt;
+&lt;p&gt;The failure has two causes. The first cause loses the REPLY. The second cause makes the loss take 60 s to show.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;1. The peer aborts the new conn.&lt;/b&gt; The initiator debug log shows this sequence (test set 7fad76f9):&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;The drop rule simulates LOCAL_DROPPED. &lt;tt&gt;kiblnd_post_tx_locked()&lt;/tt&gt; closes conn A with -22.&lt;/li&gt;
+	&lt;li&gt;LNet resends the GET. o2iblnd connects conn B 4 ms later, and the GET send completes on conn B.&lt;/li&gt;
+	&lt;li&gt;The peer closes conn B: &lt;tt&gt;Closing conn ... to 172.16.10.1@o2ib: error -103&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;No REPLY arrives.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The peer debug log has no &lt;tt&gt;net&lt;/tt&gt; mask, so it does not show the close of conn A. We infer the mechanism from the code. On the peer, the DISCONNECTED event of conn A runs &lt;tt&gt;kiblnd_close_conn_locked(A, 0)&lt;/tt&gt;. Conn B is still in the accept phase, so &lt;tt&gt;ibp_conns&lt;/tt&gt; is empty. The function then unlinks the peer NI, although &lt;tt&gt;ibp_accepting&lt;/tt&gt; is 1. When the peer gets the ESTABLISHED event of conn B, &lt;tt&gt;kiblnd_connreq_done()&lt;/tt&gt; finds &lt;tt&gt;!kiblnd_peer_active(peer_ni)&lt;/tt&gt; and closes conn B with -ECONNABORTED. The peer then drops the GET that arrived early on conn B.&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;kiblnd_peer_connect_failed()&lt;/tt&gt; does not unlink a peer NI while &lt;tt&gt;kiblnd_peer_connecting()&lt;/tt&gt; is true. &lt;tt&gt;kiblnd_close_conn_locked()&lt;/tt&gt; does not make this check.&lt;/p&gt;
+
+&lt;p&gt;Test set 2161bb2b shows the same sequence.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;2. The response timeout ignores a lower transaction_timeout.&lt;/b&gt; The step sets &lt;tt&gt;transaction_timeout&lt;/tt&gt; to 10 s. The REPLY timeout came 62 s after the send. &lt;tt&gt;lnet_monitor_thread()&lt;/tt&gt; checks for expired responses at &lt;tt&gt;rsp_timeout&lt;/tt&gt;. It sets &lt;tt&gt;rsp_timeout = now + lnet_transaction_timeout / 2&lt;/tt&gt; after each check. LNet started with the default of 150 s, so the next check was 75 s after the start. The new value does not move that check. The &lt;tt&gt;lnetctl ping&lt;/tt&gt; wait of 60 s ended first, so the ping returned -EIO, not -ETIMEDOUT.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h2&gt;
+&lt;ol&gt;
+	&lt;li&gt;o2iblnd: in &lt;tt&gt;kiblnd_close_conn_locked()&lt;/tt&gt;, do not unlink the peer NI while &lt;tt&gt;kiblnd_peer_connecting(peer_ni)&lt;/tt&gt; is true. The pending connect then either adds its conn, or &lt;tt&gt;kiblnd_peer_connect_failed()&lt;/tt&gt; unlinks the peer NI.&lt;/li&gt;
+	&lt;li&gt;lnet: in &lt;tt&gt;lnet_monitor_thread()&lt;/tt&gt;, run the response check when &lt;tt&gt;rsp_timeout&lt;/tt&gt; is later than &lt;tt&gt;now + lnet_transaction_timeout / 2&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Fix 2 alone does not stop the test failure, because LNet does not resend a GET after a REPLY timeout. Fix 2 makes the failure fast and clear.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Testresults"&gt;&lt;/a&gt;Test results&lt;/h2&gt;
+&lt;p&gt;We tested both fixes on 2 Soft-RoCE VMs. For each fix, we ran the base build first as a negative control.&lt;/p&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Test&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Base&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;With the fix&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Issue 1, race widened by injected fail_loc&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Peer closes conn B with -103 in 5 of 5 runs&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;No -103 in 10 runs, 10 of 10 pings pass&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Issue 2, new sanity-lnet test_243 (lost REPLY after transaction_timeout 10)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Ping fails after 72 s&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Ping fails after 13 to 14 s, 3 of 3 runs&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;sanity-lnet test_233, o2ib&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;-&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;5 of 5 pass&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;sanity-lnet tests 200 to 260, o2ib&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;-&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;23 pass, 0 fail&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;The fail_loc for issue 1 is synthetic and is not in the patch. Issue 1 has no test that we can push.&lt;/p&gt;</description>
+                <environment />
+        <key id="99920">LU-20978</key>
+            <summary>sanity-lnet test_233: o2ib peer aborts a fast reconnect and the lost REPLY expires late</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Fri, 16 Oct 2026 17:54:27 +0000</created>
+                <updated>Fri, 16 Oct 2026 17:59:48 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="503756" author="gerrit" created="Fri, 16 Oct 2026 17:59:47 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69750" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69750&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20978" title="sanity-lnet test_233: o2ib peer aborts a fast reconnect and the lost REPLY expires late" class="issue-link" data-issue-key="LU-20978"&gt;LU-20978&lt;/a&gt; o2iblnd: keep a connecting peer_ni in the peer table&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: e7f30a55a111f45ea615ae2cdf3f7e1af2260c7a&lt;/p&gt;</comment>
+                            <comment id="503757" author="gerrit" created="Fri, 16 Oct 2026 17:59:48 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69751" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69751&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20978" title="sanity-lnet test_233: o2ib peer aborts a fast reconnect and the lost REPLY expires late" class="issue-link" data-issue-key="LU-20978"&gt;LU-20978&lt;/a&gt; lnet: use current transaction_timeout for responses&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: a353d7f9d6024d2324e366a9436f501f06e65c80&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071lb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

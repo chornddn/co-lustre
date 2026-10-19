@@ -5,12 +5,12 @@ Type:       Improvement
 Priority:   Major
 Status:     Reopened
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Andreas Dilger
 Reporter:   Patrick Farrell
 Created:    Tue, 12 Feb 2019 19:06:56 +0000
-Updated:    Fri, 1 May 2026 05:33:23 +0000
+Updated:    Mon, 19 Oct 2026 06:58:11 +0000
 Labels:     hard, patch, performance, som
-Links:      Duplicate: is duplicated by LU-13248; Duplicate: is duplicated by LU-14461; Duplicate: is duplicated by LU-18529; Related: is related to LU-12649; Related: is related to LU-12337; Related: is related to LU-11994; Related: is related to LU-20212; Related: is related to LU-11554
+Links:      Duplicate: is duplicated by LU-13248; Duplicate: is duplicated by LU-14461; Duplicate: is duplicated by LU-18529; Related: is related to  LU-13637; Related: is related to LU-12649; Related: is related to LU-12337; Related: is related to LU-11994; Related: is related to LU-20212; Related: is related to LU-11554
 
 --- Description ---
 The layout manipulations required to bring an FLR file in to sync (READONLY in FLR parlance) also give SOM while the file is in sync.  This is true SOM, with no caveats, able to be used for any purpose (as distinct from lazy SOM which can only be used by tools which are aware of it).
@@ -21,35 +21,8 @@ Because the layout state transitions for FLR require synchronous writes to the M
 
 This would be a fairly low effort way to allow all files except those being actively modified to have true SOM and improve performance for normal stat() and similar calls.
 
---- Comment (adilger, Fri, 23 May 2025 03:38:50 +0000) ---
-I think you are referring to the transition from SOM READONLY state when the file is being written.
-
-My comment was about the (IMHO more important) transition from an existing file to SOM READONLY state.  This would potentially happen in batches when pre-existing files are accessed after this feature is deployed.  We can't have read-only file access suddenly triggering a mass of sync MDT writes.
-
-The percentage of files being written after being idle for over 24h old is vanishingly small, so I think it is a statistics game - rare chance of more overhead (sync MDT write to clear READONLY flag) vs. common case of stat() avoiding 1 or 20 extra OST RPCs to fetch size, blocks, and timestamps.
-
---- Comment (paf0186, Wed, 11 Dec 2024 04:56:44 +0000) ---
-The issue isn't atomicity, it's the state protection required, it's basically the same as for FLR - For SOM to be reliably accurate in the face of MDS evicted clients, we have to prevent writes that the MDS doesn't know about.  If an MDS evicted client were able to do a write, now SOM is wrong.  So we'll do the same stuff as regular FLR.
-
-So the SOM files are going to go through the same state transitions of RDONLY, WRITE_PENDING, and SYNC_PENDING, and have to update the OSTs with a new generation so writes are rejected.
-
---- Comment (adilger, Wed, 11 Dec 2024 04:47:11 +0000) ---
-I was thinking that the MDS sync write is only needed for FLR mirrored files, since the SOM xattr update is itself atomic regardless of when it is written to the storage, and it doesn't matter if the MDS crashes and the update is lost (ie. it would just be like the current non-SOM state).  All of the tracking for the state machine is in memory on the MDS anyway. 
-
-The main reason to make the SOM update sync for FLR is that this ensures clients will go through the dance to mark one of the mirrors stale if they open the file for write, but we don't care about that if there is no mirror on a file.
-
---- Comment (paf0186, Tue, 10 Dec 2024 23:17:03 +0000) ---
-Patrick Farrell (pfarrell@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57357
-
-Subject: LU-18529 mdt: lazy as strict som
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 2
-
-Commit: dbd79127647cfa310312803f701d3eadb58f845b
+--- Comment (adilger, Wed, 13 Mar 2024 16:57:57 +0000) ---
+This kind of LSOM upgrade would be a general performance improvement for datasets that are read-mostly and referenced frequently. This can happen with workloads like OpenFoam that is doing stat() on millions of files over and over, so having the strict SOM attributes saved on the MDS can avoid lots of unnecessary OST RPCs.
 
 --- Comment (paf0186, Tue, 10 Dec 2024 23:14:03 +0000) ---
 I've made a significant revision to my thinking on this.
@@ -82,5 +55,150 @@ This is useful, but a slightly tricky proposition which would take real work, so
 
 https://review.whamcloud.com/c/fs/lustre-release/+/57357
 
---- Comment (adilger, Wed, 13 Mar 2024 16:57:57 +0000) ---
-This kind of LSOM upgrade would be a general performance improvement for datasets that are read-mostly and referenced frequently. This can happen with workloads like OpenFoam that is doing stat() on millions of files over and over, so having the strict SOM attributes saved on the MDS can avoid lots of unnecessary OST RPCs.
+--- Comment (paf0186, Tue, 10 Dec 2024 23:17:03 +0000) ---
+Patrick Farrell (pfarrell@whamcloud.com) uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/57357
+
+Subject: LU-18529 mdt: lazy as strict som
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 2
+
+Commit: dbd79127647cfa310312803f701d3eadb58f845b
+
+--- Comment (adilger, Wed, 11 Dec 2024 04:47:11 +0000) ---
+I was thinking that the MDS sync write is only needed for FLR mirrored files, since the SOM xattr update is itself atomic regardless of when it is written to the storage, and it doesn't matter if the MDS crashes and the update is lost (ie. it would just be like the current non-SOM state).  All of the tracking for the state machine is in memory on the MDS anyway. 
+
+The main reason to make the SOM update sync for FLR is that this ensures clients will go through the dance to mark one of the mirrors stale if they open the file for write, but we don't care about that if there is no mirror on a file.
+
+--- Comment (paf0186, Wed, 11 Dec 2024 04:56:44 +0000) ---
+The issue isn't atomicity, it's the state protection required, it's basically the same as for FLR - For SOM to be reliably accurate in the face of MDS evicted clients, we have to prevent writes that the MDS doesn't know about.  If an MDS evicted client were able to do a write, now SOM is wrong.  So we'll do the same stuff as regular FLR.
+
+So the SOM files are going to go through the same state transitions of RDONLY, WRITE_PENDING, and SYNC_PENDING, and have to update the OSTs with a new generation so writes are rejected.
+
+--- Comment (adilger, Fri, 23 May 2025 03:38:50 +0000) ---
+I think you are referring to the transition from SOM READONLY state when the file is being written.
+
+My comment was about the (IMHO more important) transition from an existing file to SOM READONLY state.  This would potentially happen in batches when pre-existing files are accessed after this feature is deployed.  We can't have read-only file access suddenly triggering a mass of sync MDT writes.
+
+The percentage of files being written after being idle for over 24h old is vanishingly small, so I think it is a statistics game - rare chance of more overhead (sync MDT write to clear READONLY flag) vs. common case of stat() avoiding 1 or 20 extra OST RPCs to fetch size, blocks, and timestamps.
+
+--- Comment (adilger, Sat, 17 Oct 2026 07:57:37 +0000) ---
+I'm going to take a poke at this over the weekend and see where I can get...
+
+--- Comment (adilger, Sat, 17 Oct 2026 22:54:12 +0000) ---
+Design overview for strict SOM on regular (non-FLR) files; patches to follow.
+
+Layout: a non-mirrored file becomes an FLR file by gaining one data-less "SOM mirror": a single foreign HSM component [0, EOF) with lfm_type = LU_FOREIGN_TYPE_POSIX and a new lhm_flags = HS_SOM, the same technique PCC-RO uses. Clients 2.15 and later already handle this layout unchanged: they honour RDONLY (layout write intent before writing), send layout versions as for any FLR file, and never read from a foreign mirror. A single-mirror RDONLY layout was rejected because existing clients refuse it (lov_init_composite() requires more than one mirror when the FLR state is not NONE). The cost is that lfs getstripe shows the extra foreign mirror.
+
+Conversion reuses the FLR resync protocol, with no new RPC and no kernel client change:
+
+	write lease with LL_LEASE_RESYNC, then MDS_REINT_RESYNC: on a NONE file the MDT adds the (stale) SOM mirror, sets SYNC_PENDING, increments the layout generation and pushes gen | LU_LAYOUT_RESYNC to the OST objects, in a sync transaction;
+
+	fsync() and fstat() for current size and blocks;
+
+	lease unlock with LL_LEASE_RESYNC_DONE and no data mirror IDs: RDONLY with SOM_FL_STRICT, so with mdt.*.enable_strict_som=1 the MDT returns size/blocks and the client skips the glimpse (existing code).
+
+A later write moves the file to WRITE_PENDING and makes SOM stale, as for FLR; converting again makes it strict again. A new writer during the conversion breaks the lease (-EBUSY).
+
+Trigger: explicit for now, via a new llapi_file_som_sync(fd) and lfs somsync --strict. Policy is left to the caller, e.g. "lfs find /mnt -type f -mtime +1 -N 0 | xargs lfs somsync --strict". lfs migrate properly converts a file that was RDONLY before the migration to have RDONLY SOM again. Refused with EOPNOTSUPP for DoM-only, released and foreign-layout files, files with real data mirrors (use lfs mirror resync), and when enable_strict_som=0. Automatic conversion of idle files at last close is a possible follow-up using the same MDT code.
+
+Series (based on 2.17.59):
+
+	flr: fix the handling of foreign mirrors (pre-existing bugs: client EC lsme_dstripe_count/cstripe_count in the union clobbered the HSM flags of foreign components; an HSM mirror could be picked as the write primary; lfs mirror split could leave only a foreign mirror; lfs getstripe -N output)
+
+	flr: fix FLR and SOM state after a layout swap (strict SOM was kept after swap_layouts and the close-time swap of lfs migrate; stale ldo_flr_state after swapping in a plain layout)
+
+	ofd: prepare layout version checks for fencing (fallocate verifies the layout version; a client's version sets an object's first layout version only with LU_LAYOUT_RESYNC; a split to a non-FLR file pushes a plain version)
+
+	lod: prepare for a SOM mirror in FLR files (lod_layout_add_hsm_mirror() factored out of PCC-RO, HS_SOM, RESYNC_DONE and llapi resync handling, PCC-RO ignores the SOM mirror)
+
+	flr: add strict SOM for non-mirrored files (the conversion, llapi/lfs, man pages, sanity-flr test_44h)
+
+Patches 1-4 are low risk and useful without the feature.
+
+No connect flag is needed: 2.15+ clients handle the layout unchanged, and MDS and OSS versions are normally kept in step.
+
+Known limitation: the same gap as FLR today. A client evicted by the MDT but not by the OSTs, holding the pre-conversion layout, sends no layout version (clients send one only for FLR files) and its writes are not refused, so it can change the size behind strict SOM; the OST version push is also asynchronous (OSP sync llog). The plan for full fencing, gated on OBD_CONNECT_SOM (unused since 2.7 and kept for the complete feature rather than this partial step): OSTs advertise it, clients then send a layout version with every modifying RPC for all files, an OST tunable (default off) refuses unversioned modifications to an object in a closed write era, and a SOM-only file keeps its era closed while RDONLY. Patch 3 prepares the OST side for this.
+
+--- Comment (gerrit, Sat, 17 Oct 2026 22:56:37 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69768
+
+Subject: LU-11962 flr: fix the handling of foreign mirrors
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2658f1eb9d89397e6d2f9f22b9122c00681445be
+
+--- Comment (gerrit, Sat, 17 Oct 2026 23:02:00 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69769
+
+Subject: LU-11962 flr: fix FLR and SOM state after a layout swap
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 48fbfa4e1e8b0515032306568c5252041e1ff014
+
+--- Comment (gerrit, Sat, 17 Oct 2026 23:02:01 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69770
+
+Subject: LU-11962 ofd: prepare layout version checks for fencing
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 15b7fc794b4b65891f5901322e4196d8e2c81829
+
+--- Comment (gerrit, Sat, 17 Oct 2026 23:02:02 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69771
+
+Subject: LU-11962 lod: prepare for a SOM mirror in FLR files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4d7da0ee2c5d5e20e1c16676e109ac946c2780cd
+
+--- Comment (gerrit, Sat, 17 Oct 2026 23:02:03 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69772
+
+Subject: LU-11962 flr: add strict SOM for non-mirrored files
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ea76a1828a5055eb93fa3a114b8cf918111a05ad
+
+--- Comment (adilger, Sat, 17 Oct 2026 23:02:05 +0000) ---
+Patches for the design above:
+
+	https://review.whamcloud.com/69768 flr: fix the handling of foreign mirrors (hashtag pt_ecro)
+
+	https://review.whamcloud.com/69769 flr: fix FLR and SOM state after a layout swap
+
+	https://review.whamcloud.com/69770 ofd: prepare layout version checks for fencing
+
+	https://review.whamcloud.com/69771 lod: prepare for a SOM mirror in FLR files
+
+	https://review.whamcloud.com/69772 flr: add strict SOM for non-mirrored files
+
+Correction to the overview: 69770 no longer adds a layout version check for fallocate. Testing showed that a client fallocate on an FLR file can send an older version than the one its own write intent pushed (sanity-flr test_50c), so that check is deferred to the fencing work.

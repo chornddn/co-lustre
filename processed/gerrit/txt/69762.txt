@@ -1,0 +1,131 @@
+Change:     69762
+Subject:    LU-20287 lov: don't block FLR RDONLY setattr on down OST
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69762
+Change-Id:  I5005451e10f293279c441c1fc6d012fb5337d95d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Keguang Xu
+Created:    2026-10-17 06:30:59.000000000
+Updated:    2026-10-18 23:42:46.000000000
+Patch Set:  2
+Insertions: +219
+Deletions:  -7
+Comments:   10 (6 unresolved)
+Hashtags:   pt_ecro, 218_review_priority
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: -1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger
+
+--- Commit Message ---
+LU-20287 lov: don't block FLR RDONLY setattr on down OST
+
+chown/chgrp/chmod/touch on an FLR file in RDONLY state with
+redundant mirrors (plain FLR or EC) wait in cl_setattr_ost() when a
+stripe OST is unavailable: VFS sets ATTR_CTIME and the client sends
+OST_SETATTR to every stripe. Both the client and the MDS send
+setattr RPCs to OSTs: the client updates times/flags promptly for
+applications, while UID/GID/PROJID remain authoritative on the MDT
+and are pushed by MDS osp_sync for durability and recovery.
+
+For non-truncate/non-fallocate setattr on such files, mark the LOV
+sub-IOs ci_ndelay so OSC sends OST_SETATTR with rq_no_delay and
+rq_no_resend (plus a 5-second delay limit for idle import reconnect),
+and ignore -EAGAIN/-ENOTCONN/-ESHUTDOWN/-ETIMEDOUT at setattr end.
+The syscall then neither blocks nor fails on the unavailable OST.
+Times/flags on the missed OST object are not repaired later; the MDT
+inode remains authoritative.
+
+On FLR RESYNC_DONE, also re-push UID/GID/PROJID, read from the MDT
+inode in lod_layout_change(), together with the existing layout
+version update through osp_sync. This repairs OST objects whose
+MDS->OST ownership setattr was skipped or otherwise missed (no
+pending osp_sync record); it does not replace normal osp_sync, whose
+llog is already retried while an OST is temporarily down.
+
+Add sanity-ec 80a (setattr does not block on a stopped EC data OST)
+and sanity-flr 213a (setattr does not block on a stopped preferred
+mirror OST) and 213b (mirror resync repairs OST UID/GID/PROJID after
+a skipped stripe setattr).
+
+Test-Parameters: testlist=sanity-flr
+Test-Parameters: testlist=sanity-ec ostcount=8
+Assisted-by: Cursor:Grok-4.6/Opus5.5 llm_code_and_review_tools
+Signed-off-by: Keguang Xu <kxu@ddn.com>
+Change-Id: I5005451e10f293279c441c1fc6d012fb5337d95d
+
+--- Review History ---
+
+--- Message (Keguang Xu, 2026-10-17 06:30:59.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-17 06:34:16.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-17 06:35:25.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/133865/ : FAILURE
+
+--- Message (wc-checkpatch, 2026-10-17 06:38:23.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2026-10-17 07:46:58.000000000) ---
+Patch Set 1: Code-Review+1
+
+(3 comments)
+
+--- Message (Keguang Xu, 2026-10-18 06:31:15.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-18 06:33:50.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-18 06:39:46.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-18 06:54:33.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/133907/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-18 17:18:03.000000000) ---
+Patch Set 2: Code-Review+1
+
+(3 comments)
+
+--- Message (Andreas Dilger, 2026-10-18 17:18:22.000000000) ---
+Hashtag added: pt_ecro
+
+--- Message (Andreas Dilger, 2026-10-18 17:18:32.000000000) ---
+Hashtag added: 218_review_priority
+
+--- Message (Gerrit AI review for Lustre, 2026-10-18 23:42:46.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. There are two cases where the setattr can still fail or block on a down OST, and they go against the commit message's "neither blocks nor fails". The tests only use current-time setattr after the import has already reached DISCONN, so neither case is exercised. A `touch -m -d @1 $tf` step in sanity-flr 213a would cover the lock path.

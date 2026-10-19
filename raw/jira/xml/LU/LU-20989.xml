@@ -1,0 +1,111 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20989] lfs find: sleep instead of spinning while the parallel find workers run</title>
+                <link>https://jira.whamcloud.com/browse/LU-20989</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Component: utils (liblustreapi)&lt;br/&gt;
+Since: &lt;a href="https://jira.whamcloud.com/browse/LU-17814" title="&amp;quot;lfs find&amp;quot; to scan with multiple threads" class="issue-link" data-issue-key="LU-17814"&gt;&lt;del&gt;LU-17814&lt;/del&gt;&lt;/a&gt; (e505e7dbfb "utils: Add work unit management")&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Currentbehaviour"&gt;&lt;/a&gt;Current behaviour&lt;/h3&gt;
+
+&lt;p&gt;&lt;tt&gt;pfind_param_callback()&lt;/tt&gt; in &lt;tt&gt;lustre/utils/liblustreapi_pfind.c&lt;/tt&gt; waits for the parallel find workers like this:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;	while (ll_atomic_fetch_add(&amp;amp;queue-&amp;gt;fwq_active_units, 0) &amp;gt; 0) {
+		/* if a worker hit an error, it forces shutdown... */
+		if (queue-&amp;gt;fwq_shutdown)
+			cleanup_work_queue(queue);
+		else
+			sched_yield();
+	}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The workers spend most of their time waiting on the MDS, so &lt;tt&gt;sched_yield()&lt;/tt&gt; returns at once and the main thread spins on a CPU for the whole walk. After a worker sets &lt;tt&gt;fwq_shutdown&lt;/tt&gt;, the loop also spins taking &lt;tt&gt;fwq_lock&lt;/tt&gt; in &lt;tt&gt;cleanup_work_queue()&lt;/tt&gt; until the in-flight units finish.&lt;/p&gt;
+
+&lt;p&gt;This hits every &lt;tt&gt;lfs find&lt;/tt&gt;, not only runs with &lt;tt&gt;--threads&lt;/tt&gt;: &lt;tt&gt;calculate_default_thread_count()&lt;/tt&gt; never returns less than 4, so &lt;tt&gt;lfs find&lt;/tt&gt; always goes through &lt;tt&gt;parallel_find()&lt;/tt&gt;. Other &lt;tt&gt;llapi_find()&lt;/tt&gt; callers with &lt;tt&gt;fp_thread_count &amp;gt; 1&lt;/tt&gt; are hit too.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Measuredcost"&gt;&lt;/a&gt;Measured cost&lt;/h3&gt;
+
+&lt;p&gt;Single VM (4 vCPU, RHEL 9.7, MGS/MDT/OST/client on one node, 2 MDTs, 2 OSTs), 100 directories x 1000 files. Stock master vs the fix, same &lt;tt&gt;lfs&lt;/tt&gt; binary, library picked with &lt;tt&gt;LD_PRELOAD&lt;/tt&gt; and checked in &lt;tt&gt;/proc/&amp;lt;pid&amp;gt;/maps&lt;/tt&gt;. Arms alternated, 5 or 6 pairs each, MDC lock LRU cleared before each run for "cold". CPU is user+sys from &lt;tt&gt;/usr/bin/time&lt;/tt&gt;; main-thread CPU is from &lt;tt&gt;/proc/&amp;lt;pid&amp;gt;/task/&amp;lt;pid&amp;gt;/stat&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lfs find DIR --threads 4 -mtime -1    (stats every file)
+             wall (median)   process CPU   main thread CPU
+cold stock       4.83 s         4.69 s         1.91 s
+cold fixed       4.08 s         3.26 s         0.00 s
+warm stock       4.86 s         4.62 s         1.88 s
+warm fixed       4.28 s         2.87 s         0.00 s
+
+lfs find DIR --threads 4 -type f      (readdir only, short walk)
+cold stock       0.23 s         0.55 s         0.20 s
+cold fixed       0.24 s         0.34 s         0.00 s
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Every pair moved the same way: process CPU -1.2 to -1.9 s and wall -0.5 to -0.8 s per &lt;tt&gt;-mtime&lt;/tt&gt; run. On this node the spinner competes with the workers and the local MDS for the 4 CPUs, so it gets about 40% of a core and slows the walk. On a client with a remote MDS, where the CPUs are idle, we expect it to take a full core (not measured). Output was identical in all runs (100101 lines, same sorted md5).&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h3&gt;
+
+&lt;p&gt;Add &lt;tt&gt;fwq_done_cond&lt;/tt&gt; to &lt;tt&gt;struct find_work_queue&lt;/tt&gt;. A worker takes &lt;tt&gt;fwq_lock&lt;/tt&gt; for its decrement of &lt;tt&gt;fwq_active_units&lt;/tt&gt; and signals the condvar when it finishes the last unit or after a shutdown. The main thread sleeps on it under the same lock, so the wakeup cannot be lost. On shutdown it drains the queue only when something is queued, then sleeps again. The counter stays atomic because &lt;tt&gt;work_unit_create_and_add()&lt;/tt&gt; still increments it outside the lock.&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;struct find_work_queue&lt;/tt&gt; is in the public &lt;tt&gt;lustreapi.h&lt;/tt&gt;, so the new field changes its size. Inside the tree it is only built on the stack in &lt;tt&gt;parallel_find()&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;With &lt;tt&gt;LLAPI_FAIL_LOC=LLAPI_FAIL_PFIND_SEM&lt;/tt&gt; the fixed &lt;tt&gt;lfs find&lt;/tt&gt; still exits with "Input/output error" (10 of 10 runs, 0.06 s, no hang). 200 short finds at 2 to 16 threads all finished. Sanity 56* on the fixed build: 87 pass, 0 fail, 1 skip (56xc, needs space), including 56Ek.&lt;/p&gt;</description>
+                <environment />
+        <key id="99982">LU-20989</key>
+            <summary>lfs find: sleep instead of spinning while the parallel find workers run</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 19 Oct 2026 02:42:37 +0000</created>
+                <updated>Mon, 19 Oct 2026 02:42:59 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="503796" author="gerrit" created="Mon, 19 Oct 2026 02:42:59 +0000">&lt;p&gt;"Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69796" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69796&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20989" title="lfs find: sleep instead of spinning while the parallel find workers run" class="issue-link" data-issue-key="LU-20989"&gt;LU-20989&lt;/a&gt; utils: sleep while parallel find runs&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 76979884abe0dad03d6468ab192b6323619ca3a3&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071nz:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
