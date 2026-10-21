@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-15 10:56:38.000000000
-Updated:    2026-10-18 03:27:56.000000000
+Updated:    2026-10-19 15:20:45.000000000
 Patch Set:  1
 Insertions: +312
 Deletions:  -17
 Comments:   1 (0 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Artem Blagodarenko: +1
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -275,3 +275,56 @@ Looks good to me.
 Patch Set 1: Verified+1
 
 Passed enforced test review-dne-zfs-part-2 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-157vm89: https://testing.whamcloud.com/test_sessions/674b7aa4-6cd3-4683-8759-2679dddf1e0c ran 11 tests.
+
+--- Message (Artem Blagodarenko, 2026-10-19 15:20:45.000000000) ---
+Patch Set 1: Code-Review+1
+
+Tested PS1 with ltvm on rocky9 (5.14.0-611.55.1.el9_7), 2 MDTs and
+2 OSTs so the DNE update llogs are written too: conf-sanity test_172
+passes (56-66s, x3).
+
+The same test_172 on the parent 75721f5625 (69716 only) fails with
+"mds1 blocks allocated in the wrong groups" (reply_data and plain
+llog headers O/1/d*/* misplaced), so the test catches a missing
+osd-ldiskfs change.
+
+I also checked the allocations directly with eBPF. bpftrace with a
+kprobe/kretprobe on ldiskfs_mb_new_blocks() records, for every
+allocation on the Lustre targets, the inode, logical block, result
+block and whether the request has HINT_DATA (0x20).  Inodes were
+mapped to paths while test_172 mounts each target as ldiskfs for its
+own check.  IOPS groups end at block 32768 (MDT) and 24576 (OST).
+
+Allocations on the hybrid targets during test_172:
+
+                                       requests       blocks
+   file class                          without        IOPS/HDD
+                                       HINT_DATA
+   MDT internal files (oi.16.*,        272/272        272/0
+     last_rcvd, reply_data, LAST_ID,
+     lov_objid, fld, seq_*, quota,
+     LFSCK, nodemap...)
+   MDT named llogs and catalogs        21/21          75/0
+     (CONFIGS/*, CATALOGS, changelog_*)
+   MDT plain llog headers, < 64KiB     3644/3644      3706/0
+     (changelog, unlink, update_log_dir)
+   MDT plain llog records, >= 64KiB    2/62           8/240
+   MDT DoM file data                   0/1            0/128
+   OST internal files (O/*/LAST_ID)    156/156        156/0
+   OST named llogs (CONFIGS/*)         3/3            12/0
+   OST object data                     0/102          0/2148
+
+The 64KiB split for plain llogs is exact, including the DNE update
+llogs. The two record allocations without HINT_DATA are both in
+O/1/d2/2 ([0x1:0x2]), which looks like the OSP sync catalog and so
+is expected to be fully metadata. Regular files allocated without
+HINT_DATA appear only on the two hybrid targets during test_172,
+not on MDT0001, the second OST, or the non-hybrid mounts before and
+after it.
+
+On the parent alone, in the same phase of test_172 on MDT0000:
+
+   file class                          with HINT_DATA  blocks HDD
+   MDT internal files                  271/272         271/272
+   MDT named llogs and catalogs        21/22           75/76
+   MDT plain llog headers, < 64KiB     3641/3643       3708/3710

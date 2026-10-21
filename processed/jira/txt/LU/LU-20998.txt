@@ -1,0 +1,52 @@
+Key:        LU-20998
+Summary:    lfsck OSP side memory leak fix and memory optimization.
+Link:       https://jira.whamcloud.com/browse/LU-20998
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Tue, 20 Oct 2026 12:59:53 +0000
+Updated:    Tue, 20 Oct 2026 12:59:53 +0000
+
+--- Description ---
+osp_it_fetch() allocates an array of 256 folios and 256 single page
+
+folios for every OBD_IDX_READ, and osp_it_next_page() frees them as
+
+soon as that bulk has been consumed, only for the next fetch of the
+
+same iteration to allocate them again.
+
+The split leaks as well: the fetch assigns it->ooi_folios
+
+unconditionally, while the free is only reached once a bulk has been
+
+consumed, which a failed fetch never is. As a failing
+
+dt_index_operations::next is retried for as long as it fails unless
+
+LPF_FAILOUT was asked for, every retry after such a fetch loses 1MB.
+
+Keep the array for the life of the iterator and let osp_it_fini()
+
+release it, which takes the allocation out of the fast path and
+
+leaves no way to lose it. It is published once it is complete only,
+
+so that a retry never reuses a half filled one. The old content of
+
+a reused folio does not matter: only ooi_valid_npages of them are
+
+read and every lu_page is validated by its magic.
+
+Ask for the folios with GFP_NOFS, as the pages were asked for before
+
+the switch to the folio API. These index objects are read with the
+
+locks of the caller held, where a reclaim which re-enters this
+
+filesystem can deadlock.
+
+Fixes: 2b80459bf164 ("LU-17916 osp: switch to struct folio")

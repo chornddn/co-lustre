@@ -1,0 +1,104 @@
+Change:     69823
+Subject:    LU-20994 osd-ldiskfs: end bios on RAID row boundaries
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69823
+Change-Id:  Ibd956000ec2db86f29e50634c5322cb0ceaa650c
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Artem Blagodarenko
+Created:    2026-10-19 18:01:11.000000000
+Updated:    2026-10-21 08:36:37.000000000
+Patch Set:  1
+Insertions: +63
+Deletions:  -11
+Comments:   4 (3 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Andreas Dilger, Gerrit AI review for Lustre
+  REVIEWER: Alex Zhuravlev
+
+--- Commit Message ---
+LU-20994 osd-ldiskfs: end bios on RAID row boundaries
+
+osd_do_bio() fills each bio until the disk blocks stop being
+contiguous or bio_add_folio() fails. How far a full bio reaches
+depends on how many of the buffer pages merge into multi-page
+bvecs, so it usually ends in the middle of a RAID row (full
+stripe). The RAID device then gets that row in two bios and must
+take its partial-stripe path for it: a read-modify-write, or a
+slower stripe-cache path instead of a full-row write.
+
+On md RAID6 8+2 OSTs with 1 MiB rows and 4 MiB O_DIRECT writes,
+about half of the requests reached md in 2-4 bios cut mid-row, and
+23% of the rows were written as partial stripes; md wrote 17.2
+GiB/s against 21.4 GiB/s in a run where 90% of the requests
+happened to be a single bio.
+
+Use the ldiskfs stripe (mount -o stripe=, else the superblock's
+stripe width or stride) as the row size. For writes, at each row
+boundary end the bio if the next row, or what is left of the I/O
+if less, does not fit in the bvecs left in it. The bvecs a row
+needs are counted from its pages, one per physically contiguous
+run, so bios still grow past one row when the pages merge (for
+example with higher-order I/O buffers). A row that needs more
+bvecs than any bio can hold is split anyway, so no cut is made for
+it. A fragment within a page also stops at a row boundary. Reads
+and OSTs without a stripe are unchanged.
+
+Test: md raid6 8+2, 128 KiB chunk as an extra OST, 300 x 4 MiB
+O_DIRECT writes, bios traced at md0 (block_bio_queue), 3 runs each:
+  stripe off: 600 bios, 300 ending mid-row
+  stripe on:  650 bios, 0 ending mid-row (150 x 4 MiB,
+              50 x 3 MiB, 450 x 1 MiB); data verified
+md raid6 6+2, 256 KiB chunk (1.5 MiB row, more than 256 pages):
+  stripe off: 975-999 bios; stripe on: 753-754 bios, no extra cuts
+
+On a site with 8+2 RAID6 OSTs (1 MiB rows), 3 clients writing
+4 MiB O_DIRECT, the share of rows written as full stripes went
+from 77-94% to 100%, and client writes went from 16.4 to 20.8
+GiB/s with 2 OSTs on one server (+26%) and from 33.1 to 35.4 GiB/s
+with 4 OSTs on two servers (+7%).
+
+Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm
+Change-Id: Ibd956000ec2db86f29e50634c5322cb0ceaa650c
+
+--- Review History ---
+
+--- Message (Artem Blagodarenko, 2026-10-19 18:01:11.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-19 18:04:18.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-19 18:14:27.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-19 19:00:50.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134036/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-21 00:44:52.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; no correctness problems found in the new bio cutting logic. A few optional notes inline for whenever the patch is next refreshed, no need to re-spin for them.
+
+--- Message (Artem Blagodarenko, 2026-10-21 08:36:37.000000000) ---
+Patch Set 1:
+
+(1 comment)

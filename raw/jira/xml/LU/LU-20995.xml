@@ -1,0 +1,109 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-20995] libcfs: kallsyms lookups crash with "Missing ENDBR" on x86 kernels with IBT</title>
+                <link>https://jira.whamcloud.com/browse/LU-20995</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;On x86 kernels built with &lt;tt&gt;CONFIG_X86_KERNEL_IBT&lt;/tt&gt; (Indirect Branch Tracking, i.e. CET), loading libcfs can BUG the kernel with "Missing ENDBR". This happens when Lustre calls kernel functions through pointers it got from kallsyms.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Rootcause"&gt;&lt;/a&gt;Root cause&lt;/h3&gt;
+
+&lt;p&gt;1. The pointer to &lt;tt&gt;kallsyms_lookup_name&lt;/tt&gt; is wrong.&lt;br/&gt;
+   Since 5.7, &lt;tt&gt;kallsyms_lookup_name()&lt;/tt&gt; is no longer exported. &lt;tt&gt;find_kallsyms_lookup_name()&lt;/tt&gt; in &lt;tt&gt;lustre_compat/symbols.c&lt;/tt&gt; finds it by registering a kprobe and using &lt;tt&gt;kp.addr&lt;/tt&gt; as the function pointer:&lt;/p&gt;
+   &lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+   __cfs_kallsyms_lookup_name = (void *)kp.addr;
+   &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;   With IBT enabled, &lt;tt&gt;arch_adjust_kprobe_addr()&lt;/tt&gt; puts the probe after the ENDBR64 instruction at the function entry. So &lt;tt&gt;kp.addr&lt;/tt&gt; is &lt;tt&gt;kallsyms_lookup_name+0x4&lt;/tt&gt;, not the function start. The first indirect call to it, at the sanity check in &lt;tt&gt;lustre_symbols_init()&lt;/tt&gt;, raises a Control Protection (#CP) fault and the kernel BUGs.&lt;br/&gt;
+2. Some looked-up functions may not have an ENDBR at all.&lt;br/&gt;
+   With IBT, objtool/the kernel seals (poisons) the ENDBR of any function whose address is never taken. A function found through kallsyms may then have no valid ENDBR, and calling it through a pointer also raises #CP. This affects the functions looked up in &lt;tt&gt;lustre_symbols_init()&lt;/tt&gt;:&lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;&lt;tt&gt;alloc_workqueue_attrs&lt;/tt&gt; / &lt;tt&gt;alloc_workqueue_attrs_noprof&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;free_workqueue_attrs&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;apply_workqueue_attrs&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;folio_memcg_lock&lt;/tt&gt; / &lt;tt&gt;folio_memcg_unlock&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;account_page_dirtied&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;security_file_alloc&lt;/tt&gt; / &lt;tt&gt;security_file_free&lt;/tt&gt;&lt;br/&gt;
+  It also affects &lt;tt&gt;flush_delayed_fput&lt;/tt&gt;, which osd-wbcfs looks up in &lt;tt&gt;osd_init()&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;3. Related: osd-wbcfs does not check its lookup result.&lt;br/&gt;
+   If the &lt;tt&gt;flush_delayed_fput&lt;/tt&gt; lookup fails, &lt;tt&gt;osd_init()&lt;/tt&gt; still succeeds. &lt;tt&gt;cfs_flush_delayed_fput()&lt;/tt&gt; is then called as a NULL pointer from &lt;tt&gt;osd_flush_fput()&lt;/tt&gt; and from device cleanup.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Affectedcode"&gt;&lt;/a&gt;Affected code&lt;/h3&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;&lt;tt&gt;lustre_compat/symbols.c&lt;/tt&gt;: &lt;tt&gt;find_kallsyms_lookup_name()&lt;/tt&gt;, &lt;tt&gt;lustre_symbols_init()&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;lustre/osd-wbcfs/osd_handler.c&lt;/tt&gt;: &lt;tt&gt;osd_init()&lt;/tt&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h3&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;In &lt;tt&gt;find_kallsyms_lookup_name()&lt;/tt&gt;, rewind the kprobe address to the start of the symbol, using the symbol offset from &lt;tt&gt;sprint_symbol()&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;Add an exported helper, &lt;tt&gt;cfs_kallsyms_lookup_func()&lt;/tt&gt;. It looks up a symbol and, when &lt;tt&gt;X86_FEATURE_IBT&lt;/tt&gt; is enabled, checks that the function starts with ENDBR64 before returning it.&lt;/li&gt;
+	&lt;li&gt;Use this helper for every function that is called through a pointer: those in &lt;tt&gt;lustre_symbols_init()&lt;/tt&gt; and &lt;tt&gt;flush_delayed_fput&lt;/tt&gt; in osd-wbcfs.&lt;/li&gt;
+	&lt;li&gt;Fail module init cleanly instead of crashing when a function cannot be called safely. In osd-wbcfs, check the lookup result before &lt;tt&gt;class_register_type()&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Note"&gt;&lt;/a&gt;Note&lt;/h3&gt;
+&lt;p&gt;If the kernel has sealed &lt;tt&gt;kallsyms_lookup_name&lt;/tt&gt; itself, libcfs will refuse to load with &lt;tt&gt;-EOPNOTSUPP&lt;/tt&gt; instead of crashing. Fully supporting such kernels would need a different way to resolve symbols.&lt;/p&gt;</description>
+                <environment />
+        <key id="99989">LU-20995</key>
+            <summary>libcfs: kallsyms lookups crash with "Missing ENDBR" on x86 kernels with IBT</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="yujian">Jian Yu</assignee>
+                                    <reporter username="yujian">Jian Yu</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 19 Oct 2026 22:28:49 +0000</created>
+                <updated>Wed, 21 Oct 2026 06:53:20 +0000</updated>
+                                            <version>Lustre 2.18.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="503851" author="gerrit" created="Mon, 19 Oct 2026 22:42:39 +0000">&lt;p&gt;"Jian Yu &amp;lt;yujian@whamcloud.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69827" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69827&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20995" title="libcfs: kallsyms lookups crash with &amp;quot;Missing ENDBR&amp;quot; on x86 kernels with IBT" class="issue-link" data-issue-key="LU-20995"&gt;LU-20995&lt;/a&gt; compat: make kallsyms lookups safe with x86 kernel IBT&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 4a2a5de6f7b71d77afb013a9edf1a292f9229e8d&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071pj:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

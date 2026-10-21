@@ -1,0 +1,41 @@
+Key:        LU-20993
+Summary:    Stranded Replay Request Causing Server Recreate Stale MDT Object after MDS Reboot
+Link:       https://jira.whamcloud.com/browse/LU-20993
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Michael Guo
+Created:    Mon, 19 Oct 2026 16:25:14 +0000
+Updated:    Mon, 19 Oct 2026 18:01:45 +0000
+Attachments: client-side-fail-loc.patch, client-side-fix.patch, server-side-fix.patch
+
+--- Description ---
+The Mechanism is the following:
+
+1. A client opens a file with O_CREAT. After the reply, the client keeps that open request on its replay list so it can be replayed if the MDT restarts. 
+
+2. The file is unlinked and closed, so the server destroys the MDT object and its OST objects. Normally mdc_close() also clears the request's rq_replay, which drops it from the list. 
+
+3. Client bug: if the client has no md_open_data (mod) for that open, the close goes through but rq_replay is never cleared. That happens, for example, when obd_mod_alloc() fails in mdc_set_open_replay_data(): cannot allocate md_open_data, then couldn't find open req; expecting close error. The dead open stays on the replay list. 
+
+4. At the next MDT restart the client replays it (MSG_REPLAY). It is a committed open, so it is handled inline, and the replayed N reqs counter does not count it. 
+
+5. Server bug: in mdt_reint_open(), the replay branch calls mdt_open_by_fid(), gets -ENOENT, and then does No object(1), continue as regular open. That re-creates the destroyed FID. Because it is a replay, no_create=1: no OST objects are allocated, and the client's saved layout is written verbatim. The result is the stale entry. 
+
+6. Second client bug: a failed or refused open replay is not dropped. It is retried at every MDT restart, so each patching reboot can resurrect the same files again. 
+
+The reproducer: 
+
+	client 
+
+lctl set_param fail_loc=2147485708                  # 0x8000080c, fires once 
+
+python3 -c 'import os,time; p="/fs144/x.tmp"; fd=os.open(p,os.O_RDWR|os.O_CREAT,0o644); os.write(fd,b"x"); time.sleep(5); os.unlink(p); os.close(fd)' 
+
+lctl set_param fail_loc=0; sync 
+
+	MDS: plain (failover) restart 
+
+Also attaching my tentative fix patches here

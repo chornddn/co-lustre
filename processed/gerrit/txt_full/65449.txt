@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Lai Siyao
 Created:    2026-04-21 14:56:05.000000000
-Updated:    2026-10-16 07:32:10.000000000
-Patch Set:  8
-Insertions: +214
-Deletions:  -646
+Updated:    2026-10-21 10:38:40.000000000
+Patch Set:  9
+Insertions: +314
+Deletions:  -644
 Comments:   31 (9 unresolved)
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Nikitas Angelinas, Janitor Bot, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -32,7 +32,11 @@ Remove the priority OI scrub path and simplify the scrub bookkeeping:
    stayed inconsistent and triggered repeated partial OI scrubs.  The
    full_scrub_ratio and full_scrub_threshold_rate tunables which
    controlled that partial scan are removed as well, and
-   Documentation/lfsck.txt is updated to match.
+   Documentation/lfsck.txt is updated to match, documenting both
+   auto-start triggers: an incomplete previous scrub found in the OI
+   file at mount, and an RPC hitting a FID whose OI mapping is
+   missing, stale, or inconsistent.
+
 2. Drop osd_ldiskfs_consistency_check() from osd_ea_rec_lookup() and
    the OI check in do_osd_stripe_dir_filldir().  They duplicate the
    check in osd_fid_lookup() with subtly different semantics, which
@@ -40,16 +44,45 @@ Remove the priority OI scrub path and simplify the scrub bookkeeping:
    is enough.  That check now queues any FID whose OI mapping cannot
    be used for OI scrub, starts the scrub with SS_RESET, and only
    looks up the remote parent for MD operative FIDs.
+
 3. Do not remove the OI mapping in osd_object_init() in osd-zfs after
-   an LMA check failure: it can race with the OI scrub thread.
+   an LMA check failure: it can race with the OI scrub thread.  The
+   ldiskfs osd_fid_lookup() keeps its stale mapping as well, so that
+   the FID queued by osd_scrub_oi_insert() carries a mapping the
+   scrub can verify and repair, and the object stays reachable until
+   then.
+
 4. Move a FID that could not be fixed into the stale list in
    osd_scrub_check_update(), which is also where the
-   OBD_FAIL_OSD_SCRUB_STALE fault injection point is checked now
-   instead of in osd_fid_lookup().
-5. Small fixes found while running the tests.
-6. Update sanity-scrub.sh to create a 10 level deep directory, so
-   that the bottom directories are scrubbed after the upper ones;
-   this makes the tests more reliable.
+   OBD_FAIL_OSD_SCRUB_STALE fault injection point is checked now,
+   in addition to the iget-failure check in osd_fid_lookup().
+
+5. Queue the FID and hold the scrub write lock across the OI mapping
+   re-check in osd_scrub_oi_insert(), so the running scrub cannot
+   drain it in between; skip the re-check for an object found via
+   REMOTE_PARENT_DIR, whose inode never matches the OI mapping; and
+   restore a stale-listed FID whose OI lookup still succeeds, so it
+   is not reported -ESTALE until unmount.
+
+6. Small fixes found while running the tests: reset the
+   prior_updated counter unconditionally and move leftover
+   inconsistent items to the stale list when the scrub completes.
+
+7. Update sanity-scrub.sh for the one-pass OI scrub: create a 10 level
+   deep directory, so that the bottom directories are scrubbed after
+   the upper ones, which makes the tests more reliable; add a
+   scrub_start_running() helper that starts the OI scrub on the MDTs
+   where the RPC-triggered scrub has already finished, and call it
+   wherever a test needs the scrub to be running -- to inject a fault
+   that only a running scrub can hit, or to stop the MDT in the middle
+   of the scrub; fail the OI scrub in test_6 before it can run to
+   completion, because a completed scrub clears the
+   recreated/inconsistent flags that the MDT needs at remount below to
+   auto-restart the scrub, and it would no longer be there to hit the
+   injected OBD_FAIL_OSD_SCRUB_FATAL; and let scrub_check_status()
+   take a comparison operator, so that test_10a can wait for the
+   resumed scrub to leave the 'paused' state left behind by the MDT
+   stop instead of requiring the 'scanning' state.
 
 Signed-off-by: Lai Siyao <lai.siyao@whamcloud.com>
 Change-Id: I981b39e2f87b520e90418cd8d2df03b47a1edced
@@ -2654,3 +2687,210 @@ But I reproduced two of the AI review's defects, see inline. The first one is wh
 Patch Set 8:
 
 (1 comment)
+
+--- Message (Lai Siyao, 2026-10-21 10:13:15.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-21 10:15:50.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-21 10:28:09.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-21 10:37:48.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134160/ : SUCCESS
+
+--- Message (Maloo, 2026-10-21 10:38:40.000000000) ---
+Patch Set 9:
+
+#### The following sessions will be run for Build 134160 (patch #9):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134160&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134160#redirect

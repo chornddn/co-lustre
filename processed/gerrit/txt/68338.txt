@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Minh
 Created:    2026-08-25 15:16:07.000000000
-Updated:    2026-10-18 13:40:56.000000000
-Patch Set:  3
-Insertions: +94
+Updated:    2026-10-20 19:01:32.000000000
+Patch Set:  4
+Insertions: +97
 Deletions:  -5
-Comments:   23 (8 unresolved)
+Comments:   27 (10 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1
+  Code-Review: James Simmons: -1
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -30,29 +30,32 @@ transiently with exit 234, empty output and a cYAML error of
 succeeds.
 
 Each dump chunk is built in an skb of at least cb->min_dump_alloc
-bytes. Since LU-20221, lnet_net_show_start() sizes this from the
-configured NIs, about 6.5KB per NI plus 3.5KB per net, so a node
-with three or more NIs needs an order-4 or larger alloc_skb() and
-a large multi-rail config needs far more. Above
-PAGE_ALLOC_COSTLY_ORDER these allocations fail under memory
-fragmentation regardless of free memory, and the kernel reports
-ENOBUFS: as an NLMSG_ERROR if the first chunk fails, or as a
-socket error on recvmsg() if a later one does. Neither can be
-resumed on that socket, because the kernel only refills a dump
-from recvmsg() after a successful dequeue, so only a new request
-recovers.
+bytes. lnet_net_show_start() set this to U16_MAX, an order-4
+alloc_skb() on every node. LU-20221 sizes it from the configured
+NIs instead, about 6.5KB per NI plus 3.5KB per net, so a node with
+three or more NIs still needs order 4 and a large multi-rail
+config needs far more. Above PAGE_ALLOC_COSTLY_ORDER these
+allocations fail under memory fragmentation regardless of free
+memory, and the kernel reports ENOBUFS: as an NLMSG_ERROR if the
+first chunk fails, or as a socket error on recvmsg() if a later
+one does. Neither can be resumed on that socket, because the
+kernel only refills a dump from recvmsg() after a successful
+dequeue, so only a new request recovers.
 
 Retry the whole request on a fresh socket, bounded with
-exponential backoff, when a dump-mode request fails with ENOBUFS
-or ENOMEM. libnl maps ENOBUFS to NLE_NOMEM, whose text is "Out of
-memory", so report ENOBUFS as "No buffer space available" on both
-paths, and return the real errno from yaml_lnet_config_ni()
-instead of -EINVAL so the exit status, errno and message agree.
+exponential backoff, when a dump fails with ENOBUFS or ENOMEM. The
+retry is shared by yaml_lnet_config_ni() and yaml_lnet_route(),
+the two dumps whose kernel side raises cb->min_dump_alloc. libnl
+maps ENOBUFS to NLE_NOMEM, whose text is "Out of memory", so
+report ENOBUFS as "No buffer space available" on both paths, and
+return the real errno from yaml_lnet_config_ni() instead of
+-EINVAL so the exit status, errno and message agree.
 
-Adds sanity-lnet test_306, which runs concurrent
-`lnetctl net show -v` loops plus discovery churn.
+Add CFS_FAIL_NET_SHOW_DUMP to fail lnet_net_show_dump() with
+-ENOBUFS, and sanity-lnet test_306 to check that lnetctl net show
+retries a single failure and reports a persistent one.
 
-Fixes: fff650726b2b ("LU-13642 lnet: Allow dynamic IP specification")
+Fixes: 8f64231185a9 ("LU-9680 utils: fix nested attribute handling in liblnetconfig")
 TLC-bug-id: TLU-226
 Signed-off-by: Minh Diep <mdiep@thelustrecollective.com>
 Assisted-by: Claude:claude-opus-5
@@ -164,3 +167,41 @@ Patch Set 3:
 AI code review results below, please doublecheck
 
 The retry logic looks correct, but the commit message needs a refresh: the Fixes: target looks wrong and the ticket may not match. The new test probably can't reach the failing allocation size. Comments inline; while refreshing, there is also a small stale-message nit.
+
+--- Message (Minh, 2026-10-19 15:56:15.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-19 15:59:35.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-19 16:09:58.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (James Simmons, 2026-10-19 16:13:50.000000000) ---
+Patch Set 4: Code-Review-1
+
+(2 comments)
+
+--- Message (jenkins, 2026-10-19 16:38:31.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134019/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-20 19:01:32.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The retry logic itself looks fine, but the new fault injection never reaches the retry path, so test_306 can't pass as written and the retry has no working test yet.

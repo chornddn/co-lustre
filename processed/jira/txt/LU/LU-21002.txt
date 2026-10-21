@@ -1,0 +1,71 @@
+Key:        LU-21002
+Summary:    ldiskfs: deadlock in ldiskfs_try_to_trim_range() on RHEL 10 / 6.12+ kernels
+Link:       https://jira.whamcloud.com/browse/LU-21002
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Tue, 20 Oct 2026 20:12:09 +0000
+Updated:    Tue, 20 Oct 2026 20:13:40 +0000
+Links:      Related: is related to  LU-19288; Related: is related to  LU-14712; Related: is related to  LU-18667
+
+--- Description ---
+The RHEL 10.0 port of ext4-introduce-EXT4_BG_TRIMMED-to-optimize-fstrim.patch (added in LU-18667) moved the EXT4_BG_TRIMMED update into ext4_try_to_trim_range(). That function is entered and exits with the group lock held, and it drops the lock to start the journal handle. After it re-takes the lock, it checks whether blocks were freed in the group while it was trimming:
+
+		ext4_lock_group(sb, e4b->bd_group);
+		/* someone freed more blocks after we unlocked the group */
+		if (freed_last_trimmed_orig != e4b->bd_info->bb_freed_since_trim)
+			goto out_journal;
+...
+out_journal:
+		if (track_trim) {
+			err = ext4_journal_stop(handle);
+			...
+		}
+out_return:
+		ext4_lock_group(sb, e4b->bd_group);
+
+The mismatch path jumps to out_journal while still holding the group spinlock. If track_trim is set, it calls ext4_journal_stop() under a spinlock. It then tries to take the same lock again at out_return, so the fstrim thread deadlocks on itself. Any other thread that then frees blocks in that group (e.g. ext4_mb_mark_context() from unlink/truncate) spins behind it until the soft-lockup watchdog fires.
+
+freed_last_trimmed_orig is sampled at function entry, and the trim loop itself drops the group lock. So any free in the group while that group is being trimmed takes this path, which is easy to hit when fstrim runs alongside a delete-heavy workload.
+
+The rhel8.7, rhel9, rhel9.4 and rhel9.8 variants of the patch already unlock the group before "goto out_journal". Only the rhel10.0 variant is affected. It is used by the 6.12-ml, 6.18-ml, 7.0-ml, rhel10.0/10.1/10.2 and ubuntu26 series on master. b2_15, b2_16 and b2_17 do not carry it.
+
+Seen in the field on 6.12.90 (Debian) OSS during a nightly fstrim with mdtest/IOR deletes:
+
+rcu: INFO: rcu_sched self-detected stall on CPU
+CPU: 21 PID: 28325 Comm: fstrim
+RIP: 0010:queued_spin_lock_slowpath+0x6b/0x260
+RBX: ffff8889546ac840 ... RDI: ffff8889546ac840
+ ldiskfs_try_to_trim_range+0x6bc/0x790 [ldiskfs]
+ ldiskfs_trim_all_free+0x135/0x190 [ldiskfs]
+ ldiskfs_trim_fs+0x1d0/0x250 [ldiskfs]
+ __ldiskfs_ioctl+0xeb8/0x1720 [ldiskfs]
+
+watchdog: BUG: soft lockup - CPU#20 stuck for 23s! [kworker/20:1:415]
+RIP: 0010:queued_spin_lock_slowpath+0x1c0/0x260
+RBX: ffff8889546ac840 ... RDI: ffff8889546ac840
+ ldiskfs_mb_mark_context+0x34e/0x430 [ldiskfs]
+ ldiskfs_free_blocks+0x320/0xb10 [ldiskfs]
+ ...
+ ldiskfs_evict_inode+0x2b9/0x620 [ldiskfs]
+ osd_object_delete+0x1dd/0x6e0 [osd_ldiskfs]
+
+Both CPUs are spinning on the same group lock. fstrim is the holder.
+
+Fix: drop the group lock before jumping to out_journal, matching the other kernel variants.
+
+--- Comment (gerrit, Tue, 20 Oct 2026 20:13:06 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69844
+
+Subject: LU-21002 ldiskfs: unlock group before trim flag error path
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a7ac2ca67625e04dd55aadc21d815cffd475b7c5

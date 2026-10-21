@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2024-03-21 03:58:02.000000000
-Updated:    2026-09-03 20:39:16.000000000
-Patch Set:  5
-Insertions: +1022
-Deletions:  -60
-Comments:   201 (0 unresolved)
+Updated:    2026-10-21 10:21:04.000000000
+Patch Set:  7
+Insertions: +1182
+Deletions:  -18
+Comments:   221 (6 unresolved)
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1
-  Verified: jenkins: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell, Lustre RISC-V Builder
+  CC: Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, James Simmons, Qian Yingjin, Feng Lei , Patrick Farrell
 
 --- Commit Message ---
@@ -31,7 +31,11 @@ performance ceiling.  In order to significantly speed up
 PCC attach performance, we need to switch to DIO.
 
 DIO cannot be done from kernel memory due to various
-restrictions, so we call out to a usermode helper.
+restrictions, so we call out to a usermode helper,
+ll_fid_path_copy, for files of at least
+llite.*.pcc_dio_attach_threshold bytes (32 MiB by default).
+Each I/O is llite.*.pcc_dio_attach_iosize_mb in size (32 MiB
+by default, 0 disables the DIO copy).
 
 Note that the helper uses open by fid because given a
 file pointer, it's not possible to reliably generate the
@@ -39,103 +43,109 @@ path to a file on Lustre due to container namespace issues.
 Specifically, the path used by the user may not work for
 our helper program due to namespace differences.  So we
 must use open by fid for the Lustre side of the copy.
+"lctl pcc add" passes the Lustre mountpoint to the kernel as
+the "mntpath" parameter of the PCC backend for this.  An old
+lctl that does not pass it gets a buffered copy, and the new
+lctl retries without it on an old kernel.  If the helper is
+missing or fails, e.g. because the PCC backend does not support
+O_DIRECT, the kernel does a buffered copy instead.
 
 This patch improves attach performance from about 1 GiB/s
 to about 5 GiB/s.  This performance figure includes time to
 read the data from Lustre *and* to write it out to PCC.
----
+
+Fixes from the original patch series:
+- a helper that failed was treated as a successful copy,
+  since the positive exit status from call_usermodehelper()
+  is not an errno, leaving a PCC copy with missing data.
+- encrypted files must keep the kernel copy, so that the
+  PCC copy holds ciphertext (S_PCCCOPY).
+- remove the el7 workaround that unlocked the parent directory
+  during the copy from atomic_open().  With HAVE_INODE_RWSEM
+  gone it was compiled for all kernels, where it would
+  up_write() a lock that may be held shared.
+- in ll_fid_path_copy, terminate the getopt option list, only
+  join threads that were started, return per-thread errors,
+  and fix the chunk size rounding.  Each thread opens its own
+  destination fd, so that the buffered fallback for an
+  unaligned tail does not clear O_DIRECT for all threads.
+- llapi_pccdev_set() returned a positive errno on failure.
+
+Also fix sanity-pcc test_40, which compares async and sync
+attach times with paused bulk RPCs, by disabling the DIO copy.
+
 EX-5014 pcc: avoid deadlock during DIO open attach on rhel7
 
-The Maloo testing fails with sanity-pcc/45 due to the following
-deadlock on rhel7 kernel:
-
-    ll_fid_path_cop D ffff9a32db5eb180     0 10783  10782 0x00000080
-    Call Trace:
-    schedule_preempt_disabled+0x29/0x70
-    __mutex_lock_slowpath+0xc7/0x1d0
-    mutex_lock+0x1f/0x2f
-    lookup_slow+0x33/0xa7
-    link_path_walk+0x80f/0x8b0
-    path_openat+0xae/0x5a0
-    do_filp_open+0x4d/0xb0
-    do_sys_open+0x124/0x220
-    SyS_open+0x1e/0x20
-
-    dd              D ffff9a32fb5b6300     0 10779  10755 0x00000080
-    Call Trace:
-    wait_for_completion+0xfd/0x140
-    call_usermodehelper_exec+0x179/0x1a0
-    call_usermodehelper+0x40/0x60
-    pcc_copy_data_dio+0x267/0x340 [lustre]
-    pcc_attach_data_archive+0x6ff/0xe80 [lustre]
-    pcc_readonly_attach+0x3d2/0xad0 [lustre]
-    pcc_readonly_attach_sync+0x205/0x260 [lustre]
-    pcc_file_open+0x798/0xdd0 [lustre]
-    ll_atomic_open+0xd80/0x1780 [lustre]
-    do_last+0xa53/0x1340
-    path_openat+0xcd/0x5a0
-    do_filp_open+0x4d/0xb0
-    do_sys_open+0x124/0x220
-    SyS_open+0x1e/0x20
-
-This only happened on el7 kernel which uses mutex for inode locking.
-During ->ll_atomic_open(), the kernel will take this mutex on the
-parent inode. However, when copy data via the user space helper
-program ll_fid_path_copy, it will also try to obtain this mutex
-lock on the parent inode during lookup, resulting in deadlock.
+The Maloo testing fails with sanity-pcc/45 due to a deadlock
+on the rhel7 kernel, which uses a mutex for inode locking.
+During ->ll_atomic_open(), the kernel takes this mutex on the
+parent inode, and the user space helper program ll_fid_path_copy
+also tries to take it during lookup.
 
 Was-Change-Id: I384c7b1979d93183b86bbde311d29a50346a8d56
 
 EX-5014 pcc: minor fixes for parameter checks
 
-Improve console message when out-of-range pcc_dio_attach_size_mb
-values are supplied.
-
-Fix sanity-pcc test_49b to allow future limit changes
+Improve console message when out-of-range pcc_dio_attach_iosize_mb
+values are supplied.  Values that are not a multiple of 1 MiB are
+now rejected.
 
 Was-Change-Id: I2bf7d0bf564c954318980f7a09d8713a70f37db9
 
-EX-6193 pcc: dio attach failed on non-blksz-aligned file
+LU-10499 pcc: dio attach failed on non-blksz-aligned file
 
 PCC attach failed due to do DIO copy on files with blksz unligned
-file size.
-The reason is that the copy tool ll_fid_path_copy fails on
-non-blksize-aligned file for PCC backend (such as a local Ext4
-file system) using direct I/O.
-In this path, it fixes this bug by falling back from direct I/O to
-buffered I/O mode when copy the tail non-blksize-aligned file
-part.
+file size.  The reason is that the copy tool ll_fid_path_copy
+fails on non-blksize-aligned file for PCC backend (such as a local
+Ext4 file system) using direct I/O.  This fixes the bug by falling
+back from direct I/O to buffered I/O mode when copying the tail
+non-blksize-aligned part of the file.
 
 Was-Change-Id: I5287563029269032a91397c0094e2ccede73b9b1
 
-EX-6399 pcc: add tunable parameter for PCC attach thread
+LU-10499 pcc: add threshold to determine direct I/O during attach
 
-Currently the max number of kernel threads doing asynchronous
-attach is a hard code value (1024 by default).
-In this patch, we make it a tunable parameter:
-	llite.*.pcc_max_attach_thread_num
+This patch adds the threshold tunable parameter to determine doing
+direct I/O or buffered I/O for data copying during attach:
+	llite.*.pcc_dio_attach_threshold
+The default value is same as direct I/O size: 32MiB.
 
-Was-Change-Id: Ic59c15af935dd8dff586fa6be3939d4322c136d5
+And the usage of the parameter "pcc_dio_attach_size_mb" is
+deprecated, and use "pcc_dio_attach_iosize_mb" instead.
 
-EX-8236 pcc: abort data copy via ll_fid_path_copy
+Was-Change-Id: I393d6a06523303e749192ba9978449c3d75886ae
 
-For data copying via ll_fid_path_copy in direct I/O mode in user
-space, the client calls llapi_pcc_state_fd() to obtain the file
-PCC state. If it is marked with PCC_STATE_FL_ATTACH_ABORTING, the
-data copy process ll_fid_path_copy exits immediately.
-To reduce the overhead of these check, we do not check for each
-data copy iter, instead, we do a check for certain times of I/Os
-(32 times by default). For I/O size of 32MiB, it will be checking
-1 times per second at 1GiB/s. There should be some time-lag
-before the copy tool quits finally.
+LU-10499 pcc: parallel data copy for attach
 
-Was-Change-Id: I20631e5481a7e97d7a1ed0729bcd269ef6248a2c
+This patch parallelize the data copying work for pcc attach
+by using multiple threads in the ll_fid_path_copy helper,
+llite.*.pcc_dio_attach_threads_per_file (4 by default).
 
-Test-Parameters: clientdistro=el8.9 mdscount=2 mdtcount=4 testlist=sanity-pcc env=ONLY=45,ONLY_REPEAT=10
-EX-bug-id: EX-5014 EX-6399 EX-6193 EX-8236
+Nvidia provided performance numbers for this from their
+environment.  This was with 4 MiB I/O size, they reported
+speed was similar but *slightly* lower at larger block
+sizes. This is probably an EXT4 limitation since Lustre
+speed scales with those larger sizes.  (As PCC attach is a
+copy from Lustre to EXT4.)
+
+This is for attaching a single 2 TiB file, they also
+reported no performance regression for datasets with many
+small files.
+
+threads: 1       2         4          8
+speed:   4 GiB/s 7.8 GiB/s 14.1 GiB/s 15.2 GiB/s
+
+Performance improved only very slightly past 8 threads,
+and 4 threads is clearly the sweet spot for performance.
+
+Was-Change-Id: Iffbb3892cfb5b2e71afe15d03f9aec9c84975092
+
+Test-Parameters: trivial testlist=sanity-pcc
+Test-Parameters: testlist=sanity-pcc clientdistro=el8.10
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
 Signed-off-by: Qian Yingjin <qian@ddn.com>
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: Idb2a12296c3e4778763c9b576bbb0ecd2570a458
 
 --- Review History ---
@@ -324,3 +334,70 @@ Patch Set 5: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2026-10-20 02:35:57.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-20 02:38:43.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-20 02:39:25.000000000) ---
+Patch Set 6:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-20 02:53:25.000000000) ---
+Patch Set 6: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/134060/ : FAILURE
+
+--- Message (Andreas Dilger, 2026-10-20 09:18:04.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-20 09:19:45.000000000) ---
+Patch Set 7:
+
+(7 comments)
+
+7 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-20 09:21:55.000000000) ---
+Patch Set 7:
+
+@patrickbot watch retest
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-20 09:25:07.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-20 09:41:01.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134088/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-21 10:21:04.000000000) ---
+Patch Set 7:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that a large attach now waits uninterruptibly for the helper; the rest are minor and can ride along on that refresh.

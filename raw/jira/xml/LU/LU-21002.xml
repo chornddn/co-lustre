@@ -1,0 +1,128 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21002] ldiskfs: deadlock in ldiskfs_try_to_trim_range() on RHEL 10 / 6.12+ kernels</title>
+                <link>https://jira.whamcloud.com/browse/LU-21002</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;The RHEL 10.0 port of ext4-introduce-EXT4_BG_TRIMMED-to-optimize-fstrim.patch (added in &lt;a href="https://jira.whamcloud.com/browse/LU-18667" title="RHEL 10.0 support" class="issue-link" data-issue-key="LU-18667"&gt;&lt;del&gt;LU-18667&lt;/del&gt;&lt;/a&gt;) moved the EXT4_BG_TRIMMED update into ext4_try_to_trim_range(). That function is entered and exits with the group lock held, and it drops the lock to start the journal handle. After it re-takes the lock, it checks whether blocks were freed in the group while it was trimming:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;		ext4_lock_group(sb, e4b-&amp;gt;bd_group);
+		/* someone freed more blocks after we unlocked the group */
+		if (freed_last_trimmed_orig != e4b-&amp;gt;bd_info-&amp;gt;bb_freed_since_trim)
+			goto out_journal;
+...
+out_journal:
+		if (track_trim) {
+			err = ext4_journal_stop(handle);
+			...
+		}
+out_return:
+		ext4_lock_group(sb, e4b-&amp;gt;bd_group);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The mismatch path jumps to out_journal while still holding the group spinlock. If track_trim is set, it calls ext4_journal_stop() under a spinlock. It then tries to take the same lock again at out_return, so the fstrim thread deadlocks on itself. Any other thread that then frees blocks in that group (e.g. ext4_mb_mark_context() from unlink/truncate) spins behind it until the soft-lockup watchdog fires.&lt;/p&gt;
+
+&lt;p&gt;freed_last_trimmed_orig is sampled at function entry, and the trim loop itself drops the group lock. So any free in the group while that group is being trimmed takes this path, which is easy to hit when fstrim runs alongside a delete-heavy workload.&lt;/p&gt;
+
+&lt;p&gt;The rhel8.7, rhel9, rhel9.4 and rhel9.8 variants of the patch already unlock the group before "goto out_journal". Only the rhel10.0 variant is affected. It is used by the 6.12-ml, 6.18-ml, 7.0-ml, rhel10.0/10.1/10.2 and ubuntu26 series on master. b2_15, b2_16 and b2_17 do not carry it.&lt;/p&gt;
+
+&lt;p&gt;Seen in the field on 6.12.90 (Debian) OSS during a nightly fstrim with mdtest/IOR deletes:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;rcu: INFO: rcu_sched self-detected stall on CPU
+CPU: 21 PID: 28325 Comm: fstrim
+RIP: 0010:queued_spin_lock_slowpath+0x6b/0x260
+RBX: ffff8889546ac840 ... RDI: ffff8889546ac840
+ ldiskfs_try_to_trim_range+0x6bc/0x790 [ldiskfs]
+ ldiskfs_trim_all_free+0x135/0x190 [ldiskfs]
+ ldiskfs_trim_fs+0x1d0/0x250 [ldiskfs]
+ __ldiskfs_ioctl+0xeb8/0x1720 [ldiskfs]
+
+watchdog: BUG: soft lockup - CPU#20 stuck for 23s! [kworker/20:1:415]
+RIP: 0010:queued_spin_lock_slowpath+0x1c0/0x260
+RBX: ffff8889546ac840 ... RDI: ffff8889546ac840
+ ldiskfs_mb_mark_context+0x34e/0x430 [ldiskfs]
+ ldiskfs_free_blocks+0x320/0xb10 [ldiskfs]
+ ...
+ ldiskfs_evict_inode+0x2b9/0x620 [ldiskfs]
+ osd_object_delete+0x1dd/0x6e0 [osd_ldiskfs]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Both CPUs are spinning on the same group lock. fstrim is the holder.&lt;/p&gt;
+
+&lt;p&gt;Fix: drop the group lock before jumping to out_journal, matching the other kernel variants.&lt;/p&gt;</description>
+                <environment />
+        <key id="99996">LU-21002</key>
+            <summary>ldiskfs: deadlock in ldiskfs_try_to_trim_range() on RHEL 10 / 6.12+ kernels</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="paf0186">Patrick Farrell</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 20 Oct 2026 20:12:09 +0000</created>
+                <updated>Tue, 20 Oct 2026 20:13:40 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="503875" author="gerrit" created="Tue, 20 Oct 2026 20:13:06 +0000">&lt;p&gt;"Patrick Farrell &amp;lt;patrick@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69844" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69844&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21002" title="ldiskfs: deadlock in ldiskfs_try_to_trim_range() on RHEL 10 / 6.12+ kernels" class="issue-link" data-issue-key="LU-21002"&gt;LU-21002&lt;/a&gt; ldiskfs: unlock group before trim flag error path&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: a7ac2ca67625e04dd55aadc21d815cffd475b7c5&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="91841">LU-19288</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="64414">LU-14712</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="87095">LU-18667</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071r3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

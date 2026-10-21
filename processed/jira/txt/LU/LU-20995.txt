@@ -1,0 +1,81 @@
+Key:        LU-20995
+Summary:    libcfs: kallsyms lookups crash with "Missing ENDBR" on x86 kernels with IBT
+Link:       https://jira.whamcloud.com/browse/LU-20995
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Jian Yu
+Reporter:   Jian Yu
+Created:    Mon, 19 Oct 2026 22:28:49 +0000
+Updated:    Wed, 21 Oct 2026 06:53:20 +0000
+
+--- Description ---
+On x86 kernels built with CONFIG_X86_KERNEL_IBT (Indirect Branch Tracking, i.e. CET), loading libcfs can BUG the kernel with "Missing ENDBR". This happens when Lustre calls kernel functions through pointers it got from kallsyms.
+
+Root cause
+
+1. The pointer to kallsyms_lookup_name is wrong.
+
+   Since 5.7, kallsyms_lookup_name() is no longer exported. find_kallsyms_lookup_name() in lustre_compat/symbols.c finds it by registering a kprobe and using kp.addr as the function pointer:
+
+   
+
+   __cfs_kallsyms_lookup_name = (void *)kp.addr;
+   
+
+   With IBT enabled, arch_adjust_kprobe_addr() puts the probe after the ENDBR64 instruction at the function entry. So kp.addr is kallsyms_lookup_name+0x4, not the function start. The first indirect call to it, at the sanity check in lustre_symbols_init(), raises a Control Protection (#CP) fault and the kernel BUGs.
+
+2. Some looked-up functions may not have an ENDBR at all.
+
+   With IBT, objtool/the kernel seals (poisons) the ENDBR of any function whose address is never taken. A function found through kallsyms may then have no valid ENDBR, and calling it through a pointer also raises #CP. This affects the functions looked up in lustre_symbols_init():
+
+	alloc_workqueue_attrs / alloc_workqueue_attrs_noprof
+
+	free_workqueue_attrs
+
+	apply_workqueue_attrs
+
+	folio_memcg_lock / folio_memcg_unlock
+
+	account_page_dirtied
+
+	security_file_alloc / security_file_free
+
+  It also affects flush_delayed_fput, which osd-wbcfs looks up in osd_init().
+
+3. Related: osd-wbcfs does not check its lookup result.
+
+   If the flush_delayed_fput lookup fails, osd_init() still succeeds. cfs_flush_delayed_fput() is then called as a NULL pointer from osd_flush_fput() and from device cleanup.
+
+Affected code
+
+	lustre_compat/symbols.c: find_kallsyms_lookup_name(), lustre_symbols_init()
+
+	lustre/osd-wbcfs/osd_handler.c: osd_init()
+
+Proposed fix
+
+	In find_kallsyms_lookup_name(), rewind the kprobe address to the start of the symbol, using the symbol offset from sprint_symbol().
+
+	Add an exported helper, cfs_kallsyms_lookup_func(). It looks up a symbol and, when X86_FEATURE_IBT is enabled, checks that the function starts with ENDBR64 before returning it.
+
+	Use this helper for every function that is called through a pointer: those in lustre_symbols_init() and flush_delayed_fput in osd-wbcfs.
+
+	Fail module init cleanly instead of crashing when a function cannot be called safely. In osd-wbcfs, check the lookup result before class_register_type().
+
+Note
+If the kernel has sealed kallsyms_lookup_name itself, libcfs will refuse to load with -EOPNOTSUPP instead of crashing. Fully supporting such kernels would need a different way to resolve symbols.
+
+--- Comment (gerrit, Mon, 19 Oct 2026 22:42:39 +0000) ---
+"Jian Yu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69827
+
+Subject: LU-20995 compat: make kallsyms lookups safe with x86 kernel IBT
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4a2a5de6f7b71d77afb013a9edf1a292f9229e8d

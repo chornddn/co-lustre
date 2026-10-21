@@ -7,14 +7,14 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-15 10:56:38.000000000
-Updated:    2026-10-18 01:08:19.000000000
+Updated:    2026-10-19 17:28:51.000000000
 Patch Set:  1
 Insertions: +7153
 Deletions:  -1728
-Comments:   3 (2 unresolved)
+Comments:   5 (2 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Artem Blagodarenko: +1
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -292,3 +292,72 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Mostly good, one behavioral concern inline about the delalloc fallback into IOPS groups (applies to all copies of the patch), plus a minor comment fix.
+
+--- Message (Artem Blagodarenko, 2026-10-19 14:38:14.000000000) ---
+Patch Set 1: Code-Review+1
+
+Tested PS1 with ltvm on three kernels, one per patch copy that CI
+did not run:
+
+   patch copy   kernel                        test_170
+   rhel9.4      5.14.0-611.55.1.el9_7         PASS (6s, x2)
+   rhel10.2     6.12.0-211.47.1.el10_2        PASS (6s, x4)
+   linux-7.0    7.0.0-14 (ubuntu26 series)    PASS (9s, x5)
+
+CI built rhel10.2 but did not test it, and did not build the
+linux-6.12 or linux-7.0 copies. linux-6.12 applies and ldiskfs
+compiles on 6.12.95 (6-ml series), but osd_ldiskfs.ko does not
+link on the ltvm mainline kernel config (obd_dif_ip_fn and
+obd_dif_crc_fn undefined without CONFIG_CRC_T10DIF, also on
+master), so it was not run.
+
+I also checked the allocator behaviour directly with eBPF, so the
+result does not depend only on the test's own debugfs checks.
+bpftrace on the ldiskfs:ldiskfs_allocate_blocks tracepoint
+(block, goal, flags; HINT_DATA = 0x20 separates data from metadata)
+and on ldiskfs:ldiskfs_mballoc_alloc (cr, result group), limited
+to loop devices, with mke2fs/mount syscalls as phase markers.
+The 7.0 kernel has no BTF, so there a kprobe/kretprobe on
+ldiskfs_mb_new_blocks() reads the same fields from
+struct ldiskfs_allocation_request. Group = block >> 13 (8192
+blocks per group, as in the test).
+
+1) Same workload on parent ee61b3f6dd and on PS1: the first part
+   of test_170, run standalone (4 groups, group 0 IOPS,
+   mb_optimize_scan=1, mb_max_linear_groups=4).
+
+                                 master      PS1 (el9.7, el10.2, 7.0)
+   dir blocks in IOPS            30/30       30/30
+   xattr blocks in IOPS          0/20        20/20
+   extent index blocks in IOPS   0/2         2/2
+   data blocks in IOPS           0/5520      0/5520
+
+   The trace shows the difference is goal mapping. Of 52 metadata
+   allocations, 30 had their goal in group 0 and landed there on
+   both builds. The dir blocks only reach IOPS on master because
+   the packed inode tables put their goal there. The other 22 had
+   their goal in an HDD group: on master all 22 stayed in HDD
+   groups, with PS1 all 22 went to the IOPS group, on all three
+   kernels. No data allocation went to IOPS.
+
+2) Inside test_170 on PS1, per phase (blocks in IOPS groups),
+   identical on el9.7 and el10.2:
+
+   phase                                   metadata   data
+   main image (dirs, xattrs, frag, data)   33/33      0/5520
+   remount: HDD full, iops_data=1,
+     IOPS full, metadata fallback          0/6        5840/24894
+   quota and orphan files                  42/42      -
+   hybrid_dirs, packed itables, group 0    40/40      0/1280
+   hybrid_dirs, IOPS group 3 at the end    40/40      0/1280
+
+   The remount phase is the two intended fallbacks: data goes to
+   IOPS only with mb_enable_iops_data=1, and metadata goes to HDD
+   groups once the IOPS groups are full. With the IOPS group at
+   the end of the device (group 3), metadata follows it there and
+   data stays below it.
+
+--- Message (Andreas Dilger, 2026-10-19 17:28:51.000000000) ---
+Patch Set 1:
+
+(2 comments)

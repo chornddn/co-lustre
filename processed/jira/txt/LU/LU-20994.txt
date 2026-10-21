@@ -1,0 +1,40 @@
+Key:        LU-20994
+Summary:    osd-ldiskfs: end bios on RAID row boundaries
+Link:       https://jira.whamcloud.com/browse/LU-20994
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Artem Blagodarenko
+Reporter:   Artem Blagodarenko
+Created:    Mon, 19 Oct 2026 17:48:51 +0000
+Updated:    Mon, 19 Oct 2026 18:01:13 +0000
+Links:      Related: is related to  LU-20199; Related: is related to  LU-20564
+
+--- Description ---
+osd_do_bio() fills each bio until the disk blocks stop being contiguous or bio_add_folio() refuses the next page. Where a full bio ends then depends on how many of the I/O buffer pages merge into multi-page bvecs, not on the RAID geometry, so on RAID OSTs it usually ends in the middle of a row (full stripe). The RAID layer receives that row in two bios and has to take its partial-stripe path for it: read-modify-write, or a slower stripe-cache path instead of a full-row write.
+
+Seen on md RAID6 8+2 OSTs with a 128 KiB chunk (1 MiB rows) under 4 MiB O_DIRECT writes: about half of the requests reached md as 2-4 bios cut mid-row, and 23% of rows were written as partial stripes. Tracing block_bio_queue on the md device shows bios ending at arbitrary offsets within a row.
+
+The ldiskfs stripe (mount -o stripe=, or the superblock stripe width/stride set by mkfs -E stride=,stripe_width=) already gives the row size. Proposal: for writes, at each row boundary end the bio when the next row (or the rest of the I/O) will not fit in the bvecs left in it, counting the bvecs from the row's pages so bios still span several rows when pages merge. Reads and OSTs without a stripe are unchanged.
+
+With the patch on the site above, 100% of rows were written as full stripes, and client writes improved by 26% (2 OSTs on one server) and 7% (4 OSTs on two servers).
+
+Related:
+
+	LU-20564 (mkfs.lustre probes md geometry): sets the stripe width this change relies on, for OSTs where mke2fs cannot derive it. That aligns block allocation to rows; this change aligns the bios that write them.
+
+	LU-20199 (higher-order I/O buffers): reduces bio fragmentation from the bvec limit. Independent of this change, which keeps bios row-aligned at any bio size.
+
+--- Comment (gerrit, Mon, 19 Oct 2026 18:01:13 +0000) ---
+"Artem Blagodarenko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69823
+
+Subject: LU-20994 osd-ldiskfs: end bios on RAID row boundaries
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6474b89a45f3bf9803854a2c87eb29a1bec25ab8

@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Zhenyu Xu
 Reporter:   Andreas Dilger
 Created:    Mon, 9 May 2022 19:22:26 +0000
-Updated:    Sun, 19 Oct 2025 07:57:17 +0000
+Updated:    Wed, 21 Oct 2026 07:01:41 +0000
 Links:      Duplicate: is duplicated by LU-19495; Related: is related to  LU-16500; Related: is related to  LU-9007; Related: is related to LU-12649; Related: is related to LU-15841; Related: is related to LU-10158; Related: is related to LU-19066
 
 --- Description ---
@@ -69,36 +69,11 @@ Requirements for OST selection on components with overlapping extents should be,
 
 	objects with overlapping components should not be on OSTs on the same network switch, power supply, rack, etc. but this depends on external information that is not currently available to Lustre. That could optionally be added via a separate configuration file/options, but the above cases will automatically cover the most important failure scenarios
 
---- Comment (gerrit, Wed, 16 Apr 2025 20:42:27 +0000) ---
-"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56852/
+--- Comment (adilger, Fri, 13 May 2022 00:13:10 +0000) ---
+Is this also fixed by the LU-15841 patch?
 
-Subject: LU-15834 lfs: rid of global variable "error_loc"
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 
-
-Commit: 32eeb96e96446003e6087ef494d8deca01885796
-
---- Comment (gerrit, Fri, 1 Nov 2024 18:36:27 +0000) ---
-"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56852
-
-Subject: LU-15834 lfs: rid of global variable "error_loc"
-
-Project: fs/lustre-release
-
-Branch: master
-
-Current Patch Set: 1
-
-Commit: bbc90cd435602b3eb0c8813c89cb79f5e2434d5e
-
---- Comment (adilger, Tue, 8 Oct 2024 23:31:01 +0000) ---
-I saw in sanity-flr test_49a that it failed because both mirrors were on the same OST:
-
-https://testing.whamcloud.com/gerrit-janitor/46228/testresults/sanity-flr-special5-ldiskfs-DNE-centos7_x86_64-centos7_x86_64/
+--- Comment (bobijam, Fri, 13 May 2022 18:38:29 +0000) ---
+I think not, as mirror extent w/o specifying victim_file, the mirror_extend_layout() just create a volatile file using the basic stripe_size/stripe_count from the source file and the object allocation of the volatile file does not consider those of the source file, and mirror merge just append the layout component of the volatile file as a new mirror to the source file.
 
 --- Comment (gerrit, Thu, 13 Apr 2023 04:48:12 +0000) ---
 "Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/50622
@@ -113,8 +88,64 @@ Current Patch Set: 1
 
 Commit: 0c1dad7e0e9b533516637e3aa457ad9d263c30dc
 
---- Comment (bobijam, Fri, 13 May 2022 18:38:29 +0000) ---
-I think not, as mirror extent w/o specifying victim_file, the mirror_extend_layout() just create a volatile file using the basic stripe_size/stripe_count from the source file and the object allocation of the volatile file does not consider those of the source file, and mirror merge just append the layout component of the volatile file as a new mirror to the source file.
+--- Comment (adilger, Tue, 8 Oct 2024 23:31:01 +0000) ---
+I saw in sanity-flr test_49a that it failed because both mirrors were on the same OST:
 
---- Comment (adilger, Fri, 13 May 2022 00:13:10 +0000) ---
-Is this also fixed by the LU-15841 patch?
+https://testing.whamcloud.com/gerrit-janitor/46228/testresults/sanity-flr-special5-ldiskfs-DNE-centos7_x86_64-centos7_x86_64/
+
+--- Comment (gerrit, Fri, 1 Nov 2024 18:36:27 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/56852
+
+Subject: LU-15834 lfs: rid of global variable "error_loc"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bbc90cd435602b3eb0c8813c89cb79f5e2434d5e
+
+--- Comment (gerrit, Wed, 16 Apr 2025 20:42:27 +0000) ---
+"Oleg Drokin " merged in patch https://review.whamcloud.com/c/fs/lustre-release/+/56852/
+
+Subject: LU-15834 lfs: rid of global variable "error_loc"
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 
+
+Commit: 32eeb96e96446003e6087ef494d8deca01885796
+
+--- Comment (adilger, Wed, 21 Oct 2026 07:01:41 +0000) ---
+Proposed design for "lfs mirror extend" placement, as an alternative to passing the source FID to the MDS as in https://review.whamcloud.com/50622 ("LU-15834 lfs: mirror extend take current OSTs into account").
+
+Problem
+
+"lfs mirror extend" (mirror_extend_layout() -> migrate_open_files()) allocates the new mirror in a separate volatile file that only has the new mirror's layout, copies the data, and merges it into the source with LL_LEASE_LAYOUT_MERGE. LOD never sees the source file's existing mirrors when it allocates the new objects, so none of the mirror separation applies: lod_collect_avoidance() OST/OSS avoidance, lod_fd_check_flr_allowed() failure domains, and (with the LU-8933/LU-9 RR allocator series) failure domain round-robin and mirror stream continuation. All of these are gated on ldo_mirror_count > 1 or iterate the components of the object being allocated. 50622 passes the source FID in lmm_objects[0].l_ost_oi of a component flagged LCME_FL_FOR_MERGE, and makes the allocator look up and parse the source file's layout under its ldo_layout_mutex. That is a side channel in the layout format, needs lock ordering between two objects during allocation, and would also need the failure domain checks extended separately.
+
+Proposal: add the mirror in place as stale, then resync
+
+Let the MDS add the new mirror to the source file itself without allocating objects, and let the existing FLR resync path instantiate it, so that allocation always sees every mirror of the file.
+
+	Wire: a new XATTR_LUSTRE_LOV sub-operation, e.g. setxattr "lustre.lov.mirror" (name to be decided). lod_declare_layout_change() already dispatches "lustre.lov.add", ".del" and ".set.$field" by suffix, and an older MDS returns -ENOTSUPP for an unknown suffix, which tells the client to fall back to the current volatile file + merge. No connect flag is needed. The value is a lov_comp_md_v1 with only the new mirror's components, as "lfs mirror extend" builds today. It goes through the normal setxattr path: layout lock, layout generation, replay, and the same permission checks as setstripe on an existing file. ".add" is not reused because it is refused for FLR files (-EBUSY) and has different semantics.
+
+	MDS (new lod_declare_layout_mirror()): convert a plain or non-FLR file to composite/FLR as lod_declare_layout_merge() does; assign a new mirror ID and component IDs and check lod_mirror_count_max (-ERANGE); add the new components uninstantiated with LCME_FL_STALE so the mirror is lme_stale; set the FLR state RDONLY/NONE -> SYNC_PENDING, WRITE_PENDING unchanged. No objects are allocated here.
+
+	Allocation happens in the existing resync path: lod_prepare_resync() already instantiates every uninstantiated component of a stale mirror within the resync extent (and lod_prepare_resync_mirror() per mirror ID), through lod_qos_prep_create() on the source object with all mirrors present. All mirror separation then applies without new code, including the failure domain RR allocator once it lands.
+
+	Client ("lfs mirror extend"): build the new mirror layout as today (including --inherit), apply it with the new operation, then unless --no-sync run llapi_mirror_resync_many() for the new mirror ID, which takes its own lease and copies only the needed extents. On -ENOTSUPP fall back to the volatile file + LL_LEASE_LAYOUT_MERGE. "-f victim_file" keeps using merge, since its objects already exist.
+
+Behaviour
+
+	An interrupted extend leaves a valid stale mirror, the same as "lfs mirror extend --no-sync" (LL_LEASE_ALLOW_STALE) today, which "lfs mirror resync" completes or "lfs mirror delete" removes. No orphan volatile file.
+
+	Old clients have understood stale mirrors since FLR in 2.11.
+
+	EC mirrors: parity components must be instantiated together with their data components in the resync path.
+
+	The resync runs on the client and holds the resync lease for the copy, as "lfs mirror resync" does today.
+
+The sanity-flr test from 50622 can be kept to check that the new mirror avoids the OSTs and OSSs of the existing mirrors.

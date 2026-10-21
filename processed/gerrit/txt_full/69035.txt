@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-18 09:23:11.000000000
-Updated:    2026-10-09 06:42:01.000000000
-Patch Set:  5
-Insertions: +66
-Deletions:  -44
-Comments:   17 (1 unresolved)
+Updated:    2026-10-21 10:19:25.000000000
+Patch Set:  6
+Insertions: +114
+Deletions:  -55
+Comments:   18 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
@@ -27,42 +27,48 @@ LU-19699 quota: release grant via DQACQ on qunit shrink
 qsd_id_glimpse_ast() returns the surplus space in the glimpse
 reply and drops it from lqe_granted right away, but the slave
 QSD never learns if the master fails to apply that release in
-qmt_lvbo_update(), then the master keeps more grant accounted
+qmt_lvbo_update(). The master then keeps more grant accounted
 than the slave owns, and the leak eventually causes a bogus
 -EDQUOT. OBD_FAIL_QUOTA_PREACQ (fail_loc=0xa06) triggers this
-and cause test_80 in sanity-quota.sh to fail intermittently.
+and causes test_80 in sanity-quota.sh to fail intermittently.
 
 Only report the surplus in lvb_id_may_rel and let the regular
-DQACQ release path return it, then it will be transactional
-and retried on failure, so the two sides cannot diverge.
+DQACQ release path return it, then it will be transactional and
+retried on failure, so the two sides cannot diverge.
 
-The master still handles lvb_id_rel in qmt_lvbo_update() so
-that older slaves keep working during a rolling upgrade. In
-the other direction, a patched slave with an unpatched master
-still releases via DQACQ, but the old master only waits the old
-QMT_REBA_TIMEOUT of 2s from "lqe_revoke_time" before setting
-edquot, so a transient -EDQUOT is still possible in that mixed
-version window.
+The master still handles lvb_id_rel in qmt_lvbo_update() so that
+older slaves keep working during a rolling upgrade. In the other
+direction, a patched slave with an unpatched master still releases
+via DQACQ, but the old master only waits the old QMT_REBA_TIMEOUT
+of 2s from "lqe_revoke_time" before setting edquot, so a transient
+-EDQUOT is still possible in that mixed version window.
 
 qmt_adjust_edquot() is now the only thing holding edquot off
 until the DQACQ arrives: anchor its grace period to the reply
 that claimed the release (lqe_may_rel_time) rather than to
 "lqe_revoke_time", which may be much older, and also raise
-"QMT_REBA_TIMEOUT" to 10s to cover the extra round trip and
-the QSD update thread scheduling, otherwise the master sets
-edquot first and clients see a transient -EDQUOT.
+"QMT_REBA_TIMEOUT" to 10s to cover the extra round trip and the
+QSD update thread scheduling, otherwise the master sets edquot
+first and clients see a transient -EDQUOT.
 
 That hold-off has to cover the pool lqes too, not only the
-global one: record lqe_may_rel/lqe_may_rel_time on every lqe of
-qti_lqes in qmt_lvbo_update(), so that a pool lqe marked edquot
-by qmt_set_revoke() in the same call is held off as well. Ending
-the hold-off as soon as the quota space comes back: subtract the
-released count from lqe_may_rel in qmt_dqacq0(), so the timeout
-only acts as a ceiling for a slow or lost DQACQ instead of always
-delaying edquot by the full 10s.
+global one: record lqe_may_rel/lqe_may_rel_time on every lqe in
+qmt_lvbo_update() and reset them all before a new glimpse round
+in qmt_id_lock_glimpse(), so that a pool lqe marked edquot by
+qmt_set_revoke() is held off as well and does not keep a stale
+claim.
+
+When a DQACQ release or a plain report arrives, settle the whole
+claim in qmt_dqacq0(): the slave recomputes the surplus when it
+sends the request, so whatever it does not return was consumed
+meanwhile. A report combined with an acquire or a pre-acquire
+leaves the claim alone, so that the space other slaves are still
+releasing keeps edquot off for it. The timeout then only bounds
+a slow or lost DQACQ instead of always delaying edquot by the
+full 10s.
 
 Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=30
-Fixes: 318fd8d197 ("LU-1842 quota: qsd lock")
+Fixes: 318fd8d197ff ("LU-1842 quota: qsd lock")
 Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
 Change-Id: I129020a8e02b848b696cd2bc85c19672a0f8b594
 
@@ -1247,3 +1253,198 @@ Patch Set 5:
 AI code review results below, please doublecheck
 
 Mostly good; one minor point inline about when the edquot hold-off really ends early. Not a reason to re-spin on its own.
+
+--- Message (Hongchao Zhang, 2026-10-20 09:23:59.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-10-20 09:24:16.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-20 09:29:43.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-20 09:35:05.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-20 09:56:21.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134093/ : SUCCESS
+
+--- Message (Maloo, 2026-10-20 09:57:21.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 134093 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134093&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134093#redirect
+
+--- Message (Maloo, 2026-10-21 10:09:07.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-142vm37: https://testing.whamcloud.com/test_sessions/3de3d049-709a-4a97-9e7d-6886cebff9d4 ran 7 tests.  1 tests failed: lustre-rsync-test.
+
+--- Message (Maloo, 2026-10-21 10:19:25.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-part-1 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest from trevis-153vm191: https://testing.whamcloud.com/test_sessions/79bd2e3f-8f78-4ed3-b81c-cdb2c78b89d6 ran 3 tests.  1 tests failed: sanity.

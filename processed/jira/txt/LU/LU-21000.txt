@@ -1,0 +1,52 @@
+Key:        LU-21000
+Summary:    hsm: provide efficient per-FID lookup of pending actions
+Link:       https://jira.whamcloud.com/browse/LU-21000
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Praveen Solanki
+Reporter:   Praveen Solanki
+Created:    Tue, 20 Oct 2026 17:29:49 +0000
+Updated:    Tue, 20 Oct 2026 17:33:47 +0000
+Links:      Related: is related to  LU-9540
+
+--- Description ---
+Problem
+
+The existing MDS_HSM_ACTION request accepts a FID, but mdt_hsm_get_action() calls cdt_llog_process() and scans the HSM actions log for each query. The public llapi_hsm_current_action() helper is pathname based. We need to ask whether a given FID has a WAITING or STARTED HSM action (ideally also returning action, state and extent) without reading the full log or enumerating all actions on every query. The filesystem may contain billions of FIDs, so lookup and memory costs must be tied to outstanding HSM actions rather than namespace size.
+
+Proposal for discussion
+
+	Maintain a sparse, in-memory, per-MDT index keyed by lu_fid for active HSM action records. An rhashtable like the existing cdt_restore_hash is one option. Represent individual records/cookies or maintain a per-FID count so multiple actions for the same FID do not cause a false NONE when one completes.
+
+	Rebuild the index with one HSM actions log scan after the log becomes available during MDT mount/recovery. Initialize independently of enabling the HSM coordinator: hsm_control may be enabled later, and REMOVE actions can be recorded while the coordinator is stopped. Keep the index through coordinator disable/re-enable, and rebuild after MDT remount/failover. Until rebuild succeeds, return a distinct error (for example EAGAIN) rather than a false negative.
+
+	Update the index as records are durably added, moved from WAITING to STARTED, completed, failed, canceled, timed out, purged or deleted. Coordinate updates with successful log writes and handle late copytool replies and duplicate/multiple records correctly.
+
+	Use the index in mdt_hsm_get_action() to remove its per-query log scan. Reuse MDS_HSM_ACTION where possible. If callers need a truly FID-first public API without opening a pathname (including an unlinked REMOVE target), consider a mount-level FID-taking ioctl/liblustreapi helper, with explicit authorization semantics.
+
+	Index only outstanding actions. Measure memory per active action/FID and one-time rebuild latency for large backlogs.
+
+Questions
+
+	Is a boolean indicating any pending/in-progress action sufficient initially, or should the API return the existing action/state/extent fields or multiple actions?
+
+	What authorization should a FID-only query require?
+
+	Is one log scan per MDT mount/failover acceptable? It is for the motivating use case.
+
+Suggested acceptance criteria
+
+	No HSM actions log scan on a per-FID query.
+
+	Correct results for WAITING/STARTED, including multiple actions for one FID and completion, cancel, failure, timeout, purge and late replies.
+
+	Correct behavior when HSM is enabled after mount, disabled and re-enabled, and after MDT failover/restart; no false NONE while rebuilding.
+
+	Tests plus memory/rebuild measurements with a large action log.
+
+Related: LU-9540 proposes a FID-keyed cache for the request-submission scan in hsm_find_compatible(); LU-13651 narrowed that scan. This issue addresses the remaining per-FID query scan and FID-first interface.
+
+--- Comment (JIRAUSER19549, Tue, 20 Oct 2026 17:32:29 +0000) ---
+cc: adegremont_nvda, eaujames, courrier
