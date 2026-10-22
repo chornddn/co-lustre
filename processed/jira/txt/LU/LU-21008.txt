@@ -1,0 +1,86 @@
+Key:        LU-21008
+Summary:    o2iblnd: fall back to copy when FastReg map of an IMMEDIATE payload fails
+Link:       https://jira.whamcloud.com/browse/LU-21008
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Wed, 21 Oct 2026 20:19:10 +0000
+Updated:    Wed, 21 Oct 2026 20:19:10 +0000
+
+--- Description ---
+Problem
+
+	
+	
+
+On a FastReg device, `kiblnd_send()` registers the payload of every IMMEDIATE message with a FastReg MR. LU-14008 added this zero-copy path. If `kiblnd_setup_rd_kiov()` fails, `kiblnd_send()` returns -EIO and LNet fails the message. The payload always fits in the pre-registered message buffer, so a copy can send the message instead.
+
+A failed small send has a high cost. For an RPC request, ptlrpc reports a network error and disconnects the import. The import disconnect unlinks the reply buffers of the other RPCs in flight on that import. Those RPCs then wait for their full deadline before the client resends them.
+
+	
+	
+		Environment
+
+	
+	
+
+	Seen on b_es6_0. The same code is on master.
+
+	Client: RoCEv2 on ConnectX-7, `map_on_demand=1` (FastReg), AMD IOMMU in translated mode.
+
+	Workload: fio sequential read.
+
+	
+	
+		Evidence
+
+	
+	
+
+The client logged these errors about once every 34,000 small sends:
+
+```
+
+(o2iblnd.c:1937:kiblnd_fmr_pool_map()) Failed to map mr 0/1 elements: rc = -22
+
+(o2iblnd_cb.c:631:kiblnd_fmr_map_tx()) Can't map 488 bytes (1/1)s: -22
+
+(o2iblnd_cb.c:1818:kiblnd_send()) Can't setup IMMEDIATE src for 192.168.130.41@o2ib: -22
+
+(client.c:2403:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error ... o3->...OST0002-osc...
+
+(import.c:198:ptlrpc_set_import_discon()) ...: Connection to ...-OST0002 (at 192.168.130.41@o2ib) was lost
+
+```
+
+	Each failure was a 488-byte OST_READ request in 1 fragment.
+
+	After each failure, the other OST_READ requests in flight to that OST stalled for 38 s, then timed out and were resent. The server replied to each resend in about 1 ms.
+
+	11 failures in 30 minutes halved the read bandwidth of the client.
+
+	`map_on_demand=0` removes the errors.
+
+We do not know the root cause of the map failure yet. The fault is below LNet, in the RDMA memory registration or the IOMMU mapping. This ticket does not cover that root cause.
+
+	
+	
+		Proposed fix
+
+	
+	
+
+In the IMMEDIATE branch of `kiblnd_send()`, if the FastReg map fails, do not fail the message. Fall back to the copy path:
+
+1. Call `kiblnd_unmap_tx()` to release the DMA mapping that `kiblnd_setup_rd_kiov()` made.
+
+2. Reset the work request and SGE state that `kiblnd_init_tx_msg_payload()` set up.
+
+3. Copy the payload into `ibim_payload` with `copy_from_iter()`, and call `kiblnd_init_tx_msg()`. Devices that do not use FastReg already use this copy path.
+
+4. Keep a rate-limited error message for the map failure, so that the underlying fault stays visible.
+
+The copy fallback makes small messages tolerate a FastReg map failure. The fallback does not help a PUT or GET sink that fails to map, because a sink has no copy path.

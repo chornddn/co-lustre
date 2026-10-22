@@ -1,0 +1,135 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21013] lnet: discovery thread spins on a forced push in flight</title>
+                <link>https://jira.whamcloud.com/browse/LU-21013</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h3&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h3&gt;
+
+&lt;p&gt;The lnet_discovery thread can spin for up to 150 s. The watchdog reports a soft lockup in lnet_discovery. Messages to the affected peer stop until the spin ends. With softlockup_panic=1, the node panics.&lt;/p&gt;
+
+&lt;p&gt;The stack is the same as the stack in &lt;a href="https://jira.whamcloud.com/browse/LU-19309" title="Lnet interop crashes / lockups in master" class="issue-link" data-issue-key="LU-19309"&gt;LU-19309&lt;/a&gt;:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lnet_peer_discovery_complete
+lnet_send
+lnet_select_pathway
+lnet_initiate_peer_discovery
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h3&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;master (2.17.60), b2_16, b_es6_0 and b_es7_0. The defect started with 72726a311814 ("&lt;a href="https://jira.whamcloud.com/browse/LU-14810" title="sanity-lnet test_212: lnet_assert_handler_unused() ASSERTION(md-&amp;gt;md_handler != handler) failed" class="issue-link" data-issue-key="LU-14810"&gt;&lt;del&gt;LU-14810&lt;/del&gt;&lt;/a&gt; lnet: Do not issue multiple PUSHes", 2.15.65).&lt;/li&gt;
+	&lt;li&gt;Rocky 9 aarch64 VMs, 4KB pages, tcp and o2ib (Soft-RoCE).&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h3&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;Configure LNet on 2 nodes, L and R. Let L discover R.&lt;/li&gt;
+	&lt;li&gt;On L, drop each push ACK from R.&lt;/li&gt;
+	&lt;li&gt;On L, run &lt;tt&gt;lnetctl discover --force&lt;/tt&gt; for R 2 times. The second command sets LNET_PEER_FORCE_PUSH while LNET_PEER_PUSH_SENT is set.&lt;/li&gt;
+	&lt;li&gt;Make R push to L.&lt;/li&gt;
+	&lt;li&gt;Send an lst RPC from L to R.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Result: 5 of 5 runs spin. The discovery thread did 10M loops in 15 s.&lt;/p&gt;
+
+&lt;p&gt;A device removal can also start the spin. The removal loses a push ACK. At the re-add, &lt;tt&gt;lnet_set_link_fatal_state(ni, 0)&lt;/tt&gt; sets LNET_PEER_FORCE_PUSH.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h3&gt;
+
+&lt;p&gt;Two functions disagree about LNET_PEER_FORCE_PUSH while LNET_PEER_PUSH_SENT is set:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;lnet_peer_needs_push()&lt;/tt&gt; returns false while PUSH_SENT is set. So the discovery thread calls &lt;tt&gt;lnet_peer_discovered()&lt;/tt&gt;. Then &lt;tt&gt;lnet_peer_discovery_complete()&lt;/tt&gt; resends the messages on lp_dc_pendq.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;lnet_peer_is_uptodate_locked()&lt;/tt&gt; returns false when FORCE_PUSH is set, whatever PUSH_SENT is. So each resend calls &lt;tt&gt;lnet_initiate_peer_discovery()&lt;/tt&gt;. That call puts the message back on lp_dc_pendq and the peer back on ln_dc_request.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The inner loop of &lt;tt&gt;lnet_peer_discovery()&lt;/tt&gt; never empties ln_dc_request, so the thread never sleeps. The spin stops when the push ACK clears PUSH_SENT. If the ACK is lost, the spin stops when the response timeout (transaction_timeout, 150 s) unlinks the push MD.&lt;/p&gt;
+
+&lt;p&gt;Evidence:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;A debug log at each 10M loops showed state 0x4511 (FORCE_PUSH, PUSH_SENT, DISCOVERED, MULTI_RAIL) and 1 message on lp_dc_pendq.&lt;/li&gt;
+	&lt;li&gt;In a vmcore, lnet_discovery was running in &lt;tt&gt;lnet_peer_discovery_complete()&lt;/tt&gt;. The peer had lp_state 0x4511, and its push MD was still live.&lt;/li&gt;
+	&lt;li&gt;Without a panic, the watchdog reported "stuck for 183s". Then &lt;tt&gt;lnet_finalize_expired_responses()&lt;/tt&gt; unlinked the push, and the spin stopped.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The &lt;a href="https://jira.whamcloud.com/browse/LU-19309" title="Lnet interop crashes / lockups in master" class="issue-link" data-issue-key="LU-19309"&gt;LU-19309&lt;/a&gt; Maloo vmcore shows a different state: a gateway peer with MARK_DELETED and no PUSH_SENT. This ticket does not cover that state.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h3&gt;
+
+&lt;p&gt;In &lt;tt&gt;lnet_peer_is_uptodate_locked()&lt;/tt&gt;, do not check LNET_PEER_FORCE_PUSH. &lt;tt&gt;lnet_peer_needs_push()&lt;/tt&gt; already checks it and obeys PUSH_SENT. The forced push still goes out after the ACK.&lt;/p&gt;
+
+&lt;p&gt;With the fix, the reproducer did not spin in 15 runs (0 of 15).&lt;/p&gt;</description>
+                <environment />
+        <key id="100008">LU-21013</key>
+            <summary>lnet: discovery thread spins on a forced push in flight</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 22 Oct 2026 01:06:25 +0000</created>
+                <updated>Thu, 22 Oct 2026 02:26:38 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="504110" author="gerrit" created="Thu, 22 Oct 2026 01:07:24 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69912" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69912&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21013" title="lnet: discovery thread spins on a forced push in flight" class="issue-link" data-issue-key="LU-21013"&gt;LU-21013&lt;/a&gt; lnet: do not spin on a forced push in flight&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: c9a1a7e1451997a48d0bdef78ff6b2878efe4388&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="91917">LU-19309</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071tr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

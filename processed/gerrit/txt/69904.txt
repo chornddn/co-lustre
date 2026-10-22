@@ -1,0 +1,89 @@
+Change:     69904
+Subject:    LU-19921 ptlrpc: fix SEC_CTX_INIT timeout on undiscovered peer
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69904
+Change-Id:  I802b969b991f35ca864aa2d84e9e7a51a47c87b8
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sudheer Dantuluri
+Created:    2026-10-21 21:20:15.000000000
+Updated:    2026-10-22 05:02:43.000000000
+Patch Set:  2
+Insertions: +13
+Deletions:  -5
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  REVIEWER: wangdi
+
+--- Commit Message ---
+LU-19921 ptlrpc: fix SEC_CTX_INIT timeout on undiscovered peer
+
+When mounting an IAM-enabled Lustre filesystem (gssiam) where MDT/OST
+servers reside on separate VMs from the MGS, the client import's
+initial connection (oic_uptodate) starts at -EAGAIN (-11) because
+LNetPeerDiscovered(&peer_nid, false) has not yet discovered the peer's
+NIDs and instead queued background peer discovery.
+
+Next, preparing the client's CONNECT RPC triggers synchronous GSSIAM
+context initialization via sptlrpc_req_get_ctx() -> get_my_ctx() ->
+gssiam_lookup_ctx() [via sec->ps_policy->sp_cops->lookup_ctx =
+gssiam_sec_cops.lookup_ctx] -> gssiam_send_init_rpc(), which sends a
+synchronous SEC_CTX_INIT (o801) RPC on the same import while
+imp->imp_state is still LUSTRE_IMP_CONNECTING and oic_uptodate == -11.
+Because SEC_CTX_INIT blocks ptlrpc_connect_import_locked() inside
+ptlrpc_request_bufs_pack() before the CONNECT RPC is even queued,
+import_select_connection() is not called again to refresh
+oic_uptodate, and ptl_send_rpc() silently drops both the initial
+SEC_CTX_INIT RPC and its single retry (with rq_timeout = 1s and
+rq_real_sent = 0), causing the cold mount to fail with -ETIMEDOUT
+(-110).
+
+Fix this in ptl_send_rpc() (lustre/ptlrpc/niobuf.c): when
+oic_uptodate <= 0 during LUSTRE_IMP_CONNECTING and
+request->rq_ctx_init is set, re-query LNetPeerDiscovered() to refresh
+oic_uptodate (matching import_select_connection()) before dropping
+the RPC.
+
+Fixes: 5a89ec9e9712 ("LU-19921 ptlrpc: add GSSIAM security context client")
+Signed-off-by: Sudheer Dantuluri <dantuluris@google.com>
+Change-Id: I802b969b991f35ca864aa2d84e9e7a51a47c87b8
+
+--- Review History ---
+
+--- Message (Sudheer Dantuluri, 2026-10-21 21:20:15.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-10-21 21:23:56.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Sudheer Dantuluri, 2026-10-21 21:40:07.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2026-10-21 21:40:09.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-21 21:43:00.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-21 21:59:00.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-22 05:01:00.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134208/ : SUCCESS

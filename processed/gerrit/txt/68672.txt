@@ -1,5 +1,5 @@
 Change:     68672
-Subject:    LU-18598 mdt: take UPDATE lock of migration source
+Subject:    LU-18598 mdt: take UPDATE and LAYOUT locks of migration source
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68672
 Change-Id:  I035d94e9074bfd6ec5644e409fdcb8a9302cfe3a
 Project:    fs/lustre-release
@@ -7,52 +7,70 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-09-06 03:36:12.000000000
-Updated:    2026-10-14 16:18:05.000000000
-Patch Set:  1
-Insertions: +12
+Updated:    2026-10-22 04:28:35.000000000
+Patch Set:  3
+Insertions: +21
 Deletions:  -4
-Comments:   8 (3 unresolved)
-Hashtags:   218_review_priority
+Comments:   22 (0 unresolved)
+Hashtags:   218_review_blocker, 218_review_priority
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1; Lai Siyao: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Lai Siyao, Andreas Dilger, Alex Zhuravlev
 
 --- Commit Message ---
-LU-18598 mdt: take UPDATE lock of migration source
+LU-18598 mdt: take UPDATE and LAYOUT locks of migration source
 
-Migrating a file that has more than one hard link decrements its link
-count once per extra link (mdd_update_link()) and then destroys it, but
-the source is locked with LOOKUP|XATTR|OPEN only.  The other names of
-the inode are meant to be covered by name locks, and they are not: the
-parent PDO lock covers the migrated name only, and
-mdt_migrate_links_lock() deliberately skips a link whose parent is
-already the source or the target parent.  A second name of the same
-inode in either of those directories is therefore unlocked, and an
-unlink of it - which needs EX UPDATE of the inode, a bit migration
-never takes - can drop the link count to zero and destroy the object in
-the window where mdd_migrate_create() has released the source object
+Migrating a file that has more than one hard link decrements its
+link count once per extra link (mdd_update_link()) and then
+destroys it, but the source is locked with LOOKUP|XATTR|OPEN only.
+The other names of the inode are meant to be covered by name locks,
+but mdt_migrate_links_lock() deliberately skips a link whose parent
+is the source or the target parent.  A second name in the source
+parent is still excluded by the EX LOOKUP lock that migration holds
+on the inode on that MDT, but a second name in the target parent,
+when that is on another MDT, is not locked at all.  An unlink of it
+needs EX UPDATE of the inode, a bit migration never takes, so it
+can drop the link count to zero and destroy the object in the
+window where mdd_migrate_create() has released the source object
 lock.  osd_ref_del() then only warns about nlink == 0 and
 mdd_migrate_create() destroys the object a second time, hitting
-ASSERTION( !lu_object_is_dying(dt->do_lu.lo_header) ) in osd_destroy().
+ASSERTION( !lu_object_is_dying(dt->do_lu.lo_header) )
+in osd_destroy().
 
-Take MDS_INODELOCK_UPDATE of the source as well when the inode itself
-is migrated, so that everything which changes its link count is
-excluded for the whole migration.  Dirent-only migration goes through
-mdd_migrate_update(), which never touches the link count, and is left
-alone so that directory restripe does not revoke a client attribute
-lock per entry.
+The new object also takes over the OST objects of the source, but
+client layout locks of the source are never revoked.  A client
+that still has the old layout cached fails to set up the new
+object with -EIO, because its stripes still belong to the old one.
 
-Also return the real error from mdt_rename_source_lock() rather than 0.
-Both mdt_reint_rename() call sites already tested the return value, but
-a failed mdt_object_lock() of the source was swallowed there too, and
-rename went on to mdo_rename() with the source unlocked.
+Take MDS_INODELOCK_UPDATE and MDS_INODELOCK_LAYOUT of the source as
+well when a file inode itself is migrated, so that everything which
+changes its link count is excluded for the whole migration and
+clients invalidate the old layout.  An HSM restore holds EX LAYOUT
+until the restore completes, so such a migration now fails with
+-EBUSY while a restore of the file is running, rather than waiting
+for it with the rename lock and parent locks held.
 
-Fixes: 1d6b96a1cf0 ("LU-15529 mdt: optimize dir migration locking")
+Dirent-only migration goes through mdd_migrate_update(), which
+keeps the inode and its layout, and is left alone so that directory
+restripe does not revoke client locks per entry.  Directory
+migration is left alone too: a directory has no other names to
+update and no OST objects, and UPDATE on it would conflict with the
+PDO lock that every create and unlink inside it takes, serializing
+all namespace changes in the directory for the whole migration.
+
+Also return the real error from mdt_rename_source_lock() rather
+than 0.  Both mdt_reint_rename() call sites already tested the
+return value, but a failed mdt_object_lock() of the source was
+swallowed there too, and rename went on to mdo_rename() with the
+source unlocked.
+
+Test-Parameters: env=SLOW=y mdscount=2 mdtcount=4 testlist=sanityn,racer,racer
+Fixes: 1d6b96a1cf04 ("LU-15529 mdt: optimize dir migration locking")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
 Change-Id: I035d94e9074bfd6ec5644e409fdcb8a9302cfe3a
@@ -118,3 +136,113 @@ Patch Set 1:
 
 --- Message (Patrick Farrell, 2026-10-14 16:18:05.000000000) ---
 Hashtag added: 218_review_priority
+
+--- Message (Patrick Farrell, 2026-10-21 16:06:44.000000000) ---
+Hashtag added: 218_review_blocker
+
+--- Message (Patrick Farrell, 2026-10-21 17:00:39.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 17:01:16.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 17:24:43.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-10-21 17:25:03.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 17:25:04.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 17:25:20.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (patrick bot, 2026-10-21 17:25:49.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-21 17:27:24.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-21 17:39:23.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Alex Zhuravlev, 2026-10-21 18:04:21.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (jenkins, 2026-10-21 19:00:39.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134175/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-10-21 19:01:48.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 19:05:40.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-10-21 19:22:14.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 20:02:11.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-10-21 20:02:39.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-10-21 20:03:11.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-10-21 20:03:25.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-21 20:05:27.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-22 04:27:02.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134203/ : SUCCESS

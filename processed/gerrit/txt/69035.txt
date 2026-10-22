@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-18 09:23:11.000000000
-Updated:    2026-10-21 10:19:25.000000000
-Patch Set:  6
-Insertions: +114
-Deletions:  -55
-Comments:   18 (0 unresolved)
+Updated:    2026-10-22 12:27:00.000000000
+Patch Set:  7
+Insertions: +152
+Deletions:  -66
+Comments:   20 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -39,37 +39,47 @@ retried on failure, so the two sides cannot diverge.
 The master still handles lvb_id_rel in qmt_lvbo_update() so that
 older slaves keep working during a rolling upgrade. In the other
 direction, a patched slave with an unpatched master still releases
-via DQACQ, but the old master only waits the old QMT_REBA_TIMEOUT
-of 2s from "lqe_revoke_time" before setting edquot, so a transient
--EDQUOT is still possible in that mixed version window.
+via DQACQ, but the old master only waits 2s from "lqe_revoke_time"
+before setting edquot, so a transient -EDQUOT is still possible in
+that mixed version window.
 
 qmt_adjust_edquot() is now the only thing holding edquot off
 until the DQACQ arrives: anchor its grace period to the reply
 that claimed the release (lqe_may_rel_time) rather than to
-"lqe_revoke_time", which may be much older, and also raise
-"QMT_REBA_TIMEOUT" to 10s to cover the extra round trip and the
-QSD update thread scheduling, otherwise the master sets edquot
-first and clients see a transient -EDQUOT.
+"lqe_revoke_time", which may be much older, and raise the
+timeout from 2s to LQUOTA_MAY_REL_TIMEOUT (10s) to cover the
+extra round trip and the QSD update thread scheduling, otherwise
+the master sets edquot first and clients see a transient
+-EDQUOT. The claim is recorded on the pool lqes too in
+qmt_lvbo_update(), so that a pool lqe marked edquot by
+qmt_set_revoke() is held off as well.
 
-That hold-off has to cover the pool lqes too, not only the
-global one: record lqe_may_rel/lqe_may_rel_time on every lqe in
-qmt_lvbo_update() and reset them all before a new glimpse round
-in qmt_id_lock_glimpse(), so that a pool lqe marked edquot by
-qmt_set_revoke() is held off as well and does not keep a stale
-claim.
+The release does not necessarily return what was advertised:
+qsd_calc_adjust() recomputes it from the usage at the time the
+request is sent, so part of the surplus may be consumed in the
+meantime. The slave accumulates the advertised amounts on its
+lqe and returns the sum in qb_usage, guarded by the new flag
+QUOTA_DQACQ_FL_MAY_REL, with its next release request; when
+there is nothing left to release it sends one without any space.
+An unpatched master ignores the flag and behaves as before.
 
-When a DQACQ release or a plain report arrives, settle the whole
-claim in qmt_dqacq0(): the slave recomputes the surplus when it
-sends the request, so whatever it does not return was consumed
-meanwhile. A report combined with an acquire or a pre-acquire
-leaves the claim alone, so that the space other slaves are still
-releasing keeps edquot off for it. The timeout then only bounds
-a slow or lost DQACQ instead of always delaying edquot by the
-full 10s.
+qmt_dqacq0() subtracts that amount, clamped at 0, from
+lqe_may_rel of every lqe after the release has been committed:
+settling it before the writes would drop the claim even when
+qmt_restore_lqes() has to roll the release back. The amount is
+per slave, so the surplus recorded for other slaves is kept.
 
-Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=30
+A surplus older than LQUOTA_MAY_REL_TIMEOUT cannot hold edquot
+off any more, so both sides drop it: the master in
+qmt_adjust_edquot(), the slave in qsd_calc_adjust() and before
+accumulating a new one. A claim whose release never arrives,
+e.g. from a slave that went away, would otherwise keep delaying
+edquot in every following round.
+
+Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=50
 Fixes: 318fd8d197ff ("LU-1842 quota: qsd lock")
 Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
+Assisted-by: DeepSeek:V4.1-Flash llm_code_and_review_tools
 Change-Id: I129020a8e02b848b696cd2bc85c19672a0f8b594
 
 --- Review History ---
@@ -270,3 +280,40 @@ Patch Set 6: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/134093/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-21 15:09:19.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comment. The switch to a DQACQ release keeps the two sides' accounting consistent, but the way the claim is settled in qmt_dqacq0() can bring back the transient -EDQUOT with more than one slave.
+
+--- Message (Hongchao Zhang, 2026-10-22 08:35:04.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-10-22 08:36:11.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-22 08:37:35.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-22 08:42:06.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-22 12:26:37.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134254/ : SUCCESS

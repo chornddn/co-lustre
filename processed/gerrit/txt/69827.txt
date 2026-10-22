@@ -1,5 +1,5 @@
 Change:     69827
-Subject:    LU-20995 compat: make kallsyms lookups safe with x86 kernel IBT
+Subject:    LU-20995 compat: fail cleanly on kallsyms lookups with x86 IBT
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69827
 Change-Id:  I4fd5dae7454c9e9b0865c95c8369af15d6632516
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Jian Yu
 Created:    2026-10-19 22:42:37.000000000
-Updated:    2026-10-21 04:44:07.000000000
-Patch Set:  2
-Insertions: +94
-Deletions:  -17
-Comments:   14 (0 unresolved)
+Updated:    2026-10-22 12:04:06.000000000
+Patch Set:  3
+Insertions: +127
+Deletions:  -33
+Comments:   21 (4 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -19,34 +19,51 @@ Comments:   14 (0 unresolved)
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
+  REVIEWER: James Simmons, Timothy Day
 
 --- Commit Message ---
-LU-20995 compat: make kallsyms lookups safe with x86 kernel IBT
+LU-20995 compat: fail cleanly on kallsyms lookups with x86 IBT
 
-On x86 kernels with CONFIG_X86_KERNEL_IBT, loading libcfs can BUG
-with "Missing ENDBR" when Lustre calls kernel functions through
-pointers obtained from kallsyms.
+On x86 kernels with CONFIG_X86_KERNEL_IBT running on an IBT-enabled
+CPU, loading libcfs BUGs with "Missing ENDBR" when Lustre calls
+kernel functions through pointers obtained from kallsyms.
 
 find_kallsyms_lookup_name() takes kallsyms_lookup_name() from a
-kprobe, but kp.addr is the probe address, which with IBT is placed
-after the ENDBR64 (kallsyms_lookup_name+0x4). Calling that address
-indirectly raises #CP. In addition, the kernel seals the ENDBR of
-functions whose address is never taken, so other symbols resolved
-via kallsyms may not be callable through a pointer at all.
+kprobe, and with CONFIG_X86_KERNEL_IBT the probe address is placed
+after the ENDBR64 (kallsyms_lookup_name+0x4). Moreover, the kernel
+seals the ENDBR of every function whose address is never taken:
+objtool lists it in .ibt_endbr_seal and apply_seal_endbr() poisons
+it at boot. kallsyms_lookup_name() is one of those functions, as are
+alloc/free/apply_workqueue_attrs() and security_file_alloc/free(),
+so none of them can be called indirectly from a module, whatever
+address is used.
 
 Rewind the kprobe address to the start of the symbol using
-sprint_symbol(), and verify that the function starts with ENDBR64
-when IBT is enabled before using it. Add and export
-cfs_kallsyms_lookup_func() to do the same check for the other
-functions looked up in lustre_symbols_init(), so a sealed function
-makes module init fail cleanly instead of crashing the kernel.
+sprint_symbol(), so the real entry instruction can be checked, and
+verify that the function starts with ENDBR64 when IBT is enabled
+before using it. Add and export cfs_kallsyms_lookup_func() to do the
+same check for the other functions looked up in
+lustre_symbols_init(); it returns ERR_PTR(-EINVAL) if the symbol is
+not found and ERR_PTR(-EOPNOTSUPP) if it is not callable.
+
+This does not make Lustre usable on IBT-enabled CPUs: since these
+ENDBRs are sealed, libcfs now refuses to load with -EOPNOTSUPP and
+a clear error message instead of crashing the kernel with #CP.
+Without IBT enforcement, behavior is unchanged. Calling these
+functions with a direct call or jmp, which does not need an ENDBR
+(e.g. via a module-defined static_call() updated to the kallsyms
+address), is left for a follow-up ticket.
 
 In osd-wbcfs, also use cfs_kallsyms_lookup_func() for
 flush_delayed_fput(), and fail osd_init() before
-class_register_type() if the lookup returns NULL. Previously a
-failed lookup left cfs_flush_delayed_fput NULL while the module
-still loaded, so osd_umount()/osd_flush_fput() would later call
-a NULL pointer.
+class_register_type() if the lookup fails. Previously a failed
+lookup left cfs_flush_delayed_fput NULL while the module still
+loaded, so osd_umount()/osd_flush_fput() would later call a NULL
+pointer.
+
+The sanity runs below only exercise the IBT path if the test nodes
+boot an IBT-enabled kernel on IBT-capable hardware; otherwise they
+only verify that nothing regresses without IBT enforcement.
 
 Test-Parameters: trivial
 Test-Parameters: testlist=sanity clientdistro=el10.2
@@ -57,7 +74,7 @@ Test-Parameters: testlist=sanity clientdistro=sles15sp7
 Test-Parameters: testlist=sanity clientdistro=ubuntu2404
 Test-Parameters: testlist=sanity clientdistro=ubuntu2604
 
-Fixes: b18bfc7c79 ("LU-18687 compat: improve cfs_kallsyms_lookup_name()")
+Fixes: b18bfc7c7935 ("LU-18687 compat: improve cfs_kallsyms_lookup_name()")
 Signed-off-by: Jian Yu <yujian@whamcloud.com>
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Change-Id: I4fd5dae7454c9e9b0865c95c8369af15d6632516
@@ -126,3 +143,38 @@ Patch Set 2: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/134155/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-21 20:13:29.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The patch replaces the #CP BUG with a clean module-load failure, which is an improvement. But on an IBT-enabled CPU it looks like libcfs can never load: kallsyms_lookup_name() and most of the other looked-up functions have sealed ENDBRs. So this doesn't make Lustre usable on those systems, and the commit message should say so. A real fix probably has to call these functions with a direct call or jmp, which doesn't need an ENDBR. A module-defined static_call() updated to the kallsyms address might be worth investigating, but a follow-up ticket for that seems reasonable.
+
+--- Message (Jian Yu, 2026-10-22 07:36:34.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-22 07:40:35.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-22 07:43:30.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-22 12:03:20.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134251/ : SUCCESS

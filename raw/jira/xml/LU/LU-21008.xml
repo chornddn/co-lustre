@@ -1,0 +1,129 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21008] o2iblnd: fall back to copy when FastReg map of an IMMEDIATE payload fails</title>
+                <link>https://jira.whamcloud.com/browse/LU-21008</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Problem&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;On a FastReg device, `kiblnd_send()` registers the payload of every IMMEDIATE message with a FastReg MR. &lt;a href="https://jira.whamcloud.com/browse/LU-14008" title="avoid data copy with immediate message sending." class="issue-link" data-issue-key="LU-14008"&gt;&lt;del&gt;LU-14008&lt;/del&gt;&lt;/a&gt; added this zero-copy path. If `kiblnd_setup_rd_kiov()` fails, `kiblnd_send()` returns -EIO and LNet fails the message. The payload always fits in the pre-registered message buffer, so a copy can send the message instead.&lt;/p&gt;
+
+&lt;p&gt;A failed small send has a high cost. For an RPC request, ptlrpc reports a network error and disconnects the import. The import disconnect unlinks the reply buffers of the other RPCs in flight on that import. Those RPCs then wait for their full deadline before the client resends them.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Environment&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;Seen on b_es6_0. The same code is on master.&lt;/li&gt;
+	&lt;li&gt;Client: RoCEv2 on ConnectX-7, `map_on_demand=1` (FastReg), AMD IOMMU in translated mode.&lt;/li&gt;
+	&lt;li&gt;Workload: fio sequential read.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Evidence&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The client logged these errors about once every 34,000 small sends:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+(o2iblnd.c:1937:kiblnd_fmr_pool_map()) Failed to map mr 0/1 elements: rc = -22&lt;br/&gt;
+(o2iblnd_cb.c:631:kiblnd_fmr_map_tx()) Can't map 488 bytes (1/1)s: -22&lt;br/&gt;
+(o2iblnd_cb.c:1818:kiblnd_send()) Can't setup IMMEDIATE src for 192.168.130.41@o2ib: -22&lt;br/&gt;
+(client.c:2403:ptlrpc_expire_one_request()) @@@ Request sent has failed due to network error ... o3-&amp;gt;...&lt;del&gt;OST0002-osc&lt;/del&gt;...&lt;br/&gt;
+(import.c:198:ptlrpc_set_import_discon()) ...: Connection to ...-OST0002 (at 192.168.130.41@o2ib) was lost&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;Each failure was a 488-byte OST_READ request in 1 fragment.&lt;/li&gt;
+	&lt;li&gt;After each failure, the other OST_READ requests in flight to that OST stalled for 38 s, then timed out and were resent. The server replied to each resend in about 1 ms.&lt;/li&gt;
+	&lt;li&gt;11 failures in 30 minutes halved the read bandwidth of the client.&lt;/li&gt;
+	&lt;li&gt;`map_on_demand=0` removes the errors.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;We do not know the root cause of the map failure yet. The fault is below LNet, in the RDMA memory registration or the IOMMU mapping. This ticket does not cover that root cause.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Proposed fix&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;In the IMMEDIATE branch of `kiblnd_send()`, if the FastReg map fails, do not fail the message. Fall back to the copy path:&lt;/p&gt;
+
+&lt;p&gt;1. Call `kiblnd_unmap_tx()` to release the DMA mapping that `kiblnd_setup_rd_kiov()` made.&lt;br/&gt;
+2. Reset the work request and SGE state that `kiblnd_init_tx_msg_payload()` set up.&lt;br/&gt;
+3. Copy the payload into `ibim_payload` with `copy_from_iter()`, and call `kiblnd_init_tx_msg()`. Devices that do not use FastReg already use this copy path.&lt;br/&gt;
+4. Keep a rate-limited error message for the map failure, so that the underlying fault stays visible.&lt;/p&gt;
+
+&lt;p&gt;The copy fallback makes small messages tolerate a FastReg map failure. The fallback does not help a PUT or GET sink that fails to map, because a sink has no copy path.&lt;/p&gt;</description>
+                <environment />
+        <key id="100003">LU-21008</key>
+            <summary>o2iblnd: fall back to copy when FastReg map of an IMMEDIATE payload fails</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 21 Oct 2026 20:19:10 +0000</created>
+                <updated>Wed, 21 Oct 2026 20:19:10 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071sn:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -1,0 +1,144 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21009] lnet: discovery completes a peer with a push in flight and leaks the peer</title>
+                <link>https://jira.whamcloud.com/browse/LU-21009</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Problem&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;LNet leaks a `struct lnet_peer` when discovery completes a peer while that peer still waits for the ACK of a discovery push. The push MD holds a reference on the peer. Nothing unlinks that MD, so the reference stays until module unload. Unload then reports "Portals memory leaked" for the size of one `struct lnet_peer`.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Environment&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;master at 2.17.60 with Gerrit 69534 applied, and b_es7_0 at 2.16.0-ddn61 with a port of 69534.&lt;/li&gt;
+	&lt;li&gt;One node, socklnd, 3 LNet networks on one interface, `lock_prim_nid=1`.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Reproduction&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;1. Configure LNet with networks `tcp` and `tcp1` on one interface. Load the Lustre modules.&lt;br/&gt;
+2. Run `lctl add_uuid U &amp;lt;node&amp;gt;@tcp`. Wait until discovery gives the peer both NIDs.&lt;br/&gt;
+3. Add a silent drop rule for pushes: `lctl net_drop_add -s '&lt;b&gt;' -d '&lt;/b&gt;' -m PUT -r 1`.&lt;br/&gt;
+4. Add network `tcp2` on the same interface.&lt;br/&gt;
+5. Run `lctl add_uuid U &amp;lt;node&amp;gt;@tcp2`. Wait 3 seconds.&lt;br/&gt;
+6. Remove the drop rule, run `lctl del_uuid U`, and unload the modules.&lt;/p&gt;
+
+&lt;p&gt;The unload reports "Portals memory leaked: 336 bytes" on b_es7_0 and 320 bytes on master. That is `sizeof(struct lnet_peer)` on each branch. With `-e local_error` on the drop rule, the push fails at send time and nothing leaks.&lt;/p&gt;
+
+&lt;p&gt;Without 69534, step 5 corrupts the peer lists and the unload hits an LBUG (&lt;a href="https://jira.whamcloud.com/browse/LU-20515" title="LBUG in lnet_destroy_peer_locked() During Peer Discovery After MR Reconfiguration" class="issue-link" data-issue-key="LU-20515"&gt;LU-20515&lt;/a&gt;). So this leak is visible only with 69534.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Analysis&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;A D_NET trace of the leaked peer shows this order:&lt;/p&gt;
+
+&lt;p&gt;1. The locked peer for `&amp;lt;node&amp;gt;@tcp` sends a discovery push. The drop rule discards it, so no ACK arrives. The state keeps `LNET_PEER_PUSH_SENT`, and the push MD keeps the reference that `lnet_peer_send_push()` took.&lt;br/&gt;
+2. Discovery of the new peer for `&amp;lt;node&amp;gt;@tcp2` hands the ping data to the locked peer. `lnet_peer_set_primary_data()` finds the locked peer already queued ("Queue peer: -114"). It moves the peer to `ln_dc_request` and sets `LNET_PEER_NIDS_UPTODATE`.&lt;br/&gt;
+3. The discovery thread completes the locked peer with state `0x300511`. That state still has `LNET_PEER_PUSH_SENT`. The thread dequeues the peer.&lt;br/&gt;
+4. The discovery timeout check scans `ln_dc_working` only. The peer is not on that list, so nothing unlinks the push MD. The ACK never arrives, so the event handler never drops the reference.&lt;br/&gt;
+5. At shutdown, `lnet_peer_tables_cleanup()` frees the peer NIs and peer nets, but `lnet_destroy_peer_locked()` never runs for the peer.&lt;/p&gt;
+
+&lt;p&gt;Inference: in the field, a lost push ACK during a peer merge gives the same leak. The leak is one peer for each such event. We have not seen it outside the VM test.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20810" title="LNet: Peer discovery memory leak" class="issue-link" data-issue-key="LU-20810"&gt;LU-20810&lt;/a&gt; reports the same leak size from a different path: a peer queued after `lnet_peer_discovery_stop()`.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Proposed fix&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Do not complete discovery of a peer that has `LNET_PEER_PUSH_SENT` or `LNET_PEER_PING_SENT` set. Alternatively, unlink `lp_push_mdh` and `lp_ping_mdh` when `lnet_peer_set_primary_data()` takes over a peer that waits for a reply.&lt;/p&gt;</description>
+                <environment />
+        <key id="100004">LU-21009</key>
+            <summary>lnet: discovery completes a peer with a push in flight and leaks the peer</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 21 Oct 2026 21:00:46 +0000</created>
+                <updated>Wed, 21 Oct 2026 21:00:52 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="98616">LU-20515</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="99510">LU-20810</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071sv:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

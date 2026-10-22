@@ -1,0 +1,86 @@
+Key:        LU-21009
+Summary:    lnet: discovery completes a peer with a push in flight and leaks the peer
+Link:       https://jira.whamcloud.com/browse/LU-21009
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Wed, 21 Oct 2026 21:00:46 +0000
+Updated:    Wed, 21 Oct 2026 21:00:52 +0000
+Links:      Related: is related to  LU-20515; Related: is related to  LU-20810
+
+--- Description ---
+Problem
+
+	
+	
+
+LNet leaks a `struct lnet_peer` when discovery completes a peer while that peer still waits for the ACK of a discovery push. The push MD holds a reference on the peer. Nothing unlinks that MD, so the reference stays until module unload. Unload then reports "Portals memory leaked" for the size of one `struct lnet_peer`.
+
+	
+	
+		Environment
+
+	
+	
+
+	master at 2.17.60 with Gerrit 69534 applied, and b_es7_0 at 2.16.0-ddn61 with a port of 69534.
+
+	One node, socklnd, 3 LNet networks on one interface, `lock_prim_nid=1`.
+
+	
+	
+		Reproduction
+
+	
+	
+
+1. Configure LNet with networks `tcp` and `tcp1` on one interface. Load the Lustre modules.
+
+2. Run `lctl add_uuid U @tcp`. Wait until discovery gives the peer both NIDs.
+
+3. Add a silent drop rule for pushes: `lctl net_drop_add -s '' -d '' -m PUT -r 1`.
+
+4. Add network `tcp2` on the same interface.
+
+5. Run `lctl add_uuid U @tcp2`. Wait 3 seconds.
+
+6. Remove the drop rule, run `lctl del_uuid U`, and unload the modules.
+
+The unload reports "Portals memory leaked: 336 bytes" on b_es7_0 and 320 bytes on master. That is `sizeof(struct lnet_peer)` on each branch. With `-e local_error` on the drop rule, the push fails at send time and nothing leaks.
+
+Without 69534, step 5 corrupts the peer lists and the unload hits an LBUG (LU-20515). So this leak is visible only with 69534.
+
+	
+	
+		Analysis
+
+	
+	
+
+A D_NET trace of the leaked peer shows this order:
+
+1. The locked peer for `@tcp` sends a discovery push. The drop rule discards it, so no ACK arrives. The state keeps `LNET_PEER_PUSH_SENT`, and the push MD keeps the reference that `lnet_peer_send_push()` took.
+
+2. Discovery of the new peer for `@tcp2` hands the ping data to the locked peer. `lnet_peer_set_primary_data()` finds the locked peer already queued ("Queue peer: -114"). It moves the peer to `ln_dc_request` and sets `LNET_PEER_NIDS_UPTODATE`.
+
+3. The discovery thread completes the locked peer with state `0x300511`. That state still has `LNET_PEER_PUSH_SENT`. The thread dequeues the peer.
+
+4. The discovery timeout check scans `ln_dc_working` only. The peer is not on that list, so nothing unlinks the push MD. The ACK never arrives, so the event handler never drops the reference.
+
+5. At shutdown, `lnet_peer_tables_cleanup()` frees the peer NIs and peer nets, but `lnet_destroy_peer_locked()` never runs for the peer.
+
+Inference: in the field, a lost push ACK during a peer merge gives the same leak. The leak is one peer for each such event. We have not seen it outside the VM test.
+
+LU-20810 reports the same leak size from a different path: a peer queued after `lnet_peer_discovery_stop()`.
+
+	
+	
+		Proposed fix
+
+	
+	
+
+Do not complete discovery of a peer that has `LNET_PEER_PUSH_SENT` or `LNET_PEER_PING_SENT` set. Alternatively, unlink `lp_push_mdh` and `lp_ping_mdh` when `lnet_peer_set_primary_data()` takes over a peer that waits for a reply.
