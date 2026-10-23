@@ -1,0 +1,219 @@
+Key:        LU-21017
+Summary:    O_DIRECT with a kernel (ITER_BVEC) iterator reads and writes the wrong pages
+Link:       https://jira.whamcloud.com/browse/LU-21017
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sohei Koyama
+Reporter:   Sohei Koyama
+Created:    Thu, 22 Oct 2026 17:21:15 +0000
+Updated:    Fri, 23 Oct 2026 13:13:56 +0000
+
+--- Description ---
+When O_DIRECT I/O reaches Lustre with a kernel iterator (ITER_BVEC), Lustre moves the iterator forward twice... Data then goes to the wrong place.
+
+Reads: user data lands at the wrong offsets in the buffer. Some pages are left untouched (often zeros).
+
+Writes: the file gets data from the wrong buffer pages. The bad data stays on disk.
+
+ 
+
+Checksums (often) do not catch this. The RPC data is correct; only the page list is wrong. Often the call still returns the full length, so the corruption is silent.
+
+You can hit it with 1) sendfile()/splice() on an O_DIRECT file,2) io_uring with registered buffers, 3) a loop device with direct I/O, and 4) the NVMe-oF target file backend.
+
+ 
+
+How to reproduce
+
+The program below writes 1 MiB, then copies it with sendfile() from an O_DIRECT file. sendfile() on an O_DIRECT file makes the kernel call ->read_iter() with ITER_BVEC.
+
+# gcc -O2 -o bvec_dio_repro bvec_dio_repro.c
+# ./bvec_dio_repro /mnt/lustre/f1 /tmp/out
+sendfile returned 1048576 of 1048576 bytes
+page 1 (offset 65536): wrong, starts with 0
+page 2 (offset 131072): wrong, starts with 0x10000
+page 3 (offset 196608): wrong, starts with 0
+...
+11 of 16 pages wrong
+
+(Client: master 2.17.60, Ubuntu 24.04, kernel 6.8.0-147-generic-64k, 64 KiB pages. Our sendfile tests on 4 KiB page kernels fail the same way.)
+
+ 
+
+Root cause
+
+The iterator is moved forward in two places for the same pages.
+
+	The kernel helper moves it. ll_direct_IO() asks for the pages of the next chunk. Lustre calls iov_iter_extract_pages() (2.17.58 and later, kernel 6.3+) or iov_iter_get_pages_alloc2() (older Lustre, or older kernels). For ITER_BVEC both take only the first bvec segment and move the iterator past it (upstream v6.8, lib/iov_iter.c):
+
+static ssize_t iov_iter_extract_bvec_pages(struct iov_iter *i, ...)
+{
+        ...
+                size = min(maxsize, i->bvec->bv_len - skip);   /* first segment only */
+        ...
+        iov_iter_advance(i, size);                        /* moves the iterator */
+        return size;
+}
+static ssize_t __iov_iter_get_pages_alloc(struct iov_iter *i, ...)
+{
+        ...
+        if (iov_iter_is_bvec(i)) {
+                page = first_bvec_segment(i, &maxsize, start);   /* first segment only */
+                ...
+                i->count -= maxsize;                            /* moves the iterator */
+                i->iov_offset += maxsize;
+                ...
+                return maxsize;
+        } 
+
+ 
+
+2. Lustre moves it back only for user iterators.(master, lustre/obdclass/cl_page.c, ll_get_iov_memory())
+
+ 
+
+        bytes = ll_iov_iter_extract_pages(iter, &pages, maxsize, ...);  /* :155, step 1 */
+        ...
+                if (user_backed_iter(iter))                              /* :180 */
+                        iov_iter_revert(iter, bytes);                    /* :181 */ 
+
+3. Lustre moves it again.(master, lustre/llite/rw26.c, ll_direct_IO())
+
+ 
+
+        while (iov_iter_count(iter)) {
+                ...
+                result = cl_dio_pages_init(env, io, ..., iter, rw, bytes, ...); /* :453 -> steps 1, 2 */
+                bytes = result;
+                ...
+                result = ll_direct_rw_pages(env, io, bytes, rw, inode, sdio);
+                ...
+                iov_iter_advance(iter, bytes);                           /* :528, second move */
+                tot_bytes += bytes;
+                file_offset += bytes;
+        } 
+
+So for ITER_BVEC each chunk moves the iterator twice: once in the kernel helper and once at rw26.c.
+
+Which Lustre and kernel versions show it
+
+Whether one call gets fewer pages than asked depends on the kernel helper:
+
+	2.16.0, 2.17.0 up to 2.17.57 use iov_iter_get_pages_alloc2(). For ITER_BVEC it returns only the first bvec segment (one page) on every kernel that has it.
+
+	2.17.58 and later (LU-20438) use iov_iter_extract_pages() on kernels 6.3 and later. Up to 6.12 it returns one segment. From 6.13 (commit e4e535bff2bc "iov_iter: don't require contiguous pages in iov_iter_extract_bvec_pages") it returns all pages of a page-aligned bvec list in one call. Bvec lists that are not page-aligned take the
+
+unaligned DIO path, which does not use this code.
+
+Tested (T) means we ran the cases below on that system. Code (C) means we read lib/iov_iter.c of that kernel.
+
+ 
+
+Kernel
+2.16.0, 2.17.0 - 2.17.57
+2.17.58 and later
+
+5.19 and older, RHEL 8 (4.18.0-553, 64K pages)
+not affected (T: 2.17.57)
+not affected (T: 2.17.60)
+
+RHEL 9.2, 9.3
+not affected (C)
+not affected (C)
+
+6.0 - 6.2
+affected (C)
+affected (C)
+
+RHEL 9.4 (5.14.0-427)
+affected (T: 2.17.57)
+affected (T: 2.17.60)
+
+RHEL 9.5 (5.14.0-503)
+affected (C)
+affected (C)
+
+RHEL 9.6 (5.14.0-570)
+affected (T: 2.17.57)
+affected (T: 2.17.60)
+
+6.3 - 6.12, e.g. Ubuntu 24.04 (6.8.0-147, 4K and 64K pages)
+affected (T: 2.17.57)
+affected (T: 2.17.60)
+
+6.13 and later
+affected (C)
+not affected (C)
+
+RHEL 9.7 (5.14.0-611, 4K and 64K pages), 9.8, 9.10
+affected (T: 2.17.57)
+not affected (T: 2.17.60)
+
+ 
+
+Results by path
+
+Same cases on every tested system: 1-stripe and 2-stripe (1 MiB stripe) files, I/O inside one stripe and across a stripe boundary. "Wrong" means data inside the returned length is wrong.
+
+Path
+Read
+Write
+
+sendfile() with an O_DIRECT file
+wrong data, full length returned (across a stripe boundary sometimes short, with BAD READ CHECKSUM)
+wrong data, full length returned
+
+splice() with an O_DIRECT file
+short and wrong
+wrong data, full length returned
+
+io_uring READ_FIXED / WRITE_FIXED
+short and wrong; across a stripe boundary: BAD READ CHECKSUM, then EIO
+short and wrong
+
+loop device, losetup --direct-io=on, 8 MiB dd
+dd succeeds; 88 of 128 (64K) / about 1920 of 2048 (4K) pages wrong
+dd succeeds; 120 of 128 (64K) / 2032 of 2048 (4K) pages wrong on disk
+
+NVMe-oF target, file backend (buffered_io=0) (master on Ubuntu only)
+EIO
+EIO, but the file is partly overwritten first
+
+ 
+
+On the affected systems every one of these cases failed with both 4 KiB and 64 KiB pages, with one exception: on RHEL 9.4 sendfile() and splice() reads from an O_DIRECT file were fine, because that kernel passes splice reads as ITER_PIPE. From RHEL 9.6 (and upstream 6.5), splice reads from an O_DIRECT file go through copy_splice_read(), which uses ITER_BVEC. Writes
+
+failed on RHEL 9.4 too. On the unaffected systems every case passed. The same programs with user buffers (read(), IORING_OP_READ) always passed. Writes never caused a checksum error on the client or the server.
+
+Not affected: plain read()/write(), readv/writev, libaio, io_uring without registered buffers, GDS (nvidia-fs passes a user iterator). These use user iterators.
+
+Not tested, but likely: LIO fileio backend, copy_file_range() between O_DIRECT files (falls back to splice), and on newer kernels nfsd direct I/O, erofs file-backed mounts and cachefiles.
+
+ 
+
+Related
+
+It started with LU-16328, and then, in LU-17524, only the user-space iter was fixed.
+
+	LU-18308 / LU-17524: same double advance, fixed for user iterators only.
+
+  ITER_BVEC was not covered.
+
+	LU-13846: Lustre moves the iterator forward by itself.
+
+	LU-20438: master switched to iov_iter_extract_pages() in 2.17.58.
+
+--- Comment (gerrit, Fri, 23 Oct 2026 11:26:56 +0000) ---
+"Sohei Koyama " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69978
+
+Subject: LU-21017 clio: rewind DIO iterator by the amount extracted
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ade9e547da7073a231eec4365fbd8133ed650375

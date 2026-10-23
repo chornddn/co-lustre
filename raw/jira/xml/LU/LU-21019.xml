@@ -1,0 +1,84 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21019] DoM mirror split or migrate off DoM changes the file's mtime</title>
+                <link>https://jira.whamcloud.com/browse/LU-21019</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Splitting off a mirror that has a DoM component (&lt;tt&gt;lfs mirror split -d&lt;/tt&gt;, or &lt;tt&gt;LL_LEASE_LAYOUT_SPLIT&lt;/tt&gt;) sets the file's mtime to the time of the split. &lt;tt&gt;lfs migrate&lt;/tt&gt; of a DoM file to a layout without DoM does the same. A split of a mirror without DoM keeps the mtime. Tools that release the flash mirror of cold files change the mtime of every file they release, and backups see them as modified.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+&lt;p&gt;ldiskfs MDT, two OSTs:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-bash"&gt;
+lfs setstripe -E 64K -L mdt -E eof -c 1 f
+dd &lt;span class="code-object"&gt;if&lt;/span&gt;=/dev/urandom of=f bs=128K count=1
+touch -d &lt;span class="code-quote-red"&gt;"2020-01-01 12:00"&lt;/span&gt; f
+lfs mirror extend -N -c 1 f
+lfs mirror split -d --mirror-id=1 f
+stat -c %Y f    &lt;span class="code-comment"&gt;# the &lt;span class="code-object"&gt;time&lt;/span&gt; of the split, not 1577876400&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Cause"&gt;&lt;/a&gt;Cause&lt;/h3&gt;
+&lt;p&gt;&lt;tt&gt;mdd_dom_fixup()&lt;/tt&gt; punches the DoM data on the MDT. &lt;tt&gt;ldiskfs_truncate()&lt;/tt&gt; sets mtime and ctime to the current time, and since &lt;a href="https://jira.whamcloud.com/browse/LU-10048" title="osd-ldiskfs to truncate outside of main transaction" class="issue-link" data-issue-key="LU-10048"&gt;&lt;del&gt;LU-10048&lt;/del&gt;&lt;/a&gt; the truncate runs from &lt;tt&gt;osd_trans_stop()&lt;/tt&gt; after the punch transaction, so it also replaces times a caller set in that transaction. osd-zfs changes no times on a punch. &lt;tt&gt;lfs&lt;/tt&gt; restores no times around a split (&lt;a href="https://jira.whamcloud.com/browse/LU-14508" title="lfs mirror operations do not preserve timestamps" class="issue-link" data-issue-key="LU-14508"&gt;&lt;del&gt;LU-14508&lt;/del&gt;&lt;/a&gt; covers extend and resync only), and a restore in userspace after the split races with writes.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h3&gt;
+&lt;p&gt;&lt;tt&gt;osd_execute_truncate()&lt;/tt&gt; restores mtime and ctime after &lt;tt&gt;ldiskfs_truncate()&lt;/tt&gt;, so a punch changes no times, as on osd-zfs. A counter that &lt;tt&gt;osd_attr_set()&lt;/tt&gt; and xattr changes bump under &lt;tt&gt;oo_guard&lt;/tt&gt; keeps times set while the truncate ran. Whether an operation updates ctime is left to its caller. New &lt;tt&gt;sanity-flr&lt;/tt&gt; test 61d. Patch to follow.&lt;/p&gt;
+
+&lt;p&gt;Related: &lt;a href="https://jira.whamcloud.com/browse/LU-14508" title="lfs mirror operations do not preserve timestamps" class="issue-link" data-issue-key="LU-14508"&gt;&lt;del&gt;LU-14508&lt;/del&gt;&lt;/a&gt;, &lt;a href="https://jira.whamcloud.com/browse/LU-15557" title="creating/breaking mirror should not change file timestamps" class="issue-link" data-issue-key="LU-15557"&gt;&lt;del&gt;LU-15557&lt;/del&gt;&lt;/a&gt;, &lt;a href="https://jira.whamcloud.com/browse/LU-10048" title="osd-ldiskfs to truncate outside of main transaction" class="issue-link" data-issue-key="LU-10048"&gt;&lt;del&gt;LU-10048&lt;/del&gt;&lt;/a&gt;&lt;/p&gt;</description>
+                <environment>ldiskfs MDT with DoM</environment>
+        <key id="100087">LU-21019</key>
+            <summary>DoM mirror split or migrate off DoM changes the file's mtime</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="markus.hilger">Markus Hilger</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 22 Oct 2026 21:31:35 +0000</created>
+                <updated>Thu, 22 Oct 2026 21:48:39 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="504300" author="gerrit" created="Thu, 22 Oct 2026 21:48:39 +0000">&lt;p&gt;"Markus Hilger &amp;lt;markus.hilger@megware.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69948" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69948&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21019" title="DoM mirror split or migrate off DoM changes the file's mtime" class="issue-link" data-issue-key="LU-21019"&gt;LU-21019&lt;/a&gt; osd-ldiskfs: keep times across deferred truncate&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: b6576d7395a000b31b24d6a1b5daace1256cd86b&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071vr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

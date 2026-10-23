@@ -55,10 +55,10 @@ PID: 107101   TASK: ffff922a41bccec0  CPU: 3    COMMAND: &lt;span class="code-qu
                         <labels>
                     </labels>
                 <created>Thu, 7 Mar 2024 06:19:02 +0000</created>
-                <updated>Wed, 2 Sep 2026 18:01:40 +0000</updated>
+                <updated>Thu, 22 Oct 2026 21:41:19 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>6</watches>
+                                    <watches>7</watches>
                                                                             <comments>
                             <comment id="406657" author="gerrit" created="Thu, 7 Mar 2024 06:20:55 +0000">&lt;p&gt;"Alex Zhuravlev &amp;lt;bzzz@whamcloud.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/54310" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/54310&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-17620" title="Lustre client gets stuck in lov_layout_wait() awaiting for IO completion" class="issue-link" data-issue-key="LU-17620"&gt;LU-17620&lt;/a&gt; lov: debug activ IOs per-thread&lt;br/&gt;
@@ -144,6 +144,42 @@ whatever is decided about which layout changes are acceptable while a grouplock 
   Given this ticket is filed Minor: a single-process, single-mount reproducer&lt;br/&gt;
   that wedges in about a second and leaves an unkillable TASK_IDLE task might be&lt;br/&gt;
   worth re-rating.&lt;/p&gt;</comment>
+                            <comment id="504299" author="JIRAUSER19584" created="Thu, 22 Oct 2026 21:41:19 +0000">&lt;p&gt;I found another single-process trigger, without any second party: a layout swap under group locks, then any I/O or stat by the holder. &lt;tt&gt;llapi_fswap_layouts_grouplock(fd1, fd2, 0, 0, 0, 0)&lt;/tt&gt; with gid 0 (keep the caller's group locks, as in &lt;tt&gt;swap_lock_test&lt;/tt&gt; test59), then &lt;tt&gt;fstat()&lt;/tt&gt; or &lt;tt&gt;read()&lt;/tt&gt; of either file never returns. The task is in TASK_IDLE and SIGKILL does not end it. &lt;tt&gt;fgetxattr()&lt;/tt&gt; returns, since it does not refresh the layout. test59 only avoids it because it unlocks right after the swap.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-python"&gt;
+&lt;span class="code-keyword"&gt;import&lt;/span&gt; ctypes, os, sys
+lib = ctypes.CDLL(&lt;span class="code-quote"&gt;"liblustreapi.so.1"&lt;/span&gt;)
+lib.llapi_fswap_layouts_grouplock.argtypes = [ctypes.c_int, ctypes.c_int,
+	ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_uint64]
+fds = []
+&lt;span class="code-keyword"&gt;for&lt;/span&gt; name, n &lt;span class="code-keyword"&gt;in&lt;/span&gt; ((&lt;span class="code-quote"&gt;"foo1"&lt;/span&gt;, 2000), (&lt;span class="code-quote"&gt;"foo2"&lt;/span&gt;, 5000)):
+	p = os.path.join(sys.argv[1], name)
+	&lt;span class="code-keyword"&gt;with&lt;/span&gt; &lt;span class="code-object"&gt;open&lt;/span&gt;(p, &lt;span class="code-quote"&gt;"wb"&lt;/span&gt;) &lt;span class="code-keyword"&gt;as&lt;/span&gt; f:
+		f.write(b&lt;span class="code-quote"&gt;"x"&lt;/span&gt; * n)
+	fds.append(os.&lt;span class="code-object"&gt;open&lt;/span&gt;(p, os.O_RDWR))
+&lt;span class="code-keyword"&gt;for&lt;/span&gt; fd &lt;span class="code-keyword"&gt;in&lt;/span&gt; fds:
+	&lt;span class="code-keyword"&gt;assert&lt;/span&gt; lib.llapi_group_lock(fd, 6458909) == 0
+&lt;span class="code-keyword"&gt;assert&lt;/span&gt; lib.llapi_fswap_layouts_grouplock(fds[0], fds[1], 0, 0, 0, 0) == 0
+os.fstat(fds[0])                            &lt;span class="code-comment"&gt;# never returns (os.pread too)&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Seen on 2.17.0 (b2_17), single-node VM, ldiskfs, EL9.8. Same stack as this ticket, reached through the glimpse of &lt;tt&gt;fstat()&lt;/tt&gt; (&lt;tt&gt;file_read_confine_iter()&lt;/tt&gt; for a read):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lov_layout_wait+0x106/0x1c0 [lov]
+lov_conf_set+0x60b/0x6c0 [lov]
+cl_conf_set+0x62/0x140 [obdclass]
+ll_layout_conf+0xde/0x440 [lustre]
+ll_layout_lock_set+0x3d4/0x7b0 [lustre]
+ll_layout_refresh+0x1f2/0x380 [lustre]
+vvp_io_init+0x2b4/0x4a0 [lustre]
+__cl_io_init+0x88/0x150 [obdclass]
+cl_glimpse_size0+0x98/0x2a0 [lustre]
+ll_getattr_dentry+0xc13/0xe00 [lustre]
+vfs_getattr_nosec+0xd2/0x160
+vfs_fstat+0x45/0x80
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The swap revokes the layout lock, &lt;tt&gt;vvp_io_init()&lt;/tt&gt; refreshes the layout for the next I/O, and &lt;tt&gt;lov_layout_wait()&lt;/tt&gt; waits for &lt;tt&gt;lo_active_ios&lt;/tt&gt; to drop to 0, which includes the CIT_MISC I/O that &lt;tt&gt;cl_get_grouplock()&lt;/tt&gt; keeps open for the caller's own group lock. Failing that I/O (or the refresh) when the only active I/O is the caller's own group lock would let it unlock, and a killable wait instead of &lt;tt&gt;wait_event_idle()&lt;/tt&gt; would at least let the task die and drop its locks.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

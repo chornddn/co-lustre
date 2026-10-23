@@ -1,0 +1,47 @@
+Key:        LU-21021
+Summary:    getxattr("lustre.lov") on an open file returns a stale layout
+Link:       https://jira.whamcloud.com/browse/LU-21021
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Markus Hilger
+Created:    Thu, 22 Oct 2026 21:37:10 +0000
+Updated:    Thu, 22 Oct 2026 21:49:22 +0000
+
+--- Environment ---
+FLR files read by fd on 2 clients
+
+--- Description ---
+After another client changes a file's layout (a write that makes a mirror stale, a resync), fgetxattr(fd, "lustre.lov") on a file kept open returns the old layout until something else refreshes it, for example a stat(). llapi_layout_get_by_fd() reads the same xattr, so tools that read the layout of an open file act on a mirror state that is no longer true. getxattr by path mostly sees the change, since the lookup revalidates the inode.
+
+Reproducer
+Two clients A and B, a file with two mirrors in sync:
+
+	A opens the file and reads the layout generation with fgetxattr(): 5
+
+	B writes 4 KiB into the file: generation 6, one mirror stale
+
+	A's fgetxattr() keeps returning 5 for at least 6 s, and 6 right after a stat()
+
+Cause
+ll_getxattr_lov() packs the layout of the client's cl_object with cl_object_layout_get() and never calls ll_layout_refresh().
+
+Fix
+Call ll_layout_refresh() in getxattr before packing the layout of a regular file. Not in listxattr, which only needs to know that there is a layout, and not while a group lock is held on the file: the new layout would wait for the group lock's own I/O (LU-17620). If the refresh fails, the cached layout is returned. With a valid layout lock the refresh returns at once. New multiop command Xg, sanityn test 123, and swap_lock_test test60 (sanity 405), which reads the layout of a group-locked file after a layout swap. Patch to follow.
+
+Related: LU-14549, LU-18553, LU-17620
+
+--- Comment (gerrit, Thu, 22 Oct 2026 21:49:22 +0000) ---
+"Markus Hilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69950
+
+Subject: LU-21021 llite: refresh layout in getxattr of lustre.lov
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ee2adab427bc04daca018b9e615bce9f2f19d3e3

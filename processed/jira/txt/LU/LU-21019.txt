@@ -1,0 +1,48 @@
+Key:        LU-21019
+Summary:    DoM mirror split or migrate off DoM changes the file's mtime
+Link:       https://jira.whamcloud.com/browse/LU-21019
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Markus Hilger
+Created:    Thu, 22 Oct 2026 21:31:35 +0000
+Updated:    Thu, 22 Oct 2026 21:48:39 +0000
+
+--- Environment ---
+ldiskfs MDT with DoM
+
+--- Description ---
+Splitting off a mirror that has a DoM component (lfs mirror split -d, or LL_LEASE_LAYOUT_SPLIT) sets the file's mtime to the time of the split. lfs migrate of a DoM file to a layout without DoM does the same. A split of a mirror without DoM keeps the mtime. Tools that release the flash mirror of cold files change the mtime of every file they release, and backups see them as modified.
+
+Reproducer
+ldiskfs MDT, two OSTs:
+
+lfs setstripe -E 64K -L mdt -E eof -c 1 f
+dd if=/dev/urandom of=f bs=128K count=1
+touch -d "2020-01-01 12:00" f
+lfs mirror extend -N -c 1 f
+lfs mirror split -d --mirror-id=1 f
+stat -c %Y f    # the time of the split, not 1577876400
+
+Cause
+mdd_dom_fixup() punches the DoM data on the MDT. ldiskfs_truncate() sets mtime and ctime to the current time, and since LU-10048 the truncate runs from osd_trans_stop() after the punch transaction, so it also replaces times a caller set in that transaction. osd-zfs changes no times on a punch. lfs restores no times around a split (LU-14508 covers extend and resync only), and a restore in userspace after the split races with writes.
+
+Fix
+osd_execute_truncate() restores mtime and ctime after ldiskfs_truncate(), so a punch changes no times, as on osd-zfs. A counter that osd_attr_set() and xattr changes bump under oo_guard keeps times set while the truncate ran. Whether an operation updates ctime is left to its caller. New sanity-flr test 61d. Patch to follow.
+
+Related: LU-14508, LU-15557, LU-10048
+
+--- Comment (gerrit, Thu, 22 Oct 2026 21:48:39 +0000) ---
+"Markus Hilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69948
+
+Subject: LU-21019 osd-ldiskfs: keep times across deferred truncate
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b6576d7395a000b31b24d6a1b5daace1256cd86b

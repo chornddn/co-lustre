@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Alex Zhuravlev
 Created:    Thu, 7 Mar 2024 06:19:02 +0000
-Updated:    Wed, 2 Sep 2026 18:01:40 +0000
+Updated:    Thu, 22 Oct 2026 21:41:19 +0000
 Links:      Related: is related to LU-17575
 
 --- Description ---
@@ -212,3 +212,38 @@ This deadlocks with a single process and no external layout change
   that wedges in about a second and leaves an unkillable TASK_IDLE task might be
 
   worth re-rating.
+
+--- Comment (JIRAUSER19584, Thu, 22 Oct 2026 21:41:19 +0000) ---
+I found another single-process trigger, without any second party: a layout swap under group locks, then any I/O or stat by the holder. llapi_fswap_layouts_grouplock(fd1, fd2, 0, 0, 0, 0) with gid 0 (keep the caller's group locks, as in swap_lock_test test59), then fstat() or read() of either file never returns. The task is in TASK_IDLE and SIGKILL does not end it. fgetxattr() returns, since it does not refresh the layout. test59 only avoids it because it unlocks right after the swap.
+
+import ctypes, os, sys
+lib = ctypes.CDLL("liblustreapi.so.1")
+lib.llapi_fswap_layouts_grouplock.argtypes = [ctypes.c_int, ctypes.c_int,
+	ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int, ctypes.c_uint64]
+fds = []
+for name, n in (("foo1", 2000), ("foo2", 5000)):
+	p = os.path.join(sys.argv[1], name)
+	with open(p, "wb") as f:
+		f.write(b"x" * n)
+	fds.append(os.open(p, os.O_RDWR))
+for fd in fds:
+	assert lib.llapi_group_lock(fd, 6458909) == 0
+assert lib.llapi_fswap_layouts_grouplock(fds[0], fds[1], 0, 0, 0, 0) == 0
+os.fstat(fds[0])                            # never returns (os.pread too)
+
+Seen on 2.17.0 (b2_17), single-node VM, ldiskfs, EL9.8. Same stack as this ticket, reached through the glimpse of fstat() (file_read_confine_iter() for a read):
+
+lov_layout_wait+0x106/0x1c0 [lov]
+lov_conf_set+0x60b/0x6c0 [lov]
+cl_conf_set+0x62/0x140 [obdclass]
+ll_layout_conf+0xde/0x440 [lustre]
+ll_layout_lock_set+0x3d4/0x7b0 [lustre]
+ll_layout_refresh+0x1f2/0x380 [lustre]
+vvp_io_init+0x2b4/0x4a0 [lustre]
+__cl_io_init+0x88/0x150 [obdclass]
+cl_glimpse_size0+0x98/0x2a0 [lustre]
+ll_getattr_dentry+0xc13/0xe00 [lustre]
+vfs_getattr_nosec+0xd2/0x160
+vfs_fstat+0x45/0x80
+
+The swap revokes the layout lock, vvp_io_init() refreshes the layout for the next I/O, and lov_layout_wait() waits for lo_active_ios to drop to 0, which includes the CIT_MISC I/O that cl_get_grouplock() keeps open for the caller's own group lock. Failing that I/O (or the refresh) when the only active I/O is the caller's own group lock would let it unlock, and a killable wait instead of wait_event_idle() would at least let the task die and drop its locks.

@@ -1,0 +1,285 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21017] O_DIRECT with a kernel (ITER_BVEC) iterator reads and writes the wrong pages</title>
+                <link>https://jira.whamcloud.com/browse/LU-21017</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;When O_DIRECT I/O reaches Lustre with a kernel iterator (ITER_BVEC), Lustre moves the iterator forward twice... Data then goes to the wrong place.&lt;/p&gt;
+
+&lt;p&gt;Reads: user data lands at the wrong offsets in the buffer. Some pages are left untouched (often zeros).&lt;br/&gt;
+Writes: the file gets data from the wrong buffer pages. The bad data stays on disk.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Checksums (often) do not catch this.&lt;/b&gt; The RPC data is correct; only the page list is wrong. Often the call still returns the full length, so &lt;b&gt;the corruption is silent.&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;You can hit it with 1) sendfile()/splice() on an O_DIRECT file,2) io_uring with registered buffers, 3) a loop device with direct I/O, and 4) the NVMe-oF target file backend.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;How to reproduce&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;The program below writes 1 MiB, then copies it with sendfile() from an O_DIRECT file. sendfile() on an O_DIRECT file makes the kernel call -&amp;gt;read_iter() with ITER_BVEC.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+# gcc -O2 -o bvec_dio_repro bvec_dio_repro.c
+# ./bvec_dio_repro /mnt/lustre/f1 /tmp/out
+sendfile returned 1048576 of 1048576 bytes
+page 1 (offset 65536): wrong, starts with 0
+page 2 (offset 131072): wrong, starts with 0x10000
+page 3 (offset 196608): wrong, starts with 0
+...
+11 of 16 pages wrong&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;(Client: master 2.17.60, Ubuntu 24.04, kernel 6.8.0-147-generic-64k, 64 KiB pages. Our sendfile tests on 4 KiB page kernels fail the same way.)&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Root cause&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;The iterator is moved forward in two places for the same pages.&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;The kernel helper moves it. &lt;tt&gt;ll_direct_IO()&lt;/tt&gt; asks for the pages of the next chunk. Lustre calls &lt;tt&gt;iov_iter_extract_pages()&lt;/tt&gt; (2.17.58 and later, kernel 6.3+) or &lt;tt&gt;iov_iter_get_pages_alloc2()&lt;/tt&gt; (older Lustre, or older kernels). For ITER_BVEC both take only the first bvec segment and move the iterator past it (upstream v6.8, lib/iov_iter.c):&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; ssize_t iov_iter_extract_bvec_pages(struct iov_iter *i, ...)
+{
+        ...
+                size = min(maxsize, i-&amp;gt;bvec-&amp;gt;bv_len - skip);   &lt;span class="code-comment"&gt;/* first segment only */&lt;/span&gt;
+        ...
+        iov_iter_advance(i, size);                        &lt;span class="code-comment"&gt;/* moves the iterator */&lt;/span&gt;
+        &lt;span class="code-keyword"&gt;return&lt;/span&gt; size;
+}
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; ssize_t __iov_iter_get_pages_alloc(struct iov_iter *i, ...)
+{
+        ...
+        &lt;span class="code-keyword"&gt;if&lt;/span&gt; (iov_iter_is_bvec(i)) {
+                page = first_bvec_segment(i, &amp;amp;maxsize, start);   &lt;span class="code-comment"&gt;/* first segment only */&lt;/span&gt;
+                ...
+                i-&amp;gt;count -= maxsize;                            &lt;span class="code-comment"&gt;/* moves the iterator */&lt;/span&gt;
+                i-&amp;gt;iov_offset += maxsize;
+                ...
+                &lt;span class="code-keyword"&gt;return&lt;/span&gt; maxsize;
+        } &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;2. Lustre moves it back only for user iterators.(master, lustre/obdclass/cl_page.c, &lt;tt&gt;ll_get_iov_memory()&lt;/tt&gt;)&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+        bytes = ll_iov_iter_extract_pages(iter, &amp;amp;pages, maxsize, ...);  &lt;span class="code-comment"&gt;/* :155, step 1 */&lt;/span&gt;
+        ...
+                &lt;span class="code-keyword"&gt;if&lt;/span&gt; (user_backed_iter(iter))                              &lt;span class="code-comment"&gt;/* :180 */&lt;/span&gt;
+                        iov_iter_revert(iter, bytes);                    &lt;span class="code-comment"&gt;/* :181 */&lt;/span&gt; &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;3. Lustre moves it again.(master, lustre/llite/rw26.c, &lt;tt&gt;ll_direct_IO()&lt;/tt&gt;)&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+        &lt;span class="code-keyword"&gt;while&lt;/span&gt; (iov_iter_count(iter)) {
+                ...
+                result = cl_dio_pages_init(env, io, ..., iter, rw, bytes, ...); &lt;span class="code-comment"&gt;/* :453 -&amp;gt; steps 1, 2 */&lt;/span&gt;
+                bytes = result;
+                ...
+                result = ll_direct_rw_pages(env, io, bytes, rw, inode, sdio);
+                ...
+                iov_iter_advance(iter, bytes);                           &lt;span class="code-comment"&gt;/* :528, second move */&lt;/span&gt;
+                tot_bytes += bytes;
+                file_offset += bytes;
+        } &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;So for ITER_BVEC each chunk moves the iterator twice: once in the kernel helper and once at rw26.c.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Which Lustre and kernel versions show it&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Whether one call gets fewer pages than asked depends on the kernel helper:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;2.16.0, 2.17.0 up to 2.17.57 use &lt;tt&gt;iov_iter_get_pages_alloc2()&lt;/tt&gt;. For ITER_BVEC it returns only the first bvec segment (one page) on every kernel that has it.&lt;/li&gt;
+	&lt;li&gt;2.17.58 and later (&lt;a href="https://jira.whamcloud.com/browse/LU-20438" title="Support TPU Direct Storage (TDS) via PCI P2P DMA" class="issue-link" data-issue-key="LU-20438"&gt;LU-20438&lt;/a&gt;) use &lt;tt&gt;iov_iter_extract_pages()&lt;/tt&gt; on kernels 6.3 and later. Up to 6.12 it returns one segment. From 6.13 (commit e4e535bff2bc "iov_iter: don't require contiguous pages in iov_iter_extract_bvec_pages") it returns all pages of a page-aligned bvec list in one call. Bvec lists that are not page-aligned take the&lt;br/&gt;
+unaligned DIO path, which does not use this code.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Tested (T) means we ran the cases below on that system. Code (C) means we read lib/iov_iter.c of that kernel.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Kernel&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;2.16.0, 2.17.0 - 2.17.57&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;2.17.58 and later&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;5.19 and older, RHEL 8 (4.18.0-553, 64K pages)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (T: 2.17.57)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (T: 2.17.60)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;RHEL 9.2, 9.3&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (C)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (C)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;6.0 - 6.2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (C)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (C)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;RHEL 9.4 (5.14.0-427)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.57)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.60)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;RHEL 9.5 (5.14.0-503)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (C)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (C)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;RHEL 9.6 (5.14.0-570)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.57)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.60)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;6.3 - 6.12, e.g. Ubuntu 24.04 (6.8.0-147, 4K and 64K pages)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.57)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.60)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;6.13 and later&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (C)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (C)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;RHEL 9.7 (5.14.0-611, 4K and 64K pages), 9.8, 9.10&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;affected (T: 2.17.57)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;not affected (T: 2.17.60)&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Results by path&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Same cases on every tested system: 1-stripe and 2-stripe (1 MiB stripe) files, I/O inside one stripe and across a stripe boundary. "Wrong" means data inside the returned length is wrong.&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Path&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Read&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Write&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;sendfile() with an O_DIRECT file&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;wrong data, full length returned (across a stripe boundary sometimes short, with BAD READ CHECKSUM)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;wrong data, full length returned&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;splice() with an O_DIRECT file&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;short and wrong&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;wrong data, full length returned&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;io_uring READ_FIXED / WRITE_FIXED&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;short and wrong; across a stripe boundary: BAD READ CHECKSUM, then EIO&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;short and wrong&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;loop device, &lt;tt&gt;losetup --direct-io=on&lt;/tt&gt;, 8 MiB dd&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;dd succeeds; 88 of 128 (64K) / about 1920 of 2048 (4K) pages wrong&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;dd succeeds; 120 of 128 (64K) / 2032 of 2048 (4K) pages wrong on disk&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;NVMe-oF target, file backend (buffered_io=0) (master on Ubuntu only)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;EIO&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;EIO, but the file is partly overwritten first&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;On the affected systems every one of these cases failed with both 4 KiB and 64 KiB pages, with one exception: on RHEL 9.4 sendfile() and splice() reads from an O_DIRECT file were fine, because that kernel passes splice reads as ITER_PIPE. From RHEL 9.6 (and upstream 6.5), splice reads from an O_DIRECT file go through copy_splice_read(), which uses ITER_BVEC. Writes&lt;br/&gt;
+failed on RHEL 9.4 too. On the unaffected systems every case passed. The same programs with user buffers (read(), IORING_OP_READ) always passed. Writes never caused a checksum error on the client or the server.&lt;/p&gt;
+
+&lt;p&gt;Not affected: plain read()/write(), readv/writev, libaio, io_uring without registered buffers, GDS (nvidia-fs passes a user iterator). These use user iterators.&lt;/p&gt;
+
+&lt;p&gt;Not tested, but likely: LIO fileio backend, copy_file_range() between O_DIRECT files (falls back to splice), and on newer kernels nfsd direct I/O, erofs file-backed mounts and cachefiles.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;Related&lt;/p&gt;
+
+&lt;p&gt;It started with &lt;a href="https://jira.whamcloud.com/browse/LU-16328" title="Linux 6.0 client support" class="issue-link" data-issue-key="LU-16328"&gt;&lt;del&gt;LU-16328&lt;/del&gt;&lt;/a&gt;, and then, in &lt;a href="https://jira.whamcloud.com/browse/LU-17524" title="Fix readv/writev with O_DIRECT" class="issue-link" data-issue-key="LU-17524"&gt;&lt;del&gt;LU-17524&lt;/del&gt;&lt;/a&gt;, only the user-space iter was fixed.&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-18308" title="big DIRECT_IO reads zeroes " class="issue-link" data-issue-key="LU-18308"&gt;&lt;del&gt;LU-18308&lt;/del&gt;&lt;/a&gt; / &lt;a href="https://jira.whamcloud.com/browse/LU-17524" title="Fix readv/writev with O_DIRECT" class="issue-link" data-issue-key="LU-17524"&gt;&lt;del&gt;LU-17524&lt;/del&gt;&lt;/a&gt;: same double advance, fixed for user iterators only.&lt;br/&gt;
+  ITER_BVEC was not covered.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-13846" title="move iov iter forward by ourself" class="issue-link" data-issue-key="LU-13846"&gt;&lt;del&gt;LU-13846&lt;/del&gt;&lt;/a&gt;: Lustre moves the iterator forward by itself.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20438" title="Support TPU Direct Storage (TDS) via PCI P2P DMA" class="issue-link" data-issue-key="LU-20438"&gt;LU-20438&lt;/a&gt;: master switched to iov_iter_extract_pages() in 2.17.58.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="100082">LU-21017</key>
+            <summary>O_DIRECT with a kernel (ITER_BVEC) iterator reads and writes the wrong pages</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="2" iconUrl="https://jira.whamcloud.com/images/icons/priorities/critical.svg">Critical</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="skoyama">Sohei Koyama</assignee>
+                                    <reporter username="skoyama">Sohei Koyama</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 22 Oct 2026 17:21:15 +0000</created>
+                <updated>Fri, 23 Oct 2026 13:13:56 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="504347" author="gerrit" created="Fri, 23 Oct 2026 11:26:56 +0000">&lt;p&gt;"Sohei Koyama &amp;lt;skoyama@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69978" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69978&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21017" title="O_DIRECT with a kernel (ITER_BVEC) iterator reads and writes the wrong pages" class="issue-link" data-issue-key="LU-21017"&gt;LU-21017&lt;/a&gt; clio: rewind DIO iterator by the amount extracted&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: ade9e547da7073a231eec4365fbd8133ed650375&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071un:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
