@@ -1,5 +1,5 @@
 Change:     69762
-Subject:    LU-20287 lov: don't block FLR RDONLY setattr on down OST
+Subject:    LU-20287 lov: don't block setattr on unavailable OST
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69762
 Change-Id:  I5005451e10f293279c441c1fc6d012fb5337d95d
 Project:    fs/lustre-release
@@ -7,57 +7,58 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-10-17 06:30:59.000000000
-Updated:    2026-10-23 03:36:37.000000000
-Patch Set:  3
-Insertions: +276
-Deletions:  -11
-Comments:   17 (1 unresolved)
-Hashtags:   218_review_priority, pt_ecro
+Updated:    2026-10-26 13:01:16.000000000
+Patch Set:  4
+Insertions: +259
+Deletions:  -18
+Comments:   31 (4 unresolved)
+Hashtags:   pt_ecro, 218_review_priority
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger
 
 --- Commit Message ---
-LU-20287 lov: don't block FLR RDONLY setattr on down OST
+LU-20287 lov: don't block setattr on unavailable OST
 
-chown/chgrp/chmod/touch on an FLR file in RDONLY state with
-redundant mirrors (plain FLR or EC) wait in cl_setattr_ost() when a
-stripe OST is unavailable: VFS sets ATTR_CTIME and the client sends
-OST_SETATTR to every stripe. Both the client and the MDS send
-setattr RPCs to OSTs: the client updates times/flags promptly for
-applications, while UID/GID/PROJID remain authoritative on the MDT
-and are pushed by MDS osp_sync for durability and recovery.
+chown/chgrp/chmod/touch wait in cl_setattr_ost() when a stripe OST
+is down: VFS sets ATTR_CTIME and the client sends OST_SETATTR to
+every stripe. That RPC only carries times/flags; UID/GID/PROJID are
+authoritative on the MDT and are pushed by MDS osp_sync.
 
-For non-truncate/non-fallocate setattr on such files, mark the LOV
+For non-truncate/non-fallocate setattr on any layout, mark LOV
 sub-IOs ci_ndelay so OSC sends OST_SETATTR with rq_no_delay and
-rq_no_resend (plus a 5-second delay limit for idle import reconnect),
-and ignore -EAGAIN/-ENOTCONN/-ESHUTDOWN/-ETIMEDOUT at setattr end.
-The syscall then neither blocks nor fails on the unavailable OST.
-Times/flags on the missed OST object are not repaired later; the MDT
-inode remains authoritative.
+rq_no_resend (plus a 5s delay limit for idle import reconnect),
+and ignore -EAGAIN/-ENOTCONN/-ESHUTDOWN/-ETIMEDOUT for such sub-IOs
+in osc_io_setattr_end(). Missed OST times are harmless since
+ll_merge_attr() takes max(MDT, OST); they are not repaired later,
+and on a slow but connected OST the client update may also be
+dropped.
 
-On FLR RESYNC_DONE, also re-push UID/GID/PROJID, read from the MDT
-inode in both lod_declare_update_sync_pending() and
-lod_layout_change(), together with the existing layout version
-update through osp_sync. Filling the real IDs at declare time avoids
-declaring a bogus quota transfer on the MDT object. This repairs OST
-objects whose MDS->OST ownership setattr was skipped or otherwise
-missed (no pending osp_sync record); it does not replace normal
-osp_sync, whose llog is already retried while an OST is temporarily
-down.
+Still block when:
+- mtime/atime moves backwards: the stale OST time would win the
+  merge, and the extent lock taken for it would fail -EAGAIN;
+- OP_XVALID_FLAGS is set (chattr, encryption flag): MDS never
+  pushes flags to OSTs.
 
-Add sanity-ec 80a (setattr does not block on a stopped EC data OST)
-and sanity-flr 213a (setattr does not block on a stopped preferred
-mirror OST) and 213b (mirror resync repairs OST UID/GID/PROJID after
-a skipped stripe setattr).
+This only unblocks the setattr RPC itself (including chmod(2)).
+stat/glimpse can still hang when no usable stripe/mirror is
+reachable: e.g. coreutils chmod stats via FTS before chmod(2),
+so the command may block on plain files even though the syscall
+would not. That is unchanged here (see LU-11962 for MDT SOM).
 
+On FLR RESYNC_DONE, also re-push UID/GID/PROJID from the MDT inode
+in lod_layout_change() with the layout version update, to repair
+OST objects that missed MDS->OST ownership setattr.
+
+Add sanity 39v (plain file) and sanity-flr 213a/213b.
+
+Test-Parameters: testlist=sanity env=ONLY=39v
 Test-Parameters: testlist=sanity-flr
-Test-Parameters: testlist=sanity-ec ostcount=8
 Assisted-by: Cursor:Grok-4.6/Opus5.5 llm_code_and_review_tools
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Change-Id: I5005451e10f293279c441c1fc6d012fb5337d95d
@@ -169,3 +170,64 @@ https://build.whamcloud.com/job/lustre-reviews/134271/ : SUCCESS
 Patch Set 3:
 
 (5 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-24 09:15:38.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The MDS-side ID re-push on RESYNC_DONE looks fine; the questions are about the client no-delay setattr path.
+
+--- Message (Autotest, 2026-10-24 19:36:37.000000000) ---
+Patch Set 3:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el9.7-x86_64/ldiskfs servers and clients for build 134271 patch 3. Requested by Patrickbot because of EX-13220.
+
+--- Message (Autotest, 2026-10-24 19:44:10.000000000) ---
+Patch Set 3:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 134271 patch 3. Requested by Patrickbot because of LU-15566.
+
+--- Message (Autotest, 2026-10-24 19:44:30.000000000) ---
+Patch Set 3:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el10.1-x86_64/ldiskfs servers and clients for build 134271 patch 3. Requested by Patrickbot because of LU-19908.
+
+--- Message (Keguang Xu, 2026-10-25 02:50:45.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-25 02:53:20.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Keguang Xu, 2026-10-25 03:01:53.000000000) ---
+Patch Set 4:
+
+(5 comments)
+
+--- Message (jenkins, 2026-10-25 03:51:11.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134417/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-25 06:05:52.000000000) ---
+Patch Set 4: Code-Review+1
+
+(2 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-26 13:01:16.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The no-delay predicate only catches times moving backwards relative to the new ctime. A forward-looking setattr can still be silently lost behind a newer OST timestamp. The MDS-side resync ID re-push also looks independent of the client change. It might be easier to land (and to version-gate) as a separate patch.

@@ -1,0 +1,52 @@
+Key:        LU-21030
+Summary:    ldiskfs: el10.2 MDT goes read-only on file size above maxbytes
+Link:       https://jira.whamcloud.com/browse/LU-21030
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Bot
+Created:    Sat, 24 Oct 2026 23:26:16 +0000
+Updated:    Sat, 24 Oct 2026 23:50:10 +0000
+
+--- Description ---
+On a RHEL 10.2 MDS (and any kernel with Linux 6.16 commit 1a77a028a392 "ext4: ensure i_size is smaller than maxbytes"), ldiskfs refuses to load an MDT inode whose i_size is larger than the ldiskfs maxbytes for that inode, and remounts the MDT read-only:
+
+LDISKFS-fs error (device dm-2): osd_iget2:509: inode #994: comm mdt00_000: iget: bad i_size value: 17592181850112
+LDISKFS-fs (dm-2): Remounting filesystem read-only
+
+An MDT regular file inode records the file size for data that is not on the MDT: a truncate of a striped file, a file with no OST objects, or an HSM released file. That size can legitimately be larger than the MDT maxbytes (16TiB - 4KiB for an extent mapped inode, about 4TiB for a block mapped inode on an MDT formatted without the extents feature, which is what 2.16 and older mkfs.lustre do for MDTs under 2^32 blocks). Kernels before 6.16 only rejected negative sizes.
+
+Reproduced on master (v2_17_60) with a single node rocky10 6.12.0-211.47.1.el10_2 VM, ldiskfs, extent mapped MDT:
+
+mcreate /mnt/lustre/f1
+/usr/lib64/lustre/tests/truncate /mnt/lustre/f1 $((20 
+
+A 2 stripe file truncated to 20TiB fails the same way. Unmounting the read-only MDT afterwards then hit the ldiskfs_put_super() orphan list assertion (kernel BUG at ldiskfs/super.c:1353).
+
+In CI this is the ldiskfs half of the "sanity (suite fail)" failures in the lustre-master and lustre-master-next rolling upgrade/downgrade groups (b2_16 el9.4 to master el10.2): 30 of 105 sanity suite failures in 2026-09-25..2026-10-24. The init/oss phases run b2_16 sanity on a b2_16 formatted MDT (no extents), test_44d leaves f44d.sanity with size 2^44 - 4MiB, and once the MDS runs master on el10.2 the start of suite cleanup gets "rm: cannot remove '/mnt/lustre/f44d.sanity': Structure needs cleaning", the MDT goes read-only, and every later phase of the chain fails the same way. Examples:
+
+https://testing.whamcloud.com/test_sets/766d5e8e-81d6-4086-a06a-eaf7a854f5a0 (rolling-upgrade-mds, first phase with master MDS)
+
+https://testing.whamcloud.com/test_sets/3045f5c8-a52c-4702-9dce-64bebc4f47e7 (rolling-upgrade-client2)
+
+https://testing.whamcloud.com/test_sets/08b6f2b7-3fb5-4de2-af2c-5f4e4a0f8df2 (rolling-downgrade-client1)
+
+This is also an upgrade hazard outside testing: an MDT holding any such file goes read-only on its first lookup after the MDS moves to a RHEL 10.2 kernel. Clamping or refusing the size in osd setattr would lose the size of released and objectless files, so the proposed fix is an ldiskfs patch that keeps the maxbytes check for non regular files only.
+
+--- Comment (gerrit, Sat, 24 Oct 2026 23:49:56 +0000) ---
+"patrick bot " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70007
+
+Subject: LU-21030 ldiskfs: allow MDT file size above maxbytes
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 50688c6d37ab63f99254d7383e542b7427657e05
+
+--- Comment (JIRAUSER24100, Sat, 24 Oct 2026 23:50:10 +0000) ---
+Patch: https://review.whamcloud.com/c/fs/lustre-release/+/70007 (ldiskfs patch linux-6.16/ext4-iget-large-reg-size.patch in the rhel10.2, 6.18-ml, 7.0-ml and 7.0.0-14-ubuntu26 series, plus sanity test_44h). On a rocky10 el10.2 VM, test_44h fails without the patch (bad i_size value: 21990232555520, MDT read-only, end of suite cleanup fails) and passes with it; with the patch an MDT holding a 20TiB objectless file, a 20TiB 2 stripe file and a block mapped (no extents) inode of 2^44 - 4MiB, as left by b2_16 test_44d, survives a full remount and the files can be removed. sanity 34 and 44 pass. Separately, Lustre e2fsprogs 1.47.3-wc2 e2fsck reports such an inode as 'i_size is 21990232555520, should be 0. Fix?', so e2fsck -y would zero the size of released or objectless files; not addressed by this patch.

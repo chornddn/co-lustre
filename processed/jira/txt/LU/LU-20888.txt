@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Duncan Vogel
 Reporter:   Duncan Vogel
 Created:    Wed, 7 Oct 2026 15:13:26 +0000
-Updated:    Wed, 21 Oct 2026 16:17:06 +0000
+Updated:    Mon, 26 Oct 2026 09:50:34 +0000
 
 --- Description ---
 When an MDT restarts while a peer MDT (MDT0000) is serving lookups for objects that live on the restarting MDT, MDT0000's regular mdt service threads all block in osp_remote_sync waiting on the restarting MDT. The restarting MDT's recovery then needs MDT0000 to accept its LWP MDS_CONNECT. That connect arrives with no export, so it is a normal-priority request, and the pool will not give it one of the threads reserved for high-priority work. It never gets serviced, the LWP never reaches FULL, FLD lookups can never be sent, and recovery waits forever.
@@ -38,3 +38,172 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 7d4e397209a11653fc505aa10274dc8b91b0e44e
+
+--- Comment (gerrit, Mon, 26 Oct 2026 09:25:07 +0000) ---
+"Alexander Boyko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70028
+
+Subject: LU-20888 ptlrpc: make connect requests high priority
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: fff223195adf654a00a6102c819cd3bc99a7640f
+
+--- Comment (aboyko, Mon, 26 Oct 2026 09:50:34 +0000) ---
+We saw a similar problem during recovery. A clients connection should be high priority too, not only LWP. I've pushed a common solution for connections. 
+
+Summary
+
+On an MDS hosting several DNE targets, a failover can produce a self-sustaining
+
+deadlock between the ptlrpc service threads and target recovery:
+
+	mdt service threads block inside rename/getattr handlers waiting on
+
+cross-MDT OSP RPCs to a target that is itself still in recovery;
+
+	a recovering target cannot answer MDS_CONNECT because every thread in the
+
+affected CPT partition is blocked;
+
+	the target therefore never completes recovery, so the blocked threads are
+
+never released.
+
+The cycle breaks only when the recovery soft timer expires and evicts the
+
+clients that were waiting. The connects were delivered — they sat in the
+
+service queue and were dropped unanswered, 157s past their own deadline.
+
+Environment
+
+	Lustre 2.16 (cray), DNE, 4 MDTs, HA pairs.
+
+	MDS: 64 cores / 4 NUMA nodes / npartitions: 8 -> 8 CPTs, 100 mdt threads per CPT.
+
+	Clients on gni, servers on o2ib61, reached through LNet routers (routed traffic).
+
+	Reproducer: MDS panic/failover loop. After the peer panicked, all four MDTs
+
+ended up on one node.
+
+The cycle
+
+	MDT0000/MDT0002 fail over onto the node already hosting MDT0001/MDT0003.
+
+	MDT0001/MDT0003 threads, handling ordinary client renames/getattrs, block in
+
+ptlrpc_queue_wait() on OSP RPCs to MDT0000/MDT0002.
+
+	Those threads are mdt service threads that arrived on
+
+MDS_REQUEST_PORTAL — while blocked they still count in
+
+scp_nreqs_active.
+
+	MDT0002's clients send MDS_CONNECT on the same portal, into the same CPT
+
+partition. No thread is free.
+
+	MDT0002 cannot finish recovery (clients never connect); the threads cannot
+
+unblock (MDT0002 has not finished recovery).
+
+	At the 300s soft timeout the stale sweep evicts 6 clients, which releases the
+
+threads — and one second later the queued connects are dequeued and dropped.
+
+Evidence: the connect was delivered, queued, and dropped unanswered
+
+Client 31@gni sends the connect at 1791896049 (T+44 of a 300s window):
+
+00000100:00100000:58.0:1791896049.237153:0:17100:0:(import.c:814:ptlrpc_connect_import_locked())
+  @@@ (re)connect request (timeout 5) req@... x1878873257675392/t0(0)
+  o38->e2kp1-MDT0002-mdc-...@10.10.100.5@o2ib61
+
+and gives up 41s later with -110:
+
+(client.c:2383:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply:
+  [sent 1791896049/real 1791896049] req@... x1878873257675392/t0(0) o38->e2kp1-MDT0002-...
+(client.c:2414:ptlrpc_expire_one_request()) @@@ err -110, sent_state=CONNECTING (now=CONNECTING)
+
+The server had the same xid the whole time. It is dequeued at
+
+1791896306 — 257s after arrival, 157s past its own AT deadline — and
+
+dropped without a reply:
+
+Oct 13 07:58:26 LustreError: 221574:0:(service.c:2587:ptlrpc_server_handle_request())
+  @@@ Dropping timed-out request from 12345-31@gni: deadline 100/157s ago
+  req@... x1878873257675392/t0(0) o38->@:0/0 lens 520/0 e 0 to 0
+  dl 1791896149 ref 1 fl Interpret:/200/ffffffff rc 0/-1
+
+This message is emitted at dequeue, so it is positive proof the RPC arrived
+
+and was queued — this is not packet loss and not an LNet routing problem.
+
+Skipped 11 previous similar messages accompanies it.
+
+Evidence: one CPT partition was fully drained
+
+The blocked threads are in cross-MDT RPCs:
+
+Lustre: mdt_io06_002: service thread pid 50292 was inactive for 200.960 seconds
+  ptlrpc_set_wait for 200.177 seconds
+  lu_object_find_at 
+
+At the instant the sweep releases them, 100 mdt threads report
+
+completed after ~258s, and they are almost all in one partition:
+
+CPT
+threads stalled
+
+1
+4
+
+2
+3
+
+3
+1
+
+4
+98
+
+6
+1
+
+CPT 4 ran from mdt04_000 to mdt04_099 — its full 100-thread limit. 21
+
+threads pre-existed; 77 were spawned during the stall (contiguous pids
+
+221551-221740) and blocked as well. The other seven partitions were healthy
+
+throughout.
+
+Why only these clients: the CPT is a function of the client NID
+
+With the default portal_rotor = LNET_PTL_ROTOR_HASH_RT
+
+(lnet/lnet/lib-ptl.c:17), a routed request is assigned
+
+cpt = lnet_nid2cpt(&msg->msg_initiator, ni) (lib-ptl.c:291-306,
+
+lib-move.c:4493) — a hash of the originating client NID, not the router. For
+
+non-KFI NIDs this is (sum of the 8 bytes of the nid64) mod ncpt
+
+(api-ni.c:1656-1679), i.e. for gni with 8 CPTs: CPT = (13 + addr) mod 8.
+
+The six evicted clients were 23, 31, 47, 55, 135, 151 @gni — every one
+
+addr = 7 (mod 8), i.e. all six hash to CPT 4. No client outside that
+
+residue class was evicted. This is a deterministic cohort, not an unlucky tail,
+
+and it will recur on the same 1/8 of the cluster every time.

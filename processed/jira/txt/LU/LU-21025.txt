@@ -1,0 +1,93 @@
+Key:        LU-21025
+Summary:    quota: slave doesn't reintegrate after LWP reconnects to restarted master
+Link:       https://jira.whamcloud.com/browse/LU-21025
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Sergey Cheremencev
+Reporter:   Sergey Cheremencev
+Created:    Fri, 23 Oct 2026 16:59:45 +0000
+Updated:    Fri, 23 Oct 2026 17:07:24 +0000
+
+--- Description ---
+When an MDT (the quota master) restarts, the LWP on each OST/MDT slave
+
+reconnects to it and goes through "lwp recover" (ptlrpc_connect_interpret(),
+
+OBD_CONNECT_LIGHTWEIGHT). lwp_import_event() then cancels the global quota
+
+locks locally on IMP_EVENT_INVALIDATE.
+
+qsd_glb_blocking_ast() doesn't restart reintegration for local cancels
+
+(LDLM_FL_LOCAL_ONLY), because it treats them as stack cleanup or eviction.
+
+qsd_conn_callback() is only called on the first connect. So nothing restarts
+
+reintegration: the slave's global and slave index copies stay out of date
+
+until the writeback thread notices and retries. In testing that took ~115
+
+seconds after the master restart.
+
+During that window the slave misses limits set on the master. An ID that
+
+wasn't enforced before isn't enforced on the OSTs, and its writes don't
+
+acquire quota from the master, so users can exceed new hard limits.
+
+Reproducer: sanity-quota test_7c (restart mds during reintegration). The test
+
+passes, but the OSTs need ~120s (wait_ost_reint) to reintegrate after the MDT 
+
+restart. The debug log shows "lwp recover", then "losing global index lock"
+
+for each type, then no "Starting reintegration thread" until the writeback
+
+thread retries ~115s later.
+
+Measured (single-node VM, 1 MDT + 2 OSTs, master 2.17.60, 10 runs of
+
+test_7c each):
+
+ 
+without patch
+with patch
+
+total time of 10 runs
+1377s
+371s
+
+test_7c time, median (min-max)
+140.5s (108-143)
+24s (23-142)
+
+OST reintegration wait after MDT restart, median
+120s
+5s
+
+The single 142s run with the patch hit a separate race (see ticket 2). That
+
+race exists without this patch as well.
+
+Fix: restart reintegration on a local cancel of the global lock if the import
+
+is still valid (not on qsd/LWP cleanup or eviction), and make the 
+
+reintegration thread wait for the import to be FULL before enqueueing the 
+
+global lock.
+
+--- Comment (gerrit, Fri, 23 Oct 2026 17:07:24 +0000) ---
+"Sergey Cheremencev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/69999
+
+Subject: LU-21025 quota: reintegrate after LWP recovery
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 271b0838942944be4807d7c3ea5c2ad5370af878

@@ -3,13 +3,12 @@ Summary:    fault_in_iov_iter_readable() with a spinlock held
 Link:       https://jira.whamcloud.com/browse/LU-19536
 Type:       Bug
 Priority:   Medium
-Status:     Resolved
-Resolution: Fixed
+Status:     Reopened
+Resolution: Unresolved
 Assignee:   Patrick Farrell
 Reporter:   Alex Zhuravlev
 Created:    Wed, 29 Oct 2025 11:12:21 +0000
-Updated:    Fri, 25 Sep 2026 11:19:17 +0000
-Resolved:   Fri, 18 Sep 2026 18:39:08 +0000
+Updated:    Mon, 26 Oct 2026 07:21:42 +0000
 Links:      Duplicate: is duplicated by LU-19932; Related: is related to  LU-19932; Related: is related to LU-20317
 
 --- Description ---
@@ -166,3 +165,30 @@ Commit: 7d10878c40f4d526f46f525b218bde257e7b7746
 
 --- Comment (pjo, Fri, 18 Sep 2026 18:39:08 +0000) ---
 Merged for 2.18
+
+--- Comment (adilger, Mon, 26 Oct 2026 05:57:28 +0000) ---
+sanity test_398v fails with ENOSPC when it runs late in a full sanity run on small (400MB) OSTs, and passes when run alone:
+
+dd: error writing '/mnt/lustre/f398v.sanity': No space left on device
+ sanity test_398v: @@@@@@ FAIL: DIO write failed
+
+There are two causes:
+
+	By then the client holds nearly all free space on OST0000 as grant, e.g. 240869376 bytes of grant with kbytesavail=236192 (241860608 bytes) and tot_granted=242186688. The DIO extents that fall back to unaccounted RPCs at the max_dirty_mb limit need ungranted space on the OST, so tgt_grant_check() refuses them with ENOSPC, although the same client holds over 200MB of unused grant. This happens with no grant mismatch at all: the test printed grant before DIO: client=243015680 server=243015680 delta=0. Either test_398v needs to release the excess grant before the DIO (e.g. by lowering osc.*.cur_grant_bytes), or the OST should let unaccounted DIO pages of a client use that client's own unused grant.
+
+	The OST also leaks grant for writes refused before tgt_grant_prepare_write(). The client counts the grant of such a write as used. Its resend after a recoverable error has OBD_FL_RECOV_RESEND, so tgt_grant_check() skips the grant ("Recoverable resend arrived, skipping accounting"), and a write refused with a non-recoverable error is never charged at all. After the fail_loc tests of sanity 118 (118j OBD_FAIL_OST_BRW_WRITE_BULK2, 118k OBD_FAIL_OST_BRW_WRITE_BULK) the OST counts about 10MB more grant for the client than the client has, until it reconnects, which makes (1) more likely.
+
+A patch for (2) with a new sanity test_64k will follow under this ticket, based on patch https://review.whamcloud.com/69572 ("LU-20727 target: don't dealloc grant the export no longer has"). It fixes the refused-write leak, but about 5MB of drift from 118k remains and is still being investigated. It does not address (1).
+
+--- Comment (gerrit, Mon, 26 Oct 2026 07:21:42 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70024
+
+Subject: LU-19536 target: consume grant of writes refused early
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 082c551417bdc92e88944874b529c3c0f71bf209

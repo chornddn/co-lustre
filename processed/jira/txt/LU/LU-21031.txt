@@ -1,0 +1,52 @@
+Key:        LU-21031
+Summary:    osd-zfs: MDT accepts names longer than NAME_MAX
+Link:       https://jira.whamcloud.com/browse/LU-21031
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Bot
+Created:    Sat, 24 Oct 2026 23:41:47 +0000
+Updated:    Sat, 24 Oct 2026 23:50:11 +0000
+Links:      Related: is related to  LU-18783; Related: is related to  LU-19232
+
+--- Description ---
+A ZFS MDT built against ZFS 2.3 or newer accepts directory entry names longer than NAME_MAX (255). The ZAP layer allows names up to 1023 bytes in directory ZAPs (the ZPL enforces the longname feature, which osd-zfs bypasses), but osd-zfs readdir (osd_dir_it_rec() / osd_dir_it_rec_size()) returns -EOVERFLOW for any name over NAME_MAX, so such a directory can never be listed or removed again.
+
+Master clients reject these names since LU-18783 / LU-18891, but older clients (b2_15, b2_16) do not check the name length in LL_IOC_LMV_SETSTRIPE, so "lfs mkdir" with a 256 character name succeeds against a master ZFS MDT. LU-19232 (closed as duplicate of LU-18783) covered the client half of this.
+
+In CI this is the zfs half of the "sanity (suite fail)" failures in the lustre-master and lustre-master-next rolling upgrade/downgrade zfs groups: 60 of 105 sanity suite failures in 2026-09-25..2026-10-24. In rolling-upgrade-mds-zfs (master MDS, b2_16 client) sanity test_110 fails with "mkdir with 256 char should fail, but did not" and leaves d110.sanity behind, e.g.
+
+https://testing.whamcloud.com/test_sets/e2bfb0ef-4b35-4a7e-a612-4e6b38d5eb5a
+
+Every later phase of the same chain (upgrade-client1/2, downgrade-oss/mds/client1/client2) then fails at the start of sanity:
+
+rm: cannot remove '/mnt/lustre/d110.sanity': Value too large for defined data type
+sanity: FAIL: test-framework exiting on error
+
+or "Directory not empty" once the MDS is downgraded, e.g.
+
+https://testing.whamcloud.com/test_sets/41d5a83f-c953-4143-86af-c3a2d713b2ef
+
+https://testing.whamcloud.com/test_sets/d5b0e4e9-e259-4c37-b6a6-38f16c4c8d05
+
+Proposed fix: osd-zfs refuses to insert a directory entry longer than NAME_MAX with -ENAMETOOLONG, as ldiskfs does.
+
+Reproduced on master (v2_17_60) with a single node rocky9 el9.7 VM, ZFS 2.4.0 MDT and OSTs, and a master client changed to behave like a b2_16 client (ll_namelen taken from the MDT os_namelen of 256, no name length check in LL_IOC_LMV_SETSTRIPE): sanity test_110 fails with "mkdir with 256 char should fail, but did not", the end of suite cleanup fails with "rm: cannot remove '/mnt/lustre/d110.sanity': Value too large for defined data type", and "ls /mnt/lustre/d110.sanity" spins on the MDS with "mdd_dir_page_build() lustre-MDT0000-mdtlov: build page failed for [0x200000401:0x3:0x0]: rc = -75".
+
+--- Comment (gerrit, Sat, 24 Oct 2026 23:44:32 +0000) ---
+"patrick bot " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70006
+
+Subject: LU-21031 osd-zfs: refuse names longer than NAME_MAX
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7b24f1fc74689e11e916e9f48efd43fe185a94e4
+
+--- Comment (JIRAUSER24100, Sat, 24 Oct 2026 23:50:11 +0000) ---
+Patch: https://review.whamcloud.com/c/fs/lustre-release/+/70006. With the patch, the same simulated b2_16 client gets ENAMETOOLONG from 'lfs mkdir' with a 256 character name and sanity test_110 passed 3 of 3 runs on the ZFS 2.4.0 VM; without it test_110 failed and d110.sanity could not be removed.

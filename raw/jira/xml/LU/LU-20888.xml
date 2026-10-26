@@ -16,10 +16,10 @@
                         <labels>
                     </labels>
                 <created>Wed, 7 Oct 2026 15:13:26 +0000</created>
-                <updated>Wed, 21 Oct 2026 16:17:06 +0000</updated>
+                <updated>Mon, 26 Oct 2026 09:50:34 +0000</updated>
                                                                                 <due />
                             <votes>0</votes>
-                                    <watches>3</watches>
+                                    <watches>4</watches>
                                                                             <comments>
                             <comment id="502989" author="gerrit" created="Wed, 7 Oct 2026 15:21:50 +0000">&lt;p&gt;"Duncan Vogel &amp;lt;fvogdunc@amazon.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69486" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69486&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20888" title="DNE MDT recovery hangs if MDS_CONNECT finds a thread pool fully blocked on osp_remote_sync" class="issue-link" data-issue-key="LU-20888"&gt;LU-20888&lt;/a&gt; ptlrpc: make MDS-MDS connect high priority&lt;br/&gt;
@@ -33,6 +33,155 @@ Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
 Commit: 7d4e397209a11653fc505aa10274dc8b91b0e44e&lt;/p&gt;</comment>
+                            <comment id="504400" author="gerrit" created="Mon, 26 Oct 2026 09:25:07 +0000">&lt;p&gt;"Alexander Boyko &amp;lt;alexander.boyko@hpe.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70028" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70028&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-20888" title="DNE MDT recovery hangs if MDS_CONNECT finds a thread pool fully blocked on osp_remote_sync" class="issue-link" data-issue-key="LU-20888"&gt;LU-20888&lt;/a&gt; ptlrpc: make connect requests high priority&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: fff223195adf654a00a6102c819cd3bc99a7640f&lt;/p&gt;</comment>
+                            <comment id="504401" author="aboyko" created="Mon, 26 Oct 2026 09:50:34 +0000">&lt;p&gt;We saw a similar problem during recovery. A clients connection should be high priority too, not only LWP. I've pushed a common solution for connections. &lt;/p&gt;
+&lt;h2&gt;&lt;a name="Summary"&gt;&lt;/a&gt;Summary&lt;/h2&gt;
+
+&lt;p&gt;On an MDS hosting several DNE targets, a failover can produce a self-sustaining&lt;br/&gt;
+deadlock between the ptlrpc service threads and target recovery:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;mdt&lt;/tt&gt; service threads block inside rename/getattr handlers waiting on&lt;br/&gt;
+cross-MDT OSP RPCs to a target that is itself still in recovery;&lt;/li&gt;
+	&lt;li&gt;a recovering target cannot answer &lt;tt&gt;MDS_CONNECT&lt;/tt&gt; because every thread in the&lt;br/&gt;
+affected CPT partition is blocked;&lt;/li&gt;
+	&lt;li&gt;the target therefore never completes recovery, so the blocked threads are&lt;br/&gt;
+never released.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The cycle breaks only when the recovery soft timer expires and evicts the&lt;br/&gt;
+clients that were waiting. The connects &lt;b&gt;were delivered&lt;/b&gt; — they sat in the&lt;br/&gt;
+service queue and were dropped unanswered, 157s past their own deadline.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+&lt;ul&gt;
+	&lt;li&gt;Lustre 2.16 (cray), DNE, 4 MDTs, HA pairs.&lt;/li&gt;
+	&lt;li&gt;MDS: 64 cores / 4 NUMA nodes / &lt;tt&gt;npartitions: 8&lt;/tt&gt; -&amp;gt; 8 CPTs, 100 &lt;tt&gt;mdt&lt;/tt&gt; threads per CPT.&lt;/li&gt;
+	&lt;li&gt;Clients on &lt;tt&gt;gni&lt;/tt&gt;, servers on &lt;tt&gt;o2ib61&lt;/tt&gt;, reached through LNet routers (routed traffic).&lt;/li&gt;
+	&lt;li&gt;Reproducer: MDS panic/failover loop. After the peer panicked, all four MDTs&lt;br/&gt;
+ended up on one node.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Thecycle"&gt;&lt;/a&gt;The cycle&lt;/h2&gt;
+&lt;ol&gt;
+	&lt;li&gt;MDT0000/MDT0002 fail over onto the node already hosting MDT0001/MDT0003.&lt;/li&gt;
+	&lt;li&gt;MDT0001/MDT0003 threads, handling ordinary client renames/getattrs, block in&lt;br/&gt;
+&lt;tt&gt;ptlrpc_queue_wait()&lt;/tt&gt; on OSP RPCs to MDT0000/MDT0002.&lt;/li&gt;
+	&lt;li&gt;Those threads are &lt;tt&gt;mdt&lt;/tt&gt; service threads that arrived on&lt;br/&gt;
+&lt;tt&gt;MDS_REQUEST_PORTAL&lt;/tt&gt; — while blocked they still count in&lt;br/&gt;
+&lt;tt&gt;scp_nreqs_active&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;MDT0002's clients send &lt;tt&gt;MDS_CONNECT&lt;/tt&gt; on the same portal, into the same CPT&lt;br/&gt;
+partition. No thread is free.&lt;/li&gt;
+	&lt;li&gt;MDT0002 cannot finish recovery (clients never connect); the threads cannot&lt;br/&gt;
+unblock (MDT0002 has not finished recovery).&lt;/li&gt;
+	&lt;li&gt;At the 300s soft timeout the stale sweep evicts 6 clients, which releases the&lt;br/&gt;
+threads — and one second later the queued connects are dequeued and dropped.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h2&gt;&lt;a name="Evidence%3Atheconnectwasdelivered%2Cqueued%2Canddroppedunanswered"&gt;&lt;/a&gt;Evidence: the connect was delivered, queued, and dropped unanswered&lt;/h2&gt;
+
+&lt;p&gt;Client 31@gni sends the connect at &lt;tt&gt;1791896049&lt;/tt&gt; (T+44 of a 300s window):&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+00000100:00100000:58.0:1791896049.237153:0:17100:0:(&lt;span class="code-keyword"&gt;import&lt;/span&gt;.c:814:ptlrpc_connect_import_locked())
+  @@@ (re)connect request (timeout 5) req@... x1878873257675392/t0(0)
+  o38-&amp;gt;e2kp1-MDT0002-mdc-...@10.10.100.5@o2ib61
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;and gives up 41s later with -110:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+(client.c:2383:ptlrpc_expire_one_request()) @@@ Request sent has timed out &lt;span class="code-keyword"&gt;for&lt;/span&gt; slow reply:
+  [sent 1791896049/real 1791896049] req@... x1878873257675392/t0(0) o38-&amp;gt;e2kp1-MDT0002-...
+(client.c:2414:ptlrpc_expire_one_request()) @@@ err -110, sent_state=CONNECTING (now=CONNECTING)
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The server had the &lt;b&gt;same xid&lt;/b&gt; the whole time. It is dequeued at&lt;br/&gt;
+&lt;tt&gt;1791896306&lt;/tt&gt; — 257s after arrival, 157s past its own AT deadline — and&lt;br/&gt;
+dropped without a reply:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Oct 13 07:58:26 LustreError: 221574:0:(service.c:2587:ptlrpc_server_handle_request())
+  @@@ Dropping timed-out request from 12345-31@gni: deadline 100/157s ago
+  req@... x1878873257675392/t0(0) o38-&amp;gt;&amp;lt;?&amp;gt;@&amp;lt;unknown&amp;gt;:0/0 lens 520/0 e 0 to 0
+  dl 1791896149 ref 1 fl Interpret:/200/ffffffff rc 0/-1
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;This message is emitted &lt;b&gt;at dequeue&lt;/b&gt;, so it is positive proof the RPC arrived&lt;br/&gt;
+and was queued — this is not packet loss and not an LNet routing problem.&lt;br/&gt;
+&lt;tt&gt;Skipped 11 previous similar messages&lt;/tt&gt; accompanies it.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Evidence%3AoneCPTpartitionwasfullydrained"&gt;&lt;/a&gt;Evidence: one CPT partition was fully drained&lt;/h2&gt;
+
+&lt;p&gt;The blocked threads are in cross-MDT RPCs:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Lustre: mdt_io06_002: service thread pid 50292 was inactive &lt;span class="code-keyword"&gt;for&lt;/span&gt; 200.960 seconds
+  ptlrpc_set_wait &amp;lt;- ptlrpc_queue_wait &amp;lt;- osp_remote_sync &amp;lt;- osp_xattr_get
+  &amp;lt;- lod_xattr_get &amp;lt;- __mdd_links_read &amp;lt;- mdd_is_subdir
+  &amp;lt;- mdt_rename_determine_lock_order &amp;lt;- mdt_reint_rename
+
+Lustre: mdt02_010: service thread pid 57553 was inactive &lt;span class="code-keyword"&gt;for&lt;/span&gt; 200.177 seconds
+  lu_object_find_at &amp;lt;- mdt_object_find &amp;lt;- mdt_getattr_name_lock
+  &amp;lt;- mdt_intent_getattr &amp;lt;- mdt_intent_policy &amp;lt;- tgt_enqueue
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;At the instant the sweep releases them, 100 &lt;tt&gt;mdt&lt;/tt&gt; threads report&lt;br/&gt;
+&lt;tt&gt;completed after ~258s&lt;/tt&gt;, and they are almost all in one partition:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;CPT&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;threads stalled&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;1&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;4&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;2&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;3&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;3&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;1&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;b&gt;4&lt;/b&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;&lt;b&gt;98&lt;/b&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;6&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;1&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;CPT 4 ran from &lt;tt&gt;mdt04_000&lt;/tt&gt; to &lt;tt&gt;mdt04_099&lt;/tt&gt; — its full 100-thread limit. 21&lt;br/&gt;
+threads pre-existed; 77 were spawned &lt;b&gt;during&lt;/b&gt; the stall (contiguous pids&lt;br/&gt;
+221551-221740) and blocked as well. The other seven partitions were healthy&lt;br/&gt;
+throughout.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Whyonlytheseclients%3AtheCPTisafunctionoftheclientNID"&gt;&lt;/a&gt;Why only these clients: the CPT is a function of the client NID&lt;/h2&gt;
+
+&lt;p&gt;With the default &lt;tt&gt;portal_rotor = LNET_PTL_ROTOR_HASH_RT&lt;/tt&gt;&lt;br/&gt;
+(lnet/lnet/lib-ptl.c:17), a &lt;b&gt;routed&lt;/b&gt; request is assigned&lt;br/&gt;
+&lt;tt&gt;cpt = lnet_nid2cpt(&amp;amp;msg-&amp;gt;msg_initiator, ni)&lt;/tt&gt; (lib-ptl.c:291-306,&lt;br/&gt;
+lib-move.c:4493) — a hash of the &lt;b&gt;originating client NID&lt;/b&gt;, not the router. For&lt;br/&gt;
+non-KFI NIDs this is (sum of the 8 bytes of the nid64) mod ncpt&lt;br/&gt;
+(api-ni.c:1656-1679), i.e. for gni with 8 CPTs: &lt;tt&gt;CPT = (13 + addr) mod 8&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;The six evicted clients were &lt;b&gt;23, 31, 47, 55, 135, 151 @gni&lt;/b&gt; — every one&lt;br/&gt;
+&lt;tt&gt;addr = 7 (mod 8)&lt;/tt&gt;, i.e. &lt;b&gt;all six hash to CPT 4&lt;/b&gt;. No client outside that&lt;br/&gt;
+residue class was evicted. This is a deterministic cohort, not an unlucky tail,&lt;br/&gt;
+and it will recur on the same 1/8 of the cluster every time.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;</comment>
                     </comments>
                     <attachments>
                     </attachments>

@@ -1,5 +1,5 @@
 Change:     69827
-Subject:    LU-20995 compat: fail cleanly on kallsyms lookups with x86 IBT
+Subject:    LU-20995 compat: call kallsyms functions via static_call
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69827
 Change-Id:  I4fd5dae7454c9e9b0865c95c8369af15d6632516
 Project:    fs/lustre-release
@@ -7,59 +7,58 @@ Branch:     master
 Status:     NEW
 Owner:      Jian Yu
 Created:    2026-10-19 22:42:37.000000000
-Updated:    2026-10-22 12:04:06.000000000
-Patch Set:  3
-Insertions: +127
-Deletions:  -33
-Comments:   21 (4 unresolved)
+Updated:    2026-10-26 12:59:17.000000000
+Patch Set:  5
+Insertions: +103
+Deletions:  -54
+Comments:   36 (0 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1
+  Code-Review: Xiao Yang: +1
+  Verified: Xiao Yang: +1; jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
-  REVIEWER: James Simmons, Timothy Day
+  REVIEWER: James Simmons, Timothy Day, Xiao Yang
 
 --- Commit Message ---
-LU-20995 compat: fail cleanly on kallsyms lookups with x86 IBT
+LU-20995 compat: call kallsyms functions via static_call
 
 On x86 kernels with CONFIG_X86_KERNEL_IBT running on an IBT-enabled
 CPU, loading libcfs BUGs with "Missing ENDBR" when Lustre calls
 kernel functions through pointers obtained from kallsyms.
 
+The kernel seals the ENDBR of every function whose address is never
+taken: objtool lists it in .ibt_endbr_seal and apply_seal_endbr()
+poisons it at boot. kallsyms_lookup_name() is one of those
+functions, as are alloc/free/apply_workqueue_attrs() and
+security_file_alloc/free(), so none of them can be called through
+a pointer from a module, whatever address is used.
+
+A direct call or jmp does not need an ENDBR. With IBT, define a
+static_call() in libcfs for kallsyms_lookup_name() and for each
+function that lustre_symbols_init() looks up, and point it at the
+kallsyms address with static_call_update(). The call sites are then
+patched into direct calls to the kernel function. Other kernels keep
+calling through a function pointer, behind the same
+CFS_DEFINE_SYMBOL(), cfs_symbol_call() and cfs_symbol_set() helpers.
+
 find_kallsyms_lookup_name() takes kallsyms_lookup_name() from a
-kprobe, and with CONFIG_X86_KERNEL_IBT the probe address is placed
-after the ENDBR64 (kallsyms_lookup_name+0x4). Moreover, the kernel
-seals the ENDBR of every function whose address is never taken:
-objtool lists it in .ibt_endbr_seal and apply_seal_endbr() poisons
-it at boot. kallsyms_lookup_name() is one of those functions, as are
-alloc/free/apply_workqueue_attrs() and security_file_alloc/free(),
-so none of them can be called indirectly from a module, whatever
-address is used.
+kprobe, whose address is not always the symbol start: with IBT it
+is after the ENDBR64 (+0x4), and on ppc64le (ELFv2) it is the local
+entry point (global+8), or with KPROBES_ON_FTRACE the ftrace call
+site, so calling it skipped the r2/TOC setup or part of the
+prologue. Rewind the address to the start of the symbol using
+sprint_symbol(). On other architectures the kprobe address is
+already the symbol start.
 
-Rewind the kprobe address to the start of the symbol using
-sprint_symbol(), so the real entry instruction can be checked, and
-verify that the function starts with ENDBR64 when IBT is enabled
-before using it. Add and export cfs_kallsyms_lookup_func() to do the
-same check for the other functions looked up in
-lustre_symbols_init(); it returns ERR_PTR(-EINVAL) if the symbol is
-not found and ERR_PTR(-EOPNOTSUPP) if it is not callable.
-
-This does not make Lustre usable on IBT-enabled CPUs: since these
-ENDBRs are sealed, libcfs now refuses to load with -EOPNOTSUPP and
-a clear error message instead of crashing the kernel with #CP.
-Without IBT enforcement, behavior is unchanged. Calling these
-functions with a direct call or jmp, which does not need an ENDBR
-(e.g. via a module-defined static_call() updated to the kallsyms
-address), is left for a follow-up ticket.
-
-In osd-wbcfs, also use cfs_kallsyms_lookup_func() for
-flush_delayed_fput(), and fail osd_init() before
-class_register_type() if the lookup fails. Previously a failed
-lookup left cfs_flush_delayed_fput NULL while the module still
-loaded, so osd_umount()/osd_flush_fput() would later call a NULL
-pointer.
+In osd-wbcfs, look up flush_delayed_fput() before
+class_register_type() and fail osd_init() if the lookup fails.
+Previously a failed lookup left cfs_flush_delayed_fput NULL while
+the module still loaded, so osd_umount()/osd_flush_fput() would
+later call a NULL pointer. flush_delayed_fput() is exported since
+v5.4, before IBT support was added in v5.18, so on IBT kernels it is
+called directly and its ENDBR is never sealed.
 
 The sanity runs below only exercise the IBT path if the test nodes
 boot an IBT-enabled kernel on IBT-capable hardware; otherwise they
@@ -75,8 +74,9 @@ Test-Parameters: testlist=sanity clientdistro=ubuntu2404
 Test-Parameters: testlist=sanity clientdistro=ubuntu2604
 
 Fixes: b18bfc7c7935 ("LU-18687 compat: improve cfs_kallsyms_lookup_name()")
+Fixes: 25813cf8ba53 ("LU-18813 osd-wbcfs: MemFS-based OSD with writeback support")
 Signed-off-by: Jian Yu <yujian@whamcloud.com>
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Assisted-by: Claude:claude-opus-5-5
 Change-Id: I4fd5dae7454c9e9b0865c95c8369af15d6632516
 
 --- Review History ---
@@ -293,3 +293,186 @@ Patch Set 3:
 Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134251&commit=Apply+Filter
 
 Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134251#redirect
+
+--- Message (Maloo, 2026-10-23 21:27:41.000000000) ---
+Patch Set 3:
+
+Failed enforced test custom-1004 on RHEL 9.7 / x86_64, RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm77: https://testing.whamcloud.com/test_sessions/335f8f49-e0c4-4187-859c-d30121d1ace4 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-10-23 22:43:29.000000000) ---
+Patch Set 3: Verified-1
+
+Passed enforced test custom-1006 on RHEL 9.7 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-144vm22: https://testing.whamcloud.com/test_sessions/9db391df-d7e1-4aff-ade2-047667507417 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-23 22:48:18.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; turning the #CP BUG into a clean load failure is an improvement. A few optional points inline for whenever the patch is next refreshed. None of them needs a re-spin by itself.
+
+--- Message (Jian Yu, 2026-10-24 03:59:35.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-10-24 04:01:32.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Jian Yu, 2026-10-24 04:02:13.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+--- Message (Jian Yu, 2026-10-24 04:02:30.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-24 04:03:07.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-24 04:24:01.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134393/ : SUCCESS
+
+--- Message (Maloo, 2026-10-24 04:24:19.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 134393 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134393&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134393#redirect
+
+--- Message (Xiao Yang, 2026-10-24 11:35:00.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Xiao Yang, 2026-10-24 12:21:36.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Xiao Yang, 2026-10-24 13:07:03.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Jian Yu, 2026-10-25 22:59:11.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-25 23:02:02.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (Jian Yu, 2026-10-25 23:02:10.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (jenkins, 2026-10-25 23:21:21.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134431/ : SUCCESS
+
+--- Message (Autotest, 2026-10-25 23:21:34.000000000) ---
+Patch Set 4:
+
+Onyx Autotest 2 is abandoning the following sessions because: later build 134431 found
+- Enforced review-ldiskfs-dne-arm on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+- Enforced custom on el9.7-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2026-10-25 23:21:52.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 134431 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134431&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134431#redirect
+
+--- Message (Autotest, 2026-10-25 23:21:55.000000000) ---
+Patch Set 4:
+
+Trevis Autotest 2 is abandoning the following sessions because: later build 134431 found
+- Enforced review-ldiskfs-dne on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs-dne on el9.8-x86_64/ldiskfs servers and clients
+
+--- Message (Xiao Yang, 2026-10-26 00:58:43.000000000) ---
+Patch Set 5: Code-Review+1 Verified+1
+
+--- Message (Maloo, 2026-10-26 12:30:25.000000000) ---
+Patch Set 5: Verified+1
+
+Passed enforced test custom-1006 on RHEL 9.7 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm102: https://testing.whamcloud.com/test_sessions/631ff4d0-b60a-4ceb-8016-73738611dd6f ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-26 12:59:17.000000000) ---
+Patch Set 5:
+
+Looks good to me.
