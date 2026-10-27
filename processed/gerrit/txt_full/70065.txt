@@ -1,0 +1,125 @@
+Change:     70065
+Subject:    LU-21042 ldlm: revoke export locks with a blocking AST
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70065
+Change-Id:  I271021c58f6ae916c10ca3d0f37683a0503ebbe5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-10-27 07:18:09.000000000
+Updated:    2026-10-27 17:10:41.000000000
+Patch Set:  1
+Insertions: +360
+Deletions:  -25
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-21042 ldlm: revoke export locks with a blocking AST
+
+ldlm_revoke_export_locks() is called on nodemap changes to make
+clients drop cached permissions.  It cancelled the locks of the
+export on the server only, as if the client had been evicted, so
+the client kept its locks and its cached dentries and attributes.
+Later changes by other clients or through another MDT no longer sent
+a blocking AST to the client, and it would use stale data.  E.g.
+after sanity-hsm test_411 changed a nodemap, test_500 would create a
+directory on a remote MDT, and then stat would return -ENOENT from a
+stale negative dentry.
+
+Send a blocking AST for each granted IBITS and EXTENT lock of the
+export instead, so the client cancels the locks and drops its cache.
+A client that does not cancel is evicted by the lock callback
+timeout.  Flock and group locks are not revoked.
+
+The nodemap code calls ldlm_revoke_export_locks() with nodemap locks
+held, so it must not wait for client replies.  Queue the export with
+a reference to the ldlm_bl threads instead, which take the locks from
+exp_lock_hash and send the ASTs.  An export that is already queued is
+not queued again, and an export that is evicted or disconnected
+before the revoke runs is skipped, since its locks are cancelled
+without ASTs.  nodemap_modify and other nodemap changes return before
+the revocation is complete.
+
+The revoke ASTs are still sent synchronously from the ldlm_bl thread,
+which waits for the replies, so a dead client holds that thread until
+it is evicted.  Limit revoke work to about half of the maximum number
+of ldlm_bl threads, so that dead clients cannot tie up the pool
+needed for evictions and other blocking callbacks.  Sending the ASTs
+asynchronously through ptlrpcd is left for later, since
+ldlm_cb_interpret() would need an lu_env there.
+
+Extend sanity-sec test_82 to check that a nodemap change makes the
+client cancel its MDT0000 locks without an eviction.
+
+Test-Parameters: trivial testlist=sanity-sec
+Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity-hsm
+Fixes: 64a0a6c4559b ("LU-19157 nodemap: revoke export locks on nodemap change")
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
+Change-Id: I271021c58f6ae916c10ca3d0f37683a0503ebbe5
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-10-27 07:18:09.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-27 07:21:28.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-27 09:20:19.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134522/ : SUCCESS
+
+--- Message (Maloo, 2026-10-27 09:21:17.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 134522 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134522&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134522#redirect
+
+--- Message (Maloo, 2026-10-27 16:59:34.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm17: https://testing.whamcloud.com/test_sessions/4750df14-7a58-473a-936a-1f1c4d5d6a9b ran 5 tests.
+
+--- Message (wc-checkpatch, 2026-10-27 17:00:04.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-27 17:10:41.000000000) ---
+Patch Set 1:
+
+Looks good to me.

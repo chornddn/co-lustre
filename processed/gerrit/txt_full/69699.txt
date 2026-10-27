@@ -1,5 +1,5 @@
 Change:     69699
-Subject:    LU-20963 osp: treat disconnected OST as ENOTCONN in osp_statfs
+Subject:    LU-20963 lod: use a reconnecting OST only when needed
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69699
 Change-Id:  I5cc15d4a719a9a0874fcffdbc6e2481a64e36d7e
 Project:    fs/lustre-release
@@ -7,60 +7,70 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-10-15 05:22:49.000000000
-Updated:    2026-10-24 17:54:22.000000000
-Patch Set:  4
-Insertions: +75
-Deletions:  -11
-Comments:   18 (6 unresolved)
-Hashtags:   pt_ecro, master-next, 218_review_priority
+Updated:    2026-10-27 18:47:01.000000000
+Patch Set:  5
+Insertions: +132
+Deletions:  -12
+Comments:   22 (6 unresolved)
+Hashtags:   master-next, 218_review_priority, pt_ecro
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1
-  Verified: jenkins: +1; Oleg Drokin: -1; Maloo: +1
+  Code-Review: Ronnie Sahlberg: +1; Andreas Dilger: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Timothy Day, Marc Vef
+  REVIEWER: Lai Siyao, Oleg Drokin, Andreas Dilger, Timothy Day, Ronnie Sahlberg, Marc Vef
 
 --- Commit Message ---
-LU-20963 osp: treat disconnected OST as ENOTCONN in osp_statfs
+LU-20963 lod: use a reconnecting OST only when needed
 
 OST umount (OSS failover) only raises IMP_EVENT_DISCON: opd_imp_active
-stays set, so osp_statfs() kept returning cached statfs and LOD left
-the target ACTIVE.  Also return -ENOTCONN while the import is
-disconnected (opd_imp_connected), so that lod_statfs_and_check() can
-clear ltd_active and set ltd_discon.  Do not use opd_pre_status for
-this: it stays -ENODEV after reconnect until orphan cleanup is done,
-and a create would fail instead of waiting for that in
-osp_precreate_reserve().
+stays set, so osp_statfs() kept returning cached statfs and LOD could
+not tell that the OST was gone, and used it as before.  osp_statfs()
+now returns -EAGAIN while the import is disconnected
+(opd_imp_connected), and still returns -ENOTCONN for an inactive or
+deactivated OSP.  Do not use opd_pre_status for this: it stays -ENODEV
+after reconnect until orphan cleanup is done.
 
-osp_statfs() still fills in the cached data for a disconnected OST,
+lod_statfs_and_check() keeps a reconnecting OST active and returns
+-EAGAIN if its cached statfs data is still usable (not full or
+read-only), so the active target count (and the stripe count limit
+derived from it), ltd_discon, lod_sync() and lod_obd_set_info_async()
+(e.g. evict_client by NID) are not changed by a transient disconnect.
+lod_ost_alloc_qos() leaves a reconnecting OST out, and
+lod_ost_alloc_rr() and lod_ost_alloc_specific() skip it in their
+first passes, but use it in their last, blocking pass, which only runs
+if too few stripes were found, and wait in osp_precreate_reserve() as
+before.  The specific allocator also waits for a reconnecting OST
+requested with "-i", but not again after a reconnecting OST timed
+out, and an OST listed with "-o" is waited for.  A
+create during OSS failover or right after an OST restart then still
+waits for the OST instead of failing with -ENOSPC or getting fewer
+stripes than lod_stripe_count_min().
+
+osp_statfs() still fills in the cached data for a reconnecting OST,
 and lod_statfs() counts it, so that client df does not lose the space
-of an OST during failover.  An inactive (deactivated) OST is still
-left out, since it returns no data.  lod_trans_space_check() skips
-the space check for a disconnected target, as it does in recovery,
-so that a distributed transaction (e.g. migrate) does not return
--ENOTCONN to the client, which would reconnect and resend.
-
-Since a disconnected OST is now inactive in LOD, an FLR write picks
-a primary mirror without it and marks its mirror stale, and a SEL
-component is not extended onto it, the same as for a deactivated OST.
+of an OST during failover.  lod_trans_space_check() checks a
+reconnecting target with its cached state, so that a distributed
+transaction (e.g. migrate) does not fail with -EAGAIN.  lod target_obd
+shows a reconnecting OST as INACTIVE, and a SEL component is not
+extended onto it.
 
 Move opd_imp_connected out of the osp_device bitfield, since LOD
 allocation now depends on it, and osp_import_event() writes it without
 a lock while the precreate thread updates other bits in the same word.
 
 Refresh ltd_discon from every statfs result while the target is
-already inactive (e.g. ENOSPC then DISCONNECT), not only on the
+already inactive (e.g. ENOSPC then deactivated), not only on the
 active-to-inactive transition.
 
-sanity test_27F may now create its layout with one stripe if the
-resent create arrives before both OSTs reconnect, so only check that
-the layout has one or two stripes on distinct OSTs.
-
-Add sanity.sh test_27ya to verify LOD marks the OST INACTIVE after
-umount and setstripe avoids the disconnected OST.  Create its
-directory on MDT0000, whose OSP import the test checks.
+Add sanity.sh test_27ya to verify that target_obd shows the OST as
+INACTIVE after umount and setstripe avoids the disconnected OST when
+the other OSTs can provide all stripes.  Create its directory on
+MDT0000, whose OSP import the test checks.  Add test_27yb to verify
+that a create in a two-OST pool still gets both stripes when one OST
+is disconnected.
 
 Assisted-by: Cursor:Grok-4.6 llm_code_and_review_tools
 Assisted-by: Augment:Opus5.5 llm_code_and_review_tools
@@ -854,3 +864,266 @@ Passed enforced test review-dne-part-4 on RHEL 10.1 / x86_64 uploaded by Onyx Au
 Patch Set 4: Verified-1
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-10-26 19:02:15.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-10-26 19:02:27.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-26 19:06:13.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-10-26 19:24:31.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134462/ : SUCCESS
+
+--- Message (Maloo, 2026-10-26 19:26:09.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 134462 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134462&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134462#redirect
+
+--- Message (Ronnie Sahlberg, 2026-10-26 23:30:58.000000000) ---
+Patch Set 5: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-10-26 23:33:37.000000000) ---
+Patch Set 5: Code-Review+1
+
+--- Message (Maloo, 2026-10-27 01:53:46.000000000) ---
+Patch Set 5:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm94: https://testing.whamcloud.com/test_sessions/442ac0bd-af64-4fab-9bda-b7152e81c0a3 ran 6 tests.  1 tests failed: sanity-sec.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-10-27 02:01:15.000000000) ---
+Patch Set 5:
+
+Failed optional test review-dne-selinux-ssk-part-2 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm55: https://testing.whamcloud.com/test_sessions/fdaa973b-0447-410a-beba-5be70168c632 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-10-27 02:16:59.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm181: https://testing.whamcloud.com/test_sessions/149e49b9-66c4-44c0-8e36-2922dc3e0c88 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-10-27 02:34:37.000000000) ---
+Patch Set 5:
+
+Failed optional test review-dne-part-2 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm191: https://testing.whamcloud.com/test_sessions/1a6d3063-b4ad-46b1-82cd-13fc6700462d ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-10-27 03:16:32.000000000) ---
+Patch Set 5:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm111: https://testing.whamcloud.com/test_sessions/0426046c-0136-460b-8a1e-1b8abaaedf2d ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-10-27 03:19:27.000000000) ---
+Patch Set 5:
+
+Failed optional test review-dne-selinux-ssk-part-2 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm102: https://testing.whamcloud.com/test_sessions/47ee97c5-5ad4-46b7-a5d7-eff6108d73cf ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-10-27 04:00:04.000000000) ---
+Patch Set 5:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm239: https://testing.whamcloud.com/test_sessions/e6ac0c84-3209-4b6b-80d0-6616e4ba8511 ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-10-27 06:38:22.000000000) ---
+Patch Set 5: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm108: https://testing.whamcloud.com/test_sessions/4c008b6f-b65e-4337-8942-8fa72fef543a ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-27 06:49:50.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments: one allocation case in lod_ost_alloc_specific() that can now fail where it used to succeed, plus a user-visible sysfs change on the MDS.
+
+--- Message (Autotest, 2026-10-27 12:00:46.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 134462 patch 5. Requested by Patrickbot because of LU-20867.
+
+--- Message (wc-checkpatch, 2026-10-27 16:55:40.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Maloo, 2026-10-27 18:33:05.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm69: https://testing.whamcloud.com/test_sessions/793f4389-3cf8-4dc5-abc6-a12cfcd2eea4 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Autotest, 2026-10-27 18:47:01.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 134462 patch 5. Requested by Patrickbot because of LU-20867.

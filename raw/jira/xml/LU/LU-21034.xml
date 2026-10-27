@@ -1,0 +1,118 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21034] 2.17.0 client with hybrid_io=1 vs 2.15.8 server: write hangs in direct_write_fallback -&gt; osc_extent_wait on an active extent; client is evicted and does not reconnect</title>
+                <link>https://jira.whamcloud.com/browse/LU-21034</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+
+&lt;p&gt;On 2.17.0 clients with the default hybrid I/O, large writes can hang forever in D state doing write(). Once another client wants a lock on the same file, the OST evicts the hung client after timeout. The client's import invalidation then never completes, so the import stays EVICTED and every object on that OST is unreachable from that client ("Cannot send after transport endpoint shutdown") until the node is hard reset. A normal reboot hangs too.&lt;/p&gt;
+
+&lt;p&gt;2.15.5 clients on 2.15.5 servers (what we ran before upgrading) never showed this. We've seen evictions there, too, but they would always reconnect.&lt;/p&gt;
+
+&lt;p&gt;We can reproduce it on demand with hybrid_io=1; with &lt;tt&gt;llite.*.hybrid_io=0&lt;/tt&gt; we could not, and no new hang has been seen on the cluster since we set hybrid_io=0 on all clients, a week ago.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Expectedresult"&gt;&lt;/a&gt;Expected result&lt;/h2&gt;
+
+&lt;p&gt;A large write completes or fails with an error, never hangs forever. If a client is evicted, its import reconnects (as 2.15.5 clients do) and the OST's objects become reachable again without a reset. A 2.17.0 client with default settings was expected to work with 2.15.x servers.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="%C2%A0"&gt;&lt;/a&gt; &lt;/h2&gt;
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+&lt;ul&gt;
+	&lt;li&gt;Clients: Lustre 2.17.0 (built from source, &lt;tt&gt;--with-o2ib --disable-server&lt;/tt&gt;), Ubuntu 24.04, kernel 6.8.0-147-generic, Omni-Path (o2iblnd). Default &lt;tt&gt;hybrid_io=1&lt;/tt&gt;, &lt;tt&gt;hybrid_io_write_threshold_bytes=2097152&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;Servers: Lustre 2.15.8, Rocky Linux 8.10, ldiskfs, 22 OSTs on 8 OSS, 2 MDTs&lt;/li&gt;
+	&lt;li&gt;Also on the system: 2.15.5 clients over tcp through two routers. They had no lock-callback evictions and nothing got stuck (lost-contact evictions only, they reconnected just fine)&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;Full disclosure: we used an LLM to cross reference logs and track this issue down. The technical part below is written by the LLM. Sorry, but it's more clear this way then when I would write it myself..&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;&lt;a name="Observed"&gt;&lt;/a&gt;Observed&lt;/h2&gt;
+&lt;h3&gt;&lt;a name="Hungwriters%28client%29"&gt;&lt;/a&gt;Hung writers (client)&lt;/h3&gt;
+
+&lt;p&gt;Ordinary tools (samtools, bwa, plink, R, python, scp...) hang in write(), processes in D state and unkillable. Same stack on every node:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;ll_file_write_iter
+vvp_io_write_start
+direct_write_fallback
+filemap_write_and_wait_range
+ll_writepages
+cl_sync_file_range
+osc_extent_wait
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Console: &lt;tt&gt;osc_extent_wait() ... wait ext to 0 timedout, recovery in progress?&lt;/tt&gt; on an extent in state "active". Other threads opening the same file wait in &lt;tt&gt;osc_lock_enqueue_wait&lt;/tt&gt;. The files were opened without O_DIRECT (flags 0100001 / 0100002), so the direct path was chosen by hybrid I/O. As long as nobody else touches the file, only the writer hangs.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Eviction%28server%2CUTC%29"&gt;&lt;/a&gt;Eviction (server, UTC)&lt;/h3&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;anunna-OST0003: lock callback timer expired after 283s: evicting client at 192.168.33.72@o2ib2 ns: filter-anunna-OST0003_UUID ... mode: PW/PW res: ...
+... 230 s later:
+anunna-OST0003: haven't heard from client ... in 227 seconds. I think it's dead, and I am evicting it.
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;This pair (lock callback timeout, then a no-contact eviction about 230 s later from the same target) is the signature we used to find all affected clients. 54 lock-callback evictions on all OSS between 13 and 20 Oct (all 2.17.0 Omni-Path clients); 26 were followed by the second eviction and a stuck import.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Stuckimport%28client%2Cdayslater%29"&gt;&lt;/a&gt;Stuck import (client, days later)&lt;/h3&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;osc.anunna-OST0003-osc-*.import: state: EVICTED, flags: invalid, in-progress_invalidations: 1, inflight: 0, unregistering: 0
+lctl dl: ... IN osc anunna-OST0003-osc-...
+lfs check servers: ... Cannot send after transport endpoint shutdown (108)
+ll_imp_inval:  osc_object_invalidate &amp;lt;- osc_ldlm_resource_invalidate &amp;lt;- ptlrpc_invalidate_import
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The import is stuck in EVICTED with one invalidation in progress and no RPCs in flight; &lt;tt&gt;osc.*.active&lt;/tt&gt; is 1. The invalidation thread (&lt;tt&gt;ll_imp_inval&lt;/tt&gt;) is blocked in &lt;tt&gt;osc_object_invalidate&lt;/tt&gt;, which waits for outstanding I/O on the object to finish. The hung writers are the only I/O we know of on that OST, so we assume that is what it waits for. A client with hung writers on several OSTs loses each of them. &lt;tt&gt;lctl recover&lt;/tt&gt; and toggling &lt;tt&gt;active&lt;/tt&gt; do not help; only a hard reset does (a normal reboot hangs in sync/umount on the same extent).&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Workaround"&gt;&lt;/a&gt;Workaround&lt;/h2&gt;
+
+&lt;p&gt;&lt;tt&gt;lctl set_param llite.*.hybrid_io=0&lt;/tt&gt; on every client. It is per-mount, so we reapply it from a systemd unit after mounting. We tried with 'set_param -P' on the MGS but that doesn't take, I assume because the server version (2.15.8) doesn't know about hybrid_io at all.&lt;/p&gt;
+
+&lt;p&gt;With this workaround the clients do not attempt hybrid_io, and the issue has not appeared since.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+
+&lt;p&gt;Is this a known defect in the hybrid I/O fallback path, or a new issue? Can we help with recreating/testing and submitting logs? Since hybrid_io is default-on for 2.17.0 clients, but lustre server 2.15.8 doesn't know about it, is the default-on situation supposed to gracefully handle the mismatch? Or is turning hybrid_io off the actual solution we didn't find documented?&lt;/p&gt;</description>
+                <environment />
+        <key id="100182">LU-21034</key>
+            <summary>2.17.0 client with hybrid_io=1 vs 2.15.8 server: write hangs in direct_write_fallback -&gt; osc_extent_wait on an active extent; client is evicted and does not reconnect</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="fons.prinsen">Fons  Prinsen</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 26 Oct 2026 14:56:45 +0000</created>
+                <updated>Mon, 26 Oct 2026 14:56:45 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i071z3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

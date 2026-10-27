@@ -1,0 +1,30 @@
+Key:        LU-21047
+Summary:    sanity test_243: group_lock_test test40 hangs in client write/writeback (timeout)
+Link:       https://jira.whamcloud.com/browse/LU-21047
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Tue, 27 Oct 2026 01:46:20 +0000
+Updated:    Tue, 27 Oct 2026 01:46:20 +0000
+
+--- Description ---
+sanity test_243 (group_lock_test test40) hangs on the client until the suite times out, with a Lustre client write/writeback deadlock under a group lock.
+
+Test set: https://testing.whamcloud.com/test_sets/f2edae71-b702-46e9-9834-1daef2f777f1 (review-dne-zfs-part-1, el10.1 zfs, DNE, 4 MDT / 8 OST, kernel 6.12)
+
+group_lock_test test40 takes a GROUP lock (gid 1234) and forks 40 children, each doing pwritev() of 10000 bytes at offset 10000*i, so neighbouring writers share 4K pages. test10..test30 pass; test40 never finishes ("Starting test test40" is the last line of the suite log) and the session times out after 331 minutes.
+
+Client stacks at the timeout:
+
+	The OSC brw_queue_work kworker is stuck in folio_wait_bit_common() Several group_lock_test children are in D state in folio_wait_writeback() osc_extent_wait() reports the extent [0 -> 255/255] in state "locking", flags wiY, under the GROUP lock, "wait ext to 0 timedout".
+
+It looks like a lock-order cycle: the writeback worker holds earlier pages of an RPC in writeback and waits for the folio lock of a page that a writer holds while waiting for writeback of a page already in that RPC. The RPC cannot be sent, so writeback never ends.
+
+Not a duplicate of LU-15951 (assertion in test30, different failure). Similar symptom to LU-19951 (fixed in 7dc7cffb11, which is in the tested tree), but the extent here is in "locking" state, not "active".
+
+Seen once in 2451 review runs of this group over 30 days. Found on https://review.whamcloud.com/67604 (LU-19722 llite: send NO_APPEND flag from client), whose changes do not touch the client I/O path.
+
+Raised by Patch Watcher run pw-engineer-67604-ps23-569c11ba5aa5 on https://review.whamcloud.com/67604

@@ -1,0 +1,131 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21039] o2iblnd: NAK the GET when kiblnd_reply() cannot set up the source</title>
+                <link>https://jira.whamcloud.com/browse/LU-21039</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Problem&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;When `kiblnd_reply()` cannot set up the source of an optimized GET, it sends nothing to the peer. The peer that sent the GET_REQ waits for the full RDMA timeout. Then `kiblnd_check_conns()` closes the whole connection. The close also fails every other transfer in flight on that connection.&lt;/p&gt;
+
+&lt;p&gt;The o2iblnd protocol can already fail a GET at once. When a GET_REQ matches no MD, `kiblnd_recv()` sends a GET_DONE with status `-ENODATA`. The error paths in `kiblnd_reply()` do not send this message.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Environment&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;Seen on b_es6_0. The same code is on master.&lt;/li&gt;
+	&lt;li&gt;Client: InfiniBand on ConnectX-7, `map_on_demand=1` (FastReg), AMD IOMMU in translated mode.&lt;/li&gt;
+	&lt;li&gt;Workload: OST_WRITE from a client. The OSS sends a GET_REQ for the bulk, and the client is the GET source.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Evidence&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The client could not map one 1045059-byte bulk buffer. Each resend of the same OST_WRITE failed the same way for more than 24 hours:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+(o2iblnd.c:1922:kiblnd_fmr_pool_map()) Failed to map mr 0/1 elements&lt;br/&gt;
+(o2iblnd_cb.c:631:kiblnd_fmr_map_tx()) Can't map 1045059 bytes (256/1)s: -22&lt;br/&gt;
+(o2iblnd_cb.c:1871:kiblnd_reply()) Can't setup GET src for 10.50.25.30@o2ib: -22&lt;br/&gt;
+(events.c:215:client_bulk_callback()) event type 1, status -5, desc 00000000e816b250&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;The OSS did not see an error from the client. It waited for the RDMA timeout, closed the connection, and failed the bulk:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+LNetError: (o2iblnd_cb.c:3590:kiblnd_check_conns()) Timed out RDMA with 10.50.25.109@o2ib (8): c: 31, oc: 0, rc: 31&lt;br/&gt;
+Lustre: ...-OST0002: Bulk IO write error with ... (at 10.50.25.109@o2ib), client will retry: rc = -110&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;The OSS logged 140 bulk errors of this type for the client. Each one cost a full RDMA timeout and a connection close.&lt;/p&gt;
+
+&lt;p&gt;We do not know the root cause of the map failure yet. The fault is below LNet, in the RDMA memory registration or the IOMMU mapping. This ticket does not cover that root cause. A NAK does not make the transfer succeed. It makes the failure fast, and it keeps the connection open for other traffic.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;
+	&lt;ol&gt;
+		&lt;li&gt;Proposed fix&lt;/li&gt;
+	&lt;/ol&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;In `kiblnd_reply()`, when `kiblnd_setup_rd_kiov()` or `kiblnd_init_rdma()` fails, send a GET_DONE with the error status to the peer:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+kiblnd_send_completion(rx-&amp;gt;rx_conn, IBLND_MSG_GET_DONE, rc,&lt;br/&gt;
+		       rx-&amp;gt;rx_msg-&amp;gt;ibm_u.get.ibgm_cookie);&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;The peer then completes the GET_REQ in `kiblnd_handle_completion()` with that status. It does not wait for the RDMA timeout or close the connection.&lt;/p&gt;
+
+&lt;p&gt;The "Can't get tx for REPLY" path cannot send a NAK in the same way. `kiblnd_send_completion()` also needs an idle tx. That path can stay as it is.&lt;/p&gt;</description>
+                <environment />
+        <key id="100187">LU-21039</key>
+            <summary>o2iblnd: NAK the GET when kiblnd_reply() cannot set up the source</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 26 Oct 2026 21:04:32 +0000</created>
+                <updated>Mon, 26 Oct 2026 21:04:32 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i07207:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

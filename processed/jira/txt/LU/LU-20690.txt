@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Keguang Xu
 Reporter:   Keguang Xu
 Created:    Thu, 3 Sep 2026 09:35:49 +0000
-Updated:    Thu, 15 Oct 2026 06:03:56 +0000
+Updated:    Tue, 27 Oct 2026 08:27:42 +0000
 
 --- Description ---
 EC layouts today require k >= p. This is not a Cauchy/ISA-L limit,
@@ -112,3 +112,30 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 0e5fddefe51d614225225e412025781ba90eae34
+
+--- Comment (adilger, Tue, 27 Oct 2026 03:08:32 +0000) ---
+Landing order: patch https://review.whamcloud.com/69703 (" k" class="issue-link" data-issue-key="LU-20690">LU-20690 ec: verify parity against data, allow p > k") needs to land after patch https://review.whamcloud.com/69493 ("LU-19823 lod: unique failure domains per EC raid set").
+
+With p > k and more than one raid set, lod_ost_alloc_rr() on master can return success with a short parity component when lod_ec_add_parities() cannot fill it, because stripe_count_min is 0 for parity.  For example "lfs setstripe -c 4 --ec 2+3" on 5 OSTs without failure domains stores 5 parity stripes instead of 6, so raid set 1 has no parity, and the new parity check in lod_verify_striping() then rejects that layout on open replay.  Before 69703 llapi refused such layouts, so this was not reachable.  69493 makes lod_ost_alloc_rr() return -ENOSPC when a parity component gets fewer than all of its stripes, as lod_ost_alloc_qos() already does.
+
+--- Comment (adilger, Tue, 27 Oct 2026 03:43:23 +0000) ---
+Patch https://review.whamcloud.com/64086 ("LU-20958 lov: handle unavailable EC stripes in lseek") needs to be updated for the new parity layout and offset calculation in this series before it can land with it:
+
+	patch https://review.whamcloud.com/68361 (" k" class="issue-link" data-issue-key="LU-20690">LU-20690 ec: like-RAID10 parity layout") replaces RAID0|PARITY with LOV_PATTERN_PARITY, where the p parity objects of a raid set share one offset (one stripe_size per raid set per row).  64086 only handles RAID0|PARITY and returns -EOPNOTSUPP otherwise, so its parity SEEK_DATA/SEEK_HOLE path would never run, and its parity offset uses the old concatenated layout.
+
+	the raid set row and index must be computed from the absolute data offset (row = off / (stripe_count * stripe_size), unit = (off / stripe_size) % stripe_count) rather than from offset - e_start, as described in the 68361 review, so that each raid set's parity covers the objects LOD allocated to that raid set when e_start is not a multiple of the stripe width.  64086 needs the same mapping, ideally via the shared helper in 68361.
+
+The same applies to the parity offset in patch https://review.whamcloud.com/64919 ("LU-12669 lov: slow and dead OST detection for degraded reads").
+
+--- Comment (gerrit, Tue, 27 Oct 2026 08:27:42 +0000) ---
+"Zhenyu Xu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70067
+
+Subject:  k" class="issue-link" data-issue-key="LU-20690">LU-20690 ec: copy parity in 1+N recovery reads
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 14f4132f4a0cb6859b2332dc784b1b61fbce38c0

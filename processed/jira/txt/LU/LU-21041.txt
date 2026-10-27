@@ -1,0 +1,43 @@
+Key:        LU-21041
+Summary:    sanity-hsm test_251/254b: copytool .lustre/fid lookup ENOENT with 12 MDTs
+Link:       https://jira.whamcloud.com/browse/LU-21041
+Type:       Bug
+Priority:   Medium
+Status:     Resolved
+Resolution: Duplicate
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Mon, 26 Oct 2026 22:18:32 +0000
+Updated:    Tue, 27 Oct 2026 00:37:45 +0000
+Resolved:   Tue, 27 Oct 2026 00:37:45 +0000
+Links:      Duplicate: duplicates LU-16932; Related: is related to  LU-21042; Related: is related to  LU-14058
+
+--- Description ---
+[Claude] With 12 MDTs, the sanity-hsm copytool cannot open files by FID: llapi_hsm_action_begin() on /mnt/lustre2/.lustre/fid/ returns ENOENT for files that exist, so HSM requests never reach STARTED and test_251 and test_254b fail.
+
+sanity-hsm test_251: @@@@@@ FAIL: request on 0x20000040d:0xb5:0x0 is not STARTED on mds1
+sanity-hsm test_254b: @@@@@@ FAIL: Expected 52 (!= 0) active archive requests
+
+Copytool log (lhsmtool_posix on onyx-155vm20, mounted on /mnt/lustre2), test_251:
+
+[0x20000040d:0xb5:0x0] action ARCHIVE reclen 72, cookie=0x6abb40ff
+processing file 'd251.sanity-hsm/f251.sanity-hsm'
+llapi_hsm_action_begin() on '/mnt/lustre2/.lustre/fid/0x20000040d:0xb5:0x0' failed: No such file or directory (2)
+Action completed, notifying coordinator cookie=0x6abb40ff, FID=[0x20000040d:0xb5:0x0], hp_flags=0 err=2
+
+test_254b shows the same ENOENT for every archive request (e.g. [0x20000040d:0xb7:0x0]). The files were created on /mnt/lustre on the other client in a directory created with mkdir_on_mdt0, and still exist.
+
+Configuration: 2 MDS nodes, MDSCOUNT=12, from the custom test session for https://review.whamcloud.com/69303 (LU-14058 >10 MDT script fixes), which removes the old MDSCOUNT limit from sanity-hsm.sh. sanity-hsm has not previously been run with more than 10 MDTs.
+
+Maloo auto-linked LU-16932 by error signature, but the cause here is the ENOENT FID lookup on the copytool mount, not a timing issue. Possibly the same root cause as the sanity-hsm test_500 failure with 12 MDTs (stat of a just-created directory returns ENOENT), see linked ticket.
+
+sanity-hsm test_251 and test_254b are excluded with MDSCOUNT > 9 by LU-14058 until this is fixed.
+
+--- Comment (adilger, Tue, 27 Oct 2026 00:37:45 +0000) ---
+[Claude] The diagnosis in this ticket's description was wrong; the copytool ENOENT is a side effect, not a .lustre/fid lookup failure.
+
+	test_251 is the LU-16932 race: with active_request_timeout=1 the request stays STARTED for only about 1-2s, and wait_request_state polls about every 1.3s, so it saw WAITING then CANCELED ("Changed after 1s: from 'WAITING' to 'CANCELED'"). When the copytool then calls LL_IOC_HSM_COPY_START for the already-cancelled request, the MDS logs "mdt_hsm_update_request_state()) lustre-MDT0000: Cannot find running request for cookie 0x6abb40ff" and returns ENOENT.
+
+	test_254b failed because test_251 restored active_request_timeout and loop_period only at the end of the test body, so after the failure both stayed at 1 and 254b's requests timed out before they could be counted.
+
+Neither is specific to many MDTs. Resolving as a duplicate of LU-16932, where a test fix will be posted.

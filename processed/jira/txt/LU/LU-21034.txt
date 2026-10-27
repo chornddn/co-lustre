@@ -1,0 +1,79 @@
+Key:        LU-21034
+Summary:    2.17.0 client with hybrid_io=1 vs 2.15.8 server: write hangs in direct_write_fallback -> osc_extent_wait on an active extent; client is evicted and does not reconnect
+Link:       https://jira.whamcloud.com/browse/LU-21034
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Fons  Prinsen
+Created:    Mon, 26 Oct 2026 14:56:45 +0000
+Updated:    Mon, 26 Oct 2026 14:56:45 +0000
+
+--- Description ---
+Problem
+
+On 2.17.0 clients with the default hybrid I/O, large writes can hang forever in D state doing write(). Once another client wants a lock on the same file, the OST evicts the hung client after timeout. The client's import invalidation then never completes, so the import stays EVICTED and every object on that OST is unreachable from that client ("Cannot send after transport endpoint shutdown") until the node is hard reset. A normal reboot hangs too.
+
+2.15.5 clients on 2.15.5 servers (what we ran before upgrading) never showed this. We've seen evictions there, too, but they would always reconnect.
+
+We can reproduce it on demand with hybrid_io=1; with llite.*.hybrid_io=0 we could not, and no new hang has been seen on the cluster since we set hybrid_io=0 on all clients, a week ago.
+
+Expected result
+
+A large write completes or fails with an error, never hangs forever. If a client is evicted, its import reconnects (as 2.15.5 clients do) and the OST's objects become reachable again without a reset. A 2.17.0 client with default settings was expected to work with 2.15.x servers.
+
+ 
+Environment
+
+	Clients: Lustre 2.17.0 (built from source, --with-o2ib --disable-server), Ubuntu 24.04, kernel 6.8.0-147-generic, Omni-Path (o2iblnd). Default hybrid_io=1, hybrid_io_write_threshold_bytes=2097152
+
+	Servers: Lustre 2.15.8, Rocky Linux 8.10, ldiskfs, 22 OSTs on 8 OSS, 2 MDTs
+
+	Also on the system: 2.15.5 clients over tcp through two routers. They had no lock-callback evictions and nothing got stuck (lost-contact evictions only, they reconnected just fine)
+
+ 
+
+Full disclosure: we used an LLM to cross reference logs and track this issue down. The technical part below is written by the LLM. Sorry, but it's more clear this way then when I would write it myself..
+
+Observed
+Hung writers (client)
+
+Ordinary tools (samtools, bwa, plink, R, python, scp...) hang in write(), processes in D state and unkillable. Same stack on every node:
+
+ll_file_write_iter
+vvp_io_write_start
+direct_write_fallback
+filemap_write_and_wait_range
+ll_writepages
+cl_sync_file_range
+osc_extent_wait
+
+Console: osc_extent_wait() ... wait ext to 0 timedout, recovery in progress? on an extent in state "active". Other threads opening the same file wait in osc_lock_enqueue_wait. The files were opened without O_DIRECT (flags 0100001 / 0100002), so the direct path was chosen by hybrid I/O. As long as nobody else touches the file, only the writer hangs.
+
+Eviction (server, UTC)
+
+anunna-OST0003: lock callback timer expired after 283s: evicting client at 192.168.33.72@o2ib2 ns: filter-anunna-OST0003_UUID ... mode: PW/PW res: ...
+... 230 s later:
+anunna-OST0003: haven't heard from client ... in 227 seconds. I think it's dead, and I am evicting it.
+
+This pair (lock callback timeout, then a no-contact eviction about 230 s later from the same target) is the signature we used to find all affected clients. 54 lock-callback evictions on all OSS between 13 and 20 Oct (all 2.17.0 Omni-Path clients); 26 were followed by the second eviction and a stuck import.
+
+Stuck import (client, days later)
+
+osc.anunna-OST0003-osc-*.import: state: EVICTED, flags: invalid, in-progress_invalidations: 1, inflight: 0, unregistering: 0
+lctl dl: ... IN osc anunna-OST0003-osc-...
+lfs check servers: ... Cannot send after transport endpoint shutdown (108)
+ll_imp_inval:  osc_object_invalidate 
+
+The import is stuck in EVICTED with one invalidation in progress and no RPCs in flight; osc.*.active is 1. The invalidation thread (ll_imp_inval) is blocked in osc_object_invalidate, which waits for outstanding I/O on the object to finish. The hung writers are the only I/O we know of on that OST, so we assume that is what it waits for. A client with hung writers on several OSTs loses each of them. lctl recover and toggling active do not help; only a hard reset does (a normal reboot hangs in sync/umount on the same extent).
+
+Workaround
+
+lctl set_param llite.*.hybrid_io=0 on every client. It is per-mount, so we reapply it from a systemd unit after mounting. We tried with 'set_param -P' on the MGS but that doesn't take, I assume because the server version (2.15.8) doesn't know about hybrid_io at all.
+
+With this workaround the clients do not attempt hybrid_io, and the issue has not appeared since.
+
+ 
+
+Is this a known defect in the hybrid I/O fallback path, or a new issue? Can we help with recreating/testing and submitting logs? Since hybrid_io is default-on for 2.17.0 clients, but lustre server 2.15.8 doesn't know about it, is the default-on situation supposed to gracefully handle the mismatch? Or is turning hybrid_io off the actual solution we didn't find documented?

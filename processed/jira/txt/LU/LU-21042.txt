@@ -1,0 +1,45 @@
+Key:        LU-21042
+Summary:    nodemap: lock revocation cancels locks on the server only, client keeps stale locks and dentries
+Link:       https://jira.whamcloud.com/browse/LU-21042
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Mon, 26 Oct 2026 22:18:35 +0000
+Updated:    Tue, 27 Oct 2026 07:18:11 +0000
+Links:      Related: is related to  LU-19157; Related: is related to  LU-14058; Related: is related to LU-21041
+
+--- Description ---
+[Claude] Since 64a0a6c4559b ("LU-19157 nodemap: revoke export locks on nodemap change"), ldlm_revoke_export_locks() (called from nm_member_exp_revoke() in lustre/ptlrpc/nodemap_member.c) uses ldlm_export_cancel_locks(). That cancels the export's locks on the server only, as if the client had been evicted: the client is not told, keeps its locks and cached dentries, and the server no longer sends it blocking ASTs for them. Clients can then use stale cached negative dentries and attributes after any nodemap change that revokes locks.
+
+Found through sanity-hsm test_500 with 12 MDTs:
+
+llapi_hsm_test: llapi_test_utils.c:172: run_tests: cannot stat /mnt/lustre/d500.sanity-hsm: No such file or directory
+ sanity-hsm test_500: @@@@@@ FAIL: llapi HSM testing failed
+
+	sanity-hsm test_411 changes the nodemap rbac property just before test_500. On the MDS, the "lctl nodemap_modify" thread cancels the client's PR lock on ROOT (bits 0x13) with "ldlm_export_cancel_locks ... canceled 4 locks"; the client keeps its copy.
+
+	test_500's test_mkdir uses "-i $((500 % MDSCOUNT))", which is MDT0008 with 12 MDTs, a remote mkdir. MDT0008 gets a CW UPDATE lock on ROOT from MDT0000, and no blocking AST goes to the client because MDT0000 no longer knows about the client's lock.
+
+	The client's negative dentry from the earlier "test -d" check stays valid (ll_revalidate_dentry() returns 1), so stat() returns ENOENT.
+
+500 % MDSCOUNT is 0 for 1, 2, 4, 5 and 10 MDTs, where the mkdir goes to MDT0000 and the client's own early lock cancel drops the stale lock, so the bug is hidden in normal DNE testing. Single-node setups also hide it because 0@lo exports are never revoked. Reproduced on a 3-node cluster with 12 MDTs.
+
+The fix should send real blocking ASTs for the revoked locks, without waiting for client replies while holding the nodemap locks (nm_member_list_lock, active_config_lock, nmc_range_tree_lock) that nm_member_exp_revoke() callers hold.
+
+(Originally filed from the test_500 symptom; summary and description updated after root-causing.)
+
+--- Comment (gerrit, Tue, 27 Oct 2026 07:18:11 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70065
+
+Subject: LU-21042 ldlm: revoke export locks with a blocking AST
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5464f272167d4d801938c9f1ff2f0624858d0b07
