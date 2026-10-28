@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Sudheer Dantuluri
 Created:    2026-10-21 21:20:15.000000000
-Updated:    2026-10-26 16:14:25.000000000
-Patch Set:  2
-Insertions: +13
+Updated:    2026-10-28 08:47:23.000000000
+Patch Set:  3
+Insertions: +25
 Deletions:  -5
-Comments:   8 (0 unresolved)
+Comments:   11 (0 unresolved)
 
 --- Labels ---
-  Code-Review: wangdi: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
@@ -25,30 +25,57 @@ Comments:   8 (0 unresolved)
 LU-19921 ptlrpc: fix SEC_CTX_INIT timeout on undiscovered peer
 
 When mounting an IAM-enabled Lustre filesystem (gssiam) where MDT/OST
-servers reside on separate VMs from the MGS, the client import's
-initial connection (oic_uptodate) starts at -EAGAIN (-11) because
-LNetPeerDiscovered(&peer_nid, false) has not yet discovered the peer's
-NIDs and instead queued background peer discovery.
+servers reside on separate VMs from the MGS and peer discovery is
+disabled (discovery=0), LNetPeerDiscovered(&peer_nid, false) in
+import_select_connection() returns -EAGAIN (-11) and queues background
+peer discovery, leaving the client import's initial connection with
+oic_uptodate == -11.
 
-Next, preparing the client's CONNECT RPC triggers synchronous GSSIAM
-context initialization via sptlrpc_req_get_ctx() -> get_my_ctx() ->
-gssiam_lookup_ctx() [via sec->ps_policy->sp_cops->lookup_ctx =
-gssiam_sec_cops.lookup_ctx] -> gssiam_send_init_rpc(), which sends a
-synchronous SEC_CTX_INIT (o801) RPC on the same import while
-imp->imp_state is still LUSTRE_IMP_CONNECTING and oic_uptodate == -11.
-Because SEC_CTX_INIT blocks ptlrpc_connect_import_locked() inside
-ptlrpc_request_bufs_pack() before the CONNECT RPC is even queued,
+With krb5 and sk, sptlrpc_req_get_ctx() returns a newly allocated
+context with PTLRPC_CTX_NEW_BIT set, allowing
+ptlrpc_request_bufs_pack() to complete and
+ptlrpc_connect_import_locked() to queue the CONNECT RPC to ptlrpcd and
+register the import with the pinger. When the initial context refresh
+or CONNECT times out over the non-uptodate peer,
+ptlrpc_connect_interpret() schedules a reconnect attempt, which calls
+import_select_connection() again and refreshes oic_uptodate to 1 once
+background LNet peer discovery completes.
+
+By contrast, gssiam performs synchronous context initialization inside
+gssiam_lookup_ctx() -> gssiam_send_init_rpc(). Because SEC_CTX_INIT
+(o801) blocks ptlrpc_connect_import_locked() inside
+ptlrpc_request_bufs_pack() before the CONNECT RPC is queued,
 import_select_connection() is not called again to refresh
-oic_uptodate, and ptl_send_rpc() silently drops both the initial
-SEC_CTX_INIT RPC and its single retry (with rq_timeout = 1s and
-rq_real_sent = 0), causing the cold mount to fail with -ETIMEDOUT
-(-110).
+oic_uptodate, and ptl_send_rpc() silently drops both attempts of
+SEC_CTX_INIT while oic_uptodate == -11. Consequently,
+gssiam_lookup_ctx() returns -ETIMEDOUT directly to
+ptlrpc_request_bufs_pack(), causing ptlrpc_connect_import_locked() to
+abort before the CONNECT RPC is queued or ptlrpc_connect_interpret()
+can drive a reconnect retry.
 
-Fix this in ptl_send_rpc() (lustre/ptlrpc/niobuf.c): when
-oic_uptodate <= 0 during LUSTRE_IMP_CONNECTING and
-request->rq_ctx_init is set, re-query LNetPeerDiscovered() to refresh
-oic_uptodate (matching import_select_connection()) before dropping
-the RPC.
+Fix this in two ways:
+1. Fast path in ptl_send_rpc() (lustre/ptlrpc/niobuf.c): when
+   oic_uptodate <= 0 during LUSTRE_IMP_CONNECTING and
+   request->rq_ctx_init is set, re-query LNetPeerDiscovered() to
+   refresh oic_uptodate (matching import_select_connection()) before
+   dropping the RPC. When background peer discovery completes within
+   the first SEC_CTX_INIT attempt's 1s timeout, the retry inside
+   gssiam_send_init_rpc() refreshes oic_uptodate to 1 and succeeds
+   immediately on the first connect pass without logging an error.
+2. Fallback path in lustre/ptlrpc/gss/sec_gssiam.c (if background peer
+   discovery takes longer than gssiam_send_init_rpc()):
+   - In gssiam_lookup_ctx(), when gssiam_send_init_rpc() returns
+     -ETIMEDOUT while imp->imp_state == LUSTRE_IMP_CONNECTING, return
+     the uncached, non-uptodate context (without
+     PTLRPC_CTX_UPTODATE_BIT set and without caching it in
+     gssiam->gis_ctx) after incrementing sec->ps_nctx. This allows
+     ptlrpc_connect_import_locked() to queue the CONNECT RPC and enter
+     the normal ptlrpc_connect_interpret() / pinger reconnect state
+     machine, which refreshes oic_uptodate via
+     import_select_connection() on subsequent connect passes.
+   - In gssiam_ctx_sign(), reject GSS-framed non-SEC_CTX_INIT requests
+     (such as CONNECT) with -ETIMEDOUT if PTLRPC_CTX_UPTODATE_BIT is
+     not set on the context.
 
 Fixes: 5a89ec9e9712 ("LU-19921 ptlrpc: add GSSIAM security context client")
 Signed-off-by: Sudheer Dantuluri <dantuluris@google.com>
@@ -125,5 +152,39 @@ Patch Set 2: Code-Review+1
 
 --- Message (Sebastien Buisson, 2026-10-26 16:14:25.000000000) ---
 Patch Set 2:
+
+(1 comment)
+
+--- Message (Sudheer Dantuluri, 2026-10-27 22:07:43.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-27 22:11:05.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-27 22:20:05.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-27 22:45:42.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134585/ : SUCCESS
+
+--- Message (Sudheer Dantuluri, 2026-10-27 23:10:00.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Sudheer Dantuluri, 2026-10-27 23:14:40.000000000) ---
+Patch Set 3:
 
 (1 comment)

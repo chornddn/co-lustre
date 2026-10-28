@@ -5,11 +5,11 @@ Type:       Bug
 Priority:   Blocker
 Status:     Open
 Resolution: Unresolved
-Assignee:   Qian Yingjin
+Assignee:   Alexey Lyashkov
 Reporter:   Alexander Boyko
 Created:    Fri, 17 Apr 2026 11:35:22 +0000
-Updated:    Wed, 14 Oct 2026 16:18:04 +0000
-Links:      Related: is related to LU-20782
+Updated:    Tue, 27 Oct 2026 21:19:38 +0000
+Links:      Related: is related to LU-19427; Related: is related to LU-20782
 
 --- Environment ---
 Vms is enough for reproducer
@@ -175,3 +175,94 @@ Commit: 762205e94cd0e7d3429674f4e641a73c44d0e686
 
 --- Comment (JIRAUSER24100, Wed, 14 Oct 2026 16:18:04 +0000) ---
 Adding to 2.18 as a blocker as part of 2.18 release preparation.
+
+--- Comment (adilger, Tue, 27 Oct 2026 21:19:38 +0000) ---
+[Claude] Comparison of the two LU-20157 fixes, with test results.
+
+https://review.whamcloud.com/68711 "ldlm: do not block lock replay on invalidate_lock" keeps the LU-16651 invalidate_lock but skips it when the lock replay thread cancels unused locks (new LDLM_LRU_FLAG_NO_BLOCK / LDLM_FL_LRU_CANCEL), forcing check_and_discard_cb() in that case.  It fixes only the replay path: a blocking AST, an LRU cancel (lru_size=clear, shrinker) or namespace cleanup still take invalidate_lock exclusively and still wait for any reader of the inode.
+
+https://review.whamcloud.com/69332 "llite: clear PageUptodate only on reclaim" removes the reason for the lock.  The -EIO of LU-16651 comes from vvp_page_delete() clearing PG_uptodate while a reader is between ->read_folio() and its uptodate check (no truncated-page recheck since kernel v5.13 79e3094c53c5).  69332 clears PG_uptodate only in do_release_folio(), where removal can fail after the cl_page is gone (the LU-14541/LU-16160 orphan), and then drops ci_invalidate_page_cache and the filemap_invalidate_lock() pair entirely.  The lock cancel and truncate paths remove the folio unconditionally, so they no longer need PG_uptodate cleared or invalidate_lock held.  This covers the replay deadlock and the non-replay cases: the AST-vs-IO deadlock of LU-19427, the DIO-from-mmap ABBA Alexey described on 68711, and an LRU cancel waiting on a reader.  It also makes https://review.whamcloud.com/63132 (LU-19721) unnecessary.
+
+So 69332 addresses Alexey's concerns on 68711 in a different form, and is the broader fix.  Only one of the two should land; 68711 can be abandoned.
+
+Tests
+All on base = v2_17_60, 69332 PS6, 68711 PS7, each with the same test scripts.
+
+	recovery-small 171 from 68711 (now 69332 test_18d) (OST failover while a read of another stripe is paused in ll_read_folio() with fail_loc 0x1422).  As written it fails ost2 but places the second stripe with "-i 0", which is not OST0001 when OSTCOUNT > 2; fixed with "-o 0,1".
+
+	recovery-small 164 from 65395 (now 69332 test_18e) (buffered write + buffered read + O_DIRECT read loops across 11 OST failovers).  The file now gets "-i 0" so the IO is to the OST being failed.
+
+	new sanityn tests (69332 test_126a-c): a write from the second mount to stripe 2 (blocking AST), the same with an mmap fault reader, and lru_size=clear, each while a read of stripe 1 is paused in ll_read_folio() for 30s.  They fail if the cancel waits for the reader.
+
+Test
+Platform
+base
+68711
+69332
+
+replay vs paused read (171)
+x86_64 rocky9, 2 OSTs
+FAIL 2/2
+PASS 15/15
+PASS 15/15
+
+replay vs paused read (171)
+aarch64 rocky9 4K
+FAIL 1/1
+PASS 10/10
+PASS 10/10
+
+replay vs paused read (171)
+aarch64 rocky10 16K client
+FAIL 1/1
+-
+PASS 5/5
+
+mixed IO + OST failover (164/18e)
+x86_64 rocky9
+HANG 3/3 (30 min timeout)
+PASS 15/15
+PASS 18/18
+
+mixed IO + OST failover (164/18e)
+aarch64 rocky9 4K
+HANG 1 of 6 runs
+PASS 5/5
+PASS 7/7
+
+mixed IO + OST failover (164)
+aarch64 rocky10 16K client
+PASS 2/2 (race not hit)
+-
+PASS 3/3
+
+AST / mmap fault / LRU cancel vs paused read (sanityn)
+x86_64
+FAIL 3/3
+FAIL 3/3
+PASS 9/9
+
+AST / mmap fault / LRU cancel vs paused read (sanityn)
+aarch64 4K
+FAIL 3/3
+FAIL 3/3
+PASS 9/9
+
+AST / mmap fault / LRU cancel vs paused read (sanityn)
+aarch64 16K client
+FAIL 3/3
+-
+PASS 9/9
+
+The base hangs of 164/18e are the reported deadlock with no fault injection:
+
+ldlm_lock_replay_thread -> __ldlm_replay_locks -> ldlm_cli_cancel_list_local
+  -> ldlm_lock_cancel -> osc_ldlm_blocking_ast -> osc_lock_flush
+  -> osc_lock_discard_pages -> cl_io_init -> vvp_io_init (down_write invalidate_lock)
+dd: filemap_read -> filemap_get_pages -> filemap_update_page -> filemap_read_folio
+  -> ll_read_folio -> ll_io_read_page -> cl_sync_io_wait
+import state REPLAY_LOCKS for 30+ minutes
+
+The custom sessions Andreas queued on 69332 PS6 (sanity 833 x50, sanityn 16f x20, sanity-pcc 99b x50, covering LU-16651, LU-14541 and LU-19427) all passed.
+
+69332 PS7 adds these tests, as recovery-small test_18d (from 68711) and test_18e (from 65395, so 65395 can be abandoned), and sanityn test_126a-c, plus commit message fixes from the review comments.  The final versions fail or hang on base and pass with 69332.

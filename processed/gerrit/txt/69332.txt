@@ -7,52 +7,64 @@ Branch:     master
 Status:     NEW
 Owner:      Alexey Lyashkov
 Created:    2026-09-30 13:22:22.000000000
-Updated:    2026-10-27 18:11:01.000000000
-Patch Set:  6
-Insertions: +16
-Deletions:  -59
-Comments:   20 (6 unresolved)
-Hashtags:   218_review_blocker, 218_review_priority
+Updated:    2026-10-28 13:56:45.000000000
+Patch Set:  7
+Insertions: +203
+Deletions:  -61
+Comments:   30 (0 unresolved)
+Hashtags:   218_review_priority, 218_review_blocker
 
 --- Labels ---
-  Code-Review: Patrick Farrell: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: James Simmons: -1; Andreas Dilger: +1; Patrick Farrell: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Timothy Day, Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Alexander Boyko, Andrew Perepechko, Qian Yingjin, wangdi, Patrick Farrell
+  CC: Timothy Day, Sonia Sharma, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, James Simmons, Alexander Boyko, Andrew Perepechko, Qian Yingjin, wangdi, Patrick Farrell
 
 --- Commit Message ---
 LU-20157 llite: clear PageUptodate only on reclaim
+
+Client lock replay could deadlock with a buffered read.  Before
+replaying locks, ldlm_cancel_unused_locks_for_replay() cancels the
+idle locks of the namespace, and discarding their pages in
+osc_lock_discard_pages() took invalidate_lock of the inode exclusively
+in vvp_io_init().  A reader filling the page cache of that inode holds
+invalidate_lock shared while its read RPC waits for the import to
+leave recovery, so the replay thread waited for the reader and the
+reader for the replay.  A blocking AST or LRU cancel waited the same
+way for any reader of the inode (LU-19427).
 
 vvp_page_delete() cleared PageUptodate on every cl_page teardown.
 This violates the kernel invariant, relied upon since v5.13
 79e3094c53c5 ("mm/filemap: drop check for truncated page after I/O"),
 that invalidation leaves PG_uptodate intact.  A buffered read racing
 a DLM blocking AST could therefore find a !uptodate folio and return
--EIO (LU-16651) instead of retrying.
+-EIO (LU-16651) instead of retrying, which is why invalidate_lock was
+taken there.
 
 The flag is only needed where page removal can fail after the cl_page
-is already gone.  That is the reclaim path alone: do_release_page()
-commits cl_page_delete() before __remove_mapping() decides whether
+is already gone.  That is ->release_folio: do_release_folio() commits
+cl_page_delete() before __remove_mapping() decides whether
 folio_ref_freeze() succeeds, so an extra vmpage reference can leave a
 folio in the mapping with no cl_page.  Such a folio is invisible to
 osc_page_gang_lookup(), which walks osc->oo_tree rather than
-mapping->i_pages, and would be served stale forever.  Every other
-caller removes the folio unconditionally: cl_page_discard() via
-generic_error_remove_folio() on the AST path, and
-ll_invalidate_folio() via filemap_remove_folio() on truncate.
+mapping->i_pages, and would be served stale forever.  The lock cancel
+and truncate paths remove the folio unconditionally: cl_page_discard()
+via generic_error_remove_folio(), and ll_invalidate_folio() via
+filemap_remove_folio().
 
-Move the clear into do_release_page(), inside the !cl_page_in_use()
-branch so it fires only when the cl_page is actually destroyed.  The
-lli_page_inv_lock seqlock is retained; its only writer is now the
-reclaim path named in LU-16160.
+Move the clear into do_release_folio(), inside the !cl_page_in_use()
+branch so it fires only when the cl_page is actually destroyed.  This
+covers reclaim and also O_DIRECT write invalidation, which reaches
+->release_folio through invalidate_inode_pages2_range() and never held
+invalidate_lock.  The lli_page_inv_lock seqlock is retained for the
+reclaim race named in LU-16160.
 
-With the AST path no longer clearing PG_uptodate, it no longer needs
-to exclude page cache filling, so drop ci_invalidate_page_cache and
-the filemap_invalidate_lock() pair added by LU-16651. This also
-removes the AST-vs-IO deadlock of LU-19427, whose fix was reverted.
-The HAVE_INVALIDATE_LOCK configure check has no remaining users and is
+With lock cancel no longer clearing PG_uptodate, it no longer needs to
+exclude page cache filling, so drop ci_invalidate_page_cache and the
+filemap_invalidate_lock() pair added by LU-16651.  The
+HAVE_INVALIDATE_LOCK configure check has no remaining users and is
 removed.
 
 The reclaim refcount race itself is deliberately left alone, and
@@ -67,12 +79,21 @@ semantics for every caller and regressed sanity 255b and 398a.
 Closing the window properly requires deferred teardown from
 ->free_folio.
 
-Fixes: f2a16793fa ("LU-14541 llite: avoid stale data reading")
-Fixes: b4da788a81 ("LU-16160 llite: SIGBUS is possible on a race with page reclaim")
-Fixes: bba59b1287 ("LU-16651 llite: hold invalidate_lock when invalidate cache pages")
-Fixes: 7e0ccbf241 ("Revert "LU-19427 llite: fix invalidate_lock deadlock for mixed BIO/DIO"")
-Assisted-by: ClaudeCode:claude-opus-5-5
+Add recovery-small test_18d (from Di Wang) and test_18e (from
+Alexander Boyko) for the lock replay deadlock, and sanityn test_126a-c
+for a blocking AST, an mmap fault reader and an LRU cancel waiting for
+a reader of another stripe of the same file.
+
+Test-Parameters: testlist=sanity env=ONLY=833,ONLY_REPEAT=50
+Test-Parameters: testlist=sanityn env=ONLY=16f,ONLY_REPEAT=20
+Test-Parameters: testlist=sanity-pcc env=ONLY=99b,ONLY_REPEAT=50
+Fixes: f2a16793fa43 ("LU-14541 llite: avoid stale data reading")
+Fixes: b4da788a819f ("LU-16160 llite: SIGBUS is possible on a race with page reclaim")
+Fixes: bba59b1287c9 ("LU-16651 llite: hold invalidate_lock when invalidate cache pages")
+Fixes: 7e0ccbf24182 ("Revert "LU-19427 llite: fix invalidate_lock deadlock for mixed BIO/DIO"")
 Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: I832610825184b701124f939a4a1750ae5108125b
 
 --- Review History ---
@@ -323,5 +344,65 @@ Patch Set 6:
 
 --- Message (Patrick Farrell, 2026-10-27 18:11:01.000000000) ---
 Patch Set 6: Code-Review+1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-27 20:19:36.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-27 21:19:16.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-27 21:25:57.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-27 21:34:29.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Andreas Dilger, 2026-10-27 21:54:50.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-10-27 22:04:13.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-10-27 22:09:53.000000000) ---
+Patch Set 7:
+
+(6 comments)
+
+--- Message (Patrick Farrell, 2026-10-27 22:32:21.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (jenkins, 2026-10-27 22:36:28.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134584/ : SUCCESS
+
+--- Message (patrick bot, 2026-10-28 04:10:07.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-10-28 13:47:52.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (James Simmons, 2026-10-28 13:56:45.000000000) ---
+Patch Set 7: Code-Review-1
 
 (1 comment)

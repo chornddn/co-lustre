@@ -1,5 +1,5 @@
 Change:     66826
-Subject:    LU-15864 ofd: recreate missing object for OST_SETATTR replay
+Subject:    LU-15864 ofd: recreate lost objects for all requests
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66826
 Change-Id:  I065028c2c39a3a724ff7af152e6bd5db66ccfe04
 Project:    fs/lustre-release
@@ -7,48 +7,61 @@ Branch:     master
 Status:     NEW
 Owner:      Sonia Sharma
 Created:    2026-06-23 21:25:46.000000000
-Updated:    2026-10-27 17:00:33.000000000
-Patch Set:  2
-Insertions: +147
-Deletions:  -46
-Comments:   30 (14 unresolved)
+Updated:    2026-10-28 12:30:44.000000000
+Patch Set:  3
+Insertions: +582
+Deletions:  -103
+Comments:   37 (18 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1; Patrick Farrell: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Patrick Farrell
 
 --- Commit Message ---
-LU-15864 ofd: recreate missing object for OST_SETATTR replay
+LU-15864 ofd: recreate lost objects for all requests
 
-A replayed OST_SETATTR can race with OST orphan cleanup
-after OST recovery has completed. The object referenced
-by the replay may not exist on the OST yet, because it is
-recreated as part of the MDT/OST resync driven by the first
-orphan cleanup request after recovery.
+An OST restart loses the objects it had precreated but not
+committed. Write replay recreates them during OST recovery,
+and the MDT's orphan cleanup does so once the MDT is out of
+its own recovery. When the MDT restarts too, as when MDTs and
+OSTs share a server, that can be well after the OST has
+finished recovery. A request reaching the OST in between finds
+its object missing and fails with -ENOENT. A write with a
+cached lock fails this way and the application gets -EIO; a
+setattr from the MDT is dropped as if the object were gone.
+Only lock enqueue handled the window, by returning -EINPROGRESS
+since LU-15195.
 
-OST_WRITE already handles the recovery case by synchronously
-recreating objects up to the replayed object ID in
-ofd_preprw_write(). However, OST_SETATTR directly looks up the
-target object in ofd_setattr_hdl(). If the lookup returns -ENOENT
-in the window after OST recovery but before orphan cleanup/resync
-has completed, the replayed setattr is lost.
+Recreate a missing object, and those below it in its sequence,
+if its ID is above the OST's LAST_ID and either the OST is in
+recovery or the MDT has yet to run orphan cleanup for the
+sequence, within the hard recovery timeout. Do this for read,
+write, getattr, setattr, punch, fallocate, sync, seek, fiemap
+and ladvise, using a local transaction so that a request is not
+given a transno for it. Do not recreate while LFSCK rebuilds
+LAST_ID, nor over a gap that orphan cleanup would take as a
+replaced OST: write replay used to recreate any gap.
 
-Factor the recreate logic into ofd_recreate_objects() and reuse it
-from the write path. For replayed OST_SETATTR, retry a missing-object
-lookup after guarded recreation. Recreation is allowed only while OST
-recovery is active, or while the first orphan-cleanup resync is still
-pending within the hard recovery timeout, and only for object IDs
-beyond the OST's current LAST_ID. Error out on recreation if the gap
-above LAST_ID exceeds OST_MAX_PRECREATE.
+Lock enqueue cannot create the object, as orphan cleanup inits
+LVBs while holding the sequence's create lock. Its -EINPROGRESS
+kept stat and chown of a lost object waiting for orphan cleanup,
+however long the MDT took to recover. Give a lost object the
+empty LVB of the object it will be recreated as instead. A
+missing object at or below LAST_ID was destroyed, and still
+gets -ENOENT.
 
-This preserves the existing OST_WRITE behavior while covering the same
-missing-object race for OST_SETATTR replay.
+Add replay-ost-single tests 12c to 12l, which fail over the
+MDT and the OST together with orphan cleanup delayed and check
+that each kind of request succeeds.
 
+Test-Parameters: testlist=replay-ost-single
+Assisted-by: ClaudeCode:claude-opus-5-5
 Signed-off-by: Sonia Sharma <sonia.sh.sharma@oracle.com>
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 Change-Id: I065028c2c39a3a724ff7af152e6bd5db66ccfe04
 
 --- Review History ---
@@ -606,5 +619,370 @@ Code-wise looks good to me.
 
 --- Message (Patrick Farrell, 2026-10-27 17:00:33.000000000) ---
 Patch Set 2: Code-Review-1
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2026-10-27 19:48:58.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-10-27 19:49:13.000000000) ---
+Patch Set 3:
+
+Patch set 3 extends this to every OST request that looks up an object (read, write, getattr, setattr, punch, fallocate, sync, seek, fiemap and ladvise), and gives a lost object an empty LVB on lock enqueue instead of -EINPROGRESS, so stat and chown no longer wait for orphan cleanup. It also fixes what the AI review found in patch set 2: the gap is no longer truncated to int, a large gap no longer returns -EOVERFLOW (which replay takes as a VBR failure), and recreation holds ofd_lastid_rwsem so it cannot race an LFSCK LAST_ID rebuild. The replay-single test is replaced by replay-ost-single 12c to 12l, which fail over the MDT and the OST together; all ten fail on master and pass with this patch.
+
+Related: the compressed write path in https://review.whamcloud.com/68347 (ofd_compress.c) has its own 'BRW to missing obj' check, which would need the same ofd_object_recreate() call if it lands after this.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-27 19:52:02.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Patrick Farrell, 2026-10-27 19:55:01.000000000) ---
+Patch Set 3:
+
+Correction to my note above about 68347: its compressed read and write paths branch off ofd_preprw_read() and ofd_preprw_write() after the missing-object checks, so this patch already covers them. The two only conflict textually; I have noted that on 68347.
+
+--- Message (wc-checkpatch, 2026-10-27 20:00:50.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-27 21:08:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134570/ : SUCCESS
+
+--- Message (Maloo, 2026-10-27 21:13:32.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 134570 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134570&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134570#redirect
+
+--- Message (Maloo, 2026-10-28 00:50:29.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm174: https://testing.whamcloud.com/test_sessions/f55ec732-e272-46c3-8142-ddb10d06f618 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 00:52:30.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm64: https://testing.whamcloud.com/test_sessions/c4cddcea-c7cf-46c1-9fa4-ab80502efbd2 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 00:58:44.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm218: https://testing.whamcloud.com/test_sessions/15f90913-c490-4378-b07c-f702561bf6ff ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:04:56.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm115: https://testing.whamcloud.com/test_sessions/4b1fc363-c72a-4156-9437-5853fda6b5d3 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:04:56.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm289: https://testing.whamcloud.com/test_sessions/8626f1de-31d8-4862-8e09-4bd3cba623fe ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:04:57.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm165: https://testing.whamcloud.com/test_sessions/64246dc7-4321-4318-9712-930ec01963b9 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:04:57.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm10: https://testing.whamcloud.com/test_sessions/30a1a6a4-4153-4062-9c69-65b3e5ff31b2 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:04:57.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm156: https://testing.whamcloud.com/test_sessions/2c29aee7-4366-49a3-af71-20461008d9cc ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:05:23.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm222: https://testing.whamcloud.com/test_sessions/e45460f0-c331-4ffd-bf99-e5e323b89c2f ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:05:23.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm286: https://testing.whamcloud.com/test_sessions/b5a57926-8c0d-4ec1-9796-193078c378da ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:05:55.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-144vm22: https://testing.whamcloud.com/test_sessions/28a89a93-57c1-4307-a977-a4ea9b357e00 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:36:12.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm76: https://testing.whamcloud.com/test_sessions/95337417-0a99-41bc-af1c-dcc90bb4fb42 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:36:12.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm77: https://testing.whamcloud.com/test_sessions/d4d4ce39-00d2-4d77-9f2d-909c158260a1 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:36:42.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm114: https://testing.whamcloud.com/test_sessions/ea7098e9-37cd-481a-892a-1248e59cf1fa ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:44:18.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-144vm4: https://testing.whamcloud.com/test_sessions/c1038b96-2d5d-49ab-8269-c5b1542ba2ab ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 01:54:29.000000000) ---
+Patch Set 3:
+
+Failed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm298: https://testing.whamcloud.com/test_sessions/4f9bdef0-b552-4650-8c3b-187fdb4d0759 ran 3 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 04:15:47.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm38: https://testing.whamcloud.com/test_sessions/94eadb61-6db5-4f05-a94e-e6c60043c00b ran 8 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 05:36:37.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-part-4 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm117: https://testing.whamcloud.com/test_sessions/bd8c06f4-7d29-4c9a-ac66-1b2a15696d08 ran 9 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 06:01:25.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm105: https://testing.whamcloud.com/test_sessions/03acd5d6-93c1-4a92-b5fe-fa6764c512ae ran 9 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 06:15:12.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm152: https://testing.whamcloud.com/test_sessions/27cd7908-77be-4990-9223-af47619ab5bc ran 9 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 06:28:44.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm288: https://testing.whamcloud.com/test_sessions/b7c88992-31b4-4fd2-85f1-b9a0ecbc2a35 ran 7 tests.  1 tests failed: sanity-sec.
+
+--- Message (Maloo, 2026-10-28 07:07:44.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-part-4 on RHEL 10.1 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm43: https://testing.whamcloud.com/test_sessions/57a42146-a9d1-4117-9faf-57309b0f1455 ran 9 tests.  1 tests failed: replay-ost-single.
+
+--- Message (Maloo, 2026-10-28 10:37:55.000000000) ---
+Patch Set 3: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm192: https://testing.whamcloud.com/test_sessions/6732eec1-0c09-45da-a126-cc8265db2ccc ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-28 10:51:36.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The recreate approach and the lock ordering (ofd_lastid_rwsem -> os_create_lock, no LDLM enqueue under os_create_lock) look right. A few minor comments inline; none is a reason to re-spin on its own.
+
+--- Message (patrick bot, 2026-10-28 12:30:44.000000000) ---
+Patch Set 3:
 
 (1 comment)

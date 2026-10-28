@@ -1,5 +1,5 @@
 Change:     69035
-Subject:    LU-19699 quota: release grant via DQACQ on qunit shrink
+Subject:    LU-19699 quota: retry grant release on qmt failure
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69035
 Change-Id:  I129020a8e02b848b696cd2bc85c19672a0f8b594
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-18 09:23:11.000000000
-Updated:    2026-10-27 16:58:58.000000000
-Patch Set:  8
-Insertions: +222
-Deletions:  -66
-Comments:   26 (0 unresolved)
+Updated:    2026-10-28 12:34:29.000000000
+Patch Set:  9
+Insertions: +337
+Deletions:  -6
+Comments:   29 (2 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
@@ -22,66 +22,26 @@ Comments:   26 (0 unresolved)
   REVIEWER: Andreas Dilger, Sergey Cheremencev
 
 --- Commit Message ---
-LU-19699 quota: release grant via DQACQ on qunit shrink
+LU-19699 quota: retry grant release on qmt failure
 
-qsd_id_glimpse_ast() returns the surplus space in the glimpse
-reply and drops it from lqe_granted right away, but the slave
-QSD never learns if the master fails to apply that release in
-qmt_lvbo_update(). The master then keeps more grant accounted
-than the slave owns, and the leak eventually causes a bogus
--EDQUOT. OBD_FAIL_QUOTA_PREACQ (fail_loc=0xa06) triggers this
-and causes test_80 in sanity-quota.sh to fail intermittently.
+qsd_id_glimpse_ast() drops the surplus space from lqe_granted and
+reports it in lvb_id_rel. If the master fails to apply that release
+in qmt_lvbo_update(), for instance with OBD_FAIL_QUOTA_PREACQ, the
+space stays charged to the slave and the next write gets a bogus
+-EDQUOT.
 
-Only report the surplus in lvb_id_may_rel and let the regular
-DQACQ release path return it, then it will be transactional and
-retried on failure, so the two sides cannot diverge.
+Queue the failed release on the qmt and replay it every second
+until it succeeds. Requests for the same slave and target index are
+merged, and the ones which can never succeed are dropped.
 
-The master still handles lvb_id_rel in qmt_lvbo_update() so that
-older slaves keep working during a rolling upgrade. In the other
-direction, a patched slave with an unpatched master still releases
-via DQACQ, but the old master only waits 2s from "lqe_revoke_time"
-before setting edquot, so a transient -EDQUOT is still possible in
-that mixed version window.
-
-qmt_adjust_edquot() is now the only thing holding edquot off
-until the DQACQ arrives: anchor its grace period to the reply
-that claimed the release (lqe_may_rel_time) rather than to
-"lqe_revoke_time", which may be much older, and raise the
-timeout from 2s to LQUOTA_MAY_REL_TIMEOUT (10s) to cover the
-extra round trip and the QSD update thread scheduling, otherwise
-the master sets edquot first and clients see a transient
--EDQUOT. The claim is recorded on the pool lqes too in
-qmt_lvbo_update(), so that a pool lqe marked edquot by
-qmt_set_revoke() is held off as well.
-
-The release does not necessarily return what was advertised:
-qsd_calc_adjust() recomputes it from the usage at the time the
-request is sent, so part of the surplus may be consumed in the
-meantime. The slave accumulates the advertised amounts on its
-lqe and returns the sum in qb_usage, guarded by the new flag
-QUOTA_DQACQ_FL_MAY_REL, with its next release request; when
-there is nothing left to release it sends one without any space.
-An unpatched master ignores the flag and behaves as before.
-
-qmt_dqacq0() subtracts that amount, clamped at 0, from
-lqe_may_rel of every lqe after the release has been committed:
-settling it before the writes would drop the claim even when
-qmt_restore_lqes() has to roll the release back. The amount is
-per slave, so the surplus recorded for other slaves is kept; it
-is recorded per target too, so a release that reaches the master
-before the glimpse reply is processed settles nothing and its
-claim is left to the timeout, the same for a request without a
-target index (DOM quota).
-
-A surplus older than LQUOTA_MAY_REL_TIMEOUT cannot hold edquot
-off any more, so both sides drop it: the master in
-qmt_adjust_edquot(), the slave one second earlier in
-qsd_calc_adjust() and before accumulating a new one. A claim
-whose release never arrives, e.g. from a slave that went away,
-would otherwise keep delaying edquot in every following round.
+A reconnecting slave reads its slave index back from the master, so
+it must not see a release which is still queued. Replay the queue
+of that slave index in IT_QUOTA_CONN and return -EAGAIN while
+requests are left: the slave reconnects again, on its next DQACQ or
+within a minute when idle.
 
 Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=50
-Fixes: 318fd8d197ff ("LU-1842 quota: qsd lock")
+Fixes: 51435cfffcd6 ("LU-1842 quota: add acq/rel logic on QMT")
 Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
 Assisted-by: DeepSeek:V4.1-Flash llm_code_and_review_tools
 Change-Id: I129020a8e02b848b696cd2bc85c19672a0f8b594
@@ -363,3 +323,38 @@ https://build.whamcloud.com/job/lustre-reviews/134531/ : SUCCESS
 Patch Set 8:
 
 Looks good to me.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-27 23:57:22.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Moving the release onto the DQACQ path looks right, but the new per-target lge_may_rel bookkeeping has two holes. It is fed MDT indexes for DOM, and it never ages out. Either can let a release settle a claim that some other target made, which brings back the transient -EDQUOT this patch is meant to remove.
+
+--- Message (Hongchao Zhang, 2026-10-28 11:45:18.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-28 11:48:05.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-28 11:56:08.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-28 12:33:49.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134626/ : SUCCESS

@@ -1,5 +1,5 @@
 Change:     66826
-Subject:    LU-15864 ofd: recreate missing object for OST_SETATTR replay
+Subject:    LU-15864 ofd: recreate lost objects for all requests
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/66826
 Change-Id:  I065028c2c39a3a724ff7af152e6bd5db66ccfe04
 Project:    fs/lustre-release
@@ -7,48 +7,61 @@ Branch:     master
 Status:     NEW
 Owner:      Sonia Sharma
 Created:    2026-06-23 21:25:46.000000000
-Updated:    2026-10-27 17:00:33.000000000
-Patch Set:  2
-Insertions: +147
-Deletions:  -46
-Comments:   30 (14 unresolved)
+Updated:    2026-10-28 12:30:44.000000000
+Patch Set:  3
+Insertions: +582
+Deletions:  -103
+Comments:   37 (18 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1; Patrick Farrell: -1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Patrick Farrell
 
 --- Commit Message ---
-LU-15864 ofd: recreate missing object for OST_SETATTR replay
+LU-15864 ofd: recreate lost objects for all requests
 
-A replayed OST_SETATTR can race with OST orphan cleanup
-after OST recovery has completed. The object referenced
-by the replay may not exist on the OST yet, because it is
-recreated as part of the MDT/OST resync driven by the first
-orphan cleanup request after recovery.
+An OST restart loses the objects it had precreated but not
+committed. Write replay recreates them during OST recovery,
+and the MDT's orphan cleanup does so once the MDT is out of
+its own recovery. When the MDT restarts too, as when MDTs and
+OSTs share a server, that can be well after the OST has
+finished recovery. A request reaching the OST in between finds
+its object missing and fails with -ENOENT. A write with a
+cached lock fails this way and the application gets -EIO; a
+setattr from the MDT is dropped as if the object were gone.
+Only lock enqueue handled the window, by returning -EINPROGRESS
+since LU-15195.
 
-OST_WRITE already handles the recovery case by synchronously
-recreating objects up to the replayed object ID in
-ofd_preprw_write(). However, OST_SETATTR directly looks up the
-target object in ofd_setattr_hdl(). If the lookup returns -ENOENT
-in the window after OST recovery but before orphan cleanup/resync
-has completed, the replayed setattr is lost.
+Recreate a missing object, and those below it in its sequence,
+if its ID is above the OST's LAST_ID and either the OST is in
+recovery or the MDT has yet to run orphan cleanup for the
+sequence, within the hard recovery timeout. Do this for read,
+write, getattr, setattr, punch, fallocate, sync, seek, fiemap
+and ladvise, using a local transaction so that a request is not
+given a transno for it. Do not recreate while LFSCK rebuilds
+LAST_ID, nor over a gap that orphan cleanup would take as a
+replaced OST: write replay used to recreate any gap.
 
-Factor the recreate logic into ofd_recreate_objects() and reuse it
-from the write path. For replayed OST_SETATTR, retry a missing-object
-lookup after guarded recreation. Recreation is allowed only while OST
-recovery is active, or while the first orphan-cleanup resync is still
-pending within the hard recovery timeout, and only for object IDs
-beyond the OST's current LAST_ID. Error out on recreation if the gap
-above LAST_ID exceeds OST_MAX_PRECREATE.
+Lock enqueue cannot create the object, as orphan cleanup inits
+LVBs while holding the sequence's create lock. Its -EINPROGRESS
+kept stat and chown of a lost object waiting for orphan cleanup,
+however long the MDT took to recover. Give a lost object the
+empty LVB of the object it will be recreated as instead. A
+missing object at or below LAST_ID was destroyed, and still
+gets -ENOENT.
 
-This preserves the existing OST_WRITE behavior while covering the same
-missing-object race for OST_SETATTR replay.
+Add replay-ost-single tests 12c to 12l, which fail over the
+MDT and the OST together with orphan cleanup delayed and check
+that each kind of request succeeds.
 
+Test-Parameters: testlist=replay-ost-single
+Assisted-by: ClaudeCode:claude-opus-5-5
 Signed-off-by: Sonia Sharma <sonia.sh.sharma@oracle.com>
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
 Change-Id: I065028c2c39a3a724ff7af152e6bd5db66ccfe04
 
 --- Review History ---
@@ -158,5 +171,58 @@ Code-wise looks good to me.
 
 --- Message (Patrick Farrell, 2026-10-27 17:00:33.000000000) ---
 Patch Set 2: Code-Review-1
+
+(1 comment)
+
+--- Message (Patrick Farrell, 2026-10-27 19:48:58.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Patrick Farrell, 2026-10-27 19:49:13.000000000) ---
+Patch Set 3:
+
+Patch set 3 extends this to every OST request that looks up an object (read, write, getattr, setattr, punch, fallocate, sync, seek, fiemap and ladvise), and gives a lost object an empty LVB on lock enqueue instead of -EINPROGRESS, so stat and chown no longer wait for orphan cleanup. It also fixes what the AI review found in patch set 2: the gap is no longer truncated to int, a large gap no longer returns -EOVERFLOW (which replay takes as a VBR failure), and recreation holds ofd_lastid_rwsem so it cannot race an LFSCK LAST_ID rebuild. The replay-single test is replaced by replay-ost-single 12c to 12l, which fail over the MDT and the OST together; all ten fail on master and pass with this patch.
+
+Related: the compressed write path in https://review.whamcloud.com/68347 (ofd_compress.c) has its own 'BRW to missing obj' check, which would need the same ofd_object_recreate() call if it lands after this.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-27 19:52:02.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Patrick Farrell, 2026-10-27 19:55:01.000000000) ---
+Patch Set 3:
+
+Correction to my note above about 68347: its compressed read and write paths branch off ofd_preprw_read() and ofd_preprw_write() after the missing-object checks, so this patch already covers them. The two only conflict textually; I have noted that on 68347.
+
+--- Message (wc-checkpatch, 2026-10-27 20:00:50.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-27 21:08:43.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134570/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-10-28 10:51:36.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. The recreate approach and the lock ordering (ofd_lastid_rwsem -> os_create_lock, no LDLM enqueue under os_create_lock) look right. A few minor comments inline; none is a reason to re-spin on its own.
+
+--- Message (patrick bot, 2026-10-28 12:30:44.000000000) ---
+Patch Set 3:
 
 (1 comment)
