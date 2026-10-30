@@ -1,0 +1,77 @@
+Key:        LU-21076
+Summary:    llite: a stale OSC cat_size overwrites an MDT file size, breaking append, lseek and fallocate
+Link:       https://jira.whamcloud.com/browse/LU-21076
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Fri, 30 Oct 2026 08:36:12 +0000
+Updated:    Fri, 30 Oct 2026 08:48:57 +0000
+
+--- Description ---
+cat_size is authoritative for the OSC layer only. ll_update_inode()
+
+installs body->mbo_size straight into i_size and never touches the
+
+cl_attr, so i_size can legitimately be newer than cat_size. On a
+
+PFL layout it stays that way for as long as a component is unlocked and its
+
+LVB is stale.
+
+Both vvp_prep_size() and ll_merge_attr() then write that stale
+
+cat_size over the newer size, and the callers that read i_size right
+
+back suffer for it:
+
+an append takes its offset from it - vvp_io_write_start();
+
+lseek() turns a too small size into -ENXIO -
+
+vvp_io_lseek_start();
+
+fallocate() sizes its request from it.
+
+Fix
+
+Track where i_size came from. LLIF_SIZE_FROM_MDT marks it as newer
+
+than the OSC attributes, and neither vvp_prep_size() nor
+
+ll_merge_attr() lowers it while the flag is set.
+
+The flag is cleared where the OSC attributes become the newer ones:
+
+in cl_glimpse_lock(), where cl_lock_request() has either refreshed
+
+the LVBs by a glimpse RPC or matched a lock over the whole file, in which
+
+case cat_size is maintained locally;
+
+in vvp_do_vmtruncate(), where this client has just set the size itself.
+
+A remote truncate is therefore still able to shrink i_size - sanityn
+
+test_16i.
+
+ll_inode_size_lock() is deliberately not taken in ll_update_inode():
+
+ll_lov_setstripe_ea_info() already holds it across
+
+ll_intent_file_open() -> ll_prep_inode() -> ll_update_inode().
+
+--- Comment (gerrit, Fri, 30 Oct 2026 08:48:57 +0000) ---
+"Alexey Lyashkov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70225
+
+Subject: LU-21076 llite: keep an MDT file size against stale OSC attributes
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a80ffdd6762b67f546525995283d878473ccaafe

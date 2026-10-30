@@ -1,0 +1,56 @@
+Key:        LU-21067
+Summary:    llite write_bytes does not count tiny writes
+Link:       https://jira.whamcloud.com/browse/LU-21067
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Krause
+Created:    Thu, 29 Oct 2026 16:04:34 +0000
+Updated:    Thu, 29 Oct 2026 16:12:20 +0000
+
+--- Description ---
+Problem
+
+The write_bytes sum in llite..stats does not include successful buffered writes completed by ll_do_tiny_write(). Applications can write data successfully while the client counter under-reports their bytes.
+
+This path is used when tiny_write is enabled, the write is smaller than a page and stays within one page, and the existing cache and locking conditions are met. The page must already be cached, uptodate and dirty. Direct, synchronous and append writes do not use this path.
+
+Cause
+
+ll_do_tiny_write() has no LPROC_LL_WRITE_BYTES tally. When it consumes the whole iterator, do_file_write_iter() skips ll_file_io_generic(), where normal writes update that counter. If a tiny write completes only a prefix, the normal path counts only the remaining bytes.
+
+Commit 5208135f432a320e92dacd21e64dd4900fe9858e (LU-15197, review 45476) removed the tiny-write tally. The complete-tiny-write early exit was already present in its parent. The removal is present in the 2.15.0 source and the missing tally is still present in upstream master 40b80bc0485c7c651c33f67586c5e24b0bff061b. This is source-history evidence, not a runtime test of every release.
+
+Reproduction
+
+Use an otherwise idle, dedicated test mount. Select its exact llite. parameter prefix.
+
+	Record the client version and save the mount's tiny_write setting.
+
+	Enable tiny_write and record the write_bytes sum without clearing shared counters.
+
+	Create a new file with dd if=/dev/zero of= bs=8 count=64. Check the command's exit status.
+
+	Flush the file after the write loop. Verify that its size is 512 bytes and its contents are zero. Read the same mount's write_bytes sum and calculate the increase.
+
+	Restore tiny_write after success or failure and verify the restored value. Repeat with tiny_write=0 as a control.
+
+Expected: the counter increases by 512 bytes in both cases.
+
+Affected behavior: when the first 8-byte write uses the normal path and the following 63 writes use the tiny-write path, the counter increases by only 8 bytes.
+
+Writeback can make later writes use the normal path. A 512-byte result alone therefore does not prove the tiny-write path is correct. A regression test must establish that it exercises the affected path.
+
+Evidence and proposed repair
+
+Earlier test logs from a development build reporting version 2.17.60 show write_bytes sum 8 != 512 for this workload. A local candidate restored the positive-result tally and passed 20 repeated runs. Those logs do not identify the exact loaded binary, so they are historical reproduction evidence, not validation of a final upstream patch.
+
+Restore byte accounting for positive results in ll_do_tiny_write(). Keep normal-path accounting limited to the remaining iterator bytes. Before upload, strengthen the regression test to verify file contents and size, counter-read errors, the disabled control and setting restoration. Cover partial completion and fallback without double counting, and bind baseline/fixed results to exact source and binaries.
+
+Related work and scope
+
+LU-19939 / review 64270 optimizes the same path. LU-20253 / review 67801 covers attribute handling.
+
+This bug is independent of the client jobstats feature in LU-21060. Queued-AIO accounting remains under LU-20186. Keep this repair client-only and limited to the existing tiny-write byte counter.

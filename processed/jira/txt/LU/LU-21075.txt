@@ -1,0 +1,85 @@
+Key:        LU-21075
+Summary:    llite: vvp_prep_size() shrinks i_size down to KMS, a racing stat() reports a PFL component boundary
+Link:       https://jira.whamcloud.com/browse/LU-21075
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Fri, 30 Oct 2026 08:32:30 +0000
+Updated:    Fri, 30 Oct 2026 08:48:57 +0000
+
+--- Description ---
+vvp_prep_size() writes KMS into i_size unconditionally:
+
+i_size_write(inode, kms);
+
+KMS is a lower bound only. osc_lock_lvb_update() clamps it to the end of
+
+the granted DLM extent, and sub-objects with no valid KMS contribute nothing
+
+to the merged value. On a PFL file whose size lives in a component the client
+
+holds no lock on, that publishes the end of the component being read as the
+
+file size.
+
+A concurrent stat() reads i_size back out of the inode and reports it.
+
+A 4K read at offset 0 of a 200MB file whose first component ends at 128K
+
+leaves i_size at 131072, while the cat_size of the very same
+
+cl_attr says 209715200.
+
+Where it comes from
+
+The unconditional write was introduced by:
+
+ec07ddc4120b9850982c8f39bcc43e57d2d76549
+
+LUS-13048 llite: set read size correctly
+
+Before it, i_size was only ever extended:
+
+if (i_size_read(inode) Fix
+
+Extend i_size up to KMS, and use cat_size as the upper bound rather
+
+than KMS:
+
+cat_size is max(lvb_size, loi_kms) per stripe, merged as a max over
+
+the instantiated components, so it is always >= KMS;
+
+the OSC layer lowers it only on an authoritative update, such as another
+
+client's truncate.
+
+Keeping that clamp is what stops the generic read loop - which runs to
+
+i_size with no further control from llite - from returning zeroes between
+
+a new EOF and a stale i_size after a remote truncate, i.e. sanityn
+
+test_16i still passes.
+
+i_size is sampled once for both comparisons, since ll_update_inode()
+
+writes it without ll_inode_size_lock() and a second read may differ; the
+
+debug lines print the value actually written.
+
+--- Comment (gerrit, Fri, 30 Oct 2026 08:48:57 +0000) ---
+"Alexey Lyashkov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70224
+
+Subject: LU-21075 llite: do not shrink i_size down to KMS
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 23d1f100769a9c0d8dc5d77b43d65654afcefea6

@@ -1,0 +1,261 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21060] Client-side per-job statistics for OSC, MDC and llite</title>
+                <link>https://jira.whamcloud.com/browse/LU-21060</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;b&gt;Problem&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;CSP-managed Lustre services wall off backend access. Users, admins and&lt;br/&gt;
+cluster operators cannot read the server-side `mdt.*.job_stats` and&lt;br/&gt;
+`obdfilter.*.job_stats` counters. Jobstats is an essential tool for cluster&lt;br/&gt;
+operators to monitor and assess filesystem use. It helps them see which&lt;br/&gt;
+jobs use the resources and check that sharing is fair and works as&lt;br/&gt;
+intended. We need jobstats on the clients because operators cannot access&lt;br/&gt;
+it on the servers.&lt;/p&gt;
+
+&lt;p&gt;Large Lustre users increasingly run both on-premises Lustre and&lt;br/&gt;
+CSP-managed Lustre services. Operators need the same per-job visibility in&lt;br/&gt;
+both environments. Client-side jobstats provides a uniform observability&lt;br/&gt;
+surface for monitoring use and checking resource sharing across both.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Proposed behavior&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Keep the feature client-only. It must work with unmodified servers and&lt;br/&gt;
+require no server upgrade, server configuration change, wire-format change&lt;br/&gt;
+or disk-format change. Operators must be able to deploy it on clients&lt;br/&gt;
+without changes by the managed service provider.&lt;/p&gt;
+
+&lt;p&gt;Follow server jobstats semantics and defaults wherever they apply. Reuse&lt;br/&gt;
+job ID selection, corresponding counter names and units, YAML records,&lt;br/&gt;
+clear and per-job removal, and cleanup rules. Keep existing `jobid_var`&lt;br/&gt;
+and `jobid_name` behavior and defaults, including `jobid_var=disable`.&lt;br/&gt;
+Keep the default `job_cleanup_interval` at 600 seconds. Cleanup is&lt;br/&gt;
+periodic; the interval is not an exact record-expiry deadline.&lt;/p&gt;
+
+&lt;p&gt;Use one feature LU for three interfaces:&lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;`osc.*.job_stats`: per-job bytes and RPC activity for each OST import,&lt;br/&gt;
+with client RPC round-trip and queue times.&lt;/li&gt;
+	&lt;li&gt;`mdc.*.job_stats`: per-job metadata operations and Data-on-MDT bytes&lt;br/&gt;
+for each MDT import, with client RPC timings.&lt;/li&gt;
+	&lt;li&gt;`llite.*.job_stats`: a later delivery for application operations and&lt;br/&gt;
+bytes per mount, including reads served from the page cache.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The first delivery implements OSC and MDC. Client counting is disabled&lt;br/&gt;
+by default. Each device has `enable_job_stats=0` and&lt;br/&gt;
+`job_cleanup_interval=600`. Client `job_stats` files use debugfs mode&lt;br/&gt;
+`0600`. Their rejected-update counters use mode `0400`. The interface&lt;br/&gt;
+location and control names need upstream design review.&lt;/p&gt;
+
+&lt;p&gt;OSC and MDC use the job ID already carried on each RPC. Preserve existing&lt;br/&gt;
+shared-file, writeback, background-worker and retry attribution limits.&lt;br/&gt;
+Do not add a new job ID or change requests to improve attribution.&lt;br/&gt;
+Disabling a job ID mode does not rewrite IDs already carried by requests&lt;br/&gt;
+in flight.&lt;/p&gt;
+
+&lt;p&gt;Count successful RPC payload bytes after completion, using the transferred&lt;br/&gt;
+size for bulk I/O and the validated reply payload size for inline reads.&lt;br/&gt;
+Server page padding at EOF is included when it is transferred. These&lt;br/&gt;
+counts can exceed bytes returned to the application. Application-byte&lt;br/&gt;
+accounting belongs to the later llite interface.&lt;/p&gt;
+
+&lt;p&gt;Count metadata operations from successful replies observed by the client. For&lt;br/&gt;
+metadata batches, count each validated successful positive lookup in the&lt;br/&gt;
+completed prefix. Do not count an unreturned or retried suffix as done.&lt;br/&gt;
+The existing batch interpreter owns reply decoding.&lt;/p&gt;
+
+&lt;p&gt;Client RPC time is not server service time. Data RPC timing can include&lt;br/&gt;
+an attempt that received an error reply; successful-byte accounting cannot.&lt;br/&gt;
+Queue time applies to requests sent once, excluding deliberate retry&lt;br/&gt;
+backoff. A client sees only its own activity. These counters do not promise&lt;br/&gt;
+exact equality with server counters across errors, retries, cache hits,&lt;br/&gt;
+server versions or unsupported batch operations.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Bounded memory and visible loss&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Use a node-wide job-record memory budget across all client devices:&lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;`client_jobstats_max_memory`: reserved allocation limit in bytes;&lt;br/&gt;
+default 64 MiB, or 67,108,864 bytes.&lt;/li&gt;
+	&lt;li&gt;`client_jobstats_memory`: current reserved bytes, including allocations&lt;br/&gt;
+in progress and records waiting for final release.&lt;/li&gt;
+	&lt;li&gt;` {osc,mdc}.*.job_stats_dropped`: rejected counter updates since device&lt;br/&gt;
+initialization. This counts updates, not bytes, jobs or RPCs. One RPC&lt;br/&gt;
+can attempt more than one update.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Reserve space before allocating a new record. Use shared counters on&lt;br/&gt;
+clients and allocate their storage at admission. Do not add per-CPU&lt;br/&gt;
+counter storage later without charging it. Server counter allocation and&lt;br/&gt;
+defaults remain unchanged.&lt;/p&gt;
+
+&lt;p&gt;A zero budget stops new records; existing records continue to collect.&lt;br/&gt;
+Lowering the budget below current reservations retains existing records&lt;br/&gt;
+and prevents new ones until enough memory is released. Clear and cleanup&lt;br/&gt;
+return reservations after readers and deferred frees finish. Clearing&lt;br/&gt;
+records does not reset `job_stats_dropped`.&lt;/p&gt;
+
+&lt;p&gt;The budget covers reserved job-record allocations. It does not cap all&lt;br/&gt;
+Lustre memory, fixed device state, reader buffers or allocator metadata.&lt;br/&gt;
+Allocation or admission failure must be visible without failing the&lt;br/&gt;
+application's I/O. If optional jobstats setup fails, the mount can still&lt;br/&gt;
+succeed and enabling the unavailable interface returns an error.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Existing engine prerequisites&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;The shared engine has existing fixes under review. Track them as explicit&lt;br/&gt;
+prerequisites, with their own LUs and reviews:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Review&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Existing defect&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Revision selected for the prerequisite baseline&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;span class="error"&gt;&amp;#91;62167 / LU-19555&amp;#93;&lt;/span&gt;(&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/62167" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/62167&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;seq_file reference handling and teardown&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;`4b69d9fbacea8074d3e84ac6e881d168122196ef`&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;span class="error"&gt;&amp;#91;68602 / LU-17000&amp;#93;&lt;/span&gt;(&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/68602" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/68602&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;position-tree corruption after insertion collision&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;`b95be1553298813870e0b975e5886a46423b5285`&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;span class="error"&gt;&amp;#91;69763 / LU-20984&amp;#93;&lt;/span&gt;(&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69763" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/69763&lt;/a&gt;)&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;missing cleanup wakeups&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;`53a75006617a030a1e9b255305bf98aaf2ef52fe`&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;Refresh these reviews before submission. Record any overlap when building&lt;br/&gt;
+the prerequisite baseline. Do not copy partial fixes into the feature or&lt;br/&gt;
+present them as new client work. An unmerged prerequisite must be stated&lt;br/&gt;
+as such. No server deployment is required by these client build&lt;br/&gt;
+dependencies. Preserve server behavior in the feature changes relative&lt;br/&gt;
+to that baseline and test the shared engine on servers separately.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Delivery and review&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Deliver OSC/MDC first with tests, man pages and focused `lljobstat` support.&lt;br/&gt;
+The new selectors are `&lt;del&gt;O`/`&lt;/del&gt;&lt;del&gt;osc` and `-M`/`&lt;/del&gt;-mdc`. Focused changes to the&lt;br/&gt;
+existing Python tool are allowed; the exception does not extend to new&lt;br/&gt;
+Python software. Keep llite under the same feature LU for later review of&lt;br/&gt;
+completed-byte accounting, attribution, memory and higher event rates.&lt;/p&gt;
+
+&lt;p&gt;Keep independent tiny-write accounting, queued-AIO accounting, job ID&lt;br/&gt;
+cache invalidation and BRW retry changes outside this candidate. They are&lt;br/&gt;
+not prerequisites for observing OSC/MDC requests. Do not expand this&lt;br/&gt;
+feature to fix unrelated behavior.&lt;/p&gt;
+
+&lt;p&gt;Review interfaces, default behavior, memory accounting, visible loss,&lt;br/&gt;
+operation mapping and attribution limits. Coordinate output with&lt;br/&gt;
+&lt;a href="https://jira.whamcloud.com/browse/LU-19768" title="add jobstats, brw_stats, others to netlink/YAML output" class="issue-link" data-issue-key="LU-19768"&gt;LU-19768&lt;/a&gt;(&lt;a href="https://jira.whamcloud.com/browse/LU-19768" class="external-link" rel="nofollow"&gt;https://jira.whamcloud.com/browse/LU-19768&lt;/a&gt;). Coordinate the&lt;br/&gt;
+client enable control with existing server control work in&lt;br/&gt;
+&lt;span class="error"&gt;&amp;#91;review 70052&amp;#93;&lt;/span&gt;(&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70052" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70052&lt;/a&gt;).&lt;br/&gt;
+Neither coordination item changes the client-only deployment requirement.&lt;/p&gt;
+
+&lt;p&gt;The test plan must cover disabled and enabled collection, old and current&lt;br/&gt;
+servers, inline and bulk EOF reads, Data-on-MDT, partial batch completion,&lt;br/&gt;
+large YAML output, actual `lljobstat` parsing, root-only access, memory&lt;br/&gt;
+limits, allocation failures and concurrent logging/read/clear/unmount.&lt;br/&gt;
+Test server behavior relative to the prerequisite baseline. Measure memory&lt;br/&gt;
+and contention on representative large clients before making performance&lt;br/&gt;
+claims. Report unsupported and unavailable cases directly.&lt;/p&gt;</description>
+                <environment />
+        <key id="100213">LU-21060</key>
+            <summary>Client-side per-job statistics for OSC, MDC and llite</summary>
+                <type id="2" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11311&amp;avatarType=issuetype">New Feature</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="akrause_nvda">Andreas Krause</assignee>
+                                    <reporter username="akrause_nvda">Andreas Krause</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 28 Oct 2026 23:03:39 +0000</created>
+                <updated>Fri, 30 Oct 2026 18:21:15 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>4</watches>
+                                                                            <comments>
+                            <comment id="504632" author="JIRAUSER18710" created="Thu, 29 Oct 2026 00:25:45 +0000">&lt;p&gt;I have working code for the initial OSC/MDC implementation ready for review.&lt;/p&gt;
+
+&lt;p&gt;Gerrit SSH authentication works for my account (&lt;tt&gt;akrause&lt;/tt&gt;), but uploads to &lt;tt&gt;fs/lustre-release&lt;/tt&gt; are currently denied because the account does not yet have upload permission. The code has not been uploaded to Gerrit yet. I will add the review links here once it is uploaded.&lt;/p&gt;</comment>
+                            <comment id="504670" author="sebastien" created="Thu, 29 Oct 2026 11:55:47 +0000">&lt;p&gt;Thanks Andreas, your account should be good now. I have tried to assign this ticket to you as you want to propose a patch, but was not able to.&lt;/p&gt;</comment>
+                            <comment id="504687" author="sebastien" created="Thu, 29 Oct 2026 12:17:44 +0000">&lt;p&gt;OK now it's all yours.&lt;/p&gt;</comment>
+                            <comment id="504690" author="gerrit" created="Thu, 29 Oct 2026 12:22:22 +0000">&lt;p&gt;"Andreas Krause US &amp;lt;akrause@nvidia.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70157" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70157&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21060" title="Client-side per-job statistics for OSC, MDC and llite" class="issue-link" data-issue-key="LU-21060"&gt;LU-21060&lt;/a&gt; utils: add client jobstats selectors&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 8e65dc49c31eef31cd7eb65dead30f4d732ab418&lt;/p&gt;</comment>
+                            <comment id="504698" author="JIRAUSER18710" created="Thu, 29 Oct 2026 12:37:58 +0000">&lt;p&gt;The lljobstat utility change is now uploaded. The OSC/MDC kernel implementation is ready locally, but it needs three jobstats engine fixes that are still under review:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/62167" class="external-link" target="_blank" rel="nofollow noopener"&gt;62167 / LU-19555&lt;/a&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/68602" class="external-link" target="_blank" rel="nofollow noopener"&gt;68602 / LU-17000&lt;/a&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/69763" class="external-link" target="_blank" rel="nofollow noopener"&gt;69763 / LU-20984&lt;/a&gt;&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;These reviews do not form one dependency chain. Review 62167 is queued for master-next. Review 68602 has the unrelated quota review 68601 as its parent. Review 69763 and review 62167 have the same parent.&lt;/p&gt;
+
+&lt;p&gt;Could the prerequisite owners confirm the intended landing order or a suitable base for the client series? I can then rebase the client changes, repeat the relevant checks and upload the kernel series.&lt;/p&gt;
+
+&lt;p&gt;The feature remains client-only. It does not require a wire protocol change, server upgrade or server configuration change.&lt;/p&gt;</comment>
+                            <comment id="504700" author="gerrit" created="Thu, 29 Oct 2026 12:48:21 +0000">&lt;p&gt;"Andreas Krause US &amp;lt;akrause@nvidia.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70159" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70159&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21060" title="Client-side per-job statistics for OSC, MDC and llite" class="issue-link" data-issue-key="LU-21060"&gt;LU-21060&lt;/a&gt; osc: add OSC and MDC job statistics&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: dc81de4859836cdbb9b28cc9787191f9ea37e810&lt;/p&gt;</comment>
+                            <comment id="504795" author="JIRAUSER18710" created="Fri, 30 Oct 2026 18:21:15 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=sebastien" class="user-hover" rel="sebastien"&gt;sebastien&lt;/a&gt;, the patches for this ticket are uploaded to Gerrit:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70157" class="external-link" target="_blank" rel="nofollow noopener"&gt;70157 utils: add client jobstats selectors&lt;/a&gt;&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70159" class="external-link" target="_blank" rel="nofollow noopener"&gt;70159 osc: add OSC and MDC job statistics&lt;/a&gt; (still WIP)&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Could you assign appropriate reviewers for them? Thanks.&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0725z:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

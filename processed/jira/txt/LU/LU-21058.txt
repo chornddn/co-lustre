@@ -1,0 +1,42 @@
+Key:        LU-21058
+Summary:    Client reconnect stuck behind peer tx credits during server recovery
+Link:       https://jira.whamcloud.com/browse/LU-21058
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Jinshan Xiong
+Reporter:   Jinshan Xiong
+Created:    Wed, 28 Oct 2026 22:03:26 +0000
+Updated:    Thu, 29 Oct 2026 11:53:48 +0000
+
+--- Description ---
+When a server hangs or reboots while a client has RPCs in flight to it, those sends can hold all of the client's LNet peer tx credits for that server until the LND times them out (sock_timeout, 50s by default). The client's reconnect then waits on lpni_txq behind them.
+
+ptlrpc can't finish the connect RPC until LNet releases its MD, so the import stays in CONNECTING. IR and the pinger only get "already connecting", and each new connect attempt queues behind the next batch of RPCs. The client can take minutes to reconnect, misses the restarted target's recovery window, and is evicted:
+
+LustreError: 11-0: fsname-OST0001-osc-...: operation ldlm_enqueue to node  failed: rc = -107
+LustreError: 21283:0:(import.c:740:ptlrpc_connect_import_locked()) already connecting
+LustreError: fsname-OST0001-osc-...: This client was evicted by fsname-OST0001; in progress operations using this service will fail.
+
+LU-18681 measured the same slow client reconnects during recovery: the connect was queued behind bulk messages holding all the peer credits.
+
+The same wait is easy to see with lnetctl ping --timeout 10. When all peer credits are held, the ping doesn't return until a credit is freed, and the timeout doesn't help.
+
+Proposed fix: add an LNET_MD_URGENT MD option, so that messages sent from such an MD neither take nor wait for LNet peer or NI tx credits. ptlrpc sets it on connect requests and their replies, which are small and infrequent. socklnd sends them on its control connection. LNDs with their own credits (o2iblnd) and routers still apply them.
+
+--- Comment (gerrit, Wed, 28 Oct 2026 22:35:46 +0000) ---
+"Jinshan Xiong " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70136
+
+Subject: LU-21058 lnet: send connect RPCs without waiting for credits
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8a8895f1972e3419013aec3063b81d36264fffdf
+
+--- Comment (sebastien, Thu, 29 Oct 2026 11:53:48 +0000) ---
+Thanks for the patch Jinshan, assigning this ticket to you then.

@@ -1,0 +1,49 @@
+Key:        LU-21061
+Summary:    Proposal about MDT pool and MDT/OST pool
+Link:       https://jira.whamcloud.com/browse/LU-21061
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Di Wang
+Reporter:   Di Wang
+Created:    Wed, 28 Oct 2026 23:20:21 +0000
+Updated:    Fri, 30 Oct 2026 01:30:37 +0000
+Links:      Duplicate: duplicates LU-11571; Related: is related to LU-18015
+Attachments: Combined_MDT_OST_Pools.pdf
+
+--- Description ---
+This proposal adds two kinds of pool, each of which can combine MDTs and OSTs:
+
+	Plain pool: limits where new directories and files go. A directory tree bound to the pool keeps new subdirectories on the pool's MDTs and new file objects on the pool's OSTs, at every level below it. Members can be shared with other pools, renames across pools are allowed, and recovery is unchanged. Today's OST pools are plain pools.
+
+	Isolated pool: a failure domain. Its MDTs and OSTs belong to it alone, its whole directory tree stays inside it, and nothing outside it depends on it. When its targets are known to be bad, the administrator takes it offline: the other MDTs finish recovery without waiting for it, and clients get -EIO right away inside it. A pool that is lost for good can be dropped while the rest of the filesystem stays consistent.
+
+MDT0 can't be in either kind of pool, because it can never be skipped or removed. Directories and files can be moved between pools with lfs migrate.
+
+--- Comment (JIRAUSER24000, Wed, 28 Oct 2026 23:22:32 +0000) ---
+adilger  does this make sense to you? or is this already in the plate of some one else? Thanks
+
+--- Comment (adilger, Thu, 29 Oct 2026 23:59:16 +0000) ---
+Hi Di, I read your design and it looks generally OK, but definitely there are some questions I have.  Note that there is already LU-11571 that covers MDT Pools.
+
+The plain pools seems straight forward and should definitely be the first thing implemented.  I don't see any significant differences from what is proposed in LU-11571, except no quotas for the MDT pools...  The idea of same-named MDT and OST pools being used together makes sense.
+
+The usefulness of isolation pools is less clear to me.  At that point, why not just have separate filesystems instead of isolation pools?  The MDTs and OSTs would be isolated into a subdirectory tree and unable to use any of the external MDTs and OSTs (and vice versa).  They would have a root directory "transparent mount", and centralized management of some aspects they are not better than a new mountpoint.  On the minus side, all of the isolation pools would still have a single point of failure with MDT0000.
+
+Can you explain the primary motivation behind this?  Is it to isolate the MDTs for recovery purposes?  To simplify adding/removing ephemeral capacity to an existing filesystem (though again it wouldn't be clear how that differs from a separate filesystem mountpoint)?  To reduce the blast radius if MDTs (or OSTs) fail permanently and need to be removed?  IMHO, the latter case would be better handled by having metadata redundancy (LMR) and EC to be able to withstand MDT/OST failures more gracefully rather than make it easier to clean up a broken filesystem afterward.
+
+For reducing the complexity of N:N recovery for MDTs, I think that there are "softer" methods that can still reduce the complexity without having hard isolation within a filesystem.  For example, with plain MDT+OST pools and a clients mounted therein, there would be a natural limitation of usage by those clients/MDTs/OSTs of nodes outside their pool, so something simple like MDT idle disconnection (LU-18015) could drop most/all client connections to external MDTs, and between MDTs/OSTs inside and outside the pools.  That would eliminate them from recovery most of the time without forcing hard isolation.  Also, it would be possible to have "layered" pools like LMA so that a large group could have 16 MDTs, but then split it into 4 smaller 4-MDT groups for some projects, but use all 16 MDTs for other projects.
+
+It would still be possible to move files in/out of the pool, hard links, etc. which is important since we had lots of complaints when moving files across PROJID boundaries returned EXDEV like XFS did, until we allow the files to be moved between projects (one at a time) and only the directories need to be recreated.
+
+--- Comment (JIRAUSER24000, Fri, 30 Oct 2026 01:30:37 +0000) ---
+Thanks for the review! adilger  The main motivation is operational. Large systems usually grow in capacity groups: each group is a fixed set of MDTs and OSTs, with their servers, storage and network, that is added, upgraded and serviced as one unit. Because a group shares hardware, firmware and maintenance windows, it also tends to fail as one unit. Isolated pools let a single filesystem treat each group as a failure domain.
+
+1. Idle disconnection. Agreed that it helps. With plain pools, clients mostly talk to the MDTs and OSTs of their own pool, so LU-18015 would drop most connections to targets outside it. A client with no connection to an MDT has nothing to replay to it and doesn't hold up its recovery. What it doesn't remove is the MDT-to-MDT dependency. At startup every MDT reads the update log of every other MDT: lod_sub_init_llog() starts a retrieval thread per MDT, and tdtd_replay_ready waits for all of them, then a disconnected MDT may cause the whole recovery hang. So when a whole capacity group fails at once, skipping it still needs either a guarantee that nothing crossed the boundary, or the administrator marking the group offline and accepting that whatever did cross gets repaired later. The boundary rules exist to keep that small and easy to find.
+
+2. Moving files across the boundary.  We probably can follow the same model: allow regular files to be renamed and hard-linked across the boundary, and return EXDEV only for directories, so mv recreates directories and moves files one at a time. A moved file keeps its inode on its original MDT until it is migrated. If that group goes offline, the file returns EIO at its new path, but nothing else waits. Rejoin repair then checks cross-pool remote entries instead of only pool roots. I'd make this a per-pool option: by default only directories get EXDEV, and sites that want a strict boundary can apply it to files too.
+
+3. Layered pools. Yeah, plain pools can do overlap, so a 16-MDT pool with four 4-MDT pools inside it works as is: projects bound to the large pool use all 16 MDTs, and the others use their 4. Isolated pools can layer the same way. The 16-MDT capacity group is the isolated pool, i.e. the failure domain, and the 4-MDT plain pools inside it narrow placement for individual projects. 
+
+4. MDT0 is a single point of failure today, and each separate filesystem would have its own MDT0 as well. MDT0 can be kept outside isolated pool, on its own highly available hardware. Isolation then shrinks the set of targets whose loss affects everyone from all MDTs to MDT0 alone.

@@ -1,0 +1,96 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21067] llite write_bytes does not count tiny writes</title>
+                <link>https://jira.whamcloud.com/browse/LU-21067</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+
+&lt;p&gt;The &lt;tt&gt;write_bytes&lt;/tt&gt; sum in &lt;tt&gt;llite.&amp;lt;instance&amp;gt;.stats&lt;/tt&gt; does not include successful buffered writes completed by &lt;tt&gt;ll_do_tiny_write()&lt;/tt&gt;. Applications can write data successfully while the client counter under-reports their bytes.&lt;/p&gt;
+
+&lt;p&gt;This path is used when &lt;tt&gt;tiny_write&lt;/tt&gt; is enabled, the write is smaller than a page and stays within one page, and the existing cache and locking conditions are met. The page must already be cached, uptodate and dirty. Direct, synchronous and append writes do not use this path.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Cause"&gt;&lt;/a&gt;Cause&lt;/h2&gt;
+
+&lt;p&gt;&lt;tt&gt;ll_do_tiny_write()&lt;/tt&gt; has no &lt;tt&gt;LPROC_LL_WRITE_BYTES&lt;/tt&gt; tally. When it consumes the whole iterator, &lt;tt&gt;do_file_write_iter()&lt;/tt&gt; skips &lt;tt&gt;ll_file_io_generic()&lt;/tt&gt;, where normal writes update that counter. If a tiny write completes only a prefix, the normal path counts only the remaining bytes.&lt;/p&gt;
+
+&lt;p&gt;Commit &lt;tt&gt;5208135f432a320e92dacd21e64dd4900fe9858e&lt;/tt&gt; (&lt;a href="https://jira.whamcloud.com/browse/LU-15197" class="external-link" rel="nofollow"&gt;LU-15197&lt;/a&gt;, &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/45476" class="external-link" target="_blank" rel="nofollow noopener"&gt;review 45476&lt;/a&gt;) removed the tiny-write tally. The complete-tiny-write early exit was already present in its parent. The removal is present in the 2.15.0 source and the missing tally is still present in upstream master &lt;tt&gt;40b80bc0485c7c651c33f67586c5e24b0bff061b&lt;/tt&gt;. This is source-history evidence, not a runtime test of every release.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+
+&lt;p&gt;Use an otherwise idle, dedicated test mount. Select its exact &lt;tt&gt;llite.&amp;lt;instance&amp;gt;&lt;/tt&gt; parameter prefix.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;Record the client version and save the mount's &lt;tt&gt;tiny_write&lt;/tt&gt; setting.&lt;/li&gt;
+	&lt;li&gt;Enable &lt;tt&gt;tiny_write&lt;/tt&gt; and record the &lt;tt&gt;write_bytes&lt;/tt&gt; sum without clearing shared counters.&lt;/li&gt;
+	&lt;li&gt;Create a new file with &lt;tt&gt;dd if=/dev/zero of=&amp;lt;new-file-on-mount&amp;gt; bs=8 count=64&lt;/tt&gt;. Check the command's exit status.&lt;/li&gt;
+	&lt;li&gt;Flush the file after the write loop. Verify that its size is 512 bytes and its contents are zero. Read the same mount's &lt;tt&gt;write_bytes&lt;/tt&gt; sum and calculate the increase.&lt;/li&gt;
+	&lt;li&gt;Restore &lt;tt&gt;tiny_write&lt;/tt&gt; after success or failure and verify the restored value. Repeat with &lt;tt&gt;tiny_write=0&lt;/tt&gt; as a control.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Expected: the counter increases by 512 bytes in both cases.&lt;/p&gt;
+
+&lt;p&gt;Affected behavior: when the first 8-byte write uses the normal path and the following 63 writes use the tiny-write path, the counter increases by only 8 bytes.&lt;/p&gt;
+
+&lt;p&gt;Writeback can make later writes use the normal path. A 512-byte result alone therefore does not prove the tiny-write path is correct. A regression test must establish that it exercises the affected path.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Evidenceandproposedrepair"&gt;&lt;/a&gt;Evidence and proposed repair&lt;/h2&gt;
+
+&lt;p&gt;Earlier test logs from a development build reporting version 2.17.60 show &lt;tt&gt;write_bytes sum 8 != 512&lt;/tt&gt; for this workload. A local candidate restored the positive-result tally and passed 20 repeated runs. Those logs do not identify the exact loaded binary, so they are historical reproduction evidence, not validation of a final upstream patch.&lt;/p&gt;
+
+&lt;p&gt;Restore byte accounting for positive results in &lt;tt&gt;ll_do_tiny_write()&lt;/tt&gt;. Keep normal-path accounting limited to the remaining iterator bytes. Before upload, strengthen the regression test to verify file contents and size, counter-read errors, the disabled control and setting restoration. Cover partial completion and fallback without double counting, and bind baseline/fixed results to exact source and binaries.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Relatedworkandscope"&gt;&lt;/a&gt;Related work and scope&lt;/h2&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19939" class="external-link" rel="nofollow"&gt;LU-19939&lt;/a&gt; / &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/64270" class="external-link" target="_blank" rel="nofollow noopener"&gt;review 64270&lt;/a&gt; optimizes the same path. &lt;a href="https://jira.whamcloud.com/browse/LU-20253" class="external-link" rel="nofollow"&gt;LU-20253&lt;/a&gt; / &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/67801" class="external-link" target="_blank" rel="nofollow noopener"&gt;review 67801&lt;/a&gt; covers attribute handling.&lt;/p&gt;
+
+&lt;p&gt;This bug is independent of the client jobstats feature in &lt;a href="https://jira.whamcloud.com/browse/LU-21060" class="external-link" rel="nofollow"&gt;LU-21060&lt;/a&gt;. Queued-AIO accounting remains under &lt;a href="https://jira.whamcloud.com/browse/LU-20186" class="external-link" rel="nofollow"&gt;LU-20186&lt;/a&gt;. Keep this repair client-only and limited to the existing tiny-write byte counter.&lt;/p&gt;</description>
+                <environment />
+        <key id="100220">LU-21067</key>
+            <summary>llite write_bytes does not count tiny writes</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="akrause_nvda">Andreas Krause</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 29 Oct 2026 16:04:34 +0000</created>
+                <updated>Thu, 29 Oct 2026 16:12:20 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0727j:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

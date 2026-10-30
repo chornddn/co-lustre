@@ -1,0 +1,126 @@
+Change:     70142
+Subject:    LU-20099 nrs: dispatch BRW requests in per-object batches
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70142
+Change-Id:  I9e4feb8a465fe67ca35fbc967219fb8b23500c1e
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-10-29 03:18:40.000000000
+Updated:    2026-10-30 17:45:18.000000000
+Patch Set:  2
+Insertions: +1030
+Deletions:  -132
+Comments:   11 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Nikitas Angelinas
+  REVIEWER: Chris Horn
+
+--- Commit Message ---
+LU-20099 nrs: dispatch BRW requests in per-object batches
+
+A server runs one NRS policy per head, so a site must choose between
+the object locality of ORR and the QoS of TBF or mClock.  Under TBF or
+mClock, the BRW requests of many clients reach the backend in arrival
+order, interleaved across objects and offsets, which turns sequential
+streams into random I/O on hard disks.
+
+Add per-object batches to the classful scheduler, so TBF and mClock
+both get them.  A class bucket of a batching rule queues each OST_READ
+and OST_WRITE request by object FID, in logical offset order, and
+dispatches a batch of one object, counted in whole pages, before the
+next.  Other requests stay on the FIFO nc_list, and the older of that
+list and the next object goes first.  A batch dispatches the lowest
+queued offset of its object first, so a stream that falls behind,
+such as a slow rank writing a shared file, catches up rather than
+waiting for the streams ahead of it.  A request that arrives during a
+batch joins the current round of its object, the round closes at the
+end of the batch, and later requests join the next round, so requests
+at lower offsets cannot hold back the rest of a round for more than
+one batch.
+
+By default, a rule batches only the requests to a target on rotational
+storage, without OS_STATFS_NONROT in the statfs that the target
+caches, and a batch holds as much as one RPC of the client that starts
+it, from exp_max_brw_size().  A full size RPC then forms a batch of
+its own, and smaller RPCs of one object are gathered into one RPC's
+worth.  The new batch_kb= key of a policy start command sets the batch
+size of every rule that does not name one, for every target, and the
+key of a rule start command sets it for that rule; batch_kb=0 turns
+batches off.  A rule shows its batch size only when it has one, so the
+rule output of TBF does not change.
+
+The policy charges a class bucket for its next request, so
+nrs_class_req_first() keeps its choice until that request leaves the
+bucket.  TBF and mClock now share one request type, nrs_class_req,
+and use nrs_class_req_add/del/first/pop() instead of nc_list.  Move
+the FID and offset parsing of ORR into nrs_brw_fid_get() and
+nrs_brw_range_get(), which also count the niobufs from the request
+buffer size rather than ioo_bufcnt.
+
+Add sanityn test_77tj and test_77tk for TBF and mClock batches, and
+test_77tl for the default batch size on rotational and non-rotational
+OSTs.
+
+Test-Parameters: testlist=sanityn env=ONLY=77
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm,llm_code_and_review_tools
+Change-Id: I9e4feb8a465fe67ca35fbc967219fb8b23500c1e
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-10-29 03:18:40.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-29 03:21:45.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-29 03:29:10.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-10-29 07:42:15.000000000) ---
+Uploaded patch set 2.
+
+--- Message (jenkins, 2026-10-29 07:42:17.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/134725/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-29 07:47:19.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-29 07:50:14.000000000) ---
+Patch Set 2:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-10-29 10:54:17.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134745/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-10-30 00:26:00.000000000) ---
+Patch Set 2:
+
+(1 comment)

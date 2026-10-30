@@ -1,0 +1,93 @@
+Change:     70226
+Subject:    LU-21073 llite: report the size and times the objects report
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70226
+Change-Id:  If1df9f44db3cc38af888e19715766d15740b94d7
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Alexey Lyashkov
+Created:    2026-10-30 08:51:08.000000000
+Updated:    2026-10-30 10:21:27.000000000
+Patch Set:  1
+Insertions: +232
+Deletions:  -75
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-21073 llite: report the size and times the objects report
+
+A stat() reads the attributes back out of the inode after the glimpse
+that refreshed them.  Both of the fields it reads there are shared with
+other writers, and both can be wrong by the time it reads them.
+
+i_size is written by the IO path.  vvp_prep_size() publishes the cat_kms
+of the object being read, which is the end of whichever components this
+reader holds an extent lock on - on a composite layout that is a
+component boundary, not a size.  A 4K read at offset 0 of a 200MB file
+whose first component ends at 128K leaves i_size at 131072, and the
+cat_size of the very same cl_attr says 209715200.  Ranks of an MPI job
+that stat such a file right after it was copied get the component
+boundary back; a second stat gets the real size.  Before composite
+layouts a single lock still scaled to within one stripe of the file size
+(lov_stripe_size()), so the value was a usable lower bound and nobody
+noticed that i_size was being used as one.
+
+The timestamps are written by ll_merge_attr() in two steps - first the
+values the MDS reported, then the merge with the values the OSTs report
+- so a racing stat can catch the intermediate ones.  LUS-12265 closed
+that by making ll_getattr_dentry() take lli_size_mutex while it copies
+the times out of the inode.
+
+Neither field has to be read from the inode at all.  Take a snapshot of
+the attributes to report and report that.  When the caller has just
+glimpsed the file the object is the authority: cat_size is the size, and
+the timestamps are merged the way ll_merge_attr() merges them.  On the
+paths that do not glimpse - a size the MDS vouches for, PCC,
+AT_STATX_DONT_SYNC, a file being restored, directories - there is no
+fresher source than the inode and the snapshot is filled from it, so the
+caller has one buffer to report from either way.
+
+The snapshot writes nothing: i_blocks is read from the inode so that the
+dirty page count a glimpse put there for LU-417 is kept.  It is taken
+under the size lock LUS-12265 reached for, which now covers the whole
+snapshot rather than the copy out of the inode, so the half-updated
+timestamps that lock was added for are unobservable whichever source the
+attributes came from.
+
+lseek(SEEK_END) had the same shape - glimpse, then read i_size - and is
+changed the same way.
+
+i_size keeps its current meaning for the IO path, which is what
+LU-16025 and sanityn test_16i rely on: a read is still confined by it
+after the kms it was given is written there.  What changes is that the
+value is no longer reported to userspace as the size of the file.
+
+Change-Id: If1df9f44db3cc38af888e19715766d15740b94d7
+Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
+HPE-bug-id: LUS-13567
+
+--- Review History ---
+
+--- Message (Alexey Lyashkov, 2026-10-30 08:51:08.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-30 09:03:19.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-30 09:03:54.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-10-30 10:19:49.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134857/ : SUCCESS

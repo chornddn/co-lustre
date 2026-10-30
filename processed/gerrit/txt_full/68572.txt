@@ -7,20 +7,20 @@ Branch:     master
 Status:     NEW
 Owner:      Sohei Koyama
 Created:    2026-09-02 06:58:23.000000000
-Updated:    2026-10-28 13:37:35.000000000
+Updated:    2026-10-29 21:44:32.000000000
 Patch Set:  9
 Insertions: +39
 Deletions:  -3
-Comments:   50 (0 unresolved)
-Hashtags:   218_review_priority, 218_review_blocker
+Comments:   51 (1 unresolved)
+Hashtags:   master-next, pw_shepherd, 218_review_blocker, 218_review_priority
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1
+  Code-Review: Artem Blagodarenko: +1; Timothy Day: +1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
-  CC: Patrick Farrell, Timothy Day, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Lai Siyao, Zhenyu Xu, Andreas Dilger, Vladimir Saveliev
+  CC: Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Lai Siyao, Zhenyu Xu, Andreas Dilger, Vladimir Saveliev, Artem Blagodarenko, Timothy Day
 
 --- Commit Message ---
 LU-20682 llite: validate xattr value in ll_xattr_set()
@@ -2472,3 +2472,79 @@ Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx
 Patch Set 9:
 
 Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64/zfs servers and clients for build 134592 patch 9. Requested by Patrickbot because of LU-19582.
+
+--- Message (Artem Blagodarenko, 2026-10-28 14:15:40.000000000) ---
+Patch Set 8: Code-Review+1
+
+This fixes an important and easily reproducible problem. On the parent commit, an unprivileged user can crash the client from userspace.
+
+How I reproduced it (Rocky 9.7 client, 5.14.0-611 kernel, slub_debug=FZPU):
+- The new sanity test_102u panics the base client.
+- By hand, as a normal user on a file I own: setfattr -n lustre.lov.<name> -v 0x0bd60bd0 <file> (a 4-byte value carrying a byte-swapped composite magic) takes the node down in ll_xattr_set(). A zero-length/removexattr value reaches the same path with value == NULL.
+
+With this patch applied I could not reproduce any of it: test_102u passes with slub_debug on and no kernel warnings, and normal and composite layouts still work (sanity 27*/102*/56xd: 84 pass 0 fail; sanity-pfl: 60 pass 0 fail). I checked both the crash and the fix on real VMs.
+
+On Timothy's point: even if the swab paths are rarely useful on modern little-endian Lustre, the crashing path is reachable today on x86, so bounding it is correct. Removing swab entirely would be a larger, separate change.
+
+A few possible improvements, none blocking:
+1. lustre_swab_lov_comp_md_v1(): a bad entry is continued but the function still returns 0 after partially swabbing that entry's header; returning -EINVAL (as it does for a bad header) would be more consistent, since purge/qos already act on the error.
+2. The new return value is checked in lod_declare_layout_purge() and lod_qos_parse_config(), but ignored in lod_declare_layout_add/set/del(), lod_get_default_lov_striping() and lov_getstripe().
+3. test_102u ignores every setfattr exit code and only checks that stat works afterward; checking the expected EINVAL per call (or scanning the console) would catch an overwrite that doesn't crash immediately.
+
++1 -- a useful patch that fixes a serious, user-triggerable crash.
+
+--- Message (Timothy Day, 2026-10-28 14:25:13.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Artem Blagodarenko, 2026-10-28 14:27:16.000000000) ---
+Patch Set 9: Code-Review+1
+
+--- Message (Artem Blagodarenko, 2026-10-28 14:30:20.000000000) ---
+Patch Set 9: -Code-Review
+
+--- Message (Artem Blagodarenko, 2026-10-28 15:10:07.000000000) ---
+Patch Set 9: Code-Review+1
+
+Re-ran the same checks on PS9. This patchset takes a different, simpler approach than PS8 -- on little-endian it rejects a byte-swapped-magic lov/lmv value with -EINVAL instead of swabbing it (swab only compiled for big-endian), and drops the lustre_swab_lov_comp_md_v1() bounds-checking. That matches Timothy's point: swab serves no purpose on a little-endian client, so don't run it there.
+
+Verified on a Rocky 9.7 client (slub_debug=FZPU):
+- test_102u passes, no kernel warnings.
+- My earlier unprivileged repro no longer crashes: as a normal user, setfattr -n lustre.lov.<name> -v 0x0bd60bd0, a NULL value, and removexattr now all return EINVAL; the node stays up.
+- Layouts still work: sanity 27*/102*/56xd 87 pass 0 fail, sanity-pfl 61 pass 0 fail.
+
+Two of the improvement points from my PS8 comment no longer apply, since PS9 doesn't touch pack_generic.c or the lod callers. The remaining one still stands: test_102u ignores every setfattr exit code and only checks that stat works afterward; checking the expected EINVAL per call would catch a regression that doesn't crash immediately.
+
++1.
+
+--- Message (Maloo, 2026-10-28 15:44:29.000000000) ---
+Patch Set 9: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm55: https://testing.whamcloud.com/test_sessions/ceeaec80-66ae-443e-8b6f-8736873fa645 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-28 15:49:09.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; fixes a user-triggerable client crash on little-endian. One optional note inline about big-endian builds, for whenever the patch is next refreshed. No need to re-spin for it.
+
+--- Message (Maloo, 2026-10-28 17:41:47.000000000) ---
+Patch Set 9: Verified+1
+
+Passed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm9: https://testing.whamcloud.com/test_sessions/2b748bfa-891a-45b0-99a7-42f08416e76b ran 5 tests.
+
+--- Message (Marc Vef, 2026-10-29 00:13:34.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-10-29 00:13:35.000000000) ---
+Patch Set 9:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-10-29 00:13:35.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (patrick bot, 2026-10-29 21:44:32.000000000) ---
+Hashtag added: pw_shepherd

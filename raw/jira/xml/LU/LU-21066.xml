@@ -1,0 +1,129 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21066] ldiskfs: FORTIFY_SOURCE WARNING in ldiskfs_set_dirdata() for names of 238+ bytes</title>
+                <link>https://jira.whamcloud.com/browse/LU-21066</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;On kernels built with CONFIG_FORTIFY_SOURCE=y (all EL10 kernels), creating a file with a long name on an ldiskfs MDT triggers a kernel WARNING in ldiskfs_set_dirdata():&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;------------[ cut here ]------------
+memcpy: detected field-spanning write (size 17) of single field "&amp;amp;de-&amp;gt;name[de-&amp;gt;name_len + 1]" at /lustre/ldiskfs/namei.c:1720 (size 16)
+WARNING: CPU: 1 PID: 10681 at /lustre/ldiskfs/namei.c:1720 ldiskfs_set_dirdata+0xc2/0xe0 [ldiskfs]
+CPU: 1 UID: 0 PID: 10681 Comm: mdt00_002 Kdump: loaded Tainted: G OE ------ --- 6.12.0-124.56.1.el10_1_lustre #1
+ add_dirent_to_buf+0xe4/0x210 [ldiskfs]
+ ldiskfs_add_entry_locked+0x185/0x4d0 [ldiskfs]
+ osd_ldiskfs_add_entry+0x3d/0x260 [osd_ldiskfs]
+ __osd_ea_add_rec+0x21c/0x4f0 [osd_ldiskfs]
+ osd_ea_add_rec+0x9d/0x2e0 [osd_ldiskfs]
+ osd_index_ea_insert+0x238/0x970 [osd_ldiskfs]
+ __mdd_index_insert_only+0x86/0x140 [mdd]
+ __mdd_index_insert+0x3e/0x150 [mdd]
+ mdd_create+0x88b/0x11c0 [mdd]
+ mdt_create+0xc01/0x21d0 [mdt]
+ mdt_reint_create+0x1a3/0x410 [mdt]
+ mdt_reint_rec+0x120/0x270 [mdt]
+ mdt_reint_internal+0x4c8/0x8a0 [mdt]
+ mdt_reint+0x61/0x120 [mdt]
+ tgt_request_handle+0x232/0xd50 [ptlrpc]
+ ptlrpc_main+0xaeb/0xed0 [ptlrpc]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Cause"&gt;&lt;/a&gt;Cause&lt;/h3&gt;
+
+&lt;p&gt;ext4_set_dirdata() (ext4-dirdata-core.patch) writes the LUFID record after the filename through de-&amp;gt;name[]:&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;&lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;int&lt;/span&gt;&lt;/span&gt; data_offset = de-&amp;gt;name_len + 1;
+if (data) {
+	de-&amp;gt;name[de-&amp;gt;name_len] = 0;
+	memcpy(&amp;amp;de-&amp;gt;name[de-&amp;gt;name_len + 1], data, *(&lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;char&lt;/span&gt;&lt;/span&gt; *)data);   &lt;span class="code-comment"&gt;/* namei.c:1720 */&lt;/span&gt;
+	de-&amp;gt;file_type |= EXT4_DIRENT_LUFID;
+	...
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;de-&amp;gt;name is declared char name&lt;span class="error"&gt;&amp;#91;EXT4_NAME_LEN&amp;#93;&lt;/span&gt; (255 bytes) and the LUFID record is 17 bytes. For names of 238 bytes or longer the copy runs past the declared array, and FORTIFY_SOURCE reports a field-spanning write. The bytes are still inside the directory record (rec_len reserves the space), so no memory is corrupted, but every EL10 MDS logs a WARNING the first time a client creates such a name, and a server running with panic_on_warn panics.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;p&gt;Plain long names are enough; encryption is not needed. Single-node ltvm VM, rocky10, kernel 6.12.0-124.56.1.el10_1_lustre, Lustre master b5131ea46c:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mkdir /mnt/lustre/d
+for n in $(seq 200 255); do touch /mnt/lustre/d/$(printf 'a%.0s' $(seq 1 $n)); done
+dmesg | grep field-spanning
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The first name to warn is 238 bytes long (255 - 238 - 1 = 16 bytes left in name[] for the 17-byte record). It was first seen in sanity-sec test_46 (long ciphertext names) and is hit by any client create with a name of 238+ bytes.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Affected"&gt;&lt;/a&gt;Affected&lt;/h3&gt;
+
+&lt;p&gt;ldiskfs/kernel_patches/patches/&lt;/p&gt;
+{rhel10.0,rhel10.1,linux-6.12,linux-6.18,linux-7.0}
+&lt;p&gt;/ext4-dirdata-core.patch, used by the ldiskfs-6.12-rhel10.0, 6.12-rhel10.1, 6.12-rhel10.2, 6.12-ml, 6.18-ml, 7.0-ml and 7.0.0-14-ubuntu26 series.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h3&gt;
+
+&lt;p&gt;Address the dirdata area from the start of the name instead of through de-&amp;gt;name[], so the write is not bounded by the declared array size. The on-disk format and the bytes written are unchanged. A patch follows.&lt;/p&gt;
+
+&lt;p&gt;Tested with the fix on the same VM: no warning for names of 200-255 bytes, a 255-byte directory and a rename to a 255-byte name; LFSCK namespace makes no repairs and e2fsck -fn on the MDT is clean. Lustre builds cleanly for rhel10.0, rhel10.1, rhel10.2 and ubuntu26; on mainline 6.12.95, 6.18.22 and 7.0 ldiskfs compiles with the fix (the full build there fails at modpost on obd_dif_ip_fn/obd_dif_crc_fn in osd_ldiskfs.ko, which unfixed master hits too).&lt;/p&gt;</description>
+                <environment />
+        <key id="100219">LU-21066</key>
+            <summary>ldiskfs: FORTIFY_SOURCE WARNING in ldiskfs_set_dirdata() for names of 238+ bytes</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="ablagodarenko">Artem Blagodarenko</reporter>
+                        <labels>
+                            <label>ldiskfs</label>
+                    </labels>
+                <created>Thu, 29 Oct 2026 12:36:58 +0000</created>
+                <updated>Thu, 29 Oct 2026 12:38:05 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="504699" author="gerrit" created="Thu, 29 Oct 2026 12:38:05 +0000">&lt;p&gt;"Artem Blagodarenko &amp;lt;ablagodarenko@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70158" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70158&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21066" title="ldiskfs: FORTIFY_SOURCE WARNING in ldiskfs_set_dirdata() for names of 238+ bytes" class="issue-link" data-issue-key="LU-21066"&gt;LU-21066&lt;/a&gt; ldiskfs: avoid FORTIFY warning in ext4_set_dirdata()&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: b6fcc611f1b3cbcd03d0e3ffa220a938030bec2b&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0727b:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

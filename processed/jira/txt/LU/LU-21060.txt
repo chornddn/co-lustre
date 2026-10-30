@@ -1,0 +1,309 @@
+Key:        LU-21060
+Summary:    Client-side per-job statistics for OSC, MDC and llite
+Link:       https://jira.whamcloud.com/browse/LU-21060
+Type:       New Feature
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Krause
+Reporter:   Andreas Krause
+Created:    Wed, 28 Oct 2026 23:03:39 +0000
+Updated:    Fri, 30 Oct 2026 18:21:15 +0000
+
+--- Description ---
+Problem
+
+CSP-managed Lustre services wall off backend access. Users, admins and
+
+cluster operators cannot read the server-side `mdt.*.job_stats` and
+
+`obdfilter.*.job_stats` counters. Jobstats is an essential tool for cluster
+
+operators to monitor and assess filesystem use. It helps them see which
+
+jobs use the resources and check that sharing is fair and works as
+
+intended. We need jobstats on the clients because operators cannot access
+
+it on the servers.
+
+Large Lustre users increasingly run both on-premises Lustre and
+
+CSP-managed Lustre services. Operators need the same per-job visibility in
+
+both environments. Client-side jobstats provides a uniform observability
+
+surface for monitoring use and checking resource sharing across both.
+
+Proposed behavior
+
+Keep the feature client-only. It must work with unmodified servers and
+
+require no server upgrade, server configuration change, wire-format change
+
+or disk-format change. Operators must be able to deploy it on clients
+
+without changes by the managed service provider.
+
+Follow server jobstats semantics and defaults wherever they apply. Reuse
+
+job ID selection, corresponding counter names and units, YAML records,
+
+clear and per-job removal, and cleanup rules. Keep existing `jobid_var`
+
+and `jobid_name` behavior and defaults, including `jobid_var=disable`.
+
+Keep the default `job_cleanup_interval` at 600 seconds. Cleanup is
+
+periodic; the interval is not an exact record-expiry deadline.
+
+Use one feature LU for three interfaces:
+
+	`osc.*.job_stats`: per-job bytes and RPC activity for each OST import,
+
+with client RPC round-trip and queue times.
+
+	`mdc.*.job_stats`: per-job metadata operations and Data-on-MDT bytes
+
+for each MDT import, with client RPC timings.
+
+	`llite.*.job_stats`: a later delivery for application operations and
+
+bytes per mount, including reads served from the page cache.
+
+The first delivery implements OSC and MDC. Client counting is disabled
+
+by default. Each device has `enable_job_stats=0` and
+
+`job_cleanup_interval=600`. Client `job_stats` files use debugfs mode
+
+`0600`. Their rejected-update counters use mode `0400`. The interface
+
+location and control names need upstream design review.
+
+OSC and MDC use the job ID already carried on each RPC. Preserve existing
+
+shared-file, writeback, background-worker and retry attribution limits.
+
+Do not add a new job ID or change requests to improve attribution.
+
+Disabling a job ID mode does not rewrite IDs already carried by requests
+
+in flight.
+
+Count successful RPC payload bytes after completion, using the transferred
+
+size for bulk I/O and the validated reply payload size for inline reads.
+
+Server page padding at EOF is included when it is transferred. These
+
+counts can exceed bytes returned to the application. Application-byte
+
+accounting belongs to the later llite interface.
+
+Count metadata operations from successful replies observed by the client. For
+
+metadata batches, count each validated successful positive lookup in the
+
+completed prefix. Do not count an unreturned or retried suffix as done.
+
+The existing batch interpreter owns reply decoding.
+
+Client RPC time is not server service time. Data RPC timing can include
+
+an attempt that received an error reply; successful-byte accounting cannot.
+
+Queue time applies to requests sent once, excluding deliberate retry
+
+backoff. A client sees only its own activity. These counters do not promise
+
+exact equality with server counters across errors, retries, cache hits,
+
+server versions or unsupported batch operations.
+
+Bounded memory and visible loss
+
+Use a node-wide job-record memory budget across all client devices:
+
+	`client_jobstats_max_memory`: reserved allocation limit in bytes;
+
+default 64 MiB, or 67,108,864 bytes.
+
+	`client_jobstats_memory`: current reserved bytes, including allocations
+
+in progress and records waiting for final release.
+
+	` {osc,mdc}.*.job_stats_dropped`: rejected counter updates since device
+
+initialization. This counts updates, not bytes, jobs or RPCs. One RPC
+
+can attempt more than one update.
+
+Reserve space before allocating a new record. Use shared counters on
+
+clients and allocate their storage at admission. Do not add per-CPU
+
+counter storage later without charging it. Server counter allocation and
+
+defaults remain unchanged.
+
+A zero budget stops new records; existing records continue to collect.
+
+Lowering the budget below current reservations retains existing records
+
+and prevents new ones until enough memory is released. Clear and cleanup
+
+return reservations after readers and deferred frees finish. Clearing
+
+records does not reset `job_stats_dropped`.
+
+The budget covers reserved job-record allocations. It does not cap all
+
+Lustre memory, fixed device state, reader buffers or allocator metadata.
+
+Allocation or admission failure must be visible without failing the
+
+application's I/O. If optional jobstats setup fails, the mount can still
+
+succeed and enabling the unavailable interface returns an error.
+
+Existing engine prerequisites
+
+The shared engine has existing fixes under review. Track them as explicit
+
+prerequisites, with their own LUs and reviews:
+
+Review
+Existing defect
+Revision selected for the prerequisite baseline
+
+[62167 / LU-19555](https://review.whamcloud.com/c/fs/lustre-release/+/62167)
+seq_file reference handling and teardown
+`4b69d9fbacea8074d3e84ac6e881d168122196ef`
+
+[68602 / LU-17000](https://review.whamcloud.com/c/fs/lustre-release/+/68602)
+position-tree corruption after insertion collision
+`b95be1553298813870e0b975e5886a46423b5285`
+
+[69763 / LU-20984](https://review.whamcloud.com/c/fs/lustre-release/+/69763)
+missing cleanup wakeups
+`53a75006617a030a1e9b255305bf98aaf2ef52fe`
+
+Refresh these reviews before submission. Record any overlap when building
+
+the prerequisite baseline. Do not copy partial fixes into the feature or
+
+present them as new client work. An unmerged prerequisite must be stated
+
+as such. No server deployment is required by these client build
+
+dependencies. Preserve server behavior in the feature changes relative
+
+to that baseline and test the shared engine on servers separately.
+
+Delivery and review
+
+Deliver OSC/MDC first with tests, man pages and focused `lljobstat` support.
+
+The new selectors are `O`/`osc` and `-M`/`-mdc`. Focused changes to the
+
+existing Python tool are allowed; the exception does not extend to new
+
+Python software. Keep llite under the same feature LU for later review of
+
+completed-byte accounting, attribution, memory and higher event rates.
+
+Keep independent tiny-write accounting, queued-AIO accounting, job ID
+
+cache invalidation and BRW retry changes outside this candidate. They are
+
+not prerequisites for observing OSC/MDC requests. Do not expand this
+
+feature to fix unrelated behavior.
+
+Review interfaces, default behavior, memory accounting, visible loss,
+
+operation mapping and attribution limits. Coordinate output with
+
+LU-19768(https://jira.whamcloud.com/browse/LU-19768). Coordinate the
+
+client enable control with existing server control work in
+
+[review 70052](https://review.whamcloud.com/c/fs/lustre-release/+/70052).
+
+Neither coordination item changes the client-only deployment requirement.
+
+The test plan must cover disabled and enabled collection, old and current
+
+servers, inline and bulk EOF reads, Data-on-MDT, partial batch completion,
+
+large YAML output, actual `lljobstat` parsing, root-only access, memory
+
+limits, allocation failures and concurrent logging/read/clear/unmount.
+
+Test server behavior relative to the prerequisite baseline. Measure memory
+
+and contention on representative large clients before making performance
+
+claims. Report unsupported and unavailable cases directly.
+
+--- Comment (JIRAUSER18710, Thu, 29 Oct 2026 00:25:45 +0000) ---
+I have working code for the initial OSC/MDC implementation ready for review.
+
+Gerrit SSH authentication works for my account (akrause), but uploads to fs/lustre-release are currently denied because the account does not yet have upload permission. The code has not been uploaded to Gerrit yet. I will add the review links here once it is uploaded.
+
+--- Comment (sebastien, Thu, 29 Oct 2026 11:55:47 +0000) ---
+Thanks Andreas, your account should be good now. I have tried to assign this ticket to you as you want to propose a patch, but was not able to.
+
+--- Comment (sebastien, Thu, 29 Oct 2026 12:17:44 +0000) ---
+OK now it's all yours.
+
+--- Comment (gerrit, Thu, 29 Oct 2026 12:22:22 +0000) ---
+"Andreas Krause US " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70157
+
+Subject: LU-21060 utils: add client jobstats selectors
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8e65dc49c31eef31cd7eb65dead30f4d732ab418
+
+--- Comment (JIRAUSER18710, Thu, 29 Oct 2026 12:37:58 +0000) ---
+The lljobstat utility change is now uploaded. The OSC/MDC kernel implementation is ready locally, but it needs three jobstats engine fixes that are still under review:
+
+	62167 / LU-19555
+
+	68602 / LU-17000
+
+	69763 / LU-20984
+
+These reviews do not form one dependency chain. Review 62167 is queued for master-next. Review 68602 has the unrelated quota review 68601 as its parent. Review 69763 and review 62167 have the same parent.
+
+Could the prerequisite owners confirm the intended landing order or a suitable base for the client series? I can then rebase the client changes, repeat the relevant checks and upload the kernel series.
+
+The feature remains client-only. It does not require a wire protocol change, server upgrade or server configuration change.
+
+--- Comment (gerrit, Thu, 29 Oct 2026 12:48:21 +0000) ---
+"Andreas Krause US " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70159
+
+Subject: LU-21060 osc: add OSC and MDC job statistics
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: dc81de4859836cdbb9b28cc9787191f9ea37e810
+
+--- Comment (JIRAUSER18710, Fri, 30 Oct 2026 18:21:15 +0000) ---
+sebastien, the patches for this ticket are uploaded to Gerrit:
+
+	70157 utils: add client jobstats selectors
+
+	70159 osc: add OSC and MDC job statistics (still WIP)
+
+Could you assign appropriate reviewers for them? Thanks.

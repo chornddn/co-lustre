@@ -2,13 +2,13 @@ Key:        LU-20505
 Summary:    sanity-lfsck test_5 ldiskfs: Fail to generate linkEA
 Link:       https://jira.whamcloud.com/browse/LU-20505
 Type:       Bug
-Priority:   Medium
+Priority:   Major
 Status:     Open
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Andreas Dilger
 Reporter:   Maloo
 Created:    Tue, 21 Jul 2026 13:44:36 +0000
-Updated:    Tue, 13 Oct 2026 20:04:46 +0000
+Updated:    Thu, 29 Oct 2026 16:37:25 +0000
 Links:      Related: is related to  LU-20308
 
 --- Description ---
@@ -118,3 +118,50 @@ ddiwang the IGIF FIDs are still potentially used if the LMA FIDs are lost, thoug
 
 --- Comment (JIRAUSER24100, Tue, 13 Oct 2026 20:04:46 +0000) ---
 Moving fix version to 2.19 as part of 2.18 release preparation.  If you feel this patch is urgent for 2.18, you can put this back. Note this doesn't stop it landing if ready: if the patch is ready and reviewed, it can still land for 2.18.
+
+--- Comment (adilger, Wed, 28 Oct 2026 22:25:51 +0000) ---
+this test failure is blocking updates to el9.8 distro testing in autotest
+
+--- Comment (adilger, Wed, 28 Oct 2026 22:28:04 +0000) ---
+[Claude] Root cause from the MDS debug log of https://testing.whamcloud.com/test_sets/305475fd-8a89-4831-beab-afa95d24396e (review-dne-part-2, el9.8, 2026-10-28). The same failure is on lustre-master full runs, e.g. https://testing.whamcloud.com/test_sets/42c3ccfc-dbff-440e-bd18-90e77cbdb2b6. Since mid-October Maloo auto-links these failures to the DDN-internal EX-14442, so new failures are not showing up on this ticket. It has failed about 5% of review-dne-part-2 runs and 11% of full-part-1 runs over the past 60 days.
+
+The namespace LFSCK and the OI scrub that it starts (the MDT is mounted with noscrub after backup/restore) race on the inode that the scrub is currently processing:
+
+626.310205 osd_scrub_main()) lustre-MDT0000: OI scrub start, flags = 0x4, pos = 12
+626.313278 lfsck_master_oit_engine()) lustre-MDT0000-osd: OIT scan failed at find target [0x200005221:0x1:0x0], cookie 198: rc = -115
+626.313283 lfsck_namespace_record_failure()) lustre-MDT0000-osd: namespace LFSCK hit first non-repaired inconsistency at the pos [198, ...]
+626.313299 osd_scrub_check_update()) lustre-MDT0000: insert OI [0x200005221:0x1:0x0] -> 198/24953255
+...
+626.315113 osd_scrub_check_update()) lustre-MDT0000: insert OI [0x200005221:0x53:0x0] -> 256/3794704289
+
+The LFSCK otable preload caches inode 198 ($tdir) and looks it up 21us before the scrub inserts its OI mapping. osd_fid_lookup() finds no OI entry while the scrub is running and returns -EINPROGRESS, so LFSCK skips the whole directory. $tdir/dummy never gets its linkEA, and "lfs fid2path" then fails with ENODATA ("(13) Fail to generate linkEA").
+
+osd_preload_next() checks ooc_pos_preload >= os_pos_current before osd_iit_next() advances the preload position. As a result, a preload batch normally ends by caching the inode at exactly os_pos_current. osd_scrub_next() publishes os_pos_current before that inode has been through osd_scrub_check_update().
+
+https://review.whamcloud.com/68662 ("LU-20505 lfsck: fix osd-scrub vs lfsck race") moves the os_pos_current store after osd_iit_iget(). The store is still before osd_scrub_exec()->osd_scrub_check_update(), which is where the OI mapping is inserted. That narrows the window but does not close it, as the Gerrit AI review on PS1 points out. Storing os_pos_current after osd_scrub_check_update() would close it. 68662 PS2 passes CI and still merges cleanly on master.
+
+https://review.whamcloud.com/67474 (suppress LMA under OBD_FAIL_FID_IGIF) addresses a different theory (OI cache eviction). The log above does not need it.
+
+--- Comment (adilger, Wed, 28 Oct 2026 22:31:16 +0000) ---
+[Claude] The "(5) unexpected status" failures of test_5 (formerly LU-20667) are the same race, hitting many objects at once. In https://testing.whamcloud.com/test_sets/810e2973-4ea9-4df1-9ba7-294eb33352f2 (2026-10-28) the LFSCK OIT scan and the OI scrub move in lockstep, and LFSCK gets -EINPROGRESS on every other inode just before the scrub inserts its OI mapping:
+
+.899952 lfsck_master_oit_engine()) OIT scan failed at find target [0x200005221:0x1:0x0], cookie 20: rc = -115
+.899960 osd_scrub_check_update()) insert OI [0x200005221:0x1:0x0] -> 20/1175129186
+.900156 lfsck_master_oit_engine()) OIT scan failed at find target [0x200005221:0x3d:0x0], cookie 22: rc = -115
+.900165 osd_scrub_check_update()) insert OI [0x200005221:0x3d:0x0] -> 22/2697745045
+... (15 objects, inodes 20-48)
+
+With 15 of the 19 objects skipped (failed_phase1: 15), LFSCK never sets "inconsistent,upgrade" and goes straight to "completed", so the test fails at step (5) instead of (13). Storing os_pos_current only after osd_scrub_check_update() would fix both symptoms.
+
+--- Comment (gerrit, Wed, 28 Oct 2026 23:59:51 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70140
+
+Subject: LU-20505 osd-ldiskfs: advance scrub position after OI check
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: ba835f988c6b4f7ad75b5cdb32e4ab4f0b90a7ca

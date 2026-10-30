@@ -1,0 +1,64 @@
+Key:        LU-21057
+Summary:    LNet: discovery Push can use a source NID and a destination NID from different replies
+Link:       https://jira.whamcloud.com/browse/LU-21057
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Wed, 28 Oct 2026 20:43:04 +0000
+Updated:    Wed, 28 Oct 2026 21:54:11 +0000
+
+--- Description ---
+sanity-lnet test_237 failed with "Failed to ping 10.240.26.110@tcp1" (-113) on b_es7_0:
+
+https://testing.whamcloud.com/test_sets/eb812b2b-d1a4-4982-8eeb-3e8ffd79e973
+
+The route to tcp1 went down because a discovery Push from the client to the router failed. The Push used a source NID and a destination NID on different local networks:
+
+lnet_handle_send_case_locked()) Source Specified: 10.240.26.107@tcp2 to MR:  10.240.26.109@tcp routed destination
+lnet_handle_find_routed_path()) Unable to send message from 10.240.26.107@tcp2 to 10.240.26.109@tcp - Route table may be misconfigured
+LNetPut()) Error sending PUT to 12345-10.240.26.109@tcp: -113
+lnet_router_discovery_complete()) 10.240.26.109@tcp: Router discovery failed -113
+lnet_set_route_aliveness()) route to tcp1 through 10.240.26.109@tcp has gone from up to down
+
+The client debug log shows this sequence:
+
+	The discovery thread sends a ping to 10.240.26.109@tcp. LNet sends it from 10.240.26.107@tcp2 to 10.240.26.109@tcp2.
+
+	Before the reply arrives, a Push from the router arrives. The discovery thread merges the Push data and calls lnet_peer_send_push().
+
+	lnet_peer_send_push() reads lp_disc_dst_nid. The value is LNET_ANY_NID, so the destination is the primary NID 10.240.26.109@tcp.
+
+	The ping reply arrives. lnet_discovery_event_reply() sets lp_disc_src_nid to 10.240.26.107@tcp2 and lp_disc_dst_nid to 10.240.26.109@tcp2.
+
+	LNetPut() reads lp->lp_disc_src_nid through a pointer and gets 10.240.26.107@tcp2.
+
+lnet_peer_send_push() drops lp_lock before it reads lp_disc_dst_nid and lp_disc_src_nid. lnet_discovery_event_reply() writes both fields under lp_lock. The two reads can see different replies. The same code is on master.
+
+--- Comment (gerrit, Wed, 28 Oct 2026 21:30:39 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70135
+
+Subject: LU-21057 lnet: read the discovery NID pair under lp_lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4a5dc7a44943461f84ef3c17873a71293b23b767
+
+--- Comment (hornc, Wed, 28 Oct 2026 21:34:20 +0000) ---
+I reproduced the failure on 2 VMs, each with tcp and tcp2 on one interface. Node A used a UDSP rule to prefer tcp2, so that the discovery ping went out on tcp2. The primary NID of node B is on tcp.
+
+To make the race window wide, I used a debug build with a 5 s fail_loc sleep in lnet_peer_send_push() before LNetPut(). The steps on node A were:
+
+	Add a net_delay rule that holds a REPLY from node B for 3 s.
+
+	Run "lnetctl discover --force" to node B.
+
+	After 1 s, add a network on node B. Node B then pushes to node A while the ping is in flight.
+
+Without the fix, all 5 runs failed. The discover command returned -113, and the debug log showed "Unable to send message from A@tcp2 to B@tcp". With the fix, all 10 runs passed. The Push went out with source ANY. sanity-lnet also passed on a single node with the fix.
