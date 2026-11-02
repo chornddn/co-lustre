@@ -1,0 +1,109 @@
+Key:        LU-21085
+Summary:    ptlrpc: expired request stays queued in LNet until peer credits return
+Link:       https://jira.whamcloud.com/browse/LU-21085
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Sat, 31 Oct 2026 18:03:13 +0000
+Updated:    Sat, 31 Oct 2026 19:30:33 +0000
+Links:      Related: is related to  LU-21058; Related: is related to  LU-4006; Related: is related to  LU-18681
+
+--- Description ---
+Problem
+
+When a PtlRPC request expires, the request can still wait in LNet for a peer tx credit. PtlRPC cannot finish the request until LNet releases the request MD. The import thus stays busy, and it cannot try the next NID. When bulk RPCs hold all peer credits to a dead server, a client can take minutes to reconnect, and the restarted target can evict it.
+
+Environment
+
+	master, at commit 40b80bc048 (LU-20867), on rocky9 VMs.
+
+	tcp, with ksocklnd peer_credits=8, sock_timeout=50, credits=256, and lnet discovery=0.
+
+	One client, an MDS, and an OSS failover pair with 2 OSTs.
+
+Reproduction
+
+	On the client, set osc.*.max_rpcs_in_flight=32.
+
+	Start 32 dd writers with direct I/O and 1 MiB blocks, across both OSTs.
+
+	Confirm with lnetctl peer show -v that the client has no tx credits for the OSS.
+
+	On the client, add a static ARP entry for the OSS IP to a MAC address that does not exist. This step makes the dead NID give no reply, as on some cloud networks.
+
+	Kill the OSS VM. The partner mounts the OSTs.
+
+	Time the interval until both OSC imports are FULL. Check for eviction.
+
+On master, step 6 took 159.7-172.3 s, and the target evicted the client in 3 of 3 runs. While the import waited, it stayed in CONNECTING on the dead NID for 24-49 s at a time.
+
+Analysis
+
+	ptlrpc_unregister_reply() calls LNetMDUnlink() on rq_reply_md_h only. It then waits for rq_req_unlinked. PtlRPC never unlinks the request MD.
+
+	LU-4006 makes lnet_post_send_locked() drop a message on an aborted MD. The drop occurs only when the message gets a credit and reaches the head of lpni_txq. A queued message thus waits for the credit holders to complete.
+
+	With a silent dead peer, socklnd holds each credit holder until its conn fails, about sock_timeout. Each connect attempt waits behind them.
+
+Earlier attempts:
+
+	LU-13368 let PtlRPC discard the request-out callback, so it stopped its wait for rq_req_unlinked. LU-17379 fixed a check in that code, because a CONNECT waited on lp_dc_pendq past its timeout. LU-17704 reverted the LU-17379 fix (LU-17759 errors), and LU-14499 reverted LU-13368 (o2iblnd shutdown hang, memory leak).
+
+	These attempts let PtlRPC stop its wait while the LND could still own the message. The fix below keeps that wait.
+
+LU-21058 (change 70136) solves the connect case differently: a connect message skips the LNet credits. The two fixes complement each other. The fix below helps every RPC type, but it frees the import only at the RPC timeout. 70136 sends the connect at once, so it can also reach a server that restarted on the same NID.
+
+Proposed fix
+
+	PtlRPC: in ptlrpc_unregister_reply(), also call LNetMDUnlink(rq_req_md_h) when the request timed out (rq_timedout) or failed (rq_err), and the request MD is not unlinked yet. Read these flags under rq_lock. Use no discard flag. Keep the wait for rq_req_unlinked, so PtlRPC never frees a buffer that the LND holds. Do not unlink the request MD after a normal reply. LNet reports a send that completes on an unlinked MD as failed. A good request then ends as a network error, which is the LU-17759 failure.
+
+	LNet: each MD keeps a list of its attached messages. In LNetMDUnlink(), for a busy MD, take each message that LNet still queues off lpni_txq, tq_delayed or lp_dc_pendq. Return its credits, and finalize it with -ECANCELED after LNetMDUnlink() drops the locks. A message that the LND already holds stays as it is. The lock order is lnet_res_lock (MD CPT), then lnet_net_lock (message CPT), then lpni_lock or lp_lock. The unlink path does not take LNET_LOCK_EX.
+
+A prototype of both parts gave these results with the reproduction above. Each row has 2-5 runs.
+
+Build
+Kill only
+Kill and static ARP
+Evicted
+
+ master 
+ 42.9-66.2 s 
+ 159.7-172.3 s 
+ 3 of 3, with static ARP 
+
+ Part 1 only 
+ 42.0-57.1 s 
+ 96.3-106.4 s 
+ 0 of 4 
+
+ Part 2 only, first prototype 
+ 48.6-59.3 s 
+ 160.5-168.2 s 
+ 2 of 2, with static ARP 
+
+ Parts 1 and 2 
+ 38.3-40.0 s 
+ 50.2-52.2 s 
+ 0 of 5 
+
+ LU-21058 (70136) 
+ 37.0-41.1 s 
+ 49.2-49.9 s 
+ 0 of 4 
+
+The client debug log shows the cancel in every run, with 16-26 cancelled messages for each run. In one run, these were 14 OST_WRITE, 7 OBD_PING and 4 CONNECT requests. No node had an LBUG, an assertion or a slub_debug report. No node logged "already unlinked". sanity-lnet gave the same result on master and on an earlier form of the series.
+
+A CONNECT does not wait on lp_dc_pendq on master. Since LU-17906, PtlRPC does not send a connect over a peer that is not up to date. Other LNet users can still wait there. In an lnet_selftest test to a dead NID that was not discovered, master released the MD after 51.2 s, at the end of discovery. The series released it after 30.2-30.6 s, when lnet_selftest stopped the RPC.
+
+Work before the fix can land:
+
+	A regression test.
+
+	Full sanity-lnet and recovery-small runs on the final series.
+
+	PtlRPC does not unlink the request MD of a request that it resends after a reconnect. That request can still wait for a credit.
+
+	Tests of the tq_delayed path, of a routed path, and of o2iblnd. The LU-14499 hang was on o2iblnd.

@@ -7,18 +7,18 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-29 03:18:40.000000000
-Updated:    2026-10-30 17:45:18.000000000
+Updated:    2026-10-31 05:20:11.000000000
 Patch Set:  2
 Insertions: +1030
 Deletions:  -132
-Comments:   11 (0 unresolved)
+Comments:   15 (4 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
-  CC: Nikitas Angelinas
+  CC: Nikitas Angelinas, Gerrit AI review for Lustre
   REVIEWER: Chris Horn
 
 --- Commit Message ---
@@ -298,3 +298,89 @@ Patch Set 2:
 Patch Set 2:
 
 Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-155vm13: https://testing.whamcloud.com/test_sessions/cbae6772-1250-484f-95d1-b0af650b6bdd ran 3 tests.  1 tests failed: sanityn.
+
+--- Message (Andreas Dilger, 2026-10-30 21:33:05.000000000) ---
+Patch Set 2:
+
+Results on a single HDD OST, where requests queue in NRS.
+
+Setup: 1 MDT, 1 OST on a 100 GB image on a 7200 rpm HDD (cache=none,
+rotational, so batches are on by default), 16 clients x 8 ranks,
+max_rpcs_in_flight=32, ost_io threads_max=16.  With the default 128
+ost_io threads nothing was ever queued in NRS (all requests waited in
+threads and the disk queue), so the order did not matter.  With 16
+threads NRS held 82-94 queued requests on average.
+
+Fixed-size ior-hard write pattern, no stonewall, 12 GB total:
+  lfs setstripe -C 4; ior -C -Q 1 -g -e -w -a POSIX -t 47008 -b 47008 -s 2000
+
+                                MiB/s   total   rank avg/max
+  fifo                           8.66   1325s   1163/1324s
+  tbf opcode batch_kb=0          7.75   1482s   1351/1480s
+  tbf opcode, PS1 elevator       8.79   1306s   1229/1304s
+  tbf opcode, PS2 lowest first  10.19   1126s   1111/1124s
+
+Lowest offset first is 18% faster than fifo, 31% faster than TBF
+without batches and 16% faster than the PS1 elevator.  The ranks
+finish within 13s of each other, against 75-160s for the others,
+so slow ranks catch up rather than holding up the end of the job.
+The OST I/O sizes are the same in all runs (82-90% 64KB).  One run
+of each.
+
+The first PS1 elevator run crashed the OSS:
+
+  BUG: scheduling while atomic: ll_ost00_004/48295/0x00000002
+   schedule
+   nrs_class_findadd
+   nrs_class_res_get
+   nrs_resource_get
+   nrs_resource_get_safe
+   ptlrpc_nrs_req_hp_move
+   ldlm_server_blocking_ast
+   tgt_blocking_ast
+   ldlm_work_bl_ast_lock
+   ...
+   ldlm_handle_enqueue
+   tgt_enqueue
+  LustreError: (client.c:613:ptlrpc_request_cache_alloc()) ASSERTION(...) failed
+  LBUG
+  Kernel panic - not syncing: LBUG in interrupt.
+
+nrs_class_findadd(), added in https://review.whamcloud.com/65730
+("LU-20099 nrs: abstract rule-based classful NRS scheduler"), calls
+schedule() to retry when it loses a race with a class being freed.
+ptlrpc_nrs_req_hp_move() calls it under scp_req_lock (moving_req is
+true), and nrs_class_res_get() already allocates with GFP_ATOMIC in
+that case, but the retry still sleeps.  The retry needs cpu_relax()
+when moving_req is set, or to fail the HP move.  This patch does not
+change that code, so it can hit the same crash.  The rerun of the
+same test completed without problems.
+
+--- Message (Maloo, 2026-10-30 22:19:49.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-157vm110: https://testing.whamcloud.com/test_sessions/f4752eed-f688-42d8-8b9d-0063e786d696 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-10-30 23:40:48.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-146vm20: https://testing.whamcloud.com/test_sessions/7bf283ad-dcdf-4c73-ba57-d266a564b8d3 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-10-31 01:25:50.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest from onyx-156vm1: https://testing.whamcloud.com/test_sessions/3873b78c-b2bc-4751-842d-545f211b9141 ran 6 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-10-31 05:07:19.000000000) ---
+Patch Set 2: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest from onyx-156vm52: https://testing.whamcloud.com/test_sessions/56ec78d8-3820-4fdb-94f1-d9e01b0342f4 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-10-31 05:20:11.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the batch, round and nc_next handoff logic held up under tracing of the TBF and mClock add/get/del paths. A few optional nits inline for whenever the patch is next refreshed, no need to re-spin for them.

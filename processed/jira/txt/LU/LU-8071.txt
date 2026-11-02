@@ -8,9 +8,9 @@ Resolution: Fixed
 Assignee:   nasf
 Reporter:   Nathan Dauchy
 Created:    Tue, 26 Apr 2016 19:27:27 +0000
-Updated:    Thu, 14 Jun 2018 21:41:19 +0000
+Updated:    Mon, 2 Nov 2026 00:30:09 +0000
 Resolved:   Thu, 2 Jun 2016 18:07:45 +0000
-Links:      Related: is related to  LU-7616
+Links:      Related: is related to  LU-7616; Related: is related to LU-21088
 Attachments: bt.all, dmesg.out, lostfound_nonzero.lst, nagtest.toobig.stripes
 
 --- Environment ---
@@ -87,238 +87,286 @@ Apr 25 17:15:16 nbp9-mds multipathd: nbp9_MGS_MDS: can't flush
 
 The server had to be rebooted and e2fsck run to get it back into production.
 
---- Comment (pjones, Thu, 2 Jun 2016 18:07:45 +0000) ---
-Thanks Jay!
-
---- Comment (jaylan, Thu, 2 Jun 2016 18:05:10 +0000) ---
-Yes, this ticket can be closed. Thanks!
-
---- Comment (pjones, Thu, 2 Jun 2016 11:58:23 +0000) ---
-Now landed for 2.9 and queued up for maintenance releases. Is there anything further you need on this ticket or can it be closed?
+--- Comment (ndauchy, Tue, 26 Apr 2016 19:29:39 +0000) ---
+Not sure how closely tied this is, but... after the reboot we ran e2fsck on the MDT. The fsck was able replay the journal but during the scan found lots of unattached inodes and moved them to /lost+found.   Interestingly, most of those inodes were almost sequential:
+
+Unattached inode 584092565
+Connect to /lost+found? yes
+Unattached inode 584092567
+Connect to /lost+found? yes
+Unattached inode 584092637
+Connect to /lost+found? yes
+Unattached inode 584092640
+Connect to /lost+found? yes
+Unattached inode 584092643
+Connect to /lost+found? yes
+Unattached inode 584092645
+Connect to /lost+found? yes
+Unattached inode 584092648
+Connect to /lost+found? yes
+Unattached inode 584092715
+Connect to /lost+found? yes
+Unattached inode 584092717
+Connect to /lost+found? yes
+Unattached inode 584092720
+Connect to /lost+found? yes
+Unattached inode 584092723
+Connect to /lost+found? yes
+Unattached inode 584092784
 
---- Comment (gerrit, Thu, 2 Jun 2016 04:40:44 +0000) ---
-Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/20062/
+Mounted as ldiskfs and saw that all but about 20 files were owned by root and had surprisingly old date stamps:
 
-Subject: LU-8071 ldiskfs: handle system freeze protection
+nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found/
+total 6816
+-rw------- 1 root     root   5792 Jul 26  1970 #17831719
+-rw------- 1 root     root   5792 Jul 26  1970 #17831723
+-rw------- 1 root     root   5792 Feb  4  1988 #571005637
+-rw------- 1 root     root   5792 Feb  4  1988 #571016437
+-rw------- 1 root     root   5792 Feb  4  1988 #571029133
+...
+-rw------- 1 root     root   4832 Jul  5  1988 #584109225
+-rw------- 1 root     root   4832 Jul  5  1988 #584109227
+-rw------- 1 root     root   4832 Jul  5  1988 #584109231
+-rw------- 1 root     root   4832 Jul  5  1988 #584109233
+-rw------- 1 root     root   4832 Jul  5  1988 #584109235
 
-Project: fs/lustre-release
+nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found | grep -v " root "
+total 47328
+-rwxr----- 1 dmenemen g26209    0 Feb 10  2014 #570436464
+-rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436465
+-rwxr----- 1 dmenemen g26209    0 Feb 10  2014 #570436466
+-rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436467
+-rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436468
+-rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436469
+...
+(another dozen or so more similar files)
 
-Branch: master
+Ran "ll_recover_lost_found_objs" on the MDT mounted as ldiskfs, and it reported results like:
 
-Current Patch Set: 
+Object /mnt/lustre/nbp9-mdt/O/22d0c13d/d23/cb410817 restored.
+Object /mnt/lustre/nbp9-mdt/O/22d0c13f/d27/cb41083b restored.
+Object /mnt/lustre/nbp9-mdt/O/22d0c145/d1/cb504661 restored.
+Object /mnt/lustre/nbp9-mdt/O/22d0c147/d27/cb50467b restored.
+Object /mnt/lustre/nbp9-mdt/O/22d0c153/d16/cb504810 restored.
+Object /mnt/lustre/nbp9-mdt/O/22d0c155/d20/cb504814 restored.
 
-Commit: bd40ca206881eefeeb6ad7586f93afd685bb8120
+  (It got all the non-root owned files)
 
---- Comment (adilger, Wed, 18 May 2016 18:00:47 +0000) ---
-I would recommend against using the ext4-give-warning-with-dir-htree-growing.patch as this also requires other changes to the Lustre code.  The other changes are OK to use on other kernels.
+I believe that the rest of the files in lost+found were probably either useless or were never pointing to user data... they have no xattrs:
 
-Also, are the following patches from the upstream kernel already applied on your systems?
+# getfattr -d -m ".*" -e hex /mnt/lustre/nbp9-mdt/lost+found/*
 
-commit 437f88cc031ffe7f37f3e705367f4fe1f4be8b0f
-Author:     Eric Sandeen 
-AuthorDate: Sun Aug 1 17:33:29 2010 -0400
-Commit:     Theodore Ts'o 
-CommitDate: Sun Aug 1 17:33:29 2010 -0400
+  (returned nothing!)
 
-    ext4: fix freeze deadlock under IO
-    
-    Commit 6b0310fbf087ad6 caused a regression resulting in deadlocks
-    when freezing a filesystem which had active IO; the vfs_check_frozen
-    level (SB_FREEZE_WRITE) did not let the freeze-related IO syncing
-    through.  Duh.
-    
-    Changing the test to FREEZE_TRANS should let the normal freeze
-    syncing get through the fs, but still block any transactions from
-    starting once the fs is completely frozen.
-    
-    I tested this by running fsstress in the background while periodically
-    snapshotting the fs and running fsck on the result.  I ran into
-    occasional deadlocks, but different ones.  I think this is a
-    fine fix for the problem at hand, and the other deadlocky things
-    will need more investigation.
-    
-    Reported-by: Phillip Susi 
-    Signed-off-by: Eric Sandeen 
-    Signed-off-by: "Theodore Ts'o" 
+So, we ran another e2fsck (which came back clean!) and put the filesystem back into production.
 
-commit 6b0310fbf087ad6e9e3b8392adca97cd77184084
-Author:     Eric Sandeen 
-AuthorDate: Sun May 16 02:00:00 2010 -0400
-Commit:     Theodore Ts'o 
-CommitDate: Sun May 16 02:00:00 2010 -0400
+--- Comment (ndauchy, Tue, 26 Apr 2016 19:32:37 +0000) ---
+Uploading backtrace and dmesg from the MDS.
 
-    ext4: don't return to userspace after freezing the fs with a mutex held
-    
-    ext4_freeze() used jbd2_journal_lock_updates() which takes
-    the j_barrier mutex, and then returns to userspace.  The
-    kernel does not like this:
-    
-    ================================================
-    [ BUG: lock held when returning to user space! ]
-    ------------------------------------------------
-    lvcreate/1075 is leaving the kernel with locks still held!
-    1 lock held by lvcreate/1075:
-     #0:  (&journal->j_barrier){+.+...}, at: []
-    jbd2_journal_lock_updates+0xe1/0xf0
-    
-    Use vfs_check_frozen() added to ext4_journal_start_sb() and
-    ext4_force_commit() instead.
-    
-    Addresses-Red-Hat-Bugzilla: #568503
-    
-    Signed-off-by: Eric Sandeen 
-    Signed-off-by: "Theodore Ts'o" 
+--- Comment (mhanafi, Thu, 28 Apr 2016 00:22:24 +0000) ---
+The recovery of the mdt as resulted in 25776 file losing their stripe info.
 
-I would guess yes, since they originated from Red Hat, but just wanted to confirm.
+pfe24 /nobackupp9/gmao_SIteam/ObservingSystem/reanalysis/aqua_disc/hdf # cd /nobackupp9//nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v/
 
---- Comment (jaylan, Tue, 10 May 2016 18:31:04 +0000) ---
-The last six patches in ldiskfs-2.6-rhel6.6.series of the master branch are:
+pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # lfs getstripe temperature_energy.dat
 
-rhel6.3/ext4-drop-inode-from-orphan-list-if-ext4_delete_inode-fails.patch
+temperature_energy.dat has no stripe info
 
-rhel6.6/ext4-remove-truncate-warning.patch
+pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # lfs path2fid temperature_energy.dat
 
-rhel6.6/ext4-corrupted-inode-block-bitmaps-handling-patches.patch
+[0x20010fbee:0x66:0x0]
 
-rhel6.3/ext4-notalloc_under_idatasem.patch
+pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # stat temperature_energy.dat
 
-rhel6.5/ext4-give-warning-with-dir-htree-growing.patch
+  File: `temperature_energy.dat'
 
-rhel6.6/ext4_s_max_ext_tree_depth.patch
+  Size: 0         	Blocks: 0          IO Block: 4194304 regular empty file
 
-Only the first 2 patches have already been picked into b2_7_fe. All six have not been picked to b2_5_fe.
+Device: 162deh/90846d	Inode: 144133862291669094  Links: 1
 
-We are running Centos 6.6 and it seems to me these patches are important to have also. Some of our servers run 2.5.3 and the rest run 2.7.1. Is it safe for us to pick up those missing ldiskfs kernel patches? Please advise.
+Access: (0644/rw-rr-)  Uid: (10670/nfeather)   Gid: (41430/   s1430)
 
---- Comment (gerrit, Mon, 9 May 2016 09:23:28 +0000) ---
-Fan Yong (fan.yong@intel.com) uploaded a new patch: http://review.whamcloud.com/20062
+Access: 2016-04-19 11:04:25.000000000 -0700
 
-Subject: LU-8071 ldiskfs: handle system freeze protection
+Modify: 2016-04-19 11:04:25.000000000 -0700
 
-Project: fs/lustre-release
+Change: 2016-04-19 11:04:25.000000000 -0700
 
-Branch: master
+ Birth: -
 
-Current Patch Set: 1
+We need help to recover the stripe info!
 
-Commit: b61bdfcaef1b03f8d0f082d57120681d71ab5e40
+--- Comment (pjones, Thu, 28 Apr 2016 02:47:53 +0000) ---
+Fan Yong Is looking into this
 
---- Comment (adilger, Fri, 6 May 2016 17:20:11 +0000) ---
-The fsfreeze is the same as what LVM does internally, so it wouldn't change the problem being seen.  We don't plumb that ioctl through the MDT mountpoint to the underlying filesystem, which is why there is an error reported.
+--- Comment (yong.fan, Thu, 28 Apr 2016 03:09:48 +0000) ---
+Mahmoud,
 
-As for fixing this problem, I suspect that some of the upstream ext4 patches need to be backported (in particular kernel commits 437f88cc031ffe7f and 6b0310fbf087ad6) but there is also likely a need to add checks into the osd-ldiskfs code to block new IO submissions when the device is freezing/frozen, since these do not have the VFS-level checks.
+Usually, for the file with small LOV EA, such as four stripes or so, the LOV EA  will be stored inside the inode space (block). So if the inode is there, the LOV EA should be there also, unless the inode corrupted. But since e2fsck run completedlily, it seems not such case. So the lost LOV EA should be stored in separated block, do you still have some idea about the stripe count for the files lost the stripe info? Have you ever enable large EA to support thousands of stripes?
 
---- Comment (ndauchy, Fri, 6 May 2016 15:51:08 +0000) ---
-At some point in the future we plan to migrate to RHEL/CentOS-7, but right now CentOS-6.7 is the priority.  It looks like there is additional code that uses vfs_check_frozen in newer ext4/super.c source, but that it is not in our 2.6.32-504.30 kernel, nor is it mentioned in the changelog for a very recent CentOS-6.7 2.6.32-573.22 kernel.  Are you saying that we just need to incorporate all the existing fixes, or that a new lustre patch is needed to perform a check which is unique to ldiskfs?
+On the other hand, the files in /lost+found seems abnormal. The time "Jul 26  1970" is the start time, that is impossible for normal Lustre objects. And the time "Feb  4  1988" is also not reasonable Lustre time stamp. Then I think that the e2fsck scanned some non-initialized area, the inode bitmap maybe corrupted.
 
-If it would be more expedient to use some sort of external pause/resume commands before and after the lvm snapshot is created, then we could work that into the process as well.
+nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found/
 
-Also, just curious if this should work for a running MDT or ldiskfs:
+total 6816
 
-service322 ~ # fsfreeze -f /mnt/lustre/nbptest-mdt
-fsfreeze: /mnt/lustre/nbptest-mdt: freeze failed: Operation not supported
+rw------ 1 root     root   5792 Jul 26  1970 #17831719
 
---- Comment (adilger, Thu, 5 May 2016 22:37:46 +0000) ---
-It appears that we may be missing calls in osd-ldiskfs to check if the block device is currently (being) frozen before submitting IO to the underlying storage (i.e. all modifications blocked at a barrier while in the middle of creating a snapshot.
+rw------ 1 root     root   5792 Jul 26  1970 #17831723
 
-In newer kernels (3.5+, e.g. RHEL7) this is handled with sb_start_write() and sb_end_write() at the upper layers, and sb_start_intwrite() and sb_end_intwrite() for filesystem internal writes, and should be taken before i_mutex (see e.g. kernel commit 8e8ad8a57c75f3b for examples).
+rw------ 1 root     root   5792 Feb  4  1988 #571005637
 
-In older kernels (e.g. RHEL6) it uses vfs_check_frozen() to see if the device is currently frozen, with level=SB_FREEZE_WRITE to block new modifications from starting, and level=SB_FREEZE_TRANS to only block internal threads if the freeze barrier is complete.
+rw------ 1 root     root   5792 Feb  4  1988 #571016437
 
---- Comment (yong.fan, Thu, 5 May 2016 00:30:07 +0000) ---
-OK, I think we have a decent handle on the lost+found contents now, and the e2fsck and lfsck behaviour. It sounds like perhaps there is room for an improvement in lfsck to handle the conflicts more elegantly?
+rw------ 1 root     root   5792 Feb  4  1988 #571029133
 
-If two orphan OST-objects conflict with each other when rebuilding the lost LOV EA, from the LFSCK view, it is NOT easy to know which one is right. Because the LFSCK cannot analysis the OST-object data. We found the trouble just because of the abnormal file size based on human judgement. But from the LFSCK view, since the file/object size is in the valid range, it cannot say current OST-object A-D are invalid. So on the this degree, the LFSCK needs some human assistant to make the right choice.
+...
 
-As for the reason of lost stripe information, I do not know, I only have some guess or suspicion. Rebooting the system during "lvcreate --snapshot" is mostly suspected. For large LOV EA (with ten of or hundred stripes), the LOV EA will be stored in separated block. If someone breaks the process during the interval of inode creation and  LOV EA storing, then the inode may lost its LOV EA. On the other hand, the implementation of LMV snapshot also may affect that. For example, there maybe some internal data re-location during the "lvcreate --snapshot", if someone breaks the process, the system may be in some internal inconsistent status.
+rw------ 1 root     root   4832 Jul  5  1988 #584109225
 
-According to the stack traces in this ticket, there were some users accessing the system during "lvcreate --snapshot", right? If yes, I think that it would cause some Copy-On-Write, that may be blocked by the in-processing "lvcreate --snapshot" or handled with it currently, that depends on the LVM implementation. Unfortunately, it is out of Lustre scope, and I am not familiar with that.
+rw------ 1 root     root   4832 Jul  5  1988 #584109227
 
-Honestly, I am not the fun of LVM snapshot because of many criticisms about the performance.
+rw------ 1 root     root   4832 Jul  5  1988 #584109231
 
-Andreas, do you have any idea about the LVM/e2fsck trouble?
+rw------ 1 root     root   4832 Jul  5  1988 #584109233
 
---- Comment (ndauchy, Wed, 4 May 2016 19:21:51 +0000) ---
-OK, I think we have a decent handle on the lost+found contents now, and the e2fsck and lfsck behaviour.  It sounds like perhaps there is room for an improvement in lfsck to handle the conflicts more elegantly?
+rw------ 1 root     root   4832 Jul  5  1988 #584109235
 
-What is still a significant unknown is how this corruption happened to begin with and what we can do to avoid it in the future.  For now, we are no longer performing LVM snapshots of the MDT.   Do you have a more complete explanation for the source of the lost striping information on the MDT?  It is probably not just the LVM snapshot or e2fsck, as each have been used widely before.  The server reboot while "lvcreate --snapshot" was running could have something to do with it I suppose.  Do the stack traces and ldiskfs_journal_start_sb messages provide any clues?
+As for recover object from /lost+found via "ll_recover_lost_found_objs", it is used for OST-object. I am surprised that it recovered something on your MDT! So it makes me to suspect your system corruption in further.
 
---- Comment (yong.fan, Wed, 4 May 2016 15:01:01 +0000) ---
-There are 3 kinds of files under your lustre lost+found directory. They are:
+Back to your direct question: how to recover the lost stripe info. Our new layout LFSCK can recover the lost (MDT-object's) LOV EA from orphan OST-object(s), such functionality is available since Lustre-2.6. Seems your system is Lustre-2.5 based, so unless you upgrade your system, otherwise, you have to recover that manually as following for example:
 
-1) The file name contains infix "-C-". That means multiple OST-objects claim the same MDT-object and the same slot in the LOV EA. Then the layout LFSCK will create new MDT-object(s) to hold the conflict OST-object(s). Searching your "lostfound_nonzero.lst" file, there are 4 files with "-C-" name. As described in former comment, they are corresponding to the file "nagtest.toobig.stripes" and conflict with the OST-objects A-D. If you think that the layout LFSCK made wrong decision when re-generated the "nagtest.toobig.stripes" LOV EA, we need to make new patch to recover it. But since there is only one file with conflict OST-objects, you also can recover the file "nagtest.toobig.stripes" manually.
+1) Get the "temperature_energy.dat" FID via "lfs path2fid temperature_energy.dat"
 
-2) The file name contains infix "-R-". That means the orphan OST-object knows its parent MDT-object FID, but does not know the position (the file name) in the namespace. So have to create a file with the known PFID. Under such case, if you can remember something from file data, you can rename the file back to the normal namespace.
+2) Get PFID EA from the OST-objects. Since we do not know which OST-object(s) belong to "temperature_energy.dat", then we have to scan the OST-object's one by one.
 
-3) The file name contains infix "-O-". They are orphan MDT-objects. The backend e2fsck put them into the local /lost+found directory, that is invisible to the client. The LFSCK scans the MDT-objects under local /lost+found directory, if the MDT-object has valid linkEA, then the LFSCK will move it back to normal namespace, otherwise, it will be put under the global Lustre lost+found directory that is visible to the client. Similar as above case 2), if you can remember something from file data, you can rename the file back to the normal namespace. On the other hand, I noticed that the files with "-O-" name all have the size 5792, that is mysterious. Unless the e2fsck found some corrupted inodes, otherwise, it is almost impossible. So you have to check these file with more human knowledge and if you think they are invalid, then remove them directly.
+3) If some OST-object PFID EA matches the "temperature_energy.dat" FID, then we find one stripe of temperature_energy.dat.
 
---- Comment (ndauchy, Wed, 4 May 2016 13:40:35 +0000) ---
-Full listing of nonzero files in lost+found, gathered as:
+Above process is very inefficient and easy to be wrong. So unless you are confident for such manually operations have time, I would suggest to upgrade your system and run layout LFSCK for recovery.
 
-cd /nobackupp9/.lustre/lost+found/MDT0000
-find . -type f -a ! -size 0 | xargs ls -ld > /u/ndauchy/tmp/nbp9_diag/lostfound_nonzero.lst
+--- Comment (mhanafi, Thu, 28 Apr 2016 03:29:13 +0000) ---
+I have a modified e2scan that will dump ost object and look up the PFID for each OST. We use it to quickly identify users that are filling up an OST. So if I can run that and get a list of all OST object what would be the next step to put it back together? 
 
---- Comment (ndauchy, Wed, 4 May 2016 13:34:49 +0000) ---
-The closest match I could find in lost+found was:
+We could also upgrade to 2.7.1. How fast does the lfsck run?
 
-[0x20011c02e:0x1e13:0x0]-[0x20001d596:0x97:0x0]-3-C-0
-[0x20011c02e:0x69c7:0x0]-[0x20001d596:0x97:0x0]-0-C-0
-[0x20011c030:0x1219c:0x0]-[0x20001d596:0x97:0x0]-2-C-0
-[0x20011c030:0x13ffc:0x0]-[0x20001d596:0x97:0x0]-1-C-0
+--- Comment (yong.fan, Thu, 28 Apr 2016 04:03:54 +0000) ---
+If  you can get the OST-objects list, then I can make a patch to re-generate the MDT-objects LOV EA from such list.
 
-And the file ownership is the same as /nobackupp9/dtalcott/nagtest.toobig
+As for "how fast the LFSCK run", depends on your system environment. I have tested the layout LFSCK on OpenSFS cluster, for single MDT case, the routine scan (without repairing) speed can be up to 100K objects/sec, the repair speed is about 30K objects/sec.
 
---- Comment (ndauchy, Wed, 4 May 2016 13:18:44 +0000) ---
-To follow up on question from yesterday, which you probably already guessed...
+--- Comment (mhanafi, Thu, 28 Apr 2016 05:03:58 +0000) ---
+Since we need to install a patch we may want to just upgrade. I'll update the case tomorrow as to what we decided to do.
 
-There are 240 OSTs on the corrupted file system (on 16 OSS).
+--- Comment (yong.fan, Thu, 28 Apr 2016 06:17:39 +0000) ---
+Sorry, I did not say clearly. I mean that if you can get the OST-objects list, then I will make a tool to re-geneate the stripe info from your OST objects list. You do not need to patch your current system.
 
---- Comment (yong.fan, Wed, 4 May 2016 08:33:46 +0000) ---
-By default, the repairing behaviour will be recorded in Lustre debug log via label "D_LFSCK". But because Lustre kernel log is in RAM only, and if you did not dump them periodically, then it will be overwritten. I am not sure whether you have such log or not.
+--- Comment (ndauchy, Thu, 28 Apr 2016 14:19:26 +0000) ---
+Prior to the hang, when I had (what I thought was) a successful LVM snapshot, I happened to be looking for files with dates out of the expected range:
 
-On the other hand, the log "nagtest.toobig.stripes" shows that there are 244 OST-objects claiming as the stripe of the [0x20001d596:0x97:0x0], but the "lfs getstripe" output shows that the file "nagtest.toobig" only has 240 stripes. So there are (at least) 4 OST-objects are fake. I found that there are 4 OST-objects with the size 251658240 bytes are conflict with another 4 OST-objects with the size 4194304 bytes, as shown following:
+nohup find /mnt/snap/ROOT/ -mtime +10000 -o -mtime -0 > /tmp/nbp9_big_time_t.out 2>&1 
 
-A) 65.out.service162:F,2833,10491,1179,362692,251658240,lma,[0x100000000:0x93bfc2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461812807,1461812805,1461812807
-B) 104.out.service169:F,240,10491,1179,30814,251658240,lma,[0x100000000:0x9e78e3:0x0],0,fid,[0x20001d596:0x97:0x1],1,1461812807,1461812805,1461812807
-C) 121.out.service170:F,2375,10491,1179,304121,251658240,lma,[0x100000000:0x969e66:0x0],0,fid,[0x20001d596:0x97:0x2],2,1461812807,1461812805,1461812807
-D) 87.out.service168:F,4361,10491,1179,558333,251658240,lma,[0x100000000:0x97b343:0x0],0,fid,[0x20001d596:0x97:0x3],3,1461812807,1461812805,1461812807
+  looking at those files from a client, the results are like:
 
-a) 56.out.service169:F,32528,10491,1179,4163662,4194304,lma,[0x100000000:0x512a2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461629209,1461629204,1461629209
-b) 207.out.service176:F,37845,10491,1179,4844182,4194304,lma,[0x100000000:0x5139a:0x0],0,fid,[0x20001d596:0x97:0x1],1,1461629209,1461629204,1461629209
-c) 137.out.service170:F,40964,10491,1179,5243393,4194304,lma,[0x100000000:0x512d2:0x0],0,fid,[0x20001d596:0x97:0x2],2,1461629209,1461629204,1461629209
-d) 236.out.service173:F,35030,10491,1179,4483887,4194304,lma,[0x100000000:0x51320:0x0],0,fid,[0x20001d596:0x97:0x3],3,1461629209,1461629204,1461629209
+pfe20 /u/ndauchy/tmp # xargs -a nbp9_big_time_t.txt -d '\n' ls -ldtr
+-rwxr-xr--  1 sviken   a1426             0 Dec 31  1969 /nobackupp9/sviken/rev3mod3/grid3b/sally_grid_info/?c}x;?
 
-The OST-objects A-D with the size 251658240 bytes claim as the first 4 stripes of the file "nagtest.toobig". The reason may be as following: the file "nagtest.toobig" lost its LOV EA because some unknown reason. Either the OST-objects A-D or a-d have corrupted PFID EA. According to the size attribute, the OST-objects A-D seems have corrupted PFID EA. During the LFSCK processing, the layout LFSCK tried to re-geneate the "nagtest.toobig" LOV EA with these 244 orphan OST-objects. Unfortunately, the OST-objects A-D were found earlier than the OST-objects a-d, then the regenerated LOV EA contains the OST-objects A-D information. And then when the orphan OST-objects a-d were handled, the layout LFSCK found that they were conflict with some others, then the layout LFSCK should have created some new files with the name "[0x20001d596:0x97:0x0]-[0x100000000:0x512a2:0x0]-C-0" or similar under the directory ".lustre/lost+found/MDT0000/". Please check for verification.
+Of course, I don't know whether these are A) from the same event, B) from taking the previous LVM snapshot, or C) have been that way for a long time and are completely unrelated.  I can upload the full file with all (590) such files if needed.
 
---- Comment (mhanafi, Tue, 3 May 2016 22:11:56 +0000) ---
-Is there a way log what files that lfsck is making changes to.
+--- Comment (mhanafi, Fri, 29 Apr 2016 00:56:22 +0000) ---
+We have upgraded to 2.7.1 and started a dryrun lfsck. This is the command we uses.
 
-As for the  /nobackupp9/dtalcott/nagtest.toobig. I am attaching object scan of all osts for this file. You can see that there was 2 stripes 0. All the stripe for this file are 4194304 in size but the stripe on OST-65 is 251658240.
+lctl lfsck_start --dryrun -M nbp9-MDT0000 -A
 
-#filename:type,blockgroup,uid,gid,inode,size,type,fid,stripe,ctime,atime,mtime
+Is that correct?
 
-56.out.service169:F,32528,10491,1179,4163662,4194304,lma,[0x100000000:0x512a2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461629209,1461629204,1461629209
+--- Comment (yong.fan, Fri, 29 Apr 2016 01:38:12 +0000) ---
+The files list in nbp9_big_time_t.txt looks abnormal, although you said they were from previous successful LVM backup. For further verification, you can dump their LMA EA ("trusted.lma") and linkEA ("trusted.link").
 
-65.out.service162:F,2833,10491,1179,362692,251658240,lma,[0x100000000:0x93bfc2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461812807,1461812805,1461812807
+As for the layout LFSCK, if you want to run as "dryrun" mode, please try "lctl lfsck_start -M nbp9-MDT0000 -t layout -o --dryrun"
 
-and ost 65 has stripe 62
+--- Comment (mhanafi, Fri, 29 Apr 2016 02:42:19 +0000) ---
+Doesn't -A do both layout and orphan repair?
 
-#filename:type,blockgroup,uid,gid,inode,size,type,fid,stripe,ctime,atime,mtime
+--- Comment (yong.fan, Fri, 29 Apr 2016 02:55:32 +0000) ---
+"-A" is enabled automatically if "-o" specified.
 
-65.out.service162:F,39432,10491,1179,5047326,4194304,lma,[0x100000000:0x51208:0x0],0,fid,[0x20001d596:0x97:0xd8],216,1461629208,1461629204,1461629208
+--- Comment (ndauchy, Fri, 29 Apr 2016 14:37:53 +0000) ---
+lfsck was completed last night after the upgrade to 2.7.1.
 
---- Comment (yong.fan, Tue, 3 May 2016 06:50:52 +0000) ---
-How many OSTs in your system? Have you ever created the file nagtest.toobig with 240 stripes? If no, then it may because that some OST-object(s) contained bad PFID EA, and claimed that its parent is the file nagtest.toobig, but LFSCK could NOT know whether it is right or not. Since nobody conflict with it/them, then the nagtest.toobig's LOV EA is enlarged to contain those OST-object(s) as to the size increased.
+Initial indications are that there was a lot of improvement, out of the initial list of 24150 problem files files, only 125 remain with no stripe info.  They appear to mostly be grouped into a handful of directories (or their subdirs) for a small set of users:
 
-According to the "lfs getstripe" output, we know every OST-object's ID, then we can use such ID to check on related OST. For example:
+# sed 's/ has no .*//' /nobackupnfs2/mhanafi/nbp9_ost_scan/nbp9.no_stripe_files.out.after_lfsck | xargs -d '\n' ls -l | awk '{print $3}' | sort | uniq -c
+ls: cannot access /nobackupp9/jchang/newfile: No such file or directory
+     65 bduda
+     45 bmauer
+      1 cbrehm1
+      1 dhixon
+     11 mchoudha
+      1 nfeather
 
+# sed 's/ has no .*//' /nobackupnfs2/mhanafi/nbp9_ost_scan/nbp9.no_stripe_files.out.after_lfsck | xargs -d '\n' -L 1 dirname | xargs -L 1 dirname | sort | uniq -c
+      1 /nobackupp9
+     65 /nobackupp9/bduda
+      1 /nobackupp9/cbrehm1/OpenRotor/6848rpm_ibio_with_Plate_newRun
+      1 /nobackupp9/dhixon
+     45 /nobackupp9/gmao_SIteam/ObservingSystem/reanalysis/aqua_disc/hdf
+      6 /nobackupp9/mchoudha/powerflow
+      1 /nobackupp9/mchoudha/powerflow/fine
+      4 /nobackupp9/mchoudha/powerflow/medium_aoa0_copy
+      1 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo
+
+It also looks like the recovered files sill lost ACL information.  Is it expected that lfsck is unable to recover those attributes?
+
+--- Comment (yong.fan, Fri, 29 Apr 2016 15:09:38 +0000) ---
+There are several possible cases for the remained 125 no-stripes files.
+
+1) The file has never been written after create, so the OST-object has no parent FID information.
+
+2)  The OST-object's parent FID EA is corrupted, so the OST-object does not know which file it belongs to. Then the layout LFSCK will mark it as Lustre orphan, and put under the directory "$mount_point/.lustre/lost+found/MDT0000/".
+
+3) The OST-object was lost also.
+
+4) There was something wrong during the layout LFSCK as to the layout LFSCK failed to re-generate the LOV EA.
+
+According to my experience, the first case more possible.
+
+The layout LFSCK can recover file owner information, but cannot recover ACL. Sorry for such inconvenience.
+
+--- Comment (ndauchy, Fri, 29 Apr 2016 18:09:27 +0000) ---
+There are indeed about 464350 files in the .lustre/lost+found/MDT0000/ directory.  The vast majority of them are owned by root, size zero, and date stamped around when the lfsck was run... so I'm assuming those are useless.
+
+In going through the remaining ~969 "interesting" ones, several have IO errors:
+
+pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # file [0x2000a1e14:0x10e4b:0x0]-R-0
+[0x2000a1e14:0x10e4b:0x0]-R-0: ERROR: cannot read `�' (Input/output error)
+
+pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # ls -l [0x2000a1e14:0x10e4b:0x0]-R-0
+-r-------- 1 dlrodrig g28100 20971520 Apr 28 20:31 [0x2000a1e14:0x10e4b:0x0]-R-0
+
+pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # lfs getstripe !$
+lfs getstripe [0x2000a1e14:0x10e4b:0x0]-R-0
+[0x2000a1e14:0x10e4b:0x0]-R-0
+lmm_stripe_count:   4
+lmm_stripe_size:    1048576
+lmm_pattern:        40000001
+lmm_layout_gen:     0
+lmm_stripe_offset:  0
 	obdidx		 objid		 objid		 group
+	     0	             0	            0	             0
+	     0	             0	            0	             0
+	     0	             0	            0	             0
+	    23	       7103687	     0x6c64c7	             0
 
-	    65	       9682882	     0x93bfc2	             0
+Would I be correct in assuming that those are non-recoverable?
 
-Here "65" corresponding to the OST0041 (HEX),  the "9682882" corresponding to the sub-dir "9682882 % 32 = 2" under /O, you can check such OST-object via: debugfs -c -R "stat /O/0/d2/9682882" $OST0041_dev
+--- Comment (yong.fan, Fri, 29 Apr 2016 23:40:50 +0000) ---
+For the files under .lustre/lost+found/MDT0000/, handle them as following:
 
-On the other hand, the OST-objects  with ID "332xx" looks abnormal. Usually, the OST-object's ID on different OSTs should be quite scattered. But your case looks some adjacent numbers. That makes me to suspect that the LOV EA is over-written by some pattern data.
+1) If the file is accessible (means no IO error), and its size is NOT zero, then it contains some valid data. But since we do not know its original position in the namespace, you needs to move them back to the namespace according to your memory or some new rule.
+
+2) If the file is accessible, and if the size is zero, then it is safe to remove them directly, at least it does not contains valid data, although it may affect related inode quota a bit.
+
+3) If the file is inaccessible with IO error, means only part of the stripes are found, and there is 'hole' in the re-generated LOV EA. Then you can dump part of the data from such file via "dd conv=sync,noerror ...". If such part data is still valuable, then save them in some new file. Otherwise, you have to discard them.
 
 --- Comment (ndauchy, Mon, 2 May 2016 17:42:41 +0000) ---
 Note: we do eventually still want to get to the bottom of the snapshot journal call trace and hang issue.
@@ -598,283 +646,235 @@ lmm_stripe_offset:  65
 
 So far I have not been able to figure out any reasonable way to scan for other files that grew a lot and got filled with zeros.  The best I can think of is a find for all files modified since 4/28 that are more than ~1GB.  Then compare the alleged size (ls -l) and the blocks used (du -s), and if they are more than ~10x off it could be a problem, and look at those files individually.  Ugh!  Any other ideas?
 
---- Comment (yong.fan, Fri, 29 Apr 2016 23:40:50 +0000) ---
-For the files under .lustre/lost+found/MDT0000/, handle them as following:
+--- Comment (yong.fan, Tue, 3 May 2016 06:50:52 +0000) ---
+How many OSTs in your system? Have you ever created the file nagtest.toobig with 240 stripes? If no, then it may because that some OST-object(s) contained bad PFID EA, and claimed that its parent is the file nagtest.toobig, but LFSCK could NOT know whether it is right or not. Since nobody conflict with it/them, then the nagtest.toobig's LOV EA is enlarged to contain those OST-object(s) as to the size increased.
 
-1) If the file is accessible (means no IO error), and its size is NOT zero, then it contains some valid data. But since we do not know its original position in the namespace, you needs to move them back to the namespace according to your memory or some new rule.
+According to the "lfs getstripe" output, we know every OST-object's ID, then we can use such ID to check on related OST. For example:
 
-2) If the file is accessible, and if the size is zero, then it is safe to remove them directly, at least it does not contains valid data, although it may affect related inode quota a bit.
-
-3) If the file is inaccessible with IO error, means only part of the stripes are found, and there is 'hole' in the re-generated LOV EA. Then you can dump part of the data from such file via "dd conv=sync,noerror ...". If such part data is still valuable, then save them in some new file. Otherwise, you have to discard them.
-
---- Comment (ndauchy, Fri, 29 Apr 2016 18:09:27 +0000) ---
-There are indeed about 464350 files in the .lustre/lost+found/MDT0000/ directory.  The vast majority of them are owned by root, size zero, and date stamped around when the lfsck was run... so I'm assuming those are useless.
-
-In going through the remaining ~969 "interesting" ones, several have IO errors:
-
-pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # file [0x2000a1e14:0x10e4b:0x0]-R-0
-[0x2000a1e14:0x10e4b:0x0]-R-0: ERROR: cannot read `�' (Input/output error)
-
-pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # ls -l [0x2000a1e14:0x10e4b:0x0]-R-0
--r-------- 1 dlrodrig g28100 20971520 Apr 28 20:31 [0x2000a1e14:0x10e4b:0x0]-R-0
-
-pfe27 /nobackupp9/.lustre/lost+found/MDT0000 # lfs getstripe !$
-lfs getstripe [0x2000a1e14:0x10e4b:0x0]-R-0
-[0x2000a1e14:0x10e4b:0x0]-R-0
-lmm_stripe_count:   4
-lmm_stripe_size:    1048576
-lmm_pattern:        40000001
-lmm_layout_gen:     0
-lmm_stripe_offset:  0
 	obdidx		 objid		 objid		 group
-	     0	             0	            0	             0
-	     0	             0	            0	             0
-	     0	             0	            0	             0
-	    23	       7103687	     0x6c64c7	             0
 
-Would I be correct in assuming that those are non-recoverable?
+	    65	       9682882	     0x93bfc2	             0
 
---- Comment (yong.fan, Fri, 29 Apr 2016 15:09:38 +0000) ---
-There are several possible cases for the remained 125 no-stripes files.
+Here "65" corresponding to the OST0041 (HEX),  the "9682882" corresponding to the sub-dir "9682882 % 32 = 2" under /O, you can check such OST-object via: debugfs -c -R "stat /O/0/d2/9682882" $OST0041_dev
 
-1) The file has never been written after create, so the OST-object has no parent FID information.
+On the other hand, the OST-objects  with ID "332xx" looks abnormal. Usually, the OST-object's ID on different OSTs should be quite scattered. But your case looks some adjacent numbers. That makes me to suspect that the LOV EA is over-written by some pattern data.
 
-2)  The OST-object's parent FID EA is corrupted, so the OST-object does not know which file it belongs to. Then the layout LFSCK will mark it as Lustre orphan, and put under the directory "$mount_point/.lustre/lost+found/MDT0000/".
+--- Comment (mhanafi, Tue, 3 May 2016 22:11:56 +0000) ---
+Is there a way log what files that lfsck is making changes to.
 
-3) The OST-object was lost also.
+As for the  /nobackupp9/dtalcott/nagtest.toobig. I am attaching object scan of all osts for this file. You can see that there was 2 stripes 0. All the stripe for this file are 4194304 in size but the stripe on OST-65 is 251658240.
 
-4) There was something wrong during the layout LFSCK as to the layout LFSCK failed to re-generate the LOV EA.
+#filename:type,blockgroup,uid,gid,inode,size,type,fid,stripe,ctime,atime,mtime
 
-According to my experience, the first case more possible.
+56.out.service169:F,32528,10491,1179,4163662,4194304,lma,[0x100000000:0x512a2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461629209,1461629204,1461629209
 
-The layout LFSCK can recover file owner information, but cannot recover ACL. Sorry for such inconvenience.
+65.out.service162:F,2833,10491,1179,362692,251658240,lma,[0x100000000:0x93bfc2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461812807,1461812805,1461812807
 
---- Comment (ndauchy, Fri, 29 Apr 2016 14:37:53 +0000) ---
-lfsck was completed last night after the upgrade to 2.7.1.
+and ost 65 has stripe 62
 
-Initial indications are that there was a lot of improvement, out of the initial list of 24150 problem files files, only 125 remain with no stripe info.  They appear to mostly be grouped into a handful of directories (or their subdirs) for a small set of users:
+#filename:type,blockgroup,uid,gid,inode,size,type,fid,stripe,ctime,atime,mtime
 
-# sed 's/ has no .*//' /nobackupnfs2/mhanafi/nbp9_ost_scan/nbp9.no_stripe_files.out.after_lfsck | xargs -d '\n' ls -l | awk '{print $3}' | sort | uniq -c
-ls: cannot access /nobackupp9/jchang/newfile: No such file or directory
-     65 bduda
-     45 bmauer
-      1 cbrehm1
-      1 dhixon
-     11 mchoudha
-      1 nfeather
+65.out.service162:F,39432,10491,1179,5047326,4194304,lma,[0x100000000:0x51208:0x0],0,fid,[0x20001d596:0x97:0xd8],216,1461629208,1461629204,1461629208
 
-# sed 's/ has no .*//' /nobackupnfs2/mhanafi/nbp9_ost_scan/nbp9.no_stripe_files.out.after_lfsck | xargs -d '\n' -L 1 dirname | xargs -L 1 dirname | sort | uniq -c
-      1 /nobackupp9
-     65 /nobackupp9/bduda
-      1 /nobackupp9/cbrehm1/OpenRotor/6848rpm_ibio_with_Plate_newRun
-      1 /nobackupp9/dhixon
-     45 /nobackupp9/gmao_SIteam/ObservingSystem/reanalysis/aqua_disc/hdf
-      6 /nobackupp9/mchoudha/powerflow
-      1 /nobackupp9/mchoudha/powerflow/fine
-      4 /nobackupp9/mchoudha/powerflow/medium_aoa0_copy
-      1 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo
+--- Comment (yong.fan, Wed, 4 May 2016 08:33:46 +0000) ---
+By default, the repairing behaviour will be recorded in Lustre debug log via label "D_LFSCK". But because Lustre kernel log is in RAM only, and if you did not dump them periodically, then it will be overwritten. I am not sure whether you have such log or not.
 
-It also looks like the recovered files sill lost ACL information.  Is it expected that lfsck is unable to recover those attributes?
+On the other hand, the log "nagtest.toobig.stripes" shows that there are 244 OST-objects claiming as the stripe of the [0x20001d596:0x97:0x0], but the "lfs getstripe" output shows that the file "nagtest.toobig" only has 240 stripes. So there are (at least) 4 OST-objects are fake. I found that there are 4 OST-objects with the size 251658240 bytes are conflict with another 4 OST-objects with the size 4194304 bytes, as shown following:
 
---- Comment (yong.fan, Fri, 29 Apr 2016 02:55:32 +0000) ---
-"-A" is enabled automatically if "-o" specified.
+A) 65.out.service162:F,2833,10491,1179,362692,251658240,lma,[0x100000000:0x93bfc2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461812807,1461812805,1461812807
+B) 104.out.service169:F,240,10491,1179,30814,251658240,lma,[0x100000000:0x9e78e3:0x0],0,fid,[0x20001d596:0x97:0x1],1,1461812807,1461812805,1461812807
+C) 121.out.service170:F,2375,10491,1179,304121,251658240,lma,[0x100000000:0x969e66:0x0],0,fid,[0x20001d596:0x97:0x2],2,1461812807,1461812805,1461812807
+D) 87.out.service168:F,4361,10491,1179,558333,251658240,lma,[0x100000000:0x97b343:0x0],0,fid,[0x20001d596:0x97:0x3],3,1461812807,1461812805,1461812807
 
---- Comment (mhanafi, Fri, 29 Apr 2016 02:42:19 +0000) ---
-Doesn't -A do both layout and orphan repair?
+a) 56.out.service169:F,32528,10491,1179,4163662,4194304,lma,[0x100000000:0x512a2:0x0],0,fid,[0x20001d596:0x97:0x0],0,1461629209,1461629204,1461629209
+b) 207.out.service176:F,37845,10491,1179,4844182,4194304,lma,[0x100000000:0x5139a:0x0],0,fid,[0x20001d596:0x97:0x1],1,1461629209,1461629204,1461629209
+c) 137.out.service170:F,40964,10491,1179,5243393,4194304,lma,[0x100000000:0x512d2:0x0],0,fid,[0x20001d596:0x97:0x2],2,1461629209,1461629204,1461629209
+d) 236.out.service173:F,35030,10491,1179,4483887,4194304,lma,[0x100000000:0x51320:0x0],0,fid,[0x20001d596:0x97:0x3],3,1461629209,1461629204,1461629209
 
---- Comment (yong.fan, Fri, 29 Apr 2016 01:38:12 +0000) ---
-The files list in nbp9_big_time_t.txt looks abnormal, although you said they were from previous successful LVM backup. For further verification, you can dump their LMA EA ("trusted.lma") and linkEA ("trusted.link").
+The OST-objects A-D with the size 251658240 bytes claim as the first 4 stripes of the file "nagtest.toobig". The reason may be as following: the file "nagtest.toobig" lost its LOV EA because some unknown reason. Either the OST-objects A-D or a-d have corrupted PFID EA. According to the size attribute, the OST-objects A-D seems have corrupted PFID EA. During the LFSCK processing, the layout LFSCK tried to re-geneate the "nagtest.toobig" LOV EA with these 244 orphan OST-objects. Unfortunately, the OST-objects A-D were found earlier than the OST-objects a-d, then the regenerated LOV EA contains the OST-objects A-D information. And then when the orphan OST-objects a-d were handled, the layout LFSCK found that they were conflict with some others, then the layout LFSCK should have created some new files with the name "[0x20001d596:0x97:0x0]-[0x100000000:0x512a2:0x0]-C-0" or similar under the directory ".lustre/lost+found/MDT0000/". Please check for verification.
 
-As for the layout LFSCK, if you want to run as "dryrun" mode, please try "lctl lfsck_start -M nbp9-MDT0000 -t layout -o --dryrun"
+--- Comment (ndauchy, Wed, 4 May 2016 13:18:44 +0000) ---
+To follow up on question from yesterday, which you probably already guessed...
 
---- Comment (mhanafi, Fri, 29 Apr 2016 00:56:22 +0000) ---
-We have upgraded to 2.7.1 and started a dryrun lfsck. This is the command we uses.
+There are 240 OSTs on the corrupted file system (on 16 OSS).
 
-lctl lfsck_start --dryrun -M nbp9-MDT0000 -A
+--- Comment (ndauchy, Wed, 4 May 2016 13:34:49 +0000) ---
+The closest match I could find in lost+found was:
 
-Is that correct?
+[0x20011c02e:0x1e13:0x0]-[0x20001d596:0x97:0x0]-3-C-0
+[0x20011c02e:0x69c7:0x0]-[0x20001d596:0x97:0x0]-0-C-0
+[0x20011c030:0x1219c:0x0]-[0x20001d596:0x97:0x0]-2-C-0
+[0x20011c030:0x13ffc:0x0]-[0x20001d596:0x97:0x0]-1-C-0
 
---- Comment (ndauchy, Thu, 28 Apr 2016 14:19:26 +0000) ---
-Prior to the hang, when I had (what I thought was) a successful LVM snapshot, I happened to be looking for files with dates out of the expected range:
+And the file ownership is the same as /nobackupp9/dtalcott/nagtest.toobig
 
-nohup find /mnt/snap/ROOT/ -mtime +10000 -o -mtime -0 > /tmp/nbp9_big_time_t.out 2>&1 
+--- Comment (ndauchy, Wed, 4 May 2016 13:40:35 +0000) ---
+Full listing of nonzero files in lost+found, gathered as:
 
-  looking at those files from a client, the results are like:
+cd /nobackupp9/.lustre/lost+found/MDT0000
+find . -type f -a ! -size 0 | xargs ls -ld > /u/ndauchy/tmp/nbp9_diag/lostfound_nonzero.lst
 
-pfe20 /u/ndauchy/tmp # xargs -a nbp9_big_time_t.txt -d '\n' ls -ldtr
--rwxr-xr--  1 sviken   a1426             0 Dec 31  1969 /nobackupp9/sviken/rev3mod3/grid3b/sally_grid_info/?c}x;?
+--- Comment (yong.fan, Wed, 4 May 2016 15:01:01 +0000) ---
+There are 3 kinds of files under your lustre lost+found directory. They are:
 
-Of course, I don't know whether these are A) from the same event, B) from taking the previous LVM snapshot, or C) have been that way for a long time and are completely unrelated.  I can upload the full file with all (590) such files if needed.
+1) The file name contains infix "-C-". That means multiple OST-objects claim the same MDT-object and the same slot in the LOV EA. Then the layout LFSCK will create new MDT-object(s) to hold the conflict OST-object(s). Searching your "lostfound_nonzero.lst" file, there are 4 files with "-C-" name. As described in former comment, they are corresponding to the file "nagtest.toobig.stripes" and conflict with the OST-objects A-D. If you think that the layout LFSCK made wrong decision when re-generated the "nagtest.toobig.stripes" LOV EA, we need to make new patch to recover it. But since there is only one file with conflict OST-objects, you also can recover the file "nagtest.toobig.stripes" manually.
 
---- Comment (yong.fan, Thu, 28 Apr 2016 06:17:39 +0000) ---
-Sorry, I did not say clearly. I mean that if you can get the OST-objects list, then I will make a tool to re-geneate the stripe info from your OST objects list. You do not need to patch your current system.
+2) The file name contains infix "-R-". That means the orphan OST-object knows its parent MDT-object FID, but does not know the position (the file name) in the namespace. So have to create a file with the known PFID. Under such case, if you can remember something from file data, you can rename the file back to the normal namespace.
 
---- Comment (mhanafi, Thu, 28 Apr 2016 05:03:58 +0000) ---
-Since we need to install a patch we may want to just upgrade. I'll update the case tomorrow as to what we decided to do.
+3) The file name contains infix "-O-". They are orphan MDT-objects. The backend e2fsck put them into the local /lost+found directory, that is invisible to the client. The LFSCK scans the MDT-objects under local /lost+found directory, if the MDT-object has valid linkEA, then the LFSCK will move it back to normal namespace, otherwise, it will be put under the global Lustre lost+found directory that is visible to the client. Similar as above case 2), if you can remember something from file data, you can rename the file back to the normal namespace. On the other hand, I noticed that the files with "-O-" name all have the size 5792, that is mysterious. Unless the e2fsck found some corrupted inodes, otherwise, it is almost impossible. So you have to check these file with more human knowledge and if you think they are invalid, then remove them directly.
 
---- Comment (yong.fan, Thu, 28 Apr 2016 04:03:54 +0000) ---
-If  you can get the OST-objects list, then I can make a patch to re-generate the MDT-objects LOV EA from such list.
+--- Comment (ndauchy, Wed, 4 May 2016 19:21:51 +0000) ---
+OK, I think we have a decent handle on the lost+found contents now, and the e2fsck and lfsck behaviour.  It sounds like perhaps there is room for an improvement in lfsck to handle the conflicts more elegantly?
 
-As for "how fast the LFSCK run", depends on your system environment. I have tested the layout LFSCK on OpenSFS cluster, for single MDT case, the routine scan (without repairing) speed can be up to 100K objects/sec, the repair speed is about 30K objects/sec.
+What is still a significant unknown is how this corruption happened to begin with and what we can do to avoid it in the future.  For now, we are no longer performing LVM snapshots of the MDT.   Do you have a more complete explanation for the source of the lost striping information on the MDT?  It is probably not just the LVM snapshot or e2fsck, as each have been used widely before.  The server reboot while "lvcreate --snapshot" was running could have something to do with it I suppose.  Do the stack traces and ldiskfs_journal_start_sb messages provide any clues?
 
---- Comment (mhanafi, Thu, 28 Apr 2016 03:29:13 +0000) ---
-I have a modified e2scan that will dump ost object and look up the PFID for each OST. We use it to quickly identify users that are filling up an OST. So if I can run that and get a list of all OST object what would be the next step to put it back together? 
+--- Comment (yong.fan, Thu, 5 May 2016 00:30:07 +0000) ---
+OK, I think we have a decent handle on the lost+found contents now, and the e2fsck and lfsck behaviour. It sounds like perhaps there is room for an improvement in lfsck to handle the conflicts more elegantly?
 
-We could also upgrade to 2.7.1. How fast does the lfsck run?
+If two orphan OST-objects conflict with each other when rebuilding the lost LOV EA, from the LFSCK view, it is NOT easy to know which one is right. Because the LFSCK cannot analysis the OST-object data. We found the trouble just because of the abnormal file size based on human judgement. But from the LFSCK view, since the file/object size is in the valid range, it cannot say current OST-object A-D are invalid. So on the this degree, the LFSCK needs some human assistant to make the right choice.
 
---- Comment (yong.fan, Thu, 28 Apr 2016 03:09:48 +0000) ---
-Mahmoud,
+As for the reason of lost stripe information, I do not know, I only have some guess or suspicion. Rebooting the system during "lvcreate --snapshot" is mostly suspected. For large LOV EA (with ten of or hundred stripes), the LOV EA will be stored in separated block. If someone breaks the process during the interval of inode creation and  LOV EA storing, then the inode may lost its LOV EA. On the other hand, the implementation of LMV snapshot also may affect that. For example, there maybe some internal data re-location during the "lvcreate --snapshot", if someone breaks the process, the system may be in some internal inconsistent status.
 
-Usually, for the file with small LOV EA, such as four stripes or so, the LOV EA  will be stored inside the inode space (block). So if the inode is there, the LOV EA should be there also, unless the inode corrupted. But since e2fsck run completedlily, it seems not such case. So the lost LOV EA should be stored in separated block, do you still have some idea about the stripe count for the files lost the stripe info? Have you ever enable large EA to support thousands of stripes?
+According to the stack traces in this ticket, there were some users accessing the system during "lvcreate --snapshot", right? If yes, I think that it would cause some Copy-On-Write, that may be blocked by the in-processing "lvcreate --snapshot" or handled with it currently, that depends on the LVM implementation. Unfortunately, it is out of Lustre scope, and I am not familiar with that.
 
-On the other hand, the files in /lost+found seems abnormal. The time "Jul 26  1970" is the start time, that is impossible for normal Lustre objects. And the time "Feb  4  1988" is also not reasonable Lustre time stamp. Then I think that the e2fsck scanned some non-initialized area, the inode bitmap maybe corrupted.
+Honestly, I am not the fun of LVM snapshot because of many criticisms about the performance.
 
-nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found/
+Andreas, do you have any idea about the LVM/e2fsck trouble?
 
-total 6816
+--- Comment (adilger, Thu, 5 May 2016 22:37:46 +0000) ---
+It appears that we may be missing calls in osd-ldiskfs to check if the block device is currently (being) frozen before submitting IO to the underlying storage (i.e. all modifications blocked at a barrier while in the middle of creating a snapshot.
 
-rw------ 1 root     root   5792 Jul 26  1970 #17831719
+In newer kernels (3.5+, e.g. RHEL7) this is handled with sb_start_write() and sb_end_write() at the upper layers, and sb_start_intwrite() and sb_end_intwrite() for filesystem internal writes, and should be taken before i_mutex (see e.g. kernel commit 8e8ad8a57c75f3b for examples).
 
-rw------ 1 root     root   5792 Jul 26  1970 #17831723
+In older kernels (e.g. RHEL6) it uses vfs_check_frozen() to see if the device is currently frozen, with level=SB_FREEZE_WRITE to block new modifications from starting, and level=SB_FREEZE_TRANS to only block internal threads if the freeze barrier is complete.
 
-rw------ 1 root     root   5792 Feb  4  1988 #571005637
+--- Comment (ndauchy, Fri, 6 May 2016 15:51:08 +0000) ---
+At some point in the future we plan to migrate to RHEL/CentOS-7, but right now CentOS-6.7 is the priority.  It looks like there is additional code that uses vfs_check_frozen in newer ext4/super.c source, but that it is not in our 2.6.32-504.30 kernel, nor is it mentioned in the changelog for a very recent CentOS-6.7 2.6.32-573.22 kernel.  Are you saying that we just need to incorporate all the existing fixes, or that a new lustre patch is needed to perform a check which is unique to ldiskfs?
 
-rw------ 1 root     root   5792 Feb  4  1988 #571016437
+If it would be more expedient to use some sort of external pause/resume commands before and after the lvm snapshot is created, then we could work that into the process as well.
 
-rw------ 1 root     root   5792 Feb  4  1988 #571029133
+Also, just curious if this should work for a running MDT or ldiskfs:
+
+service322 ~ # fsfreeze -f /mnt/lustre/nbptest-mdt
+fsfreeze: /mnt/lustre/nbptest-mdt: freeze failed: Operation not supported
 
-...
+--- Comment (adilger, Fri, 6 May 2016 17:20:11 +0000) ---
+The fsfreeze is the same as what LVM does internally, so it wouldn't change the problem being seen.  We don't plumb that ioctl through the MDT mountpoint to the underlying filesystem, which is why there is an error reported.
 
-rw------ 1 root     root   4832 Jul  5  1988 #584109225
+As for fixing this problem, I suspect that some of the upstream ext4 patches need to be backported (in particular kernel commits 437f88cc031ffe7f and 6b0310fbf087ad6) but there is also likely a need to add checks into the osd-ldiskfs code to block new IO submissions when the device is freezing/frozen, since these do not have the VFS-level checks.
 
-rw------ 1 root     root   4832 Jul  5  1988 #584109227
+--- Comment (gerrit, Mon, 9 May 2016 09:23:28 +0000) ---
+Fan Yong (fan.yong@intel.com) uploaded a new patch: http://review.whamcloud.com/20062
 
-rw------ 1 root     root   4832 Jul  5  1988 #584109231
+Subject: LU-8071 ldiskfs: handle system freeze protection
 
-rw------ 1 root     root   4832 Jul  5  1988 #584109233
+Project: fs/lustre-release
 
-rw------ 1 root     root   4832 Jul  5  1988 #584109235
+Branch: master
 
-As for recover object from /lost+found via "ll_recover_lost_found_objs", it is used for OST-object. I am surprised that it recovered something on your MDT! So it makes me to suspect your system corruption in further.
+Current Patch Set: 1
 
-Back to your direct question: how to recover the lost stripe info. Our new layout LFSCK can recover the lost (MDT-object's) LOV EA from orphan OST-object(s), such functionality is available since Lustre-2.6. Seems your system is Lustre-2.5 based, so unless you upgrade your system, otherwise, you have to recover that manually as following for example:
+Commit: b61bdfcaef1b03f8d0f082d57120681d71ab5e40
 
-1) Get the "temperature_energy.dat" FID via "lfs path2fid temperature_energy.dat"
+--- Comment (jaylan, Tue, 10 May 2016 18:31:04 +0000) ---
+The last six patches in ldiskfs-2.6-rhel6.6.series of the master branch are:
 
-2) Get PFID EA from the OST-objects. Since we do not know which OST-object(s) belong to "temperature_energy.dat", then we have to scan the OST-object's one by one.
+rhel6.3/ext4-drop-inode-from-orphan-list-if-ext4_delete_inode-fails.patch
 
-3) If some OST-object PFID EA matches the "temperature_energy.dat" FID, then we find one stripe of temperature_energy.dat.
+rhel6.6/ext4-remove-truncate-warning.patch
 
-Above process is very inefficient and easy to be wrong. So unless you are confident for such manually operations have time, I would suggest to upgrade your system and run layout LFSCK for recovery.
+rhel6.6/ext4-corrupted-inode-block-bitmaps-handling-patches.patch
 
---- Comment (pjones, Thu, 28 Apr 2016 02:47:53 +0000) ---
-Fan Yong Is looking into this
+rhel6.3/ext4-notalloc_under_idatasem.patch
 
---- Comment (mhanafi, Thu, 28 Apr 2016 00:22:24 +0000) ---
-The recovery of the mdt as resulted in 25776 file losing their stripe info.
+rhel6.5/ext4-give-warning-with-dir-htree-growing.patch
 
-pfe24 /nobackupp9/gmao_SIteam/ObservingSystem/reanalysis/aqua_disc/hdf # cd /nobackupp9//nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v/
+rhel6.6/ext4_s_max_ext_tree_depth.patch
 
-pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # lfs getstripe temperature_energy.dat
+Only the first 2 patches have already been picked into b2_7_fe. All six have not been picked to b2_5_fe.
 
-temperature_energy.dat has no stripe info
+We are running Centos 6.6 and it seems to me these patches are important to have also. Some of our servers run 2.5.3 and the rest run 2.7.1. Is it safe for us to pick up those missing ldiskfs kernel patches? Please advise.
 
-pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # lfs path2fid temperature_energy.dat
+--- Comment (adilger, Wed, 18 May 2016 18:00:47 +0000) ---
+I would recommend against using the ext4-give-warning-with-dir-htree-growing.patch as this also requires other changes to the Lustre code.  The other changes are OK to use on other kernels.
 
-[0x20010fbee:0x66:0x0]
+Also, are the following patches from the upstream kernel already applied on your systems?
 
-pfe24 /nobackupp9/nfeather/marti/Builds/Scaling/Dynamo/Np256_san_v # stat temperature_energy.dat
+commit 437f88cc031ffe7f37f3e705367f4fe1f4be8b0f
+Author:     Eric Sandeen 
+AuthorDate: Sun Aug 1 17:33:29 2010 -0400
+Commit:     Theodore Ts'o 
+CommitDate: Sun Aug 1 17:33:29 2010 -0400
 
-  File: `temperature_energy.dat'
+    ext4: fix freeze deadlock under IO
+    
+    Commit 6b0310fbf087ad6 caused a regression resulting in deadlocks
+    when freezing a filesystem which had active IO; the vfs_check_frozen
+    level (SB_FREEZE_WRITE) did not let the freeze-related IO syncing
+    through.  Duh.
+    
+    Changing the test to FREEZE_TRANS should let the normal freeze
+    syncing get through the fs, but still block any transactions from
+    starting once the fs is completely frozen.
+    
+    I tested this by running fsstress in the background while periodically
+    snapshotting the fs and running fsck on the result.  I ran into
+    occasional deadlocks, but different ones.  I think this is a
+    fine fix for the problem at hand, and the other deadlocky things
+    will need more investigation.
+    
+    Reported-by: Phillip Susi 
+    Signed-off-by: Eric Sandeen 
+    Signed-off-by: "Theodore Ts'o" 
 
-  Size: 0         	Blocks: 0          IO Block: 4194304 regular empty file
+commit 6b0310fbf087ad6e9e3b8392adca97cd77184084
+Author:     Eric Sandeen 
+AuthorDate: Sun May 16 02:00:00 2010 -0400
+Commit:     Theodore Ts'o 
+CommitDate: Sun May 16 02:00:00 2010 -0400
 
-Device: 162deh/90846d	Inode: 144133862291669094  Links: 1
+    ext4: don't return to userspace after freezing the fs with a mutex held
+    
+    ext4_freeze() used jbd2_journal_lock_updates() which takes
+    the j_barrier mutex, and then returns to userspace.  The
+    kernel does not like this:
+    
+    ================================================
+    [ BUG: lock held when returning to user space! ]
+    ------------------------------------------------
+    lvcreate/1075 is leaving the kernel with locks still held!
+    1 lock held by lvcreate/1075:
+     #0:  (&journal->j_barrier){+.+...}, at: []
+    jbd2_journal_lock_updates+0xe1/0xf0
+    
+    Use vfs_check_frozen() added to ext4_journal_start_sb() and
+    ext4_force_commit() instead.
+    
+    Addresses-Red-Hat-Bugzilla: #568503
+    
+    Signed-off-by: Eric Sandeen 
+    Signed-off-by: "Theodore Ts'o" 
 
-Access: (0644/rw-rr-)  Uid: (10670/nfeather)   Gid: (41430/   s1430)
+I would guess yes, since they originated from Red Hat, but just wanted to confirm.
 
-Access: 2016-04-19 11:04:25.000000000 -0700
+--- Comment (gerrit, Thu, 2 Jun 2016 04:40:44 +0000) ---
+Oleg Drokin (oleg.drokin@intel.com) merged in patch http://review.whamcloud.com/20062/
 
-Modify: 2016-04-19 11:04:25.000000000 -0700
+Subject: LU-8071 ldiskfs: handle system freeze protection
 
-Change: 2016-04-19 11:04:25.000000000 -0700
+Project: fs/lustre-release
 
- Birth: -
+Branch: master
 
-We need help to recover the stripe info!
+Current Patch Set: 
 
---- Comment (ndauchy, Tue, 26 Apr 2016 19:32:37 +0000) ---
-Uploading backtrace and dmesg from the MDS.
+Commit: bd40ca206881eefeeb6ad7586f93afd685bb8120
 
---- Comment (ndauchy, Tue, 26 Apr 2016 19:29:39 +0000) ---
-Not sure how closely tied this is, but... after the reboot we ran e2fsck on the MDT. The fsck was able replay the journal but during the scan found lots of unattached inodes and moved them to /lost+found.   Interestingly, most of those inodes were almost sequential:
+--- Comment (pjones, Thu, 2 Jun 2016 11:58:23 +0000) ---
+Now landed for 2.9 and queued up for maintenance releases. Is there anything further you need on this ticket or can it be closed?
 
-Unattached inode 584092565
-Connect to /lost+found? yes
-Unattached inode 584092567
-Connect to /lost+found? yes
-Unattached inode 584092637
-Connect to /lost+found? yes
-Unattached inode 584092640
-Connect to /lost+found? yes
-Unattached inode 584092643
-Connect to /lost+found? yes
-Unattached inode 584092645
-Connect to /lost+found? yes
-Unattached inode 584092648
-Connect to /lost+found? yes
-Unattached inode 584092715
-Connect to /lost+found? yes
-Unattached inode 584092717
-Connect to /lost+found? yes
-Unattached inode 584092720
-Connect to /lost+found? yes
-Unattached inode 584092723
-Connect to /lost+found? yes
-Unattached inode 584092784
+--- Comment (jaylan, Thu, 2 Jun 2016 18:05:10 +0000) ---
+Yes, this ticket can be closed. Thanks!
 
-Mounted as ldiskfs and saw that all but about 20 files were owned by root and had surprisingly old date stamps:
-
-nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found/
-total 6816
--rw------- 1 root     root   5792 Jul 26  1970 #17831719
--rw------- 1 root     root   5792 Jul 26  1970 #17831723
--rw------- 1 root     root   5792 Feb  4  1988 #571005637
--rw------- 1 root     root   5792 Feb  4  1988 #571016437
--rw------- 1 root     root   5792 Feb  4  1988 #571029133
-...
--rw------- 1 root     root   4832 Jul  5  1988 #584109225
--rw------- 1 root     root   4832 Jul  5  1988 #584109227
--rw------- 1 root     root   4832 Jul  5  1988 #584109231
--rw------- 1 root     root   4832 Jul  5  1988 #584109233
--rw------- 1 root     root   4832 Jul  5  1988 #584109235
-
-nbp9-mds ~ # ls -l /mnt/lustre/nbp9-mdt/lost+found | grep -v " root "
-total 47328
--rwxr----- 1 dmenemen g26209    0 Feb 10  2014 #570436464
--rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436465
--rwxr----- 1 dmenemen g26209    0 Feb 10  2014 #570436466
--rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436467
--rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436468
--rw-r--r-- 1 dmenemen g26209    0 Feb 10  2014 #570436469
-...
-(another dozen or so more similar files)
-
-Ran "ll_recover_lost_found_objs" on the MDT mounted as ldiskfs, and it reported results like:
-
-Object /mnt/lustre/nbp9-mdt/O/22d0c13d/d23/cb410817 restored.
-Object /mnt/lustre/nbp9-mdt/O/22d0c13f/d27/cb41083b restored.
-Object /mnt/lustre/nbp9-mdt/O/22d0c145/d1/cb504661 restored.
-Object /mnt/lustre/nbp9-mdt/O/22d0c147/d27/cb50467b restored.
-Object /mnt/lustre/nbp9-mdt/O/22d0c153/d16/cb504810 restored.
-Object /mnt/lustre/nbp9-mdt/O/22d0c155/d20/cb504814 restored.
-
-  (It got all the non-root owned files)
-
-I believe that the rest of the files in lost+found were probably either useless or were never pointing to user data... they have no xattrs:
-
-# getfattr -d -m ".*" -e hex /mnt/lustre/nbp9-mdt/lost+found/*
-
-  (returned nothing!)
-
-So, we ran another e2fsck (which came back clean!) and put the filesystem back into production.
+--- Comment (pjones, Thu, 2 Jun 2016 18:07:45 +0000) ---
+Thanks Jay!

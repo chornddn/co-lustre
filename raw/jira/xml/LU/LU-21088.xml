@@ -1,0 +1,137 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21088] osd-ldiskfs: osd_drop_preallocated_space() starts a journal handle on a frozen filesystem</title>
+                <link>https://jira.whamcloud.com/browse/LU-21088</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;When an ldiskfs target is frozen (for a block-level snapshot: LVM, md, or &lt;tt&gt;fsfreeze&lt;/tt&gt;), osd_object_delete() can still change it. If the object is on the orphan list (&lt;tt&gt;oo_on_orphan_list&lt;/tt&gt;, set by the llog batch block allocation from &lt;a href="https://jira.whamcloud.com/browse/LU-18562" title="batch allocation in osd_write()" class="issue-link" data-issue-key="LU-18562"&gt;&lt;del&gt;LU-18562&lt;/del&gt;&lt;/a&gt;), osd_drop_preallocated_space() calls ldiskfs_truncate(), which starts a journal handle. Nothing checks for the freeze on this path. &lt;a href="https://jira.whamcloud.com/browse/LU-8071" title="lvcreate --snapshot of MDT hangs in ldiskfs_journal_start_sb" class="issue-link" data-issue-key="LU-8071"&gt;&lt;del&gt;LU-8071&lt;/del&gt;&lt;/a&gt; added freeze protection to osd_trans_create() only.&lt;/p&gt;
+
+&lt;p&gt;ext4 does not block a new handle on a frozen filesystem. ext4_freeze() unlocks the journal again after the flush ("we rely on upper layer to stop further updates"), and ext4_journal_check_start() only warns. So the truncate goes ahead on a filesystem whose superblock was just marked clean (needs_recovery cleared).&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Seen on&lt;/b&gt;&lt;br/&gt;
+Master 2.17.60_79 plus local snapshot patches (not posted yet), RHEL 9.7 kernel 5.14.0-611.55.1, ldiskfs MDT on an md array. &lt;tt&gt;lctl snapshot_create&lt;/tt&gt; ran 5 times under a create + write load on a client. On the 4th run, kswapd freed the object while the MDT was frozen, 10 ms before the snapshot was taken:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;WARNING: CPU: 6 PID: 105 at ldiskfs/ext4_jbd2.c:75 ldiskfs_journal_check_start+0x57/0xa0 [ldiskfs]
+md/raid:md72: snap fz4 created (id 4, frozen)
+CPU: 6 PID: 105 Comm: kswapd0 Tainted: G           OE      ------  ---  5.14.0-611.55.1.el9_7.x86_64 #1
+Call Trace:
+ __ldiskfs_journal_start_sb+0x3a/0x190 [ldiskfs]
+ ldiskfs_truncate+0x176/0x4a0 [ldiskfs]
+ osd_drop_preallocated_space+0x2f/0x290 [osd_ldiskfs]
+ osd_object_delete+0x27a/0x320 [osd_ldiskfs]
+ lu_object_free.isra.0+0x93/0x200 [obdclass]
+ lu_site_purge_objects+0x54d/0x770 [obdclass]
+ lu_cache_shrink_scan+0xfc/0x1a0 [obdclass]
+ do_shrink_slab+0x139/0x2f0
+ shrink_slab+0xa6/0x130
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;It was seen once in 5 runs with md native snapshots, and not in 5 runs with LVM thin snapshots. It needs memory pressure during the freeze.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Effect&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;The WARNING on the console.&lt;/li&gt;
+	&lt;li&gt;The snapshot may not match its superblock. If the journal commit, or part of the in-place metadata write, reaches the disk before the snapshot is cut, the snapshot says "no recovery needed" but holds a half-applied change. e2fsck on the snapshot would then find errors. Usually nothing reaches the disk in time and the snapshot is fine, but it is not guaranteed.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Fix&lt;/b&gt;&lt;br/&gt;
+Take freeze protection in osd_drop_preallocated_space() around ldiskfs_truncate(): &lt;tt&gt;sb_start_intwrite()&lt;/tt&gt; / &lt;tt&gt;sb_end_intwrite()&lt;/tt&gt;. ext4_evict_inode() does the same for its own truncate, so a thread that frees an inode during a freeze already waits for the thaw today; this only makes our path behave the same way.&lt;/p&gt;
+
+&lt;p&gt;Skipping the truncate while frozen is not an option: the inode is on the in-memory orphan list, so it cannot be freed without ldiskfs_truncate() or ldiskfs_orphan_del(), and both need a journal handle.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Reproducer&lt;/b&gt;&lt;br/&gt;
+Single node, master 2.17.60_79, RHEL 9.7. Targets on plain LVM LVs (the MDT is &lt;tt&gt;lpvg/mdt0&lt;/tt&gt;), combined MGS/MDT, formatted and mounted with &lt;tt&gt;llmount.sh&lt;/tt&gt;. Right after the mount, the MGS config llogs written at target registration are cached objects on the orphan list.&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;dmsetup suspend lpvg-mdt0              # freezes the ldiskfs MDT (freeze_bdev)
+echo 2 &amp;gt; /proc/sys/vm/drop_caches &amp;amp;    # runs lu_cache_shrink_scan()
+sleep 5; dmsetup resume lpvg-mdt0
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Without the fix: WARNING from ldiskfs_journal_check_start() in 2 of 2 runs (1-2 per run), called from drop_caches -&amp;gt; lu_cache_shrink_scan -&amp;gt; osd_object_delete -&amp;gt; osd_drop_preallocated_space -&amp;gt; ldiskfs_truncate. While the MDT is frozen, drop_caches is already inside ldiskfs_truncate(), waiting for a block read from the suspended device. ftrace counted 30-31 calls of osd_drop_preallocated_space() per run.&lt;/p&gt;
+
+&lt;p&gt;With the fix (&lt;tt&gt;sb_start_intwrite()&lt;/tt&gt;): no WARNING in 3 of 3 runs, 29-31 calls each. While the MDT is frozen, drop_caches waits in percpu_rwsem_wait() before the truncate, and finishes right after the resume.&lt;/p&gt;
+
+&lt;p&gt;The objects are only there after a fresh mount; a second drop_caches on the same mount finds none (0 calls), so each run starts with a new format and mount.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Test&lt;/b&gt;&lt;br/&gt;
+conf-sanity test_174 in the fix patch does the same with the test framework's dm device (&lt;tt&gt;FLAKEY=true&lt;/tt&gt;, the default): it formats and mounts, suspends the MGS device, runs drop_caches and fails if a new ldiskfs_journal_check_start() WARNING appears. Run as &lt;tt&gt;ONLY="164 174"&lt;/tt&gt;: FAIL without the fix ("journal handle started on frozen MGS: 0 -&amp;gt; 11"), PASS with it. A patch follows.&lt;/p&gt;</description>
+                <environment />
+        <key id="100281">LU-21088</key>
+            <summary>osd-ldiskfs: osd_drop_preallocated_space() starts a journal handle on a frozen filesystem</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hnishida">Hiroshi Nishida</assignee>
+                                    <reporter username="hnishida">Hiroshi Nishida</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 2 Nov 2026 00:30:01 +0000</created>
+                <updated>Mon, 2 Nov 2026 01:29:49 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="504922" author="gerrit" created="Mon, 2 Nov 2026 00:31:32 +0000">&lt;p&gt;"Hiroshi Nishida &amp;lt;hnishida@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70297" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70297&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21088" title="osd-ldiskfs: osd_drop_preallocated_space() starts a journal handle on a frozen filesystem" class="issue-link" data-issue-key="LU-21088"&gt;LU-21088&lt;/a&gt; osd-ldiskfs: wait for thaw before dropping prealloc&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: f260328df28415b53837c5889569e5ce3598404e&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="96518">LU-20018</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="36417">LU-8071</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="86456">LU-18562</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                                <inwardlinks description="is related to">
+                                        <issuelink>
+            <issuekey id="100282">LU-21089</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072cf:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -1,5 +1,5 @@
 Change:     67599
-Subject:    LU-20531 mdc: skip close when import is not connected
+Subject:    LU-20531 mdc: do not delay MDS_CLOSE for import recovery
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67599
 Change-Id:  I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 Project:    fs/lustre-release
@@ -7,37 +7,85 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-10-29 21:39:14.000000000
-Patch Set:  14
-Insertions: +74
+Updated:    2026-11-01 07:32:18.000000000
+Patch Set:  16
+Insertions: +110
 Deletions:  -0
-Comments:   62 (17 unresolved)
+Comments:   87 (5 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1
+  Code-Review: wc-checkpatch: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Timothy Day, Duncan Vogel, Keguang Xu
 
 --- Commit Message ---
-LU-20531 mdc: skip close when import is not connected
+LU-20531 mdc: do not delay MDS_CLOSE for import recovery
 
-When an MDT peer crashes on a DNE filesystem, the reconnecting client
-must cancel OPEN-bit ibit locks held against the peer.  Each cancel
-calls ll_md_real_close() -> mdc_close() -> ptlrpc_get_mod_rpc_slot(),
-which blocks waiting for the single close mod-RPC slot.  Since the
-import is recovering (not FULL), the slot is never granted; the
-ldlm_bl thread parks permanently.  All other ldlm_bl threads then pile
-up on the same lock's l_bl_ast callback, draining the pool and
-deadlocking recovery.
+Ten ldlm_bl threads on an MDS that also carries a client mount were
+reported blocked for over 122 seconds, all with the same stack:
 
-Skip the close RPC when imp_state != LUSTRE_IMP_FULL.  The server will
-clean up open state on reconnect (replay) or eviction, so the close is
-redundant during recovery.
+  obd_get_mod_rpc_slot <- ptlrpc_get_mod_rpc_slot <- mdc_close
+  <- lmv_close <- ll_close_inode_openhandle <- ll_md_real_close
+  <- ll_clear_inode <- ll_delete_inode <- evict <- iput
+  <- d_prune_aliases <- ll_prune_aliases <- ll_lock_cancel_bits
+  <- ll_md_blocking_ast <- ldlm_cancel_callback
+  <- ldlm_cli_cancel_local <- ldlm_cli_cancel_list_local
+  <- ldlm_bl_thread_blwi
 
-Test-Parameters: testlist=recovery-small env=ONLY=171,MDSCOUNT=3
+A close can be driven from lock cancellation, and that path is also
+walked inline on the import's own lock replay thread, by
+ldlm_cancel_unused_locks_for_replay().  Cancelling a LOOKUP or PERM
+lock runs ll_prune_aliases(), which can drop the last dentry of an
+inode whose open handle is still cached by an OPEN lock, so the inode
+is evicted and ll_clear_inode() has to issue MDS_CLOSE.
+
+MDS_CLOSE keeps the default rq_send_state of LUSTRE_IMP_FULL, so
+ptlrpc_import_delay_req() parks it on imp_delayed_list.  That is a
+deadlock: mdc_close() holds the reserved close modify-RPC slot across
+ptlrpc_queue_wait(), and the import cannot leave recovery until the
+same thread returns, so the close waits for a recovery that is waiting
+for the close.  It cannot time out either - a non-FULL import is not
+pinged, ptlrpc_set_import_discon() requires FULL, and
+ptlrpc_abort_inflight() skips requests of the current generation.
+Every other close then blocks in obd_get_mod_rpc_slot(), which waits
+uninterruptibly with no timeout, so each ldlm_bl thread that picks up
+an LRU cancel batch is consumed and lock revocation on the node stops.
+
+A target already handles MDS_CLOSE while it is recovering:
+tgt_filter_recovery_request() lists it, and
+target_queue_recovery_request() processes rather than queues a request
+with no transno, which a fresh close has.  So set rq_allow_replay on
+the close, as ldlm_cli_cancel_req() already does for a cross-MDT
+LDLM_CANCEL to avoid an analogous deadlock; that guard is gated on
+OBD_CONNECT_MDS_MDS and so never covers a close issued through llite.
+Should a close ever overtake its own open's replay, mdc_close()
+already maps -ESTALE on a committed open to success.
+
+Measured with a matched A/B on real hardware, same harness, this one
+line as the only variable:
+
+                                   unpatched      patched
+  o35 "req waiting for recovery"       1             0
+  o35 "allow during recovery"          0            26
+  ldlm_bl parked (state S)           727 samples    0 of 730
+  imp_replay_inflight              stuck at 10    drained to 0
+  recovery outcome                  COMPLETE      COMPLETE
+
+This removes the demonstrated trigger, not the whole class: the
+untimed wait in obd_get_mod_rpc_slot() and the inline Data-on-MDT
+flush in ll_lock_cancel_bits() are unchanged and remain separate
+blocking points.
+
+The new subtest is a regression guard, not a reproducer.  It passes
+with and without the fix.  See the ticket for why there is no
+reproducer: the condition is not observable through any stable
+interface, so a test would have to assert on the debug text emitted by
+the two branches of the very "if" that rq_allow_replay controls.
+
+Test-Parameters: mdscount=2 testlist=recovery-small
 Signed-off-by: Vandana Rungta <vrungta@amazon.com>
 Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 
@@ -1845,3 +1893,606 @@ Hashtag added: pw_retest
 
 --- Message (patrick bot, 2026-10-29 21:39:14.000000000) ---
 Hashtag removed: pw_retest
+
+--- Message (Vandana Rungta, 2026-10-30 23:32:40.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-10-30 23:32:42.000000000) ---
+Patch Set 15:
+
+Patchset 15 replaces the approach. Instead of skipping the close, it lets it
+through: one line in mdc_close(), req->rq_allow_replay = 1.
+
+Briefly, the close is parked by the very recovery it is blocking. mdc_close()
+holds the reserved close modify-RPC slot across ptlrpc_queue_wait(), and the
+import cannot leave recovery until that same thread returns. Full detail is in
+the commit message and the ticket.
+
+Measured with a matched A/B on real hardware, same harness, this one line as
+the only variable:
+
+                                   unpatched      patched
+  o35 "req waiting for recovery"       1             0
+  o35 "allow during recovery"          0            26
+  ldlm_bl parked (state S)           727 samples    0 of 730
+  imp_replay_inflight              stuck at 10    drained to 0
+  recovery outcome                  COMPLETE      COMPLETE
+
+Also built and smoke-tested on 2.15.8 (kernel 5.10) against a live 3-MDT DNE
+filesystem: all MDCs and OSCs reach FULL, normal I/O timings.
+
+This is option A. The in-tree precedent is ldlm_cli_cancel_req(), which
+already sets rq_allow_replay for a cross-MDT LDLM_CANCEL to avoid an analogous
+deadlock; it is gated on OBD_CONNECT_MDS_MDS, so it never covers a close
+issued through llite.
+
+Option C looks like a no-op to me: mdc_cancel_weight() already returns 0 for
+any lock holding MDS_INODELOCK_OPEN, and the replay pass is the no-wait policy
+that consults it. The close in the reported stack also came from a LOOKUP/PERM
+cancel rather than an OPEN cancel, so protecting OPEN-bit locks would not have
+prevented it. Happy to be shown wrong.
+
+test_171 is a regression guard, not a reproducer: it passes with and without
+the fix, and checks that admitting the close does not lose the close or the
+attribute update it carries - recovery COMPLETE, zero evictions, and every
+seeded file still at its original size with a matching checksum. The size
+matters because mdc_close() carries an mdt_rec_setattr, so a lost close shows
+up as a short file. There is no reproducer because the condition is not
+observable through any stable interface: mdc.*.import has no delayed-request
+counter, which leaves only the CDEBUG text from ptlrpc_import_delay_req(), and
+those two strings are the two branches of the very "if" that rq_allow_replay
+controls.
+
+What this does not establish: the original field condition is not reproduced.
+Every lab variant either self-heals once the target returns or requires the
+target never to return, and the import state was never captured in the field,
+so identifying it as REPLAY_LOCKS is inference from the timeline.
+
+I am abandoning 68014. Its test number 171 is reused here, without the LU
+number in the description, per your comment there.
+
+The flag is set unconditionally, so a close can now go out during
+LUSTRE_IMP_REPLAY, where the server may not have reconstructed the open handle
+yet. I believe that is safe: target_queue_recovery_request() processes rather
+than queues a request with no transno, which a fresh close has, and
+mdc_close() already maps -ESTALE on a committed open to success. The alternate
+would be to set the flag only for closes issued from the cancel path, plumbed
+through md_op_data.
+
+--- Message (wc-checkpatch, 2026-10-30 23:33:36.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-30 23:37:52.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (Vandana Rungta, 2026-10-30 23:42:04.000000000) ---
+Patch Set 15:
+
+(16 comments)
+
+--- Message (Vandana Rungta, 2026-10-30 23:43:57.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (jenkins, 2026-10-31 00:44:38.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/134960/ : SUCCESS
+
+--- Message (Maloo, 2026-10-31 00:45:46.000000000) ---
+Patch Set 15:
+
+#### The following sessions will be run for Build 134960 (patch #15):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=134960&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=134960#redirect
+
+--- Message (Autotest, 2026-10-31 00:45:47.000000000) ---
+Patch Set 14:
+
+Onyx Autotest is abandoning the following sessions because: later build 134960 found
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-5 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-5 on el9.7-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+
+--- Message (Autotest, 2026-10-31 00:45:53.000000000) ---
+Patch Set 14:
+
+Trevis Autotest is abandoning the following sessions because: later build 134960 found
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-zfs on el8.10-x86_64/zfs servers and clients
+- Enforced review-dne-part-1 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-3 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-2 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-ipv6 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-1 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-1 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-6 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.8-x86_64/ldiskfs clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el10.1-x86_64/ldiskfs clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and sles15sp7-x86_64/ldiskfs clients
+- Enforced review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients
+
+--- Message (Maloo, 2026-10-31 16:09:48.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-159vm80: https://testing.whamcloud.com/test_sessions/6f3b5af3-8d18-4c8e-8929-bff1d535cbec ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-10-31 16:13:50.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm239: https://testing.whamcloud.com/test_sessions/4332829e-e575-4205-8c77-27ccbd64ea7f ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (patrick bot, 2026-10-31 17:26:31.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Maloo, 2026-10-31 17:48:25.000000000) ---
+Patch Set 15:
+
+Failed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm36: https://testing.whamcloud.com/test_sessions/ec4c1566-7254-4e34-81cb-e270871bbbe8 ran 3 tests.  1 tests failed: recovery-small.
+
+--- Message (patrick bot, 2026-10-31 18:02:52.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Maloo, 2026-10-31 19:48:10.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-157vm124: https://testing.whamcloud.com/test_sessions/6a86cbc6-e611-47b6-8937-4194bc87be1a ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Maloo, 2026-10-31 19:49:07.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-156vm31: https://testing.whamcloud.com/test_sessions/eea79892-6d5e-49de-abad-fef6500c24b7 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (patrick bot, 2026-10-31 20:04:17.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Vandana Rungta, 2026-10-31 20:23:10.000000000) ---
+Uploaded patch set 16.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-10-31 20:23:13.000000000) ---
+Patch Set 16:
+
+Patchset 16 fixes the test. mdc_request.c is unchanged from patchset 15.
+
+The two review-dne*-subtest-change failures on patchset 15 were my test_171
+colliding with test-framework.sh, not the fix. wait_clients_import_state()
+does "local params=$(expand_list $params ...)", reading $params while
+declaring it, and bash scoping is dynamic - so a local named "params" in the
+calling test is expanded into the import list that fail() waits on. The test
+then waited for an "import" named after its own temp file and failed at the
+1475s timeout with "import is not in (FULL|IDLE) state", from inside fail().
+
+Reproduced locally at MDSCOUNT=4. Before, fail() waited on
+
+  mdc.lustre-MDT0001-mdc-*.mds_server_uuid,/tmp/f171.recovery-small.params
+
+and after renaming the locals it waits on
+
+  mdc.lustre-MDT0001-mdc-*.mds_server_uuid
+
+and the subtest passes in 19s. All four MDC imports reached FULL in both
+cases, so recovery itself was never affected.
+
+The test's locals now have deliberately distinct names, with a comment
+explaining why, so this does not get reintroduced by a later cleanup.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-10-31 20:26:18.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-10-31 20:26:39.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Maloo, 2026-10-31 20:29:54.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest from onyx-156vm221: https://testing.whamcloud.com/test_sessions/f576a5b0-1cc9-47ff-a519-dc5e1f4e3539 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (jenkins, 2026-10-31 20:45:06.000000000) ---
+Patch Set 16: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135009/ : SUCCESS
+
+--- Message (Autotest, 2026-10-31 20:45:20.000000000) ---
+Patch Set 15:
+
+Onyx Autotest is abandoning the following sessions because: later build 135009 found
+- Enforced review-dne-part-2 on el9.7-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-3 on el10.1-x86_64/zfs servers and clients
+- Enforced review-dne-zfs-part-4 on el10.1-x86_64/zfs servers and clients
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+
+--- Message (Maloo, 2026-10-31 20:45:27.000000000) ---
+Patch Set 16:
+
+#### The following sessions will be run for Build 135009 (patch #16):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-5 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.1-x86_64/el10.1-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.1-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135009&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135009#redirect
+
+--- Message (Autotest, 2026-10-31 20:45:39.000000000) ---
+Patch Set 15:
+
+Trevis Autotest is abandoning the following sessions because: later build 135009 found
+- Enforced review-dne-part-3 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-3 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-part-4 on el10.1-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.1-x86_64/zfs servers and clients
+
+--- Message (Maloo, 2026-10-31 20:45:39.000000000) ---
+Patch Set 15:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-155vm218: https://testing.whamcloud.com/test_sessions/64d0da0e-5941-4734-8f68-a3afc814be5e ran 11 tests.  1 tests failed: mds-survey.
+
+--- Message (Maloo, 2026-11-01 04:14:58.000000000) ---
+Patch Set 16:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest from onyx-158vm141: https://testing.whamcloud.com/test_sessions/5669db68-f077-4ae7-9470-12fae15a2303 ran 9 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-01 04:23:37.000000000) ---
+Patch Set 16:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-156vm70: https://testing.whamcloud.com/test_sessions/94e87fe7-997d-4691-82d9-816a5b3f735a ran 9 tests.  1 tests failed: racer.
+
+--- Message (wc-checkpatch, 2026-11-01 04:40:09.000000000) ---
+Patch Set 16: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Maloo, 2026-11-01 07:23:43.000000000) ---
+Patch Set 16: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest from trevis-152vm53: https://testing.whamcloud.com/test_sessions/4b3f1012-e29c-4a2b-9e3d-740c36ad96d3 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-01 07:32:18.000000000) ---
+Patch Set 16:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Problematic, see inline comments. The deadlock is real, but setting rq_allow_replay on every MDS_CLOSE lets fresh closes from any thread reach the MDT in the middle of recovery. That breaks two things recovery relies on: open handles are fixed up before a delayed close is sent, and only replays carry transnos until recovery ends. A narrower fix that keeps the close off the lock replay thread (defer the iput()/close, or skip locks whose cancel would evict an inode with a cached open handle) may avoid both. test_171 doesn't exercise either case. A test that keeps a file open across failover and closes it while replay is paused would show whether the close leaks the server open handle.

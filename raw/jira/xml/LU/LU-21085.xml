@@ -1,0 +1,181 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21085] ptlrpc: expired request stays queued in LNet until peer credits return</title>
+                <link>https://jira.whamcloud.com/browse/LU-21085</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+
+&lt;p&gt;When a PtlRPC request expires, the request can still wait in LNet for a peer tx credit. PtlRPC cannot finish the request until LNet releases the request MD. The import thus stays busy, and it cannot try the next NID. When bulk RPCs hold all peer credits to a dead server, a client can take minutes to reconnect, and the restarted target can evict it.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;master, at commit 40b80bc048 (&lt;a href="https://jira.whamcloud.com/browse/LU-20867" title="sanity-sec test_79: Timeout occurred after 313 minutes" class="issue-link" data-issue-key="LU-20867"&gt;&lt;del&gt;LU-20867&lt;/del&gt;&lt;/a&gt;), on rocky9 VMs.&lt;/li&gt;
+	&lt;li&gt;tcp, with ksocklnd peer_credits=8, &lt;tt&gt;sock_timeout&lt;/tt&gt;=50, credits=256, and lnet discovery=0.&lt;/li&gt;
+	&lt;li&gt;One client, an MDS, and an OSS failover pair with 2 OSTs.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;On the client, set &lt;tt&gt;osc.*.max_rpcs_in_flight=32&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;Start 32 dd writers with direct I/O and 1 MiB blocks, across both OSTs.&lt;/li&gt;
+	&lt;li&gt;Confirm with &lt;tt&gt;lnetctl peer show -v&lt;/tt&gt; that the client has no tx credits for the OSS.&lt;/li&gt;
+	&lt;li&gt;On the client, add a static ARP entry for the OSS IP to a MAC address that does not exist. This step makes the dead NID give no reply, as on some cloud networks.&lt;/li&gt;
+	&lt;li&gt;Kill the OSS VM. The partner mounts the OSTs.&lt;/li&gt;
+	&lt;li&gt;Time the interval until both OSC imports are FULL. Check for eviction.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;On master, step 6 took 159.7-172.3 s, and the target evicted the client in 3 of 3 runs. While the import waited, it stayed in CONNECTING on the dead NID for 24-49 s at a time.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;ptlrpc_unregister_reply()&lt;/tt&gt; calls &lt;tt&gt;LNetMDUnlink()&lt;/tt&gt; on &lt;tt&gt;rq_reply_md_h&lt;/tt&gt; only. It then waits for &lt;tt&gt;rq_req_unlinked&lt;/tt&gt;. PtlRPC never unlinks the request MD.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-4006" title="LNET Messages staying in Queue" class="issue-link" data-issue-key="LU-4006"&gt;&lt;del&gt;LU-4006&lt;/del&gt;&lt;/a&gt; makes &lt;tt&gt;lnet_post_send_locked()&lt;/tt&gt; drop a message on an aborted MD. The drop occurs only when the message gets a credit and reaches the head of &lt;tt&gt;lpni_txq&lt;/tt&gt;. A queued message thus waits for the credit holders to complete.&lt;/li&gt;
+	&lt;li&gt;With a silent dead peer, socklnd holds each credit holder until its conn fails, about &lt;tt&gt;sock_timeout&lt;/tt&gt;. Each connect attempt waits behind them.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Earlier attempts:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-13368" title="lnet may be trying to use deleted routes leading to errors kiblnd_rejected(): 10.0.10.212@o2ib7 rejected: consumer defined fatal error" class="issue-link" data-issue-key="LU-13368"&gt;&lt;del&gt;LU-13368&lt;/del&gt;&lt;/a&gt; let PtlRPC discard the request-out callback, so it stopped its wait for &lt;tt&gt;rq_req_unlinked&lt;/tt&gt;. &lt;a href="https://jira.whamcloud.com/browse/LU-17379" title="try MGS NIDs more quickly at initial mount" class="issue-link" data-issue-key="LU-17379"&gt;&lt;del&gt;LU-17379&lt;/del&gt;&lt;/a&gt; fixed a check in that code, because a CONNECT waited on &lt;tt&gt;lp_dc_pendq&lt;/tt&gt; past its timeout. &lt;a href="https://jira.whamcloud.com/browse/LU-17704" title="network error in sanity-benchmark" class="issue-link" data-issue-key="LU-17704"&gt;&lt;del&gt;LU-17704&lt;/del&gt;&lt;/a&gt; reverted the &lt;a href="https://jira.whamcloud.com/browse/LU-17379" title="try MGS NIDs more quickly at initial mount" class="issue-link" data-issue-key="LU-17379"&gt;&lt;del&gt;LU-17379&lt;/del&gt;&lt;/a&gt; fix (&lt;a href="https://jira.whamcloud.com/browse/LU-17759" title="lnet errors &amp;quot;md 0x%p already unlinked&amp;quot;" class="issue-link" data-issue-key="LU-17759"&gt;&lt;del&gt;LU-17759&lt;/del&gt;&lt;/a&gt; errors), and &lt;a href="https://jira.whamcloud.com/browse/LU-14499" title="o2iblnd: LU-13368 changes cause shutdown procedure to not complete" class="issue-link" data-issue-key="LU-14499"&gt;&lt;del&gt;LU-14499&lt;/del&gt;&lt;/a&gt; reverted &lt;a href="https://jira.whamcloud.com/browse/LU-13368" title="lnet may be trying to use deleted routes leading to errors kiblnd_rejected(): 10.0.10.212@o2ib7 rejected: consumer defined fatal error" class="issue-link" data-issue-key="LU-13368"&gt;&lt;del&gt;LU-13368&lt;/del&gt;&lt;/a&gt; (o2iblnd shutdown hang, memory leak).&lt;/li&gt;
+	&lt;li&gt;These attempts let PtlRPC stop its wait while the LND could still own the message. The fix below keeps that wait.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-21058" title="Client reconnect stuck behind peer tx credits during server recovery" class="issue-link" data-issue-key="LU-21058"&gt;LU-21058&lt;/a&gt; (change 70136) solves the connect case differently: a connect message skips the LNet credits. The two fixes complement each other. The fix below helps every RPC type, but it frees the import only at the RPC timeout. 70136 sends the connect at once, so it can also reach a server that restarted on the same NID.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h2&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;PtlRPC: in &lt;tt&gt;ptlrpc_unregister_reply()&lt;/tt&gt;, also call &lt;tt&gt;LNetMDUnlink(rq_req_md_h)&lt;/tt&gt; when the request timed out (&lt;tt&gt;rq_timedout&lt;/tt&gt;) or failed (&lt;tt&gt;rq_err&lt;/tt&gt;), and the request MD is not unlinked yet. Read these flags under &lt;tt&gt;rq_lock&lt;/tt&gt;. Use no discard flag. Keep the wait for &lt;tt&gt;rq_req_unlinked&lt;/tt&gt;, so PtlRPC never frees a buffer that the LND holds. Do not unlink the request MD after a normal reply. LNet reports a send that completes on an unlinked MD as failed. A good request then ends as a network error, which is the &lt;a href="https://jira.whamcloud.com/browse/LU-17759" title="lnet errors &amp;quot;md 0x%p already unlinked&amp;quot;" class="issue-link" data-issue-key="LU-17759"&gt;&lt;del&gt;LU-17759&lt;/del&gt;&lt;/a&gt; failure.&lt;/li&gt;
+	&lt;li&gt;LNet: each MD keeps a list of its attached messages. In &lt;tt&gt;LNetMDUnlink()&lt;/tt&gt;, for a busy MD, take each message that LNet still queues off &lt;tt&gt;lpni_txq&lt;/tt&gt;, &lt;tt&gt;tq_delayed&lt;/tt&gt; or &lt;tt&gt;lp_dc_pendq&lt;/tt&gt;. Return its credits, and finalize it with &lt;tt&gt;-ECANCELED&lt;/tt&gt; after &lt;tt&gt;LNetMDUnlink()&lt;/tt&gt; drops the locks. A message that the LND already holds stays as it is. The lock order is &lt;tt&gt;lnet_res_lock&lt;/tt&gt; (MD CPT), then &lt;tt&gt;lnet_net_lock&lt;/tt&gt; (message CPT), then &lt;tt&gt;lpni_lock&lt;/tt&gt; or &lt;tt&gt;lp_lock&lt;/tt&gt;. The unlink path does not take &lt;tt&gt;LNET_LOCK_EX&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;A prototype of both parts gave these results with the reproduction above. Each row has 2-5 runs.&lt;/p&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Build&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Kill only&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Kill and static ARP&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Evicted&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; master &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 42.9-66.2 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 159.7-172.3 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 3 of 3, with static ARP &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Part 1 only &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 42.0-57.1 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 96.3-106.4 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 0 of 4 &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Part 2 only, first prototype &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 48.6-59.3 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 160.5-168.2 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 2 of 2, with static ARP &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Parts 1 and 2 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 38.3-40.0 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 50.2-52.2 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 0 of 5 &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; &lt;a href="https://jira.whamcloud.com/browse/LU-21058" title="Client reconnect stuck behind peer tx credits during server recovery" class="issue-link" data-issue-key="LU-21058"&gt;LU-21058&lt;/a&gt; (70136) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 37.0-41.1 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 49.2-49.9 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 0 of 4 &lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;The client debug log shows the cancel in every run, with 16-26 cancelled messages for each run. In one run, these were 14 OST_WRITE, 7 OBD_PING and 4 CONNECT requests. No node had an LBUG, an assertion or a slub_debug report. No node logged "already unlinked". sanity-lnet gave the same result on master and on an earlier form of the series.&lt;/p&gt;
+
+&lt;p&gt;A CONNECT does not wait on &lt;tt&gt;lp_dc_pendq&lt;/tt&gt; on master. Since &lt;a href="https://jira.whamcloud.com/browse/LU-17906" title="conf-sanity test_153a: check mount failed" class="issue-link" data-issue-key="LU-17906"&gt;&lt;del&gt;LU-17906&lt;/del&gt;&lt;/a&gt;, PtlRPC does not send a connect over a peer that is not up to date. Other LNet users can still wait there. In an lnet_selftest test to a dead NID that was not discovered, master released the MD after 51.2 s, at the end of discovery. The series released it after 30.2-30.6 s, when lnet_selftest stopped the RPC.&lt;/p&gt;
+
+&lt;p&gt;Work before the fix can land:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;A regression test.&lt;/li&gt;
+	&lt;li&gt;Full sanity-lnet and recovery-small runs on the final series.&lt;/li&gt;
+	&lt;li&gt;PtlRPC does not unlink the request MD of a request that it resends after a reconnect. That request can still wait for a credit.&lt;/li&gt;
+	&lt;li&gt;Tests of the &lt;tt&gt;tq_delayed&lt;/tt&gt; path, of a routed path, and of o2iblnd. The &lt;a href="https://jira.whamcloud.com/browse/LU-14499" title="o2iblnd: LU-13368 changes cause shutdown procedure to not complete" class="issue-link" data-issue-key="LU-14499"&gt;&lt;del&gt;LU-14499&lt;/del&gt;&lt;/a&gt; hang was on o2iblnd.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="100239">LU-21085</key>
+            <summary>ptlrpc: expired request stays queued in LNet until peer credits return</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 31 Oct 2026 18:03:13 +0000</created>
+                <updated>Sat, 31 Oct 2026 19:30:33 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="100211">LU-21058</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="21115">LU-4006</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="87221">LU-18681</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072br:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

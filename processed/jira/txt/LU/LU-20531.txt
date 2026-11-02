@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Vandana Rungta
 Reporter:   Vandana Rungta
 Created:    Tue, 28 Jul 2026 15:26:36 +0000
-Updated:    Fri, 14 Aug 2026 16:03:00 +0000
+Updated:    Fri, 30 Oct 2026 23:49:56 +0000
 
 --- Environment ---
 16-MDT DNE filesystem, ~535 TiB, Lustre 2.15, EL9 kernel (5.14.x). Triggered during failover/recovery of a single MDT.
@@ -449,3 +449,168 @@ mkdir $DIR/newdir
 
 With fix: succeeds instantly
 Without fix: hangs forever (only reboot clears)
+
+--- Comment (JIRAUSER19474, Fri, 30 Oct 2026 23:49:56 +0000) ---
+Root cause, with a one-line fix. Patch:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/67599
+
+The reported stack is ten ldlm_bl threads blocked in obd_get_mod_rpc_slot().
+
+They are acquirers, not the holder. For all ten to be parked, the avail test
+
+in genops.c requires cl_close_rpcs_in_flight != 0, so an unseen thread held
+
+the reserved close slot. That thread is the import's own ldlm_lock_replay
+
+kthread, and it is absent from the report because ptlrpc_set_wait() sleeps
+
+TASK_IDLE / TASK_INTERRUPTIBLE and is invisible to khungtaskd. The mechanism
+
+predicts its own absence from the evidence.
+
+At LUSTRE_IMP_REPLAY_LOCKS, __ldlm_replay_locks() first calls
+
+ldlm_cancel_unused_locks_for_replay(), which runs every unused lock's
+
+CANCELING AST inline on that thread. A LOOKUP/PERM cancel reaches
+
+ll_prune_aliases(), drops the last dentry of an inode whose open handle is
+
+still cached by an OPEN lock, and ll_clear_inode() then has to issue
+
+MDS_CLOSE. That close is parked by ptlrpc_import_delay_req() while holding
+
+the close slot, and the import cannot reach FULL until the same thread
+
+returns and drops imp_replay_inflight.
+
+The cycle is permanent, and that is provable from source: a non-FULL import
+
+is not pinged (pinger.c), cannot be set DISCON (ptlrpc_set_import_discon()
+
+requires FULL), cannot be advanced by the state machine (imp_replay_inflight
+
+never reaches 0), and ptlrpc_abort_inflight() skips requests of the current
+
+generation. No timeout, eviction or reconnect breaks it, which is consistent
+
+with the duration observed and with the reboot-only resolution.
+
+Note the page-cache theory in the original analysis does not hold: there is
+
+no truncate_inode_pages or page-wait frame anywhere in the full stack.
+
+Fix: set rq_allow_replay on the close so it is not deferred during its own
+
+import's recovery. The target already processes MDS_CLOSE while recovering -
+
+tgt_filter_recovery_request() lists it, and target_queue_recovery_request()
+
+processes rather than queues a request with no transno, which a fresh close
+
+has. Direct in-tree precedent: ldlm_cli_cancel_req() does exactly this for a
+
+cross-MDT LDLM_CANCEL, for the same deadlock class, but is gated on
+
+OBD_CONNECT_MDS_MDS so it never covers a close issued through llite.
+
+Measured with a matched A/B, same harness, this one line as the only
+
+variable:
+
+                                   unpatched      patched
+
+  o35 "req waiting for recovery"       1             0
+
+  o35 "allow during recovery"          0            26
+
+  ldlm_bl parked (state S)           727 samples    0 of 730
+
+  imp_replay_inflight              stuck at 10    drained to 0
+
+  recovery outcome                  COMPLETE      COMPLETE
+
+Also built and smoke-tested on 2.15.8 (kernel 5.10) against a live 3-MDT DNE
+
+filesystem: all MDCs and OSCs reach FULL, with normal I/O timings.
+
+recovery-small tests 1, 4, 5, 6, 8, 9 and the new 171 all pass on the patched
+
+build.
+
+On the two options discussed earlier: option A is this fix. Option C appears
+
+to be a no-op - mdc_cancel_weight() already returns 0 for any lock holding
+
+MDS_INODELOCK_OPEN, and the replay pass is exactly the no-wait policy that
+
+consults it; separately, the observed close came from a LOOKUP/PERM cancel,
+
+so protecting OPEN-bit locks would not have prevented it. Worth noting that
+
+ldlm_cancel_no_wait_policy()'s own comment promises not to pick locks that
+
+would need an RPC "to close a file" - that contract is already violated
+
+today, and mdc_cancel_weight() cannot honour it.
+
+The open-locking hypothesis is correct and load-bearing: ll_md_close() skips
+
+the real close precisely when md_lock_match() finds a cached OPEN lock, which
+
+is what leaves the handle for eviction to close. Without opencache the path
+
+is not reachable from an AST at all.
+
+Why there is no reproducer. A test that fails without the fix would have to
+
+observe that the close was parked on imp_delayed_list, and that is not
+
+observable through any stable interface - mdc.*.import exposes rpcs: 
+
+{
+inflight, unregistering, timeouts, avg_waittime }
+ and no delayed-request
+
+counter. The only remaining signal is the CDEBUG text from
+
+ptlrpc_import_delay_req(), and those two strings are the two branches of the
+
+very "if" that rq_allow_replay controls, so a test grepping them asserts only
+
+that the flag just set is set. It restates the implementation, cannot catch a
+
+bug in it, and stops asserting anything the moment the message is reworded.
+
+The patch therefore carries a regression guard only: recovery-small test_171
+
+passes with and without the fix, and checks recovery COMPLETE, zero
+
+evictions, and every seeded file still at its original size with a matching
+
+checksum. The size matters because mdc_close() carries an mdt_rec_setattr, so
+
+a lost close shows up as a short file.
+
+What is not established. The original field condition is not reproduced.
+
+Every lab variant either self-heals once the target returns or requires the
+
+target never to return, and the defining feature - persisting for over two
+
+hours after the peer was healthy again - was not reproduced. The import state
+
+was never captured in the field, so identifying it as REPLAY_LOCKS is
+
+inference from the timeline. On a single-client, single-node configuration
+
+there is no replay window to drive a close into at all: the import reports
+
+"FULL state after 0 sec" and not one RPC of any opcode is delayed. This fix
+
+also removes only the demonstrated trigger, not the whole class - the untimed
+
+wait in obd_get_mod_rpc_slot() and the inline Data-on-MDT flush in
+
+ll_lock_cancel_bits() are untouched and remain separate blocking points.
