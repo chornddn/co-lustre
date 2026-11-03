@@ -8,17 +8,16 @@ Resolution: Unresolved
 Assignee:   Chris Horn
 Reporter:   Chris Horn
 Created:    Sat, 31 Oct 2026 18:03:13 +0000
-Updated:    Sat, 31 Oct 2026 19:30:33 +0000
-Links:      Related: is related to  LU-21058; Related: is related to  LU-4006; Related: is related to  LU-18681
+Updated:    Tue, 3 Nov 2026 00:17:46 +0000
+Links:      Related: is related to  LU-21058; Related: is related to  LU-4006; Related: is related to  LU-18681; Related: is related to LU-21101
 
 --- Description ---
 Problem
-
 When a PtlRPC request expires, the request can still wait in LNet for a peer tx credit. PtlRPC cannot finish the request until LNet releases the request MD. The import thus stays busy, and it cannot try the next NID. When bulk RPCs hold all peer credits to a dead server, a client can take minutes to reconnect, and the restarted target can evict it.
 
 Environment
 
-	master, at commit 40b80bc048 (LU-20867), on rocky9 VMs.
+	master, at commit 40b80bc048 ("LU-20867 gss: re-resolve lsvcgssd ioctl device on failure"), on rocky9 VMs.
 
 	tcp, with ksocklnd peer_credits=8, sock_timeout=50, credits=256, and lnet discovery=0.
 
@@ -58,16 +57,16 @@ LU-21058 (change 70136) solves the connect case differently: a connect message s
 
 Proposed fix
 
-	PtlRPC: in ptlrpc_unregister_reply(), also call LNetMDUnlink(rq_req_md_h) when the request timed out (rq_timedout) or failed (rq_err), and the request MD is not unlinked yet. Read these flags under rq_lock. Use no discard flag. Keep the wait for rq_req_unlinked, so PtlRPC never frees a buffer that the LND holds. Do not unlink the request MD after a normal reply. LNet reports a send that completes on an unlinked MD as failed. A good request then ends as a network error, which is the LU-17759 failure.
+	PtlRPC: in ptlrpc_unregister_reply(), also call LNetMDUnlink(rq_req_md_h) in three cases: the request timed out (rq_timedout), failed (rq_err) or waits for a resend (rq_resend). Skip the call when LNet already unlinked the request MD. Read these flags under rq_lock. Use no discard flag. Keep the wait for rq_req_unlinked, so PtlRPC never frees a buffer that the LND holds. Do not unlink the request MD after a normal reply. LNet reports a send that completes on an unlinked MD as failed. A good request then ends as a network error, which is the LU-17759 failure. PtlRPC uses no result of the old send for a resend or for an aborted request (rq_err). But for these requests, the cancelled send would set rq_net_err. Then ptlrpc_check_set() would call ptlrpc_expire_one_request(), which logs a false network error and can set a FULL import to DISCONN. Thus request_out_callback() does not set rq_net_err for a request with rq_resend or rq_err. ptl_send_rpc() clears both flags before the next send. Side effect: a real LND failure of the old send no longer expires the request. The resend or the abort replaces the old send, so I think this is correct. Reviewers must agree.
 
 	LNet: each MD keeps a list of its attached messages. In LNetMDUnlink(), for a busy MD, take each message that LNet still queues off lpni_txq, tq_delayed or lp_dc_pendq. Return its credits, and finalize it with -ECANCELED after LNetMDUnlink() drops the locks. A message that the LND already holds stays as it is. The lock order is lnet_res_lock (MD CPT), then lnet_net_lock (message CPT), then lpni_lock or lp_lock. The unlink path does not take LNET_LOCK_EX.
 
 A prototype of both parts gave these results with the reproduction above. Each row has 2-5 runs.
 
-Build
-Kill only
-Kill and static ARP
-Evicted
+ Build 
+ Kill only 
+ Kill and static ARP 
+ Evicted 
 
  master 
  42.9-66.2 s 
@@ -94,16 +93,82 @@ Evicted
  49.2-49.9 s 
  0 of 4 
 
-The client debug log shows the cancel in every run, with 16-26 cancelled messages for each run. In one run, these were 14 OST_WRITE, 7 OBD_PING and 4 CONNECT requests. No node had an LBUG, an assertion or a slub_debug report. No node logged "already unlinked". sanity-lnet gave the same result on master and on an earlier form of the series.
+The client debug log shows the cancel in every run, with 16-26 cancelled messages for each run. In one run, these were 14 OST_WRITE, 7 OBD_PING and 4 CONNECT requests. No node had an LBUG, an assertion or a slub_debug report. No node logged "already unlinked".
 
-A CONNECT does not wait on lp_dc_pendq on master. Since LU-17906, PtlRPC does not send a connect over a peer that is not up to date. Other LNet users can still wait there. In an lnet_selftest test to a dead NID that was not discovered, master released the MD after 51.2 s, at the end of discovery. The series released it after 30.2-30.6 s, when lnet_selftest stopped the RPC.
+A CONNECT does not wait on lp_dc_pendq on master. Since LU-17906, PtlRPC does not send a connect over a peer that is not up to date. Other LNet users can still wait there. In an lnet_selftest test to a dead NID that LNet did not discover, master released the MD after 51.2 s, at the end of discovery. The series released it after 30.2-30.6 s, when lnet_selftest stopped the RPC.
+
+The series adds sanity-lnet test_261. A delay rule holds all 8 peer tx credits, and an lnetctl ping with a 5 s timeout then waits for a credit. The test needs proof that the ping fails in less than 20 s, and that all credits come back. On master the test failed in 4 of 4 runs: the ping returned after 60-64 s. On the series the test passed in 7 of 7 runs: the ping failed after 5 s.
+
+Other results on the series, with the same ping test:
+
+ Case 
+ master 
+ Series 
+
+ Message waits for an NI credit (tq_delayed) 
+ 58.6-63.8 s 
+ 5.0-5.1 s, 3 of 3 
+
+ Routed path (tcp1, router, tcp2) 
+ 61-63 s 
+ 5.0-5.1 s, 4 of 4 
+
+The credits came back in every run.
+
+Full suites on 4-node clusters, with slub_debug=FZPU:
+
+ Suite 
+ master 
+ Series 
+
+ sanity-lnet 
+ 162 pass, 1 fail (test_261) 
+ 163 pass, 0 fail 
+
+ recovery-small 
+ 132 pass, 0 fail 
+ 132 pass, 0 fail 
+
+Both builds skipped the same tests. All router tests ran. lustre_rmmod passed on all nodes after each suite. No node had an LBUG, an assertion, a slub_debug report or an "already unlinked" message.
+
+lnet_selftest brw throughput was not lower on the series. The VM network limited both builds to about 35 MiB/s. struct lnet_msg grows by 24 bytes, and struct lnet_libmd grows by 16 bytes.
+
+The series also adds recovery-small test_165. The client delays requests to the OST by 10 s, sends 16 ladvise requests and then deactivates the OSC. The test fails if the import goes to DISCONN or if the import timeout count changes. Without the rq_err check, the test failed in 3 of 3 runs: each run logged 8 false network errors and set the import to DISCONN. With the check, the test passed in 4 of 4 runs. On master it passed in 3 of 3 runs. With the check, recovery-small gave 133 pass and 0 fail.
+
+recovery-small test_166 covers an aborted request with a send state other than FULL. A delay rule holds an OSC CONNECT, and the test then deactivates the OSC. Without the rq_err check, ptlrpc_expire_one_request() changed the status from -EIO to -ETIMEDOUT and added 1 to the import timeout count. The test failed in 3 of 3 runs. With the check, and on master, the interpret callback got -EIO, and the test passed in 3 of 3 runs. The console output and the import state were the same on all builds.
+
+Master has the same false network error for bulk RPCs. The function client_bulk_callback() sets rq_net_err when an abort unlinks the bulk MD. That function does not check rq_err. This series does not change that path.
 
 Work before the fix can land:
 
-	A regression test.
+	A test of o2iblnd. The LU-14499 hang was on o2iblnd.
 
-	Full sanity-lnet and recovery-small runs on the final series.
+	A lockdep run.
 
-	PtlRPC does not unlink the request MD of a request that it resends after a reconnect. That request can still wait for a credit.
+	A runtime test of the resend unlink. ptlrpc_abort_set() has no runtime trigger, so no test covers it. This test needs a reconnect to a second server NID while the credits to the old NID stay held.
 
-	Tests of the tq_delayed path, of a routed path, and of o2iblnd. The LU-14499 hang was on o2iblnd.
+--- Comment (gerrit, Tue, 3 Nov 2026 00:17:45 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70345
+
+Subject: LU-21085 lnet: cancel queued messages on MD unlink
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0584aa9259771e9bfcde8879e7a24c92ec074f7f
+
+--- Comment (gerrit, Tue, 3 Nov 2026 00:17:46 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70346
+
+Subject: LU-21085 ptlrpc: unlink the request MD on request timeout
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f51e72451a8df8f2918c12099e127046f7a6b816

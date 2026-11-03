@@ -1,0 +1,51 @@
+Key:        LU-21095
+Summary:    mgs: IR NID lists for tcp0 and o2ib0 use one key
+Link:       https://jira.whamcloud.com/browse/LU-21095
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Mon, 2 Nov 2026 16:30:32 +0000
+Updated:    Mon, 2 Nov 2026 16:30:37 +0000
+Links:      Related: is related to  LU-20290; Related: is related to  LU-18885
+
+--- Description ---
+Problem
+
+The MGS keys the per-target IR NID lists (mnt_xa_nids) by LNET_NETNUM() only. LNET_NETNUM() drops the LND type, so tcp0 and o2ib0 use the same key 0. The same applies to tcp1 and o2ib1. A target with NIDs on two LND types with the same net number thus gets one mixed NID list at the MGS.
+
+The mixed list causes two errors:
+
+	An IR query for one net (for example o2ib0) also returns the NIDs of the other net (tcp0).
+
+	A net delete for one net removes the NIDs of both nets. The target sends "#" (NETDEL_TOKEN) when LNet deletes a local net (lnet_notify_net_update()). mgs_build_nidlists() then calls xa_erase() with LNET_NETNUM(net). After "lnetctl net del --net tcp", the MGS IR table has no o2ib0 NIDs for that target.
+
+Environment
+
+	master (2.17.x) after LU-18885 and LU-19095.
+
+	Any server with NIDs on two LND types that share a net number, for example o2ib0 and tcp0.
+
+Analysis
+
+Source analysis only. We did not reproduce this on a test system.
+
+	LU-18885 (558f6c90c7) added the per-net lists. mti_nidnet() returns LNET_NETNUM(LNET_NID_NET(&nid)), and mgs_tnl_update() stores the list at that index.
+
+	nidtbl_fill_entry() looks up a single net with xa_index = LNET_NETNUM(netid).
+
+	LU-19095 (b625dac234) added the NETDEL_TOKEN delete. mgs_build_nidlists() erases LNET_NETNUM(net).
+
+	mgs_build_nidlists() groups consecutive NIDs by key, so adjacent o2ib0 and tcp0 NIDs make one group. Otherwise mgs_tnl_update() appends the second group to the same list, because the version is the same.
+
+Proposed fix
+
+Key mnt_xa_nids by the full net ID (LNET_NID_NET()), not by LNET_NETNUM(). Change mti_nidnet(), the single-net lookup in nidtbl_fill_entry(), and the NETDEL erase together. Use the full net ID also for the LNET_NET_ANY check. An xarray index is an unsigned long, so the full 32-bit net ID fits.
+
+Change 67240 (LU-20290) changes the key inside a larger patch. A separate patch can land on its own, and maintenance branches can take it alone.
+
+Test
+
+Add a conf-sanity test: configure tcp and a second LND with the same net number on the OSS, and mount. Remove the tcp net with "lnetctl net del". Check that the client still gets the other net's NIDs for the OST through IR.

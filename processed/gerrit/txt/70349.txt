@@ -1,0 +1,97 @@
+Change:     70349
+Subject:    LU-20211 lod: count offline OSTs to skip per-stripe checks
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70349
+Change-Id:  I94d6b7e0b796824e00b3be87b2f036bc5d3ebbe5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-11-03 03:51:59.000000000
+Updated:    2026-11-03 04:19:49.000000000
+Patch Set:  1
+Insertions: +343
+Deletions:  -51
+Comments:   3 (2 unresolved)
+Hashtags:   pt_ecro
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-20211 lod: count offline OSTs to skip per-stripe checks
+
+Checking a file for stripes on unavailable OSTs looks up the OST of
+every stripe and its state, on every truncate (layout replace probe),
+FLR primary mirror pick and migration parent FID update, even though
+an OST is rarely unavailable.  A read-only OST was also treated as
+usable for truncate, so a truncate of a file with an object there
+would fail with -EROFS instead of replacing that object.
+
+Add lod_ost_offline_count, the number of OSTs that cannot modify
+their objects: the OSP import is not connected or is deactivated, or
+the OST reported OS_STATFS_READONLY in its last statfs.  LOD gives
+each OST's OSP a pointer to the count with KEY_OFFLINE_COUNT when the
+OST is added, and clears it under ltd_mutex before the OST is
+removed.  The OSP raises the count by one while it is unusable,
+checked under a lock at each import event, read-only state change in
+osp_pre_update_msfs() and pointer change, so an OST that is offline
+when it is added is counted at once and a late IMP_EVENT_ACTIVE
+cannot undo a newer disconnect.  A connected OST that is full or not
+precreating is not counted, since it can still be truncated and have
+its parent FID changed.
+
+Skip the per-stripe checks while the count is zero in
+lod_layout_check(MD_LAYOUT_UNAVAILABLE) and
+lod_obj_stripe_replace_parent_fid_offline_cb().  lod_ost_offline()
+treats a read-only OST and an invalid (deactivated) import as
+offline, as the count does, reading the import and the OSP's cached
+statfs rather than waiting for LOD's next statfs refresh.
+
+lod_primary_pick() must still avoid a mirror on any inactive OST, so
+it skips its check only while every OST is active, and takes each
+stripe's OST index from llc_ost_indices[] instead of an FLD lookup.
+
+While the checks are skipped, a stripe on an OST index that was
+removed from the configuration is no longer reported unavailable.
+
+Show the count in lod.*.ost_offline_count, and add sanity/test_27xw
+to check that it rises when an OST is deactivated, stopped or made
+read-only and returns to zero afterward, that truncate(0) moves a
+file off a read-only OST, and that a no-create OST is not counted.
+
+Test-Parameters: trivial testlist=sanity-flr,sanity-ec
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
+Change-Id: I94d6b7e0b796824e00b3be87b2f036bc5d3ebbe5
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-11-03 03:51:59.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Andreas Dilger, 2026-11-03 03:54:10.000000000) ---
+Hashtag added: pt_ecro
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 03:54:37.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-03 03:59:14.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-03 04:18:40.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135296/ : SUCCESS

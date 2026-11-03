@@ -7,11 +7,12 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-19 19:55:28.000000000
-Updated:    2026-10-29 22:40:18.000000000
+Updated:    2026-11-03 11:25:16.000000000
 Patch Set:  41
 Insertions: +2030
 Deletions:  -127
-Comments:   209 (0 unresolved)
+Comments:   214 (5 unresolved)
+Hashtags:   lfu
 
 --- Labels ---
   Code-Review: (no votes)
@@ -9653,3 +9654,55 @@ Passed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploade
 Patch Set 27:
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-11-03 07:40:26.000000000) ---
+Hashtag added: lfu
+
+--- Message (Artem Blagodarenko, 2026-11-03 11:25:16.000000000) ---
+Patch Set 41:
+
+(5 comments)
+
+Tested PS41 on rocky9, 1 MDT and 2 OSTs, ldiskfs, alone and with 68160 on top (that is the first caller of llapi_find_device()).
+
+Test suites:
+
+```
+68159 alone      sanity 27K, 56*            84 pass, 0 fail, 7 skip
+68159 + 68160    sanity 27K, 56*            85 pass, 0 fail, 7 skip
+68159 + 68160    conf-sanity 300a 300b 300c  see 68160
+```
+
+The 7 skips need 2 MDTs or 2 GB free.
+
+Coverage: bpftrace uprobes on every statement line this patch adds (by git blame), counting only the test suites above:
+
+```
+liblustreapi_pfind.c         279/393
+liblustreapi_scan_device.c    56/59
+liblustreapi_layout.c         10/10
+liblustreapi.c                 1/1
+total                        346/463  74%
+```
+
+No test reaches:
+- printf_format_ost_indices() (0/7), so the %Lo fixes the commit message describes for a walk are untested
+- find_lmm_fits() beyond a valid layout (10/32): torn, short or byte-swapped layouts
+- -name over several linkea names (find_device_prefilter() loop); conf-sanity 300* makes no hard links
+- lazy size/blocks from trusted.som; the SEL and SPECIFIC conversions; growing fp_lmv_md for a large foreign LMV; obj:ID output; the "could not be decided" warning
+- the walk change for -btime/-newerbY on an object with no birth time
+- find_device_supported() and the lfsp_stats copy-out: reachable only from a direct API caller (see 68160)
+
+Manual steps outside the test suites, so not something CI repeats:
+1. The same tree searched by a walk and by lfs find --device over the MDT, compared predicate by predicate. The tree held a plain file, a 2-stripe file, DoM, PFL with an uninstantiated component, a directory default layout, a hard link in a subdirectory, a FIFO, a symlink, a foreign file and a foreign directory, a project id and an old mtime. About 35 predicates answer the same, -name through a second link name included. The only differences are documented ones: a hard-linked file is printed once, and %i is the inode on the target.
+2. Refusals by hand: --xattr, %p, %+5p, -maxdepth, -mindepth, --threads, --ost over an MDT, and --mdt and the layout options over an OST. Each gives rc 95 with a clear message. The OST sweep is right: --ost 0 gives 33, --ost 1 gives 0, ! --ost 1 gives 33.
+3. The walk-side -printf changes against a master build of the same tree. Master fills the %Lo buffer with '?,' for a DoM+PFL file and prints LLAPI_LAYOUT_DEFAULT for %Lc, and this patch fixes both.
+
+With these hand checks the same probes reach 401/463 (86%).
+
+Problems, inline:
+1. %Lo over a scan prints 4294967295 for a component with no objects (new here)
+2. --foreign on a directory is inverted on master, and the scan inherits it. 69795 fixes both (checked on top of this series); it needs to land first
+3. every -name over an MDT warns about 2 undecided objects (ROOT and .lustre)
+4. the %Lo error prints the wrong errno (old, but in a function this patch rewrites)
+5. (FYI, master too, not reachable from a scan) --mdt/--ost with -printf hangs on a FIFO, and --mdt with -type p/c/s ends the walk

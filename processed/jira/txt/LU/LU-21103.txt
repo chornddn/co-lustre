@@ -1,0 +1,141 @@
+Key:        LU-21103
+Summary:    lov: refactor mirror/EC read selection into fact / evaluate / select layers
+Link:       https://jira.whamcloud.com/browse/LU-21103
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Keguang Xu
+Created:    Tue, 3 Nov 2026 01:10:54 +0000
+Updated:    Tue, 3 Nov 2026 01:27:00 +0000
+Labels:     FLR-EC-RO, FLR-EC-backlog
+
+--- Description ---
+Goal
+
+Refactor the LOV mirror / EC degraded-read path so selection policy is cohesive and extensible: separate OST facts, per-mirror evaluation (no side effects), and IO selection (the only place that writes ci_* / restart state). Improve maintainability after LU-12669 without a feature rewrite.
+
+This is not a feature rewrite: keep current behaviour except where a documented inconsistency is fixed on purpose.
+
+Background — where “selection” lives today
+
+After checking lov_io_mirror_init() and consumers of the ci_* flags, read-source policy is spread across at least seven places:
+
+ Location 
+ What it decides 
+
+ lov_object.c lo_preferred_mirror 
+ Layout-time static preference (stale, NID preference) 
+
+ lov_io_mirror_init() main loop 
+ valid / foreign / parity skip / coverage / EC route 
+
+ lov_io_mirror_init() tail 
+ rotation, tried_all_mirrors, 10ms yield, switch to CIT_EC_RD, ci_ndelay / ci_no_soft_tmo 
+
+ lov_ecio_add_data_sub() 
+ Whether each stripe gets a sub-IO 
+
+ lov_io_ec_rd_start() 
+ Parity stripe read order (prefer available) 
+
+ osc_io_iter_init() 
+ Fast -EAGAIN on imp_unreachable 
+
+ osc_cache.c (two sites) 
+ oe_soft_tmo 
+
+Unifying this is not “add another layer”. It is splitting three concerns that are mixed today.
+
+Related context: LU-12669 / https://review.whamcloud.com/64919 (soft deadline + slow mark + LOV routing); https://review.whamcloud.com/69710 (split a read when one raid set cannot be rebuilt). LOD lod_primary_pick() / lod_check_ost_avail() share the same shape as LOV selection but different inputs and stakes; share model/geometry later, not a pick engine (see Non-goals).
+
+Target structure
+
+(a) Fact layer — OST state predicates
+
+lov_sub_unreachable / slow / loaded / unavailable. Pure queries, no IO context. Shared by FLR and EC; FLR slow-mark avoidance reuses these directly.
+
+(b) Evaluate layer — verdict for one candidate (values, no side effects)
+
+Input (lio, mirror, io_ext, file_size). Output a struct; do not write any ci_*:
+
+enum lov_mirror_fit {
+	LOV_MIRROR_NONE,	/* no component covers this IO */
+	LOV_MIRROR_INTACT,
+	LOV_MIRROR_SLOW,	/* FLR: touched stripes slow-marked */
+	LOV_MIRROR_REBUILD,	/* EC: unavailable stripes, parity can stand in */
+	LOV_MIRROR_WAIT,	/* unavailable stripes, must wait */
+};
+
+struct lov_mirror_verdict {
+	enum lov_mirror_fit	lmv_fit;
+	bool			lmv_busy;	/* -> ci_no_soft_tmo */
+	bool			lmv_cross_ec;
+};
+
+Internally call lov_ec_raid_set_decision() per raid set (same helper as lov_ecio_add_data_sub()), so “skip this stripe or not” has one implementation. Fast path: if every touched stripe is reachable, do not walk parity budget (preserve today’s cost on the healthy path).
+
+Document the total order used by selection, e.g. INTACT > SLOW > REBUILD > WAIT > NONE, including how FLR “accept SLOW when no INTACT” interacts with EC REBUILD → CIT_EC_RD.
+
+(c) Select layer — order, rotation, backoff, restart
+
+lov_io_select_mirror(lio, obj, io): start from lo_preferred_mirror or the last index, evaluate candidates, pick by lmv_fit, and in one place set lis_mirror_index, ci_cross_ec, ci_no_soft_tmo, ci_ndelay, ci_tried_all_mirrors, ci_switch_ec_io (and split/restart hooks as needed for 69710-style boundaries).
+
+Under this layout, “FLR avoids slow OSTs” is a one-line change in the ranking rule (prefer INTACT over SLOW; accept SLOW if nothing better), without retouching evaluation or restart plumbing.
+
+Boundaries
+
+	Keep designated-mirror (resync) as an override / early return, not selection.
+
+	Keep write intent as a separate concern.
+
+	lo_preferred_mirror stays layout-time; selection only consumes it as the start index.
+
+	No ops table / pluggable strategy — an enum plus a ranking function is enough.
+
+	Keep osc_io_iter_init() imp_unreachable as a post-selection race fallback.
+
+	Do not shrink or merge ci_cross_ec / ci_tried_all_mirrors / ci_switch_ec_io in the first round; only make the write site unique. Collapsing those flags is a later patch (consumers in llite, vvp, glimpse, cl_io, osc).
+
+	First round need not fold lov_io_ec_rd_start() parity ordering into lov_mirror_evaluate(); it can keep using fact-layer predicates only.
+
+	Leave room in the verdict/select path for a split offset (69710); wait_slow/busy splitting can come later.
+
+Behaviour
+
+Aside from the intentional busy-set fix below, extractions should be behaviour-preserving. Land pure-structure patches first (sanity-ec 29a, 54a–54k, sanity-flr as baseline), then stack policy changes.
+
+Open question for authors of 64919: when one raid set is REBUILD (dead, parity OK) and another is slow+busy, lov_ec_io_route() returns RECONSTRUCT while lov_ecio_add_data_sub() may still skip the busy set’s slow stripe. Is skipping intentional, or an oversight? That answer decides whether the raid-set helper patch is pure refactor or includes one fix (skip_slow && !busy).
+
+Proposed patch order
+
+	Fact layer: move lov_sub_* to lovsub_object.c or lov_cl_internal.h inlines. Pure move.
+
+	lov_ec_raid_set_decision() (unify route + add_sub; four-level set verdict, fold by max). At most one intentional behaviour change — call it out in the commit message. Put pure geometry next to ec_split_stripes().
+
+	lov_mirror_evaluate() + lov_io_select_mirror() in lov_mirror.c; lov_io_mirror_init() becomes designated → write intent → select. Raid-set math/budget helpers in lov_ec.c. Behaviour unchanged. Prefer writing new code in the new files over refactor-in-place then migrate.
+
+	OSC oe_soft_tmo helper: mechanical constraints only (ndelay, CIT_READ, aio, DIO only if ci_cross_ec). Policy stays in LOV (ci_no_soft_tmo from select). Behaviour unchanged.
+
+	FLR slow mark: ranking rule + sanity-flr + update osc_read_slow_mark() comments and osc.slow_read_pct(4).
+
+	Optional: move remaining EC read path (lov_io_ec_rd_*, recover) into lov_ec.c.
+
+Non-goals
+
+	A shared callback pick_mirror() for LOD and LOV (adapters would dwarf the loops).
+
+	Equating MDS ltd_active with client import/slow mark via one is_available hook.
+
+	Folding soft deadline into adaptive timeout.
+
+	Aligning lod_primary_pick() in the first series (same fact/evaluate/select model later via something like lu_mirror_fit; not a merged engine).
+
+Test plan
+
+	sanity-ec 29a, 54a–54k as regression baseline for structure patches.
+
+	If the busy-set fix lands: explicit multi-raid-set case (dead-rebuildable set + slow+busy set) — reconstruct without skipping/amplifying the busy set’s slow stripe.
+
+	sanity-flr: after OBD_FAIL_OST_BRW_PAUSE_BULK soft timeout, later IOs should not keep bumping soft_timeouts while the mark holds (when another mirror can serve).

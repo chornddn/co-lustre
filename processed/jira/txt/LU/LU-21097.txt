@@ -1,0 +1,42 @@
+Key:        LU-21097
+Summary:    quota: qmt_seed_glbe_all() LBUG when an OST lacks the slave index of one quota type
+Link:       https://jira.whamcloud.com/browse/LU-21097
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Bot
+Created:    Mon, 2 Nov 2026 17:51:17 +0000
+Updated:    Mon, 2 Nov 2026 17:51:22 +0000
+Links:      Related: is related to  LU-19537; Related: is related to  LU-17770; Related: is related to  LU-19959; Related: is related to  LU-20869
+
+--- Description ---
+The QMT can LBUG in qmt_seed_glbe_all() when an OST has slave index files on MDT0 for some quota types but not for the type whose global lqe is being set up. Seen on master (as of 516b98b3ab):
+
+qmt_map_lge_idx()) qmt: cannot map ostidx 0, num_used 1: rc = -22
+qmt_seed_glbe_all()) ASSERTION( idx >= 0 ) failed: idx -22 lqe_is_global 1
+
+Cause
+
+The global pool has one slave array shared by all quota types, but the per-ID global data (lgd) is sized from a per-type slave count:
+
+	At QMT start, qmt_slv_add() adds a target to the global pool's slave array for an index file of any type, but only increments qpi_slv_nr[stype][qtype] for that file's type.
+
+	When a slave connects, qmt_pool_new_conn() creates the missing index for its type. If the target is already in the array (-EEXIST, "already added by another qtype"), it increments qpi_slv_nr but does not call qmt_lgd_extend_cb() on existing lqes (see the TODO in qmt_lvbo_init() about qmt_extend_lqe_gd).
+
+	qmt_alloc_lqe_gd() sizes the lgd from qpi_slv_nr for the lqe's type, and qmt_setup_lqe_gd() maps only the first lqeg_num_used entries of the array.
+
+	qmt_seed_glbe_all() then walks every entry of the shared array. For a global lqe, an entry it cannot map hits LASSERTF(idx >= 0).
+
+So any OST that has a group or project index but no user index (or any other such combination) on MDT0 can take the MDS down if a per-ID lock for the missing type is set up before all of those OSTs have reconnected and been counted.
+
+Reproduction
+
+Found during review of https://review.whamcloud.com/70192 (LU-20869), on ldiskfs with 1 MDT and 2 OSTs. Patchset 1 of that change ran sanity-quota test_91 on the live filesystem: after test_1a had run with quota.ost=ugp, test_91 set quota.ost=u, created OST pool qpool1 with both OSTs, set a user block limit, stopped mds1, removed only the user OST slave indexes (quota_master/dt-0x0/0x20000-OST000[01]_UUID) with debugfs, restarted mds1 and wrote as the quota user. The group and project indexes (0x1020000-/0x2020000-) left behind by test_1a put both OSTs in the global array with a user slave count of 0, and the MDS hit the assertion above. Change 70192 now removes the group and project indexes too, so the test no longer reaches this; the kernel defect remains.
+
+The same mismatch looks reachable without debugfs: a filesystem that ran with quota.ost=g (only group indexes on MDT0) and is switched to ug, with user limits set and writes going on while the OSTs reintegrate for user quota. That sequence has not been reproduced.
+
+Related
+
+= 0 ) failed" class="issue-link" data-issue-key="LU-19537">LU-19537 (same assertion, resolved for a locking race), lqeg_num_used )" class="issue-link" data-issue-key="LU-17770">LU-17770 (removing dt-0x0 indexes with OSTs in a pool), LU-19959 (qpi_slv_nr duplicates the slave array count; removing it would also remove this mismatch).

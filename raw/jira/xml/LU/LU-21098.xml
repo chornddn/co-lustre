@@ -1,0 +1,217 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21098] lnet: monitor thread soft lockup in lnet_finalize_expired_responses()</title>
+                <link>https://jira.whamcloud.com/browse/LU-21098</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h1&gt;&lt;a name="Description"&gt;&lt;/a&gt;Description&lt;/h1&gt;
+
+&lt;p&gt;On a busy OSS the LNet monitor thread is held on one CPU long enough for the&lt;br/&gt;
+kernel soft-lockup watchdog to fire, repeatedly and on every OSS of the system&lt;br/&gt;
+at once, roughly once every other day under an IOR workload. The task is always&lt;br/&gt;
+&lt;tt&gt;monitor_thread&lt;/tt&gt; and every trace ends in &lt;tt&gt;lnet_finalize_expired_responses()&lt;/tt&gt;.&lt;br/&gt;
+Kernel 5.14.0 (x86_64), 2.16 Lustre, kfilnd over CXI; the same code is in master.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Whattheconsoleshows"&gt;&lt;/a&gt;What the console shows&lt;/h2&gt;
+
+&lt;p&gt;Three episodes within a minute, the thread stuck 22-49 s each time. The first&lt;br/&gt;
+one is taken while the walk unlinks an entry:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;[238053.956108] watchdog: BUG: soft lockup - CPU#9 stuck for 23s! [monitor_thread:48625]
+[238053.956414] Modules linked in: obdecho(O) osp(O) ofd(O) lfsck(O) ost(O) mgc(O)
+ osd_ldiskfs(O) ldiskfs(O) lquota(O) lustre(O) mdc(O) lov(O) osc(O) lmv(O) fid(O)
+ fld(O) ptlrpc(O) obdclass(O) raid5_pd(PO) raid456 ... kkfilnd(O) lnet(O) libcfs(O)
+ ext4 mbcache jbd2 ... kfi_cxi(O) kfabric(O) cxi_eth(O) cxi_user(O) ... cxi_ss1(O)
+ cxi_sl(O) cxi_sbl(O) ...
+[238053.959136] CPU: 9 PID: 48625 Comm: monitor_thread Kdump: loaded Tainted: P           O L    -------  ---  5.14.0-570.32.1.x7.3.010.39.x86_64 #1
+[238053.959892] RIP: 0010:__list_del_entry_valid+0x3d/0x50
+[238053.960673] RSP: 0018:ff66aa390158fb40 EFLAGS: 00000246
+[238053.960960] RAX: dead000000000122 RBX: 0000000000000001 RCX: 0000000000490030
+[238053.961238] RDX: ff17eeab2f5ccc78 RSI: ff17eeab2f5ccc78 RDI: ff17eeab2f5ccc78
+[238053.961518] RBP: ff17eeab2f5ccc78 R08: ff66aa390158fb68 R09: 0000000000490030
+[238053.961787] R10: 0000000040000000 R11: 0000000000000000 R12: ff17eeabbc8149a0
+[238053.962072] R13: ff66aa390158fb68 R14: 0000000000000008 R15: ff17eeab2f5ccc78
+[238053.963542] Call Trace:
+[238053.963847]  &amp;lt;IRQ&amp;gt;
+[238053.964121]  ? show_trace_log_lvl+0x1c4/0x2df
+[238053.964680]  ? lnet_finalize_expired_responses.part.0+0x467/0x610 [lnet]
+[238053.964997]  ? watchdog_timer_fn+0x1ad/0x210
+[238053.965268]  ? __pfx_watchdog_timer_fn+0x10/0x10
+[238053.965560]  ? __hrtimer_run_queues+0x10f/0x2b0
+[238053.965846]  ? hrtimer_interrupt+0xfc/0x210
+[238053.966127]  ? __sysvec_apic_timer_interrupt+0x4b/0x100
+[238053.966409]  ? sysvec_apic_timer_interrupt+0x6d/0x90
+[238053.966708]  &amp;lt;/IRQ&amp;gt;
+[238053.966998]  &amp;lt;TASK&amp;gt;
+[238053.967289]  ? asm_sysvec_apic_timer_interrupt+0x16/0x20
+[238053.967599]  ? __list_del_entry_valid+0x3d/0x50
+[238053.967881]  lnet_finalize_expired_responses.part.0+0x467/0x610 [lnet]
+[238053.968181]  ? native_queued_spin_lock_slowpath+0x76/0x2b0
+[238053.968463]  ? __pfx_lnet_monitor_thread+0x10/0x10 [lnet]
+[238053.968793]  lnet_monitor_thread+0xb2/0x1a0 [lnet]
+[238053.969089]  ? sched_balance_newidle+0x25e/0x430
+[238053.969360]  ? update_load_avg+0x7e/0x7a0
+[238053.969642]  ? __update_idle_core+0x23/0xc0
+[238053.969908]  ? pick_next_task_idle+0x26/0x40
+[238053.970147]  ? pick_next_task+0x9f9/0xaf0
+[238053.970398]  ? dequeue_task_fair+0xaa/0x370
+[238053.970650]  ? finish_task_switch.isra.0+0x8c/0x2a0
+[238053.970901]  ? __schedule+0x231/0x4a0
+[238053.971132]  kthread+0xdd/0x100
+[238053.971362]  ? __pfx_kthread+0x10/0x10
+[238053.971576]  ret_from_fork+0x29/0x50
+[238053.971774]  &amp;lt;/TASK&amp;gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;RAX is &lt;tt&gt;dead000000000122&lt;/tt&gt; only because it is the &lt;tt&gt;LIST_POISON2&lt;/tt&gt; constant the&lt;br/&gt;
+check compares against; R08 points just above RSP, i.e. at the on-stack head of&lt;br/&gt;
+the private list the function splices into, so this is a normal unlink of the&lt;br/&gt;
+head of that list and not list corruption.&lt;/p&gt;
+
+&lt;p&gt;28 s later the same thread is still in the same function, now spinning on a&lt;br/&gt;
+lock:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;[238081.954079] watchdog: BUG: soft lockup - CPU#9 stuck for 49s! [monitor_thread:48625]
+[238081.957146] CPU: 9 PID: 48625 Comm: monitor_thread Kdump: loaded Tainted: P           O L    -------  ---  5.14.0-570.32.1.x7.3.010.39.x86_64 #1
+[238081.957892] RIP: 0010:native_queued_spin_lock_slowpath+0x210/0x2b0
+[238081.958712] RSP: 0018:ff66aa390158fb18 EFLAGS: 00000202
+[238081.958985] RAX: 0000000000280001 RBX: ff17eef588274800 RCX: 0000000000280000
+[238081.959244] RDX: 0000000000000000 RSI: 0000000000680000 RDI: ff17ee9874d99e40
+[238081.959532] RBP: ff17ee9874d99e40 R08: ff17eeaa12000968 R09: 0000000080490018
+[238081.959815] R10: 0000000040000000 R11: 000000000003a600 R12: 0000000000000000
+[238081.960091] R13: 0000000000000009 R14: 0000000000000030 R15: ff17eeaa12000968
+[238081.961546] Call Trace:
+[238081.961814]  &amp;lt;IRQ&amp;gt;
+[238081.962105]  ? show_trace_log_lvl+0x1c4/0x2df
+[238081.962668]  ? _raw_spin_lock+0x25/0x30
+[238081.962951]  ? watchdog_timer_fn+0x1ad/0x210
+[238081.963232]  ? __pfx_watchdog_timer_fn+0x10/0x10
+[238081.963500]  ? __hrtimer_run_queues+0x10f/0x2b0
+[238081.963775]  ? hrtimer_interrupt+0xfc/0x210
+[238081.964051]  ? __sysvec_apic_timer_interrupt+0x4b/0x100
+[238081.964329]  ? sysvec_apic_timer_interrupt+0x6d/0x90
+[238081.964607]  &amp;lt;/IRQ&amp;gt;
+[238081.964895]  &amp;lt;TASK&amp;gt;
+[238081.965167]  ? asm_sysvec_apic_timer_interrupt+0x16/0x20
+[238081.965441]  ? native_queued_spin_lock_slowpath+0x210/0x2b0
+[238081.965729]  _raw_spin_lock+0x25/0x30
+[238081.966013]  lnet_finalize_expired_responses.part.0+0x51d/0x610 [lnet]
+[238081.966336]  ? native_queued_spin_lock_slowpath+0x76/0x2b0
+[238081.966620]  ? __pfx_lnet_monitor_thread+0x10/0x10 [lnet]
+[238081.966932]  lnet_monitor_thread+0xb2/0x1a0 [lnet]
+[238081.967250]  ? sched_balance_newidle+0x25e/0x430
+[238081.967535]  ? update_load_avg+0x7e/0x7a0
+[238081.967794]  ? __update_idle_core+0x23/0xc0
+[238081.968059]  ? pick_next_task_idle+0x26/0x40
+[238081.968318]  ? pick_next_task+0x9f9/0xaf0
+[238081.968567]  ? dequeue_task_fair+0xaa/0x370
+[238081.968801]  ? finish_task_switch.isra.0+0x8c/0x2a0
+[238081.969046]  ? __schedule+0x231/0x4a0
+[238081.969268]  kthread+0xdd/0x100
+[238081.969485]  ? __pfx_kthread+0x10/0x10
+[238081.969695]  ret_from_fork+0x29/0x50
+[238081.969911]  &amp;lt;/TASK&amp;gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;A third episode 36 s later is the same &lt;tt&gt;_raw_spin_lock&lt;/tt&gt; from the same function&lt;br/&gt;
+on CPU#43, and three more follow in the next 40 minutes on CPU#17 and CPU#9. The&lt;br/&gt;
+thread migrating between CPUs and spinning on different locks is consistent with&lt;br/&gt;
+one long &lt;tt&gt;cfs_cpt_for_each()&lt;/tt&gt; walk progressing through the CPTs, not with a&lt;br/&gt;
+single stuck lock.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h2&gt;
+
+&lt;p&gt;Two things make that walk unbounded, and they are independent.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="1.Thewalkisrunonceperlnettransactiontimeout%2F2%2Cnotonceperpass"&gt;&lt;/a&gt;1. The walk is run once per lnet_transaction_timeout/2, not once per pass&lt;/h3&gt;
+
+&lt;p&gt;&lt;tt&gt;lnet_monitor_thread()&lt;/tt&gt; wakes once a second, but calls&lt;br/&gt;
+&lt;tt&gt;lnet_finalize_expired_responses()&lt;/tt&gt; only when &lt;tt&gt;now &amp;gt;= rsp_timeout&lt;/tt&gt; and then&lt;br/&gt;
+re-arms &lt;tt&gt;rsp_timeout&lt;/tt&gt; to &lt;tt&gt;now + lnet_transaction_timeout / 2&lt;/tt&gt; - 75 seconds&lt;br/&gt;
+with the default timeout. Every pass therefore faces 75 seconds of accumulated&lt;br/&gt;
+response trackers at once, walked in a single hold of &lt;tt&gt;lnet_res_lock()&lt;/tt&gt;, which&lt;br/&gt;
+is a plain spinlock, so preemption is off for the whole walk.&lt;/p&gt;
+
+&lt;p&gt;The period of the pass was never meant to be a function of the transaction&lt;br/&gt;
+timeout: the timeout says when a response is late, it does not say how often&lt;br/&gt;
+lateness should be looked for. Deriving one from the other also means that&lt;br/&gt;
+raising &lt;tt&gt;lnet_transaction_timeout&lt;/tt&gt; multiplies the batch, which is the opposite&lt;br/&gt;
+of what tuning it is for. This was introduced by a57fa1176e7 ("&lt;a href="https://jira.whamcloud.com/browse/LU-9120" title="LNet Network Health Feature" class="issue-link" data-issue-key="LU-9120"&gt;&lt;del&gt;LU-9120&lt;/del&gt;&lt;/a&gt; lnet:&lt;br/&gt;
+timeout delayed REPLYs and ACKs"); dc1f5f08b42 ("&lt;a href="https://jira.whamcloud.com/browse/LU-11468" title="LNet Health: Recovery interval" class="issue-link" data-issue-key="LU-11468"&gt;&lt;del&gt;LU-11468&lt;/del&gt;&lt;/a&gt; lnet: configure&lt;br/&gt;
+recovery interval") only converted the wakeup counter into a timestamp.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="2.Whatthewalkwalksiscompletedtraffic%2Cnottimeouts"&gt;&lt;/a&gt;2. What the walk walks is completed traffic, not timeouts&lt;/h3&gt;
+
+&lt;p&gt;The walk stops at the first entry that has not expired, so the queue prefix it&lt;br/&gt;
+traverses is not a backlog of timeouts. It is the prefix of requests whose&lt;br/&gt;
+response has &lt;b&gt;already arrived&lt;/b&gt;: &lt;tt&gt;lnet_detach_rsp_tracker()&lt;/tt&gt; only invalidates&lt;br/&gt;
+the MD handle and leaves the tracker on &lt;tt&gt;ln_mt_rstq&lt;/tt&gt; for the monitor thread to&lt;br/&gt;
+reap. The cost of the walk is therefore proportional to the traffic that&lt;br/&gt;
+completed normally since the previous pass - on an OSS, where a tracker is&lt;br/&gt;
+queued per &lt;tt&gt;LNetGet()&lt;/tt&gt; and per ACK-requesting &lt;tt&gt;LNetPut()&lt;/tt&gt;, that is millions&lt;br/&gt;
+of entries - on one CPU, holding the resource lock and taking a net lock per&lt;br/&gt;
+entry.&lt;/p&gt;
+
+&lt;p&gt;Adding &lt;tt&gt;cond_resched()&lt;/tt&gt; inside the walk, which is the obvious first fix, only&lt;br/&gt;
+spreads that cost: the monitor thread still has the same total work to do, now&lt;br/&gt;
+over an unpredictably long time, and it is the thread that also drives peer and&lt;br/&gt;
+NI recovery.&lt;/p&gt;
+
+&lt;p&gt;Note also that the current code splices the expired entries onto a private list&lt;br/&gt;
+and then works on them with the lock dropped, while they are still reachable&lt;br/&gt;
+through the MD - which is the most plausible source of the&lt;br/&gt;
+&lt;tt&gt;__list_del_entry_valid&lt;/tt&gt; trace above.&lt;/p&gt;</description>
+                <environment />
+        <key id="100294">LU-21098</key>
+            <summary>lnet: monitor thread soft lockup in lnet_finalize_expired_responses()</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="shadow">Alexey Lyashkov</assignee>
+                                    <reporter username="shadow">Alexey Lyashkov</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 2 Nov 2026 19:59:25 +0000</created>
+                <updated>Mon, 2 Nov 2026 19:59:25 +0000</updated>
+                                            <version>Lustre 2.16.0</version>
+                    <version>Lustre 2.17.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072fb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -1,0 +1,118 @@
+Key:        LU-21101
+Summary:    lockdep reports in osd-ldiskfs, LNet, lnet_selftest and llite on master
+Link:       https://jira.whamcloud.com/browse/LU-21101
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Mon, 2 Nov 2026 23:48:35 +0000
+Updated:    Mon, 2 Nov 2026 23:48:42 +0000
+Links:      Related: is related to  LU-20422; Related: is related to  LU-21085
+
+--- Description ---
+Problem
+A lockdep kernel shows 5 lock order reports on master. Each report needs investigation. Some reports can be real deadlocks. Others can need only a lockdep annotation, for example a nested lock class.
+
+Lockdep stops after its first report on a node. S1 occurs at each MGS mount. Thus S1 stops lockdep on every server at mount time. Lockdep cannot check server code under Lustre load until a change fixes or annotates S1.
+
+I found these reports while I tested LU-21085. All 5 reports are in master code, and LU-21085 does not change that code. The same reports occurred on master without LU-21085.
+
+Environment
+
+	master at commit 40b80bc048 (LU-20867).
+
+	Rocky Linux 9.7 kernel 5.14.0-611.55.1.el9_7, aarch64, built with: CONFIG_LOCKDEP=y, CONFIG_DEBUG_LOCK_ALLOC=y, CONFIG_PROVE_LOCKING=y, CONFIG_DEBUG_SPINLOCK=y, CONFIG_DEBUG_ATOMIC_SLEEP=y and CONFIG_PROVE_RCU=y.
+
+	VMs with 2 vCPUs and 3 GB each: one server (MGS, MDS and OSS, ldiskfs) and two clients, on tcp.
+
+Reports
+
+ ID 
+ Node 
+ When 
+ Type 
+ Lock classes 
+
+ S1 
+ Server 
+ Each MGS mount 
+ Circular 
+ i_mutex_dir_key, jbd2_handle, oo_dt.dd_sem 
+
+ S2 
+ Server 
+ Target mount after a hard failover (recovery-small test_136) 
+ Circular 
+ i_mutex_key, jbd2_handle, oo_dt.dd_sem 
+
+ S3 
+ Client 
+ sanity-lnet test_205 to test_219, peer merge 
+ Recursive 
+ lp_lock 
+
+ S4 
+ Client 
+ lnet_selftest unload, with 2 or more CPTs 
+ Recursive 
+ scd_lock 
+
+ S5 
+ Client 
+ umount, recovery-small test_102 
+ Recursive 
+ lli_lsm_sem 
+
+S1: circular locking at MGS mount
+
+mount.lustre_tg is trying to acquire &type->i_mutex_dir_key#7 at osd_obj_add_entry+0x1c0
+but task is already holding &mo->oo_dt.dd_sem at dt_write_lock+0x188
+#0 i_mutex_dir_key: down_write 
+
+Lockdep uses one class for every dd_sem and one class for every directory i_mutex. Thus the chain can link different objects. Investigate whether two paths can take these locks on the same objects in opposite orders.
+
+S2: circular locking at target mount after a failover
+
+mount.lustre_tg is trying to acquire &sb->s_type->i_mutex_key#17 at osd_getnblk+0x34c
+but task is already holding &mo->oo_dt.dd_sem at dt_write_lock+0x188
+#0 i_mutex_key: down_write 
+
+S2 has the same pattern as S1. The orphan cleanup at mount gives the jbd2_handle link.
+
+S3: recursive lp_lock in lnet_peer_data_present()
+
+lnet_discovery is trying to acquire &lp->lp_lock at lnet_peer_data_present+0x1f4
+but task is already holding &lp->lp_lock at lnet_peer_data_present+0x1ec
+held: the_lnet.ln_api_mutex, lp_lock
+_raw_spin_lock 
+
+When lnet_peer_data_present() merges lp into new_lp, it locks lp->lp_lock and then new_lp->lp_lock. LU-13894 added this code. The two locks are in one class, and the code does not use spin_lock_nested(). Investigate whether two threads can lock the same two peers in opposite orders. If they cannot, add a lockdep subclass.
+
+S4: recursive scd_lock in srpc_shutdown_service()
+
+rmmod is trying to acquire &scd->scd_lock at srpc_shutdown_service+0x50
+but task is already holding &scd->scd_lock at srpc_shutdown_service+0x50
+held: console_session.ses_mutex, scd_lock
+_raw_spin_lock 
+
+srpc_shutdown_service() locks the scd_lock of each CPT in a loop, and holds all of them at the same time. The loop always uses the same order. Lockdep reports S4 only when libcfs has 2 or more CPTs.
+
+S5: recursive lli_lsm_sem at umount
+
+umount is trying to acquire &lli->lli_lsm_sem at ll_dir_clear_lsm_md+0x34
+but task is already holding &lli->lli_lsm_sem at ll_dir_clear_lsm_md+0x34
+held: s_umount, lli_lsm_sem
+down_write 
+
+A striped directory inode releases the last reference to a stripe inode while it holds its own lli_lsm_sem. The stripe inode then takes its own lli_lsm_sem. Investigate whether a stripe inode can also be a striped directory with a reference back to its parent.
+
+Requested work
+For each report:
+
+	Find whether a real deadlock is possible.
+
+	Fix the lock order, or add a lockdep annotation with a comment that says why the order is safe.
+
+Start with S1. S1 stops lockdep on every server, and it hides all other server reports.

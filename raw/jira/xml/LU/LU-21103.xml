@@ -1,0 +1,196 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21103] lov: refactor mirror/EC read selection into fact / evaluate / select layers</title>
+                <link>https://jira.whamcloud.com/browse/LU-21103</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Goal"&gt;&lt;/a&gt;Goal&lt;/h2&gt;
+
+&lt;p&gt;Refactor the LOV mirror / EC degraded-read path so selection policy is cohesive and extensible: separate OST facts, per-mirror evaluation (no side effects), and IO selection (the only place that writes ci_* / restart state). Improve maintainability after &lt;a href="https://jira.whamcloud.com/browse/LU-12669" title="FLR-EC: recover data from parity code" class="issue-link" data-issue-key="LU-12669"&gt;LU-12669&lt;/a&gt; without a feature rewrite.&lt;/p&gt;
+
+&lt;p&gt;This is &lt;b&gt;not&lt;/b&gt; a feature rewrite: keep current behaviour except where a documented inconsistency is fixed on purpose.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Background%E2%80%94where%E2%80%9Cselection%E2%80%9Dlivestoday"&gt;&lt;/a&gt;Background — where “selection” lives today&lt;/h2&gt;
+
+&lt;p&gt;After checking lov_io_mirror_init() and consumers of the ci_* flags, read-source policy is spread across at least seven places:&lt;/p&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt; Location &lt;/th&gt;
+&lt;th class='confluenceTh'&gt; What it decides &lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; lov_object.c lo_preferred_mirror &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Layout-time static preference (stale, NID preference) &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; lov_io_mirror_init() main loop &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; valid / foreign / parity skip / coverage / EC route &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; lov_io_mirror_init() tail &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; rotation, tried_all_mirrors, 10ms yield, switch to CIT_EC_RD, ci_ndelay / ci_no_soft_tmo &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; lov_ecio_add_data_sub() &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Whether each stripe gets a sub-IO &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; lov_io_ec_rd_start() &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Parity stripe read order (prefer available) &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; osc_io_iter_init() &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Fast -EAGAIN on imp_unreachable &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; osc_cache.c (two sites) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; oe_soft_tmo &lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;Unifying this is not “add another layer”. It is splitting three concerns that are mixed today.&lt;/p&gt;
+
+&lt;p&gt;Related context: &lt;a href="https://jira.whamcloud.com/browse/LU-12669" title="FLR-EC: recover data from parity code" class="issue-link" data-issue-key="LU-12669"&gt;LU-12669&lt;/a&gt; / &lt;a href="https://review.whamcloud.com/64919" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/64919&lt;/a&gt; (soft deadline + slow mark + LOV routing); &lt;a href="https://review.whamcloud.com/69710" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/69710&lt;/a&gt; (split a read when one raid set cannot be rebuilt). LOD lod_primary_pick() / lod_check_ost_avail() share the same &lt;b&gt;shape&lt;/b&gt; as LOV selection but different inputs and stakes; share model/geometry later, not a pick engine (see Non-goals).&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Targetstructure"&gt;&lt;/a&gt;Target structure&lt;/h2&gt;
+
+&lt;h3&gt;&lt;a name="%28a%29Factlayer%E2%80%94OSTstatepredicates"&gt;&lt;/a&gt;(a) Fact layer — OST state predicates&lt;/h3&gt;
+
+&lt;p&gt;lov_sub_unreachable / slow / loaded / unavailable. Pure queries, no IO context. Shared by FLR and EC; FLR slow-mark avoidance reuses these directly.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="%28b%29Evaluatelayer%E2%80%94verdictforonecandidate%28values%2Cnosideeffects%29"&gt;&lt;/a&gt;(b) Evaluate layer — verdict for one candidate (values, no side effects)&lt;/h3&gt;
+
+&lt;p&gt;Input (lio, mirror, io_ext, file_size). Output a struct; do not write any ci_*:&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+&lt;span class="code-keyword"&gt;enum&lt;/span&gt; lov_mirror_fit {
+	LOV_MIRROR_NONE,	&lt;span class="code-comment"&gt;/* no component covers &lt;span class="code-keyword"&gt;this&lt;/span&gt; IO */&lt;/span&gt;
+	LOV_MIRROR_INTACT,
+	LOV_MIRROR_SLOW,	&lt;span class="code-comment"&gt;/* FLR: touched stripes slow-marked */&lt;/span&gt;
+	LOV_MIRROR_REBUILD,	&lt;span class="code-comment"&gt;/* EC: unavailable stripes, parity can stand in */&lt;/span&gt;
+	LOV_MIRROR_WAIT,	&lt;span class="code-comment"&gt;/* unavailable stripes, must wait */&lt;/span&gt;
+};
+
+struct lov_mirror_verdict {
+	&lt;span class="code-keyword"&gt;enum&lt;/span&gt; lov_mirror_fit	lmv_fit;
+	bool			lmv_busy;	&lt;span class="code-comment"&gt;/* -&amp;gt; ci_no_soft_tmo */&lt;/span&gt;
+	bool			lmv_cross_ec;
+};
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Internally call lov_ec_raid_set_decision() per raid set (same helper as lov_ecio_add_data_sub()), so “skip this stripe or not” has one implementation. Fast path: if every touched stripe is reachable, do not walk parity budget (preserve today’s cost on the healthy path).&lt;/p&gt;
+
+&lt;p&gt;Document the total order used by selection, e.g. INTACT &amp;gt; SLOW &amp;gt; REBUILD &amp;gt; WAIT &amp;gt; NONE, including how FLR “accept SLOW when no INTACT” interacts with EC REBUILD → CIT_EC_RD.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="%28c%29Selectlayer%E2%80%94order%2Crotation%2Cbackoff%2Crestart"&gt;&lt;/a&gt;(c) Select layer — order, rotation, backoff, restart&lt;/h3&gt;
+
+&lt;p&gt;lov_io_select_mirror(lio, obj, io): start from lo_preferred_mirror or the last index, evaluate candidates, pick by lmv_fit, and in &lt;b&gt;one&lt;/b&gt; place set lis_mirror_index, ci_cross_ec, ci_no_soft_tmo, ci_ndelay, ci_tried_all_mirrors, ci_switch_ec_io (and split/restart hooks as needed for 69710-style boundaries).&lt;/p&gt;
+
+&lt;p&gt;Under this layout, “FLR avoids slow OSTs” is a one-line change in the ranking rule (prefer INTACT over SLOW; accept SLOW if nothing better), without retouching evaluation or restart plumbing.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Boundaries"&gt;&lt;/a&gt;Boundaries&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;Keep designated-mirror (resync) as an override / early return, not selection.&lt;/li&gt;
+	&lt;li&gt;Keep write intent as a separate concern.&lt;/li&gt;
+	&lt;li&gt;lo_preferred_mirror stays layout-time; selection only consumes it as the start index.&lt;/li&gt;
+	&lt;li&gt;No ops table / pluggable strategy — an enum plus a ranking function is enough.&lt;/li&gt;
+	&lt;li&gt;Keep osc_io_iter_init() imp_unreachable as a post-selection race fallback.&lt;/li&gt;
+	&lt;li&gt;Do not shrink or merge ci_cross_ec / ci_tried_all_mirrors / ci_switch_ec_io in the first round; only make the &lt;b&gt;write site&lt;/b&gt; unique. Collapsing those flags is a later patch (consumers in llite, vvp, glimpse, cl_io, osc).&lt;/li&gt;
+	&lt;li&gt;First round need not fold lov_io_ec_rd_start() parity ordering into lov_mirror_evaluate(); it can keep using fact-layer predicates only.&lt;/li&gt;
+	&lt;li&gt;Leave room in the verdict/select path for a split offset (69710); wait_slow/busy splitting can come later.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Behaviour"&gt;&lt;/a&gt;Behaviour&lt;/h2&gt;
+
+&lt;p&gt;Aside from the intentional busy-set fix below, extractions should be behaviour-preserving. Land pure-structure patches first (sanity-ec 29a, 54a–54k, sanity-flr as baseline), then stack policy changes.&lt;/p&gt;
+
+&lt;p&gt;Open question for authors of 64919: when one raid set is REBUILD (dead, parity OK) and another is slow+busy, lov_ec_io_route() returns RECONSTRUCT while lov_ecio_add_data_sub() may still skip the busy set’s slow stripe. Is skipping intentional, or an oversight? That answer decides whether the raid-set helper patch is pure refactor or includes one fix (skip_slow &amp;amp;&amp;amp; !busy).&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Proposedpatchorder"&gt;&lt;/a&gt;Proposed patch order&lt;/h2&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;Fact layer: move lov_sub_* to lovsub_object.c or lov_cl_internal.h inlines. Pure move.&lt;/li&gt;
+	&lt;li&gt;lov_ec_raid_set_decision() (unify route + add_sub; four-level set verdict, fold by max). At most one intentional behaviour change — call it out in the commit message. Put pure geometry next to ec_split_stripes().&lt;/li&gt;
+	&lt;li&gt;lov_mirror_evaluate() + lov_io_select_mirror() in lov_mirror.c; lov_io_mirror_init() becomes designated → write intent → select. Raid-set math/budget helpers in lov_ec.c. Behaviour unchanged. Prefer writing new code in the new files over refactor-in-place then migrate.&lt;/li&gt;
+	&lt;li&gt;OSC oe_soft_tmo helper: mechanical constraints only (ndelay, CIT_READ, aio, DIO only if ci_cross_ec). Policy stays in LOV (ci_no_soft_tmo from select). Behaviour unchanged.&lt;/li&gt;
+	&lt;li&gt;FLR slow mark: ranking rule + sanity-flr + update osc_read_slow_mark() comments and osc.slow_read_pct(4).&lt;/li&gt;
+	&lt;li&gt;Optional: move remaining EC read path (lov_io_ec_rd_*, recover) into lov_ec.c.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h2&gt;&lt;a name="Nongoals"&gt;&lt;/a&gt;Non-goals&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;A shared callback pick_mirror() for LOD and LOV (adapters would dwarf the loops).&lt;/li&gt;
+	&lt;li&gt;Equating MDS ltd_active with client import/slow mark via one is_available hook.&lt;/li&gt;
+	&lt;li&gt;Folding soft deadline into adaptive timeout.&lt;/li&gt;
+	&lt;li&gt;Aligning lod_primary_pick() in the first series (same fact/evaluate/select &lt;b&gt;model&lt;/b&gt; later via something like lu_mirror_fit; not a merged engine).&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Testplan"&gt;&lt;/a&gt;Test plan&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;sanity-ec 29a, 54a–54k as regression baseline for structure patches.&lt;/li&gt;
+	&lt;li&gt;If the busy-set fix lands: explicit multi-raid-set case (dead-rebuildable set + slow+busy set) — reconstruct without skipping/amplifying the busy set’s slow stripe.&lt;/li&gt;
+	&lt;li&gt;sanity-flr: after OBD_FAIL_OST_BRW_PAUSE_BULK soft timeout, later IOs should not keep bumping soft_timeouts while the mark holds (when another mirror can serve).&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="100299">LU-21103</key>
+            <summary>lov: refactor mirror/EC read selection into fact / evaluate / select layers</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="kxu">Keguang Xu</reporter>
+                        <labels>
+                            <label>FLR-EC-RO</label>
+                            <label>FLR-EC-backlog</label>
+                    </labels>
+                <created>Tue, 3 Nov 2026 01:10:54 +0000</created>
+                <updated>Tue, 3 Nov 2026 01:27:00 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072gf:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

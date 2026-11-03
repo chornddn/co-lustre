@@ -1,0 +1,206 @@
+Key:        LU-21098
+Summary:    lnet: monitor thread soft lockup in lnet_finalize_expired_responses()
+Link:       https://jira.whamcloud.com/browse/LU-21098
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexey Lyashkov
+Reporter:   Alexey Lyashkov
+Created:    Mon, 2 Nov 2026 19:59:25 +0000
+Updated:    Mon, 2 Nov 2026 19:59:25 +0000
+
+--- Description ---
+Description
+
+On a busy OSS the LNet monitor thread is held on one CPU long enough for the
+
+kernel soft-lockup watchdog to fire, repeatedly and on every OSS of the system
+
+at once, roughly once every other day under an IOR workload. The task is always
+
+monitor_thread and every trace ends in lnet_finalize_expired_responses().
+
+Kernel 5.14.0 (x86_64), 2.16 Lustre, kfilnd over CXI; the same code is in master.
+
+What the console shows
+
+Three episodes within a minute, the thread stuck 22-49 s each time. The first
+
+one is taken while the walk unlinks an entry:
+
+[238053.956108] watchdog: BUG: soft lockup - CPU#9 stuck for 23s! [monitor_thread:48625]
+[238053.956414] Modules linked in: obdecho(O) osp(O) ofd(O) lfsck(O) ost(O) mgc(O)
+ osd_ldiskfs(O) ldiskfs(O) lquota(O) lustre(O) mdc(O) lov(O) osc(O) lmv(O) fid(O)
+ fld(O) ptlrpc(O) obdclass(O) raid5_pd(PO) raid456 ... kkfilnd(O) lnet(O) libcfs(O)
+ ext4 mbcache jbd2 ... kfi_cxi(O) kfabric(O) cxi_eth(O) cxi_user(O) ... cxi_ss1(O)
+ cxi_sl(O) cxi_sbl(O) ...
+[238053.959136] CPU: 9 PID: 48625 Comm: monitor_thread Kdump: loaded Tainted: P           O L    -------  ---  5.14.0-570.32.1.x7.3.010.39.x86_64 #1
+[238053.959892] RIP: 0010:__list_del_entry_valid+0x3d/0x50
+[238053.960673] RSP: 0018:ff66aa390158fb40 EFLAGS: 00000246
+[238053.960960] RAX: dead000000000122 RBX: 0000000000000001 RCX: 0000000000490030
+[238053.961238] RDX: ff17eeab2f5ccc78 RSI: ff17eeab2f5ccc78 RDI: ff17eeab2f5ccc78
+[238053.961518] RBP: ff17eeab2f5ccc78 R08: ff66aa390158fb68 R09: 0000000000490030
+[238053.961787] R10: 0000000040000000 R11: 0000000000000000 R12: ff17eeabbc8149a0
+[238053.962072] R13: ff66aa390158fb68 R14: 0000000000000008 R15: ff17eeab2f5ccc78
+[238053.963542] Call Trace:
+[238053.963847]  
+[238053.964121]  ? show_trace_log_lvl+0x1c4/0x2df
+[238053.964680]  ? lnet_finalize_expired_responses.part.0+0x467/0x610 [lnet]
+[238053.964997]  ? watchdog_timer_fn+0x1ad/0x210
+[238053.965268]  ? __pfx_watchdog_timer_fn+0x10/0x10
+[238053.965560]  ? __hrtimer_run_queues+0x10f/0x2b0
+[238053.965846]  ? hrtimer_interrupt+0xfc/0x210
+[238053.966127]  ? __sysvec_apic_timer_interrupt+0x4b/0x100
+[238053.966409]  ? sysvec_apic_timer_interrupt+0x6d/0x90
+[238053.966708]  
+[238053.966998]  
+[238053.967289]  ? asm_sysvec_apic_timer_interrupt+0x16/0x20
+[238053.967599]  ? __list_del_entry_valid+0x3d/0x50
+[238053.967881]  lnet_finalize_expired_responses.part.0+0x467/0x610 [lnet]
+[238053.968181]  ? native_queued_spin_lock_slowpath+0x76/0x2b0
+[238053.968463]  ? __pfx_lnet_monitor_thread+0x10/0x10 [lnet]
+[238053.968793]  lnet_monitor_thread+0xb2/0x1a0 [lnet]
+[238053.969089]  ? sched_balance_newidle+0x25e/0x430
+[238053.969360]  ? update_load_avg+0x7e/0x7a0
+[238053.969642]  ? __update_idle_core+0x23/0xc0
+[238053.969908]  ? pick_next_task_idle+0x26/0x40
+[238053.970147]  ? pick_next_task+0x9f9/0xaf0
+[238053.970398]  ? dequeue_task_fair+0xaa/0x370
+[238053.970650]  ? finish_task_switch.isra.0+0x8c/0x2a0
+[238053.970901]  ? __schedule+0x231/0x4a0
+[238053.971132]  kthread+0xdd/0x100
+[238053.971362]  ? __pfx_kthread+0x10/0x10
+[238053.971576]  ret_from_fork+0x29/0x50
+[238053.971774]  
+
+RAX is dead000000000122 only because it is the LIST_POISON2 constant the
+
+check compares against; R08 points just above RSP, i.e. at the on-stack head of
+
+the private list the function splices into, so this is a normal unlink of the
+
+head of that list and not list corruption.
+
+28 s later the same thread is still in the same function, now spinning on a
+
+lock:
+
+[238081.954079] watchdog: BUG: soft lockup - CPU#9 stuck for 49s! [monitor_thread:48625]
+[238081.957146] CPU: 9 PID: 48625 Comm: monitor_thread Kdump: loaded Tainted: P           O L    -------  ---  5.14.0-570.32.1.x7.3.010.39.x86_64 #1
+[238081.957892] RIP: 0010:native_queued_spin_lock_slowpath+0x210/0x2b0
+[238081.958712] RSP: 0018:ff66aa390158fb18 EFLAGS: 00000202
+[238081.958985] RAX: 0000000000280001 RBX: ff17eef588274800 RCX: 0000000000280000
+[238081.959244] RDX: 0000000000000000 RSI: 0000000000680000 RDI: ff17ee9874d99e40
+[238081.959532] RBP: ff17ee9874d99e40 R08: ff17eeaa12000968 R09: 0000000080490018
+[238081.959815] R10: 0000000040000000 R11: 000000000003a600 R12: 0000000000000000
+[238081.960091] R13: 0000000000000009 R14: 0000000000000030 R15: ff17eeaa12000968
+[238081.961546] Call Trace:
+[238081.961814]  
+[238081.962105]  ? show_trace_log_lvl+0x1c4/0x2df
+[238081.962668]  ? _raw_spin_lock+0x25/0x30
+[238081.962951]  ? watchdog_timer_fn+0x1ad/0x210
+[238081.963232]  ? __pfx_watchdog_timer_fn+0x10/0x10
+[238081.963500]  ? __hrtimer_run_queues+0x10f/0x2b0
+[238081.963775]  ? hrtimer_interrupt+0xfc/0x210
+[238081.964051]  ? __sysvec_apic_timer_interrupt+0x4b/0x100
+[238081.964329]  ? sysvec_apic_timer_interrupt+0x6d/0x90
+[238081.964607]  
+[238081.964895]  
+[238081.965167]  ? asm_sysvec_apic_timer_interrupt+0x16/0x20
+[238081.965441]  ? native_queued_spin_lock_slowpath+0x210/0x2b0
+[238081.965729]  _raw_spin_lock+0x25/0x30
+[238081.966013]  lnet_finalize_expired_responses.part.0+0x51d/0x610 [lnet]
+[238081.966336]  ? native_queued_spin_lock_slowpath+0x76/0x2b0
+[238081.966620]  ? __pfx_lnet_monitor_thread+0x10/0x10 [lnet]
+[238081.966932]  lnet_monitor_thread+0xb2/0x1a0 [lnet]
+[238081.967250]  ? sched_balance_newidle+0x25e/0x430
+[238081.967535]  ? update_load_avg+0x7e/0x7a0
+[238081.967794]  ? __update_idle_core+0x23/0xc0
+[238081.968059]  ? pick_next_task_idle+0x26/0x40
+[238081.968318]  ? pick_next_task+0x9f9/0xaf0
+[238081.968567]  ? dequeue_task_fair+0xaa/0x370
+[238081.968801]  ? finish_task_switch.isra.0+0x8c/0x2a0
+[238081.969046]  ? __schedule+0x231/0x4a0
+[238081.969268]  kthread+0xdd/0x100
+[238081.969485]  ? __pfx_kthread+0x10/0x10
+[238081.969695]  ret_from_fork+0x29/0x50
+[238081.969911]  
+
+A third episode 36 s later is the same _raw_spin_lock from the same function
+
+on CPU#43, and three more follow in the next 40 minutes on CPU#17 and CPU#9. The
+
+thread migrating between CPUs and spinning on different locks is consistent with
+
+one long cfs_cpt_for_each() walk progressing through the CPTs, not with a
+
+single stuck lock.
+
+Analysis
+
+Two things make that walk unbounded, and they are independent.
+
+1. The walk is run once per lnet_transaction_timeout/2, not once per pass
+
+lnet_monitor_thread() wakes once a second, but calls
+
+lnet_finalize_expired_responses() only when now >= rsp_timeout and then
+
+re-arms rsp_timeout to now + lnet_transaction_timeout / 2 - 75 seconds
+
+with the default timeout. Every pass therefore faces 75 seconds of accumulated
+
+response trackers at once, walked in a single hold of lnet_res_lock(), which
+
+is a plain spinlock, so preemption is off for the whole walk.
+
+The period of the pass was never meant to be a function of the transaction
+
+timeout: the timeout says when a response is late, it does not say how often
+
+lateness should be looked for. Deriving one from the other also means that
+
+raising lnet_transaction_timeout multiplies the batch, which is the opposite
+
+of what tuning it is for. This was introduced by a57fa1176e7 ("LU-9120 lnet:
+
+timeout delayed REPLYs and ACKs"); dc1f5f08b42 ("LU-11468 lnet: configure
+
+recovery interval") only converted the wakeup counter into a timestamp.
+
+2. What the walk walks is completed traffic, not timeouts
+
+The walk stops at the first entry that has not expired, so the queue prefix it
+
+traverses is not a backlog of timeouts. It is the prefix of requests whose
+
+response has already arrived: lnet_detach_rsp_tracker() only invalidates
+
+the MD handle and leaves the tracker on ln_mt_rstq for the monitor thread to
+
+reap. The cost of the walk is therefore proportional to the traffic that
+
+completed normally since the previous pass - on an OSS, where a tracker is
+
+queued per LNetGet() and per ACK-requesting LNetPut(), that is millions
+
+of entries - on one CPU, holding the resource lock and taking a net lock per
+
+entry.
+
+Adding cond_resched() inside the walk, which is the obvious first fix, only
+
+spreads that cost: the monitor thread still has the same total work to do, now
+
+over an unpredictably long time, and it is the thread that also drives peer and
+
+NI recovery.
+
+Note also that the current code splices the expired entries onto a private list
+
+and then works on them with the lock dropped, while they are still reachable
+
+through the MD - which is the most plausible source of the
+
+__list_del_entry_valid trace above.

@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Chakshu Kansal
 Created:    2026-07-14 10:32:37.000000000
-Updated:    2026-10-29 23:32:12.000000000
-Patch Set:  13
-Insertions: +1302
-Deletions:  -119
-Comments:   478 (16 unresolved)
+Updated:    2026-11-03 07:19:52.000000000
+Patch Set:  14
+Insertions: +1346
+Deletions:  -110
+Comments:   501 (2 unresolved)
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1; Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Vitaly Oratovsky, Lustre RISC-V Builder, Gerrit AI review for Lustre
@@ -51,15 +51,47 @@ each lookup.
 
 Changing IMMUTABLE_FL/APPEND_FL requires both CAP_LINUX_IMMUTABLE and
 the nodemap RBAC role NODEMAP_RBAC_IMMUTABLE_FLAGS (surfaced as
-uc_rbac_immutable_flags); the RBAC role lets a nodemap deny this
+uc_rbac_immutable_flags). The RBAC role lets a nodemap deny this
 capability to clients that would otherwise have it, rather than
-granting it to clients that lack it.
+granting it to clients that lack it. Every other place that bypasses
+a retained/immutable file's checks on CAP_LINUX_IMMUTABLE alone --
+lu_immutable_relocate_check() (swap/migrate), the migrate sanity
+check in mdd_migrate_sanity_check(), and mdt_swap_write_permission()
+-- requires the same RBAC role, so a nodemap can deny the capability
+consistently across all of these paths, not just chattr.
 
-A caller with CAP_LINUX_IMMUTABLE (e.g. root) may migrate an
-immutable file or swap its layout at any time, regardless of
-retention/expiry. A caller without it (e.g. the owner) must wait
-for expiry first. This requires relaxing a few MAY_WRITE checks
-(layout swap, migration) specifically for CAP_LINUX_IMMUTABLE
+mdt_swap_write_permission() still calls mo_permission() for every
+caller, so once IMMUTABLE_FL is bypassed via the capability/RBAC
+check, the usual owner/mode/ACL checks in
+__mdd_permission_internal() keep applying, and a caller with
+CAP_LINUX_IMMUTABLE but without DAC write access cannot swap layouts
+on a file it could not otherwise write. mdt_swap_layouts() also
+rejects, rather than honours, a client-supplied
+SWAP_LAYOUTS_MDS_RELEASE or SWAP_LAYOUTS_MDS_HSM, since both are
+MDS-internal-only flags that would otherwise let a modified client
+skip the immutable and uid/gid checks in mdd_swap_layouts().
+
+mdd_fix_attr() stops MDS_PERM_BYPASS (set from the client's
+ATTR_FORCE, e.g. by ll_setattr() when clearing setuid/setgid, or by
+ll_hsm_import()) from skipping the APPEND_FL or IMMUTABLE_FL checks
+on a non-flag setattr. Previously an owner could use ATTR_FORCE to set
+atime to a time in the past, forcing immediate "expiry" of a retained
+file and bypassing retention, or to write to an administrator's
+chattr +i file before CAP_LINUX_IMMUTABLE was actually checked.
+
+mdt_init_ucred_reint()'s CAP_FS_SET raise on MDS_CLOSE (LU-5564)
+includes CAP_LINUX_IMMUTABLE, and only MDS_HSM_RELEASE and
+MDS_CLOSE_LAYOUT_SWAP were excluded from it. Add
+MDS_CLOSE_LAYOUT_MERGE and MDS_CLOSE_LAYOUT_SPLIT to that exclusion,
+since those closes also reach mdt_close_handle_layouts() and should
+not get a blanket immutable-override capability for a layout-
+modifying operation.
+
+A caller with CAP_LINUX_IMMUTABLE and the RBAC immutable_flags role
+(e.g. root on an admin nodemap) may migrate an immutable file or swap
+its layout at any time, regardless of retention/expiry. A caller
+without both must wait for expiry first. This requires relaxing a
+few MAY_WRITE checks (layout swap, migration) specifically for such
 callers, since normal MAY_WRITE checks reject IMMUTABLE_FL files for
 every caller, including root, unless explicitly bypassed via the
 capability check. The capability check needs the request's ucred,
@@ -73,14 +105,15 @@ working as before: by the time the swap runs, mdt_hsm_is_admin() has
 already checked CAP_SYS_ADMIN and released its ucred, so this path
 cannot be checked via CAP_LINUX_IMMUTABLE.
 
-On the client, since IMMUTABLE_FL is time-based rather than fixed, a
-cached dentry must not keep the VFS from reaching the MDS once atime
-has passed: ll_revalidate_dentry() forces a fresh lookup whenever the
-cached inode is IS_IMMUTABLE and its atime is already in the past, so
-open/unlink/rename after expiry reach the MDS for the authoritative
-check instead of being rejected locally on stale cached flags. It is
-re-checked on the next operation that triggers a lookup or MDS round
-trip (e.g. close and reopen, stat, unlink, or rename).
+On the client, ll_update_inode_flags() strips IMMUTABLE_FL whenever
+RETENTION_FL is set, so a POSIX-retained file is never cached as
+S_IMMUTABLE and the VFS never blocks locally on stale cached flags
+once atime has passed. The MDS stays the sole authority enforcing
+immutability on each modifying RPC. RETENTION_FL itself is never
+reported to userspace (fileattr_get(), stat via mdt_body, statx).
+fileattr_get() also folds the atime and flags from its fresh MDS
+getattr into the inode, so the next FS_IOC_GETFLAGS/lsattr call
+reflects the MDS's current state.
 
 Test-Parameters: testlist=sanityn serverversion=2.17 env=SANITYN_EXCEPT=32b
 Test-Parameters: testlist=sanityn clientversion=2.17
@@ -3224,3 +3257,162 @@ Please rebase the change locally and upload the rebased commit for review.
 Patch Set 13: Code-Review-1
 
 (20 comments)
+
+--- Message (Chakshu Kansal, 2026-11-03 06:31:05.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chakshu Kansal, 2026-11-03 06:31:20.000000000) ---
+Patch Set 14:
+
+(15 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 06:33:33.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-03 06:34:24.000000000) ---
+Patch Set 14:
+
+(8 comments)
+
+8 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-03 07:19:10.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135308/ : SUCCESS
+
+--- Message (Maloo, 2026-11-03 07:19:52.000000000) ---
+Patch Set 14:
+
+#### The following sessions will be run for Build 135308 (patch #14):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135308&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135308#redirect
