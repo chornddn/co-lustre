@@ -1,0 +1,41 @@
+Key:        LU-21110
+Summary:    client device names reuse the super block address after umount
+Link:       https://jira.whamcloud.com/browse/LU-21110
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Tue, 3 Nov 2026 18:02:59 +0000
+Updated:    Tue, 3 Nov 2026 19:51:40 +0000
+Links:      Related: is related to LU-21109
+
+--- Description ---
+Problem
+Client device names contain the super block address. After a umount, the kernel can give the same address to the next super block. A device of the old mount can still be alive. The new mount then gets a device with the same name, and the mount fails with EEXIST. The ldlm namespace sysfs entry is the first name to collide:
+
+sysfs: cannot create duplicate filename '/fs/lustre/ldlm/namespaces/lustre-OST0000-osc-ff2ab407957f8000'
+LustreError: (ldlm_resource.c:839:ldlm_namespace_new()) lustre-OST0000-osc-ff2ab407957f8000: cannot initialize ns sysfs: rc = -17
+
+Any reference that outlives the umount gives this failure. Known causes:
+
+	LU-20543: a leaked GSS key kept a context reference. Fixed.
+
+	LU-21109: a GSS ctx init RPC sent after the import invalidation. The fix for LU-21109 narrows that race, but a window of about 20 ms stays open.
+
+Analysis
+ll_get_cfg_instance() in lustre/include/obd_class.h returns the super block pointer. Its comment calls this a temporary hack for ASLR. The llite code puts the value in the client device names (%s-%016lx). The MGC uses the value to match config logs to a mount. The MGC already has a workaround for the same address reuse: it skips a stopping config log of an old mount with the same instance.
+
+A unique instance value per mount would remove this class of collision for all causes. This ticket does not choose the solution yet.
+
+Possible approaches
+These are sketches. We have not tested any of them.
+
+	Return a per-mount value from a global counter, kept in the lsi and set once at mount. Keep the %016lx format. Check each user that assumes the value is the super block address, for example the LASSERT in mgc_apply_recover_logs() and the config log matching in mgc_request.c. Device names then change from address-like hex to small numbers.
+
+	Use the client UUID, as the comment on ll_get_cfg_instance() proposes. This change is larger, because the UUID does not fit the current name format.
+
+	Keep the address, and make the device teardown release its names (sysfs, debugfs, the device name table) at cleanup, not at the last reference. A late reference then cannot block a new mount. This approach touches more code paths, and other names can still collide.
+
+A regression test can hold an old device alive with a fail_loc, and then check that a new mount succeeds. The OBD_FAIL_SEC_CTX_INIT_PAUSE hold from LU-21109 can do this. A negative control for that test is not deterministic, because the old code fails only when the kernel reuses the address.

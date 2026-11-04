@@ -1,0 +1,179 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21109] sanity test_247f: client mount fails with EEXIST: GSS ctx init RPC outlives umount</title>
+                <link>https://jira.whamcloud.com/browse/LU-21109</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+&lt;p&gt;A client mount fails with EEXIST (-17) when it starts soon after a umount on a file system with GSS (SSK or krb5). The new OSC cannot create its LDLM namespace in sysfs. The previous OSC with the same name still holds that sysfs entry. The failure occurred in sanity test_247f, in review testing of a change that is not public.&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mount.lustre: mount 10.240.44.29@tcp:/lustre/d247f.sanity/striped/. at /mnt/lustre_d247f.sanity failed: File exists
+sysfs: cannot create duplicate filename '/fs/lustre/ldlm/namespaces/lustre-OST0000-osc-ff2ab407957f8000'
+LustreError: (ldlm_resource.c:839:ldlm_namespace_new()) lustre-OST0000-osc-ff2ab407957f8000: cannot initialize ns sysfs: rc = -17
+LustreError: (ldlm_lib.c:637:client_obd_setup()) lustre-OST0000-osc-ff2ab407957f8000: unable to create client namespace: rc = -17
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+&lt;ul&gt;
+	&lt;li&gt;Test group: review-dne-selinux-ssk-part-1 (SSK flavor ski), Rocky 9.7 x86_64, 2 or more MDTs.&lt;/li&gt;
+	&lt;li&gt;Master has the same code in &lt;tt&gt;gss_do_ctx_init_rpc()&lt;/tt&gt; and &lt;tt&gt;ptlrpc_import_delay_req()&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+&lt;ol&gt;
+	&lt;li&gt;Mount a client with a GSS flavor.&lt;/li&gt;
+	&lt;li&gt;Unmount the client before the GSS context negotiation of an OSC import completes.&lt;/li&gt;
+	&lt;li&gt;Mount the client again at once, so that the new super block gets the address of the old one.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;sanity test_247f does steps 1 to 3 in a loop.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h2&gt;
+&lt;p&gt;The client debug log shows this sequence (epoch seconds 1793714xxx):&lt;/p&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Time &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Thread &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Event &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;------&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;--------&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;-------&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 465.507 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; mount &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Creates the GSS ctx for OST0000 and starts the &lt;tt&gt;lgss_keyring&lt;/tt&gt; upcall. The OSC import never connects. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 467.512 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;tt&gt;lgss_keyring&lt;/tt&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;tt&gt;gss_do_ctx_init_rpc()&lt;/tt&gt; checks &lt;tt&gt;imp_deactive&lt;/tt&gt;, takes an import reference and allocates the request. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 467.525 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; umount &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;tt&gt;obd_cleanup_client_import()&lt;/tt&gt; sets the import INVALID. &lt;tt&gt;ptlrpc_invalidate_import()&lt;/tt&gt; sees &lt;tt&gt;imp_inflight == 0&lt;/tt&gt; and returns at once. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 467.530 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;tt&gt;lgss_keyring&lt;/tt&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Sends SEC_CTX_INIT (o801) on the INVALID import. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 467.533 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; umount &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Detaches the OSC. The obd refcount stays at 2, because the RPC holds the import. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 467.759 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; mount &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; Creates a new OSC with the same name. &lt;tt&gt;ldlm_namespace_new()&lt;/tt&gt; fails with -17. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; 468.131 &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;tt&gt;lgss_keyring&lt;/tt&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; The reply arrives. The ctx, sec, import and old obd are freed. &lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;The race has two parts:&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;&lt;tt&gt;gss_do_ctx_init_rpc()&lt;/tt&gt; checks the import state before the send, not at the send. &lt;tt&gt;ptlrpc_invalidate_import()&lt;/tt&gt; can run between the check and the send.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;ptlrpc_import_delay_req()&lt;/tt&gt; always passes ctx init and ctx fini requests. Thus the ctx init request goes out on the import of a stopping obd, after the invalidate wait is complete.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The client OBD names contain the super block address. A new super block can get the address of the freed one, so the new OSC gets the name of the old OSC.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20543" title="sanity-krb5 test_11: Error: 'remount /mnt/lustre failed'" class="issue-link" data-issue-key="LU-20543"&gt;&lt;del&gt;LU-20543&lt;/del&gt;&lt;/a&gt; has the same symptom. Its fix (048bb8c49f) removes a permanent key leak. The fix is present in this build. Here the reference is transient and lasts for one RPC round trip.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h2&gt;
+&lt;p&gt;In &lt;tt&gt;ptlrpc_import_delay_req()&lt;/tt&gt;, under &lt;tt&gt;imp_lock&lt;/tt&gt;, fail a ctx init request with -ESHUTDOWN when the obd is stopping. &lt;tt&gt;class_cleanup()&lt;/tt&gt; sets the stopping flag before &lt;tt&gt;obd_precleanup()&lt;/tt&gt; invalidates the import. Thus the invalidate either sees the request in flight and waits for it, or the send sees the flag and fails. Ctx fini requests do not change.&lt;/p&gt;</description>
+                <environment />
+        <key id="100305">LU-21109</key>
+            <summary>sanity test_247f: client mount fails with EEXIST: GSS ctx init RPC outlives umount</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="hornc">Chris Horn</assignee>
+                                    <reporter username="maloo">Maloo</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 3 Nov 2026 17:12:58 +0000</created>
+                <updated>Tue, 3 Nov 2026 19:51:40 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505084" author="hornc" created="Tue, 3 Nov 2026 18:03:13 +0000">&lt;p&gt;A master fix and a regression test are ready. The patch is not pushed yet.&lt;/p&gt;
+
+&lt;p&gt;The fix makes &lt;tt&gt;ptlrpc_import_delay_req()&lt;/tt&gt; fail a ctx init request with -ESHUTDOWN when the import is CLOSED or the device is stopping. A new sanity-sec subtest holds an OSC ctx init request across a forced umount, and the OSS drops the reply. Results on a 3-node VM cluster with SSK:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;Without the fix, the subtest fails. The old OSC namespace stays after the umount, and the held request goes out on the CLOSED import.&lt;/li&gt;
+	&lt;li&gt;With the fix, the subtest passes.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The fix narrows the race but does not remove it. &lt;tt&gt;gss_do_ctx_init_rpc()&lt;/tt&gt; holds an import reference from its state check until the send fails. That window is about 20 ms in the CI trace. A mount in that window can still fail with EEXIST.&lt;/p&gt;
+
+&lt;p&gt;The client device names contain the super block address, and a new super block can reuse that address. A unique instance value for each mount would remove this class of collision. &lt;a href="https://jira.whamcloud.com/browse/LU-21110" title="client device names reuse the super block address after umount" class="issue-link" data-issue-key="LU-21110"&gt;LU-21110&lt;/a&gt; tracks that change.&lt;/p&gt;</comment>
+                            <comment id="505090" author="gerrit" created="Tue, 3 Nov 2026 19:40:42 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70375" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70375&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21109" title="sanity test_247f: client mount fails with EEXIST: GSS ctx init RPC outlives umount" class="issue-link" data-issue-key="LU-21109"&gt;LU-21109&lt;/a&gt; ptlrpc: refuse ctx init RPC on a closing import&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 5b4d294fea9af642d6cc92676ea6a82d5015cd94&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="100306">LU-21110</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072hr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

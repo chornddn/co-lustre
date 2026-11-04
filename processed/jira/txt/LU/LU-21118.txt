@@ -1,0 +1,54 @@
+Key:        LU-21118
+Summary:    osd-ldiskfs: MDS LBUG in osd_olc_save() for names longer than NAME_MAX
+Link:       https://jira.whamcloud.com/browse/LU-21118
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Jinshan Xiong
+Created:    Wed, 4 Nov 2026 03:57:19 +0000
+Updated:    Wed, 4 Nov 2026 04:09:45 +0000
+Links:      Related: is related to  LU-15928; Related: is related to  LU-18783; Related: is related to  LU-19409; Related: is related to  LU-21031
+
+--- Environment ---
+ldiskfs MDT; clients without LU-18783 on RHEL 10 kernels (e.g. 6.12.0-124.27.1.el10_1)
+
+--- Description ---
+An ldiskfs MDT LBUGs when a client sends a directory entry name longer than 256 bytes in a request that looks the name up before mdd_name_check() runs, e.g. rename or open-by-name:
+
+LustreError: 4212:0:(osd_handler.c:8127:osd_olc_save()) ASSERTION( ln->ln_namelen 
+
+The MDT never limits the name length before the OSD lookup:
+
+	mdt_name_unpack() / lu_name_is_valid() only check that the name is non-empty, NUL terminated and contains no '/'; there is no upper bound.
+
+	mdt_reint_rename() looks up rr_name and rr_tgt_name via mdt_lookup_version_check() straight away, and mdt_reint_open() calls mdo_lookup() before creating. The ENAMETOOLONG check in mdd_name_check() only runs later (and is skipped for encrypted parents).
+
+	osd_index_ea_lookup() always calls osd_olc_save(), even when the lookup itself fails, and osd_olc_save() asserts ln_namelen 
+
+So any client that does not check the length itself can LBUG the MDS with a single rename(2). This is the ldiskfs counterpart of LU-21031 (osd-zfs accepting such names on insert).
+
+How such names reach the MDS in practice: clients without LU-18783 (e.g. 2.14/2.15/2.16-based) only check d_name.len > ll_namelen in ll_lookup_it(). ll_lookup_nd() skips ll_lookup_it() for (LOOKUP_CREATE && !LOOKUP_OPEN) (LU-4185). Since Linux commit 204a575e91f3 ("VFS: add common error checks to lookup_one_qstr_excl()"), backported to RHEL 10 (kernel-6.12.0-91.el10 and later, so all EL10.1 6.12.0-124.*.el10_1 kernels), do_renameat2() looks up the rename target with LOOKUP_RENAME_TARGET | LOOKUP_CREATE. So on EL10 clients the rename target length is never checked and the name is sent to the MDT. EL8/EL9 and upstream v6.12 pass only LOOKUP_RENAME_TARGET and are not affected. In our case the clients were 6.12.0-124.27.1.el10_1 with a 2.14.0-based client that lacks LU-18783.
+
+LU-18783 closes the hole on the client side, but the MDS must not depend on every client checking the length. LU-15928 (passing keylen through dt_lookup()) does not cover this case, since rename names are already NUL terminated and strlen() == ln_namelen.
+
+Proposed fix: osd_index_ea_lookup() refuses names longer than LDISKFS_NAME_LEN with -ENAMETOOLONG, after any critical-decoding of an encrypted name and before the lookup cache is touched.
+
+Reproducer (expected, not yet run on master): ldiskfs MDT on master, a client without LU-18783 on a RHEL 10 kernel, then
+
+touch /mnt/lustre/f
+mv /mnt/lustre/f /mnt/lustre/$(printf 'z%.0s' {1..256})
+
+--- Comment (gerrit, Wed, 4 Nov 2026 04:09:45 +0000) ---
+"Jinshan Xiong " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70397
+
+Subject: LU-21118 osd-ldiskfs: refuse lookup of names over NAME_MAX
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2944295ac3d68e73c7a7cf52d38867f44175ecfd

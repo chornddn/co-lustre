@@ -1,0 +1,83 @@
+Change:     70374
+Subject:    LU-21098 lnet: reap a response tracker when the response arrives
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70374
+Change-Id:  I628581490bebe8c0b98f037e7313f7ddedf4e4ab
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Alexey Lyashkov
+Created:    2026-11-03 18:46:56.000000000
+Updated:    2026-11-03 19:14:03.000000000
+Patch Set:  1
+Insertions: +163
+Deletions:  -133
+Comments:   4 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-21098 lnet: reap a response tracker when the response arrives
+
+The monitor thread is stuck 22-49 s in
+lnet_finalize_expired_responses() on every OSS of a system under IOR.
+
+The walk stops at the first entry that has not expired, so what it
+walks is not a backlog of timeouts: it is the prefix of requests whose
+response has already arrived. lnet_detach_rsp_tracker() only
+invalidates the MD handle and leaves the tracker on ln_mt_rstq, so the
+cost of the walk is proportional to the traffic that completed
+normally, on one CPU, holding a resource lock and taking a net lock per
+entry. Rescheduling inside that walk spreads the cost, it does not
+remove it.
+
+Reap the tracker where the response is handled instead. The queue is
+protected by the resource lock of its CPT, which attach and detach
+already hold, so the net lock around it is dropped;
+lnet_detach_rsp_tracker() unlinks the tracker and returns it to the
+caller, which frees it after the lock, keeping the slab free out of the
+completion path. What stays queued is only requests still waiting, in
+deadline order, so the monitor thread stops at the first unexpired
+entry after one entry per CPT.
+
+The entries a pass does find expired are taken off the queue and
+cleared from the MD in the same locked section, and reaped after it.
+The previous code left the spliced entries reachable through the MD
+while it worked on them, which is the most plausible source of the
+__list_del_entry_valid trace in the report.
+
+The thread also remembers the deadline of the head it last saw and
+skips a CPT whose queue is empty or whose earliest deadline is in the
+future without taking the resource lock. Entries are queued in deadline
+order, so a head replaced behind its back carries a later deadline: the
+hint can only be early, never late.
+
+HPe-bug-id: LUS-13579
+Change-Id: I628581490bebe8c0b98f037e7313f7ddedf4e4ab
+Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
+
+--- Review History ---
+
+--- Message (Alexey Lyashkov, 2026-11-03 18:46:56.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 18:51:14.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-03 18:54:53.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-03 19:13:10.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135330/ : SUCCESS

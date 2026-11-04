@@ -7,17 +7,17 @@ Branch:     master
 Status:     NEW
 Owner:      Keguang Xu
 Created:    2026-08-26 09:56:30.000000000
-Updated:    2026-11-03 01:40:36.000000000
-Patch Set:  21
-Insertions: +2237
-Deletions:  -857
-Comments:   199 (12 unresolved)
+Updated:    2026-11-04 03:33:21.000000000
+Patch Set:  26
+Insertions: +2329
+Deletions:  -745
+Comments:   227 (9 unresolved)
 Topic:      ec2
-Hashtags:   pt_ecro, raid10-like, 218_review_priority
+Hashtags:   pt_ecro, 218_review_priority, raid10-like
 
 --- Labels ---
   Code-Review: Ronnie Sahlberg: +1; Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
@@ -88,9 +88,14 @@ such as:
 - -E 64K -L mdt -E 16M -c 2 -S 1M -E eof -c 4 -S 4M --ec 2+2;
 - -E 64K -L mdt -E eof -c 4 -S 1M --ec 2+2;
 - -E 1M -c 1 -S 1M -E 64M -c 1 -S 4M -E eof -c 4 -S 4M --ec 4+2.
-With --ec 1+N, ec_off is the data offset. O depends only on e_start,
-the data stripe count, k and the stripe size, not on e_end. When
-e_start is a multiple of the stripe width, O is e_start.
+When every raidset has one data stripe (--ec 1+N, or one data
+stripe), there is one parity slot per data stripe and nothing to
+pack, so rows and O count from file offset 0, as RAID0 does: ec_off
+is the data offset, and each parity object is a copy of its data
+object at the same object offsets, so it can stand in for it.
+Otherwise O depends only on e_start, the data stripe count, k and the
+stripe size, not on e_end, and when e_start is a multiple of the
+stripe width, O is e_start.
 
 Add ec_raidset_count(), ec_raidset_first(), ec_stripe_to_raidset()
 and ec_off_to_raidset_offset() next to ec_split_stripes() in
@@ -98,14 +103,21 @@ lustre_user.h, and struct ec_parity_geom with ec_parity_geom_init(),
 ec_data_to_parity() and its inverse ec_parity_to_data(), with
 ec_parity_width() for the parity bytes of one stripe set, and use
 them in lov, lod and llapi instead of open-coding the k0 * n0 split.
+ec_parity_geom_init() also records the data row of parity slot 0 in
+epg_row0 (0 for 1-data raidsets).
 lov caches O in lsme_parity_origin when the layout is unpacked and
 returns it from lsme_stripe_origin(), and lov_parity_geom_init()
 fails a degraded read whose pair does not match in stripe size,
 raidsets or origin; the parity mirror EOF of such a pair is also
 bounded by one parity row per stripe set from e_start. Raidset
 objects before e_start read as zero in degraded reads and resync.
-Drop lsme_parity_raid10() and lsme_parity_slots_per_raidset(), which
-have no users left once every parity component is LOV_PATTERN_PARITY.
+A read is widened to whole raid sets, but not past the e_end of its
+component, so a read ending there does not start an empty recovery
+cycle for the next component's first raid set, which may begin before
+its e_start.
+lsme_parity_raid10() now just returns lsme_is_parity(), as every
+parity component is LOV_PATTERN_PARITY, and
+lsme_parity_slots_per_raidset() is dropped.
 
 A component shorter than one stripe (e_end < e_start + stripe_size)
 whose raidset continues past e_end (e.g. [64K, 1M) with -S 1M -c 2
@@ -127,10 +139,9 @@ and verifies parity components with it. EC has not shipped, so the old
 combination is not kept. Finite-extent stripe-count shrinking, now in
 one lod_comp_shrink_to_extent() helper instead of three copies, is
 skipped for parity components. lsm_unpackmd_comp_md_v1() and
-lod_parse_striping() reject a component whose LCME_FL_PARITY flag and
+lod_verify_striping() reject a component whose LCME_FL_PARITY flag and
 LOV_PATTERN_PARITY disagree, since the parity geometry follows the
-flag, and lod_declare_layout_set() refuses to modify a parity
-component.
+flag.
 
 vvp_prep_size() no longer writes KMS into i_size for parity I/O.
 ci_parity_eof is derived from i_size, and KMS is only a lower bound
@@ -139,7 +150,10 @@ for later parity I/O.
 
 Userspace resync and verify move to the RAID10 offsets: one
 stripe_size per raidset, each parity addressed by its stripe index,
-leaving the part of the first parity slot below e_start alone. Hole
+leaving the part of the first parity slot below e_start alone. The
+punch, zero-fill and hole verify of a parity slot are bounded by the
+e_end of its component; no slot runs past e_end while
+ec_parity_fits() holds, so this is only a defensive bound. Hole
 punch-or-clear and hole verify loop over the p parity stripes that
 share an offset when they fall back to zero-fill or zero-content
 reads.
@@ -177,7 +191,7 @@ Example: -E 128M -c 11 -S 1M --ec 4+2
 The concat column is what RAID0|PARITY would have used, and is what
 overflows a finite extent when p > k.
 
-Tests: sanity-ec 6g rejects clearing LCME_FL_PARITY, 12c/12d/34c cover
+Tests: sanity-ec 12c/12d/34c cover
 holes and multi-raidset offsets, 30d and 31b-31e check the parity dump
 size, 34d dumps a mixed-p mirror whose first extent is not a multiple
 of the stripe set, 63d recovers reads from parity of raidset 1 in a
@@ -187,17 +201,21 @@ would pass e_end is refused for that reason, 302 resyncs, verifies and
 reads degraded common PFL layouts with an unaligned e_start, 303
 recovers reads when e_start is not a multiple of the stripe width,
 with equal and unequal raidsets, 304 covers zero-fill before e_start,
-and 312 truncates at raidset and unaligned component boundaries.
+305 truncates at raidset and unaligned component boundaries, and 306
+reads degraded across a component boundary where the raid set of the
+first component runs into the next one.
 llapi_layout_test asserts the component pattern is LLAPI_LAYOUT_PARITY
 and 68 checks the parity placement over a range of geometries and
-extents.
+extents, and that 1-data raidset copies are at the data object
+offsets.
 
 Test-Parameters: testlist=sanity-ec ostcount=8
 Test-Parameters: testlist=sanity-ec ostcount=8 fstype=zfs
 Signed-off-by: Keguang Xu <kxu@ddn.com>
 Signed-off-by: Ronnie Sahlberg <rsahlberg@whamcloud.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: Cursor:Composer/Opus5.5 llm_code_and_review_tools
-Assisted-by: ClaudeCode:claude-opus-5-5 llm_code_and_review_tools
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Assisted-by: ClaudeCode:claude-fable-5-1 llm_code_and_review_tools
 Change-Id: I9574df44969ddd40776f028b3c326d150ea08eb5
 
@@ -1081,3 +1099,196 @@ Patch Set 21:
 
 --- Message (Andreas Dilger, 2026-11-03 00:34:55.000000000) ---
 Patch Set 21: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-11-03 19:55:05.000000000) ---
+Uploaded patch set 22.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-03 19:55:44.000000000) ---
+Patch Set 22:
+
+(3 comments)
+
+PS22 starts from Keguang's conflict-free version (PS20 content) and re-adds the PS21 absolute-origin parity geometry, so it cherry-picks cleanly onto master and onto 69517 PS9 without rebasing the parents. It also caps lis_endpos at the component e_end in lov_io_set_range(), bounds the parity punch/zero-fill/hole verify by the component e_end, and leaves test_parity_read unchanged. New sanity-ec 301-306; full sanity-ec 233/233 pass locally on 8 OSTs.
+
+--- Message (wc-checkpatch, 2026-11-03 19:56:25.000000000) ---
+Patch Set 22:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 19:57:46.000000000) ---
+Patch Set 22:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-11-03 20:20:25.000000000) ---
+Patch Set 22: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135332/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-03 22:06:46.000000000) ---
+Patch Set 22: Code-Review+1
+
+--- Message (Ronnie Sahlberg, 2026-11-03 22:08:47.000000000) ---
+Patch Set 22: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-11-03 23:15:46.000000000) ---
+Uploaded patch set 23.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Ronnie Sahlberg, 2026-11-03 23:17:30.000000000) ---
+Patch Set 23: Code-Review+1
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 23:19:13.000000000) ---
+Patch Set 23:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-03 23:30:38.000000000) ---
+Patch Set 23:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-03 23:41:03.000000000) ---
+Patch Set 23: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135343/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-03 23:49:46.000000000) ---
+Uploaded patch set 24.
+
+Count 1-data-stripe parity rows and origin from 0 (--ec 1 N), so each parity object is a copy of its data object at the same object offsets
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-03 23:52:58.000000000) ---
+Patch Set 24:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Ronnie Sahlberg, 2026-11-03 23:53:36.000000000) ---
+Patch Set 24: Code-Review+1
+
+--- Message (wc-checkpatch, 2026-11-04 00:01:34.000000000) ---
+Patch Set 24:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-04 00:13:52.000000000) ---
+Patch Set 24: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135344/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-04 02:02:04.000000000) ---
+Uploaded patch set 25.
+
+Move lod ec check parity fits() before lod collect avoidance() to avoid a conflict with 69493; 70381 test renumbered to 313 (69517 PS9 adds test 312)
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-04 02:03:43.000000000) ---
+Patch Set 25:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Andreas Dilger, 2026-11-04 02:05:09.000000000) ---
+Patch Set 25: Code-Review+1
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-04 02:06:28.000000000) ---
+Patch Set 25:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Andreas Dilger, 2026-11-04 02:10:35.000000000) ---
+Patch Set 26: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-04 02:13:39.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Andreas Dilger, 2026-11-04 02:13:52.000000000) ---
+Patch Set 26: Code-Review+1
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-04 02:19:06.000000000) ---
+Patch Set 26:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Ronnie Sahlberg, 2026-11-04 02:35:54.000000000) ---
+Patch Set 26: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-11-04 02:42:02.000000000) ---
+Patch Set 26:
+
+(8 comments)
+
+--- Message (jenkins, 2026-11-04 02:44:40.000000000) ---
+Patch Set 26: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/135352/ : FAILURE
+
+--- Message (Ronnie Sahlberg, 2026-11-04 03:08:46.000000000) ---
+Patch Set 26:
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-04 03:33:02.000000000) ---
+Patch Set 26: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135358/ : SUCCESS

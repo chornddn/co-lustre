@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Qian Yingjin
 Reporter:   Qian Yingjin
 Created:    Wed, 8 Apr 2026 09:11:56 +0000
-Updated:    Thu, 29 Oct 2026 03:18:42 +0000
+Updated:    Wed, 4 Nov 2026 02:02:56 +0000
 Links:      Related: is related to LU-20107
 
 --- Description ---
@@ -192,3 +192,47 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 0c99a9d9f6fa4732b0cbd863e2ba999bcf29989a
+
+--- Comment (adilger, Wed, 4 Nov 2026 02:02:56 +0000) ---
+The offset-ordered RPC submission shows quite good behavior in ior-hard-write, where there were often single ranks that ran far ahead of others, and at the stonewall the straggler threads can take hundreds of seconds to write their part of the file.
+
+Results on a single HDD OST, where requests queue in NRS.
+
+Setup: 1 MDT, 1 OST on a 100 GB image on a 7200 rpm HDD (cache=none, rotational, so batches are on by default), 16 clients x 8 ranks, max_rpcs_in_flight=32, ost_io threads_max=16. With the default 128 ost_io threads nothing was ever queued in NRS (all requests waited in threads and the disk queue), so the order did not matter. With 16 threads NRS held 82-94 queued requests on average.
+
+Fixed-size ior-hard write pattern, no stonewall, 12 GB total:
+
+lfs setstripe -C 4
+ior -C -Q 1 -g -e -w -a POSIX -t 47008 -b 47008 -s 2000
+
+workload
+MiB/s
+total
+rank avg
+rank max
+
+fifo
+8.66
+1325s
+1163s
+1324s
+
+tbf opcode batch_kb=0
+7.75
+1482s
+1351s
+1480s
+
+tbf opcode, PS1 deadline
+8.79
+1306s
+1229s
+1304s
+
+tbf opcode, PS2 lowest first
+10.19
+1126s
+1111s
+1124s
+
+Lowest offset first is 18% faster than fifo, 31% faster than TBF without batches and 16% faster than the PS1 elevator that held lower offsets that missed the elevator until the next cycle. The PS2 ranks finish within 13s of each other, against 75-160s for the others, so slow ranks catch up and fastest ones are held back if there is enough IO in flight, rather than holding up the end of the job, which should also facilitate merging in page cache before IO submission. The OST I/O sizes are the same in all runs (82-90% 64KB).

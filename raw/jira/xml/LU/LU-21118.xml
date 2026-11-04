@@ -1,0 +1,129 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21118] osd-ldiskfs: MDS LBUG in osd_olc_save() for names longer than NAME_MAX</title>
+                <link>https://jira.whamcloud.com/browse/LU-21118</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;An ldiskfs MDT LBUGs when a client sends a directory entry name longer than 256 bytes in a request that looks the name up before mdd_name_check() runs, e.g. rename or open-by-name:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LustreError: 4212:0:(osd_handler.c:8127:osd_olc_save()) ASSERTION( ln-&amp;gt;ln_namelen &amp;lt;= 255 + 1 ) failed:
+LustreError: 4212:0:(osd_handler.c:8127:osd_olc_save()) LBUG
+CPU: 17 PID: 4212 Comm: mdt_io02_002 Kdump: loaded Tainted: G           OE     -------- -  - 4.18.0-553.117.1+2.1.el8_10_ciq.x86_64 #1
+Call Trace:
+ dump_stack+0x41/0x60
+ lbug_with_loc.cold.8+0x5/0x43 [libcfs]
+ osd_index_ea_lookup+0x6f8/0x770 [osd_ldiskfs]
+ __mdd_lookup.isra.21+0x286/0x370 [mdd]
+ mdd_lookup+0x10d/0x150 [mdd]
+ mdt_lookup_version_check+0x59/0x2e0 [mdt]
+ mdt_reint_rename+0x99b/0x1e30 [mdt]
+ mdt_reint_rec+0x127/0x260 [mdt]
+ mdt_reint_internal+0x4ac/0x7a0 [mdt]
+ mdt_reint+0x5e/0x100 [mdt]
+ tgt_request_handle+0xc0a/0x1b50 [ptlrpc]
+ ptlrpc_server_handle_request+0x25a/0xca0 [ptlrpc]
+ ptlrpc_main+0xb45/0x13a0 [ptlrpc]
+ kthread+0x134/0x150
+ ret_from_fork+0x1f/0x40
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The MDT never limits the name length before the OSD lookup:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;mdt_name_unpack() / lu_name_is_valid() only check that the name is non-empty, NUL terminated and contains no '/'; there is no upper bound.&lt;/li&gt;
+	&lt;li&gt;mdt_reint_rename() looks up rr_name and rr_tgt_name via mdt_lookup_version_check() straight away, and mdt_reint_open() calls mdo_lookup() before creating. The ENAMETOOLONG check in mdd_name_check() only runs later (and is skipped for encrypted parents).&lt;/li&gt;
+	&lt;li&gt;osd_index_ea_lookup() always calls osd_olc_save(), even when the lookup itself fails, and osd_olc_save() asserts ln_namelen &amp;lt;= LDISKFS_NAME_LEN + 1 before copying into the fixed-size lce_name[] cache slot.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;So any client that does not check the length itself can LBUG the MDS with a single rename(2). This is the ldiskfs counterpart of &lt;a href="https://jira.whamcloud.com/browse/LU-21031" title="osd-zfs: MDT accepts names longer than NAME_MAX" class="issue-link" data-issue-key="LU-21031"&gt;&lt;del&gt;LU-21031&lt;/del&gt;&lt;/a&gt; (osd-zfs accepting such names on insert).&lt;/p&gt;
+
+&lt;p&gt;How such names reach the MDS in practice: clients without &lt;a href="https://jira.whamcloud.com/browse/LU-18783" title="pjdfstest test chmod 2 fails with ZFS 2.3.0" class="issue-link" data-issue-key="LU-18783"&gt;&lt;del&gt;LU-18783&lt;/del&gt;&lt;/a&gt; (e.g. 2.14/2.15/2.16-based) only check d_name.len &amp;gt; ll_namelen in ll_lookup_it(). ll_lookup_nd() skips ll_lookup_it() for (LOOKUP_CREATE &amp;amp;&amp;amp; !LOOKUP_OPEN) (&lt;a href="https://jira.whamcloud.com/browse/LU-4185" title="Incorrect permission handling when creating existing directories at ICHEC" class="issue-link" data-issue-key="LU-4185"&gt;&lt;del&gt;LU-4185&lt;/del&gt;&lt;/a&gt;). Since Linux commit 204a575e91f3 ("VFS: add common error checks to lookup_one_qstr_excl()"), backported to RHEL 10 (kernel-6.12.0-91.el10 and later, so all EL10.1 6.12.0-124.*.el10_1 kernels), do_renameat2() looks up the rename target with LOOKUP_RENAME_TARGET | LOOKUP_CREATE. So on EL10 clients the rename target length is never checked and the name is sent to the MDT. EL8/EL9 and upstream v6.12 pass only LOOKUP_RENAME_TARGET and are not affected. In our case the clients were 6.12.0-124.27.1.el10_1 with a 2.14.0-based client that lacks &lt;a href="https://jira.whamcloud.com/browse/LU-18783" title="pjdfstest test chmod 2 fails with ZFS 2.3.0" class="issue-link" data-issue-key="LU-18783"&gt;&lt;del&gt;LU-18783&lt;/del&gt;&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-18783" title="pjdfstest test chmod 2 fails with ZFS 2.3.0" class="issue-link" data-issue-key="LU-18783"&gt;&lt;del&gt;LU-18783&lt;/del&gt;&lt;/a&gt; closes the hole on the client side, but the MDS must not depend on every client checking the length. &lt;a href="https://jira.whamcloud.com/browse/LU-15928" title="pass key length as part of index API" class="issue-link" data-issue-key="LU-15928"&gt;LU-15928&lt;/a&gt; (passing keylen through dt_lookup()) does not cover this case, since rename names are already NUL terminated and strlen() == ln_namelen.&lt;/p&gt;
+
+&lt;p&gt;Proposed fix: osd_index_ea_lookup() refuses names longer than LDISKFS_NAME_LEN with -ENAMETOOLONG, after any critical-decoding of an encrypted name and before the lookup cache is touched.&lt;/p&gt;
+
+&lt;p&gt;Reproducer (expected, not yet run on master): ldiskfs MDT on master, a client without &lt;a href="https://jira.whamcloud.com/browse/LU-18783" title="pjdfstest test chmod 2 fails with ZFS 2.3.0" class="issue-link" data-issue-key="LU-18783"&gt;&lt;del&gt;LU-18783&lt;/del&gt;&lt;/a&gt; on a RHEL 10 kernel, then&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;touch /mnt/lustre/f
+mv /mnt/lustre/f /mnt/lustre/$(printf 'z%.0s' {1..256})
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</description>
+                <environment>ldiskfs MDT; clients without &lt;a href="https://jira.whamcloud.com/browse/LU-18783" title="pjdfstest test chmod 2 fails with ZFS 2.3.0" class="issue-link" data-issue-key="LU-18783"&gt;&lt;strike&gt;LU-18783&lt;/strike&gt;&lt;/a&gt; on RHEL 10 kernels (e.g. 6.12.0-124.27.1.el10_1)</environment>
+        <key id="100316">LU-21118</key>
+            <summary>osd-ldiskfs: MDS LBUG in osd_olc_save() for names longer than NAME_MAX</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="jinshanx">Jinshan Xiong</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 4 Nov 2026 03:57:19 +0000</created>
+                <updated>Wed, 4 Nov 2026 04:09:45 +0000</updated>
+                                            <version>Lustre 2.18.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505118" author="gerrit" created="Wed, 4 Nov 2026 04:09:45 +0000">&lt;p&gt;"Jinshan Xiong &amp;lt;jinshanx@google.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70397" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70397&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21118" title="osd-ldiskfs: MDS LBUG in osd_olc_save() for names longer than NAME_MAX" class="issue-link" data-issue-key="LU-21118"&gt;LU-21118&lt;/a&gt; osd-ldiskfs: refuse lookup of names over NAME_MAX&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 2944295ac3d68e73c7a7cf52d38867f44175ecfd&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="70704">LU-15928</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="88130">LU-18783</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="92401">LU-19409</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="100099">LU-21031</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072k7:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

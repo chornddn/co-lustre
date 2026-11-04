@@ -1,0 +1,39 @@
+Key:        LU-21119
+Summary:    DNE recovery: target recovery thread cannot be aborted while waiting for a remote lock held by a peer MDT
+Link:       https://jira.whamcloud.com/browse/LU-21119
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Jian Yu
+Reporter:   Jian Yu
+Created:    Wed, 4 Nov 2026 04:40:51 +0000
+Updated:    Wed, 4 Nov 2026 04:49:46 +0000
+
+--- Description ---
+Description:
+
+During DNE recovery, a replayed request on a recovering MDT may need a lock on a remote MDT. If a thread on that remote MDT holds a conflicting lock and is itself waiting for the recovering MDT, the two deadlock. Neither abort_recovery, the hard recovery timeout, nor umount can break it, so the target stays in RECOVERING indefinitely.
+
+How the deadlock forms (MDT0000 recovering, MDT0001 already recovered):
+
+1. A service thread on MDT0001 holds a lock on a directory, for example a parent PDO lock taken in mdt_getattr_name_lock(). It then sends an RPC to MDT0000, for example osp_attr_get() for a remote child. MDT0001 is not recovering, so osp_set_req_replay() doesn't set rq_allow_replay, and ptlrpc_import_delay_req() holds the RPC until the import to MDT0000 is FULL. That only happens after MDT0000's recovery completes.
+
+2. tgt_recover_0 on MDT0000 replays a request that needs a conflicting lock on that directory, through osp_md_object_lock(). It waits in ldlm_completion_ast(). When the lock times out, ldlm_expired_completion_wait() only reconnects the import, and the thread keeps waiting.
+
+3. Recovery abort (OBDF_ABORT_RECOVERY) is only checked in target_recovery_overseer(), between replays. The recovery thread never returns there, so target_check_recovery_timer() keeps logging "Aborting recovery" with no effect. target_stop_recovery_thread() (umount) would hang the same way.
+
+Proposed fix: when the target recovery thread enqueues a remote lock in osp_md_object_lock(), use a completion AST that waits in intervals and gives up with an error once obd_recovery_abort() is true for the top device. The failed enqueue is cleaned up through the existing failed_lock_cleanup() path, the same as a signal-interrupted enqueue, and the replayed request fails while recovery is being aborted anyway. This lets the abort (manual, automatic, or umount) end the hang.
+
+--- Comment (gerrit, Wed, 4 Nov 2026 04:45:24 +0000) ---
+"Jian Yu " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70398
+
+Subject: LU-21119 osp: allow recovery abort to break remote lock wait
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0eede3c449f06ea54e0bfd436939cb2d3ddb4b64

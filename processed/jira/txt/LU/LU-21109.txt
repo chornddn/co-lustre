@@ -1,0 +1,115 @@
+Key:        LU-21109
+Summary:    sanity test_247f: client mount fails with EEXIST: GSS ctx init RPC outlives umount
+Link:       https://jira.whamcloud.com/browse/LU-21109
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Maloo
+Created:    Tue, 3 Nov 2026 17:12:58 +0000
+Updated:    Tue, 3 Nov 2026 19:51:40 +0000
+Links:      Related: is related to  LU-21110
+
+--- Description ---
+Problem
+A client mount fails with EEXIST (-17) when it starts soon after a umount on a file system with GSS (SSK or krb5). The new OSC cannot create its LDLM namespace in sysfs. The previous OSC with the same name still holds that sysfs entry. The failure occurred in sanity test_247f, in review testing of a change that is not public.
+
+mount.lustre: mount 10.240.44.29@tcp:/lustre/d247f.sanity/striped/. at /mnt/lustre_d247f.sanity failed: File exists
+sysfs: cannot create duplicate filename '/fs/lustre/ldlm/namespaces/lustre-OST0000-osc-ff2ab407957f8000'
+LustreError: (ldlm_resource.c:839:ldlm_namespace_new()) lustre-OST0000-osc-ff2ab407957f8000: cannot initialize ns sysfs: rc = -17
+LustreError: (ldlm_lib.c:637:client_obd_setup()) lustre-OST0000-osc-ff2ab407957f8000: unable to create client namespace: rc = -17
+
+Environment
+
+	Test group: review-dne-selinux-ssk-part-1 (SSK flavor ski), Rocky 9.7 x86_64, 2 or more MDTs.
+
+	Master has the same code in gss_do_ctx_init_rpc() and ptlrpc_import_delay_req().
+
+Reproduction
+
+	Mount a client with a GSS flavor.
+
+	Unmount the client before the GSS context negotiation of an OSC import completes.
+
+	Mount the client again at once, so that the new super block gets the address of the old one.
+
+sanity test_247f does steps 1 to 3 in a loop.
+
+Analysis
+The client debug log shows this sequence (epoch seconds 1793714xxx):
+
+ Time 
+ Thread 
+ Event 
+
+------
+--------
+-------
+
+ 465.507 
+ mount 
+ Creates the GSS ctx for OST0000 and starts the lgss_keyring upcall. The OSC import never connects. 
+
+ 467.512 
+ lgss_keyring 
+ gss_do_ctx_init_rpc() checks imp_deactive, takes an import reference and allocates the request. 
+
+ 467.525 
+ umount 
+ obd_cleanup_client_import() sets the import INVALID. ptlrpc_invalidate_import() sees imp_inflight == 0 and returns at once. 
+
+ 467.530 
+ lgss_keyring 
+ Sends SEC_CTX_INIT (o801) on the INVALID import. 
+
+ 467.533 
+ umount 
+ Detaches the OSC. The obd refcount stays at 2, because the RPC holds the import. 
+
+ 467.759 
+ mount 
+ Creates a new OSC with the same name. ldlm_namespace_new() fails with -17. 
+
+ 468.131 
+ lgss_keyring 
+ The reply arrives. The ctx, sec, import and old obd are freed. 
+
+The race has two parts:
+
+	gss_do_ctx_init_rpc() checks the import state before the send, not at the send. ptlrpc_invalidate_import() can run between the check and the send.
+
+	ptlrpc_import_delay_req() always passes ctx init and ctx fini requests. Thus the ctx init request goes out on the import of a stopping obd, after the invalidate wait is complete.
+
+The client OBD names contain the super block address. A new super block can get the address of the freed one, so the new OSC gets the name of the old OSC.
+
+LU-20543 has the same symptom. Its fix (048bb8c49f) removes a permanent key leak. The fix is present in this build. Here the reference is transient and lasts for one RPC round trip.
+
+Proposed fix
+In ptlrpc_import_delay_req(), under imp_lock, fail a ctx init request with -ESHUTDOWN when the obd is stopping. class_cleanup() sets the stopping flag before obd_precleanup() invalidates the import. Thus the invalidate either sees the request in flight and waits for it, or the send sees the flag and fails. Ctx fini requests do not change.
+
+--- Comment (hornc, Tue, 3 Nov 2026 18:03:13 +0000) ---
+A master fix and a regression test are ready. The patch is not pushed yet.
+
+The fix makes ptlrpc_import_delay_req() fail a ctx init request with -ESHUTDOWN when the import is CLOSED or the device is stopping. A new sanity-sec subtest holds an OSC ctx init request across a forced umount, and the OSS drops the reply. Results on a 3-node VM cluster with SSK:
+
+	Without the fix, the subtest fails. The old OSC namespace stays after the umount, and the held request goes out on the CLOSED import.
+
+	With the fix, the subtest passes.
+
+The fix narrows the race but does not remove it. gss_do_ctx_init_rpc() holds an import reference from its state check until the send fails. That window is about 20 ms in the CI trace. A mount in that window can still fail with EEXIST.
+
+The client device names contain the super block address, and a new super block can reuse that address. A unique instance value for each mount would remove this class of collision. LU-21110 tracks that change.
+
+--- Comment (gerrit, Tue, 3 Nov 2026 19:40:42 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70375
+
+Subject: LU-21109 ptlrpc: refuse ctx init RPC on a closing import
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5b4d294fea9af642d6cc92676ea6a82d5015cd94
