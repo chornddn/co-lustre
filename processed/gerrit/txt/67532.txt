@@ -7,12 +7,12 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-25 18:39:08.000000000
-Updated:    2026-11-04 14:14:58.000000000
-Patch Set:  6
-Insertions: +187
+Updated:    2026-11-04 23:46:15.000000000
+Patch Set:  7
+Insertions: +195
 Deletions:  -20
-Comments:   45 (0 unresolved)
-Hashtags:   pw_smallfix, testfix
+Comments:   55 (0 unresolved)
+Hashtags:   testfix, pw_smallfix
 
 --- Labels ---
   Code-Review: (no votes)
@@ -25,90 +25,39 @@ Hashtags:   pw_smallfix, testfix
 --- Commit Message ---
 LU-20522 obdclass: size the llog header swab to its buffer
 
-LLOG_HDR_TAIL() locates the header tail at llh_hdr.lrh_len - 8 bytes
-from the start of the header buffer.  lustre_swab_llog_hdr()
-dereferences it twice -- print_llog_hdr() reads lrt_index and lrt_len,
-and lustre_swab_llog_rec() swabs them -- without ever checking
-lrh_len, which at that point is raw data from disk or the wire.  The
-first print_llog_hdr() runs before the header is swabbed, so lrh_len
-is still in the peer's byte order: even a valid foreign-endian 8KB
-header reads ~2MB past the buffer, because __swab32(8192) is
-0x00200000.
+lustre_swab_llog_hdr() reads and swabs the header tail that
+LLOG_HDR_TAIL() locates from lrh_len, without checking lrh_len.
+That length is raw data from disk or the wire, and the first
+print_llog_hdr() reads it before the swab, so even a valid
+foreign-endian 8KB header has its tail read about 2MB past the
+buffer. recovery-small test_154a crashes in print_llog_hdr() when
+the random header it writes over a catalog passes
+LLOG_REC_HDR_NEEDS_SWABBING(), about one header in 4096.
 
-recovery-small test_154a overwrites an update log catalog with
-/dev/urandom and expects the corrupt log to be rejected.  Roughly one
-random lrh_type in 4096 satisfies LLOG_REC_HDR_NEEDS_SWABBING(), which
-feeds that random header to lustre_swab_llog_hdr() and dereferences
-the tail at a random multi-gigabyte offset:
+Pass the swab the size of the buffer the header was read into and
+touch the tail only when lrh_len places it inside that buffer. The
+bound has to be the caller's: the header reply and the stale update
+log check read 8KB, llog_osd_read_header() up to 32KB. Also swab
+only a byte-swapped LLOG_HDR_MAGIC: the swab check matches only the
+type prefix, so other record types such as CHANGELOG_REC and
+UPDATE_REC would reach swabbers that trust unvalidated lengths and
+counts. Callers already reject a header with a bad lrh_type, and
+lod_sub_prep_llog() renews such a log.
 
-  BUG: unable to handle kernel paging request at ffff9857f0a959ca
-  RIP: print_llog_hdr+0x568/0x6b0 [obdclass]
-   lustre_swab_llog_hdr+0x37/0x140 [obdclass]
-   llog_osd_read_header+0x4b1/0xb60 [obdclass]
-   llog_read_header+0x6a/0x390 [obdclass]
-   llog_init_handle+0xf2/0xad0 [obdclass]
-   lod_sub_prep_llog+0x581/0xcd9 [lod]
-   lod_sub_recovery_thread+0xd6/0xef0 [lod]
+llog_client_read_header() now bounds lrh_len by its buffer and the
+reply before using it; an lrh_len below 8 made LLOG_HDR_TAIL() read
+in front of the buffer. It and llog_osd_read_header() also reject
+an llh_bitmap_offset other than that of llh_bitmap, the only value
+ever written.
 
-Pass the size of the buffer the header was read into to
-lustre_swab_llog_hdr(), and only touch the tail when lrh_len places it
-within that buffer.  The bound has to be the caller's buffer and not a
-tree-wide maximum, because the buffer sizes differ: 8KB for
-lod_update_log_stale() and for the RMF_LLOG_LOG_HDR reply, but up to
-32KB for an update log read by llog_osd_read_header().  A bound of
-32KB would still let a legitimate big-endian 32KB header write eight
-bytes past the two 8KB buffers.  The tail swab therefore moves out of
-lustre_swab_llog_rec(), which has no way to know the buffer size, and
-into lustre_swab_llog_hdr().
+Outside test_154a, a corrupt header on an expired update log
+reaches the swab during stale log cleanup, and a corrupt or
+foreign-endian peer reaches it through RMF_LLOG_LOG_HDR.
+recovery-small test_154c plants a byte-swapped LLOG_HDR_MAGIC and
+a byte-swapped CHANGELOG_REC header with an out-of-range lrh_len,
+and checks that the MDS rejects the log.
 
-Bounding the tail is not enough on its own.
-LLOG_REC_HDR_NEEDS_SWABBING() only matches the 12-bit LLOG_OP_MASK
-prefix, so a header buffer whose lrh_type swabs to CHANGELOG_REC or
-UPDATE_REC is handed to a record swabber that locates its tail, or
-sizes its loops, from fields nothing has validated: CHANGELOG_REC
-puts its tail at rec + lrh_len, and UPDATE_REC sizes its loops from
-ur_update_count and uop_param_count and finds its tail with
-update_records_size(), fields just as unvalidated as lrh_len.  So
-also refuse to interpret the buffer as anything but a log header.
-
-Callers reject the untouched header through their existing lrh_type
-and lrh_len checks and return -EINVAL, which is what
-lod_sub_prep_llog() already handles by renewing the log.
-
-llog_client_read_header() then bounds lrh_len itself before it uses
-it. It already rejected an lrh_len above lgh_hdr_size before the
-memcpy(), via a plain "if (handle->lgh_hdr_size <
-hdr->llh_hdr.lrh_len) GOTO(out, rc = -EFAULT)"; only the duplicate
-upper-bound arm in the later sanity block ran after the memcpy() and
-after LLOG_HDR_TAIL().  What is genuinely new is the low bound: an
-lrh_len under sizeof(struct llog_rec_tail) made LLOG_HDR_TAIL() read
-in front of lgh_hdr, and nothing checked that before.  The new check
-also bounds lrh_len by the reply buffer.  req_capsule already refuses
-a buffer shorter than struct llog_log_hdr, so this arm only matters if
-a client header buffer ever grows past that, and the diagnostic prints
-whichever bound is smaller.  Bounding all of this up front leaves the
-range arms of the later sanity block unreachable, so they are dropped
-and their "incorrectly sized log header" diagnostic moves to the new
-check, which also names the import.
-
-llh_bitmap_offset comes off the same untrusted header and locates the
-bitmap that is then tested, set and written back, so both
-llog_osd_read_header() and llog_client_read_header() now reject a
-header whose offset is not that of llh_bitmap, the only value ever
-written.
-
-This is not test-only.  lod_update_log_stale() swabs an on-disk header
-during ordinary stale update log cleanup with no length check at all,
-and a foreign-endian peer reaches the out-of-bounds write over the
-network through RMF_LLOG_LOG_HDR.
-
-recovery-small test_154c plants both shapes -- a byte-swapped
-LLOG_HDR_MAGIC and a byte-swapped CHANGELOG_REC -- with an
-out-of-range lrh_len, so the bad dereference is reached on every run
-instead of on a 1-in-4096 draw.  Whether it faults still depends on
-what happens to sit at the out-of-bounds address, so the test does not
-wait for a crash: it checks that the MDS read the log and rejected it.
-
+Test-Parameters: testlist=runtests serverversion=2.16
 Fixes: dc689955366c ("LU-6602 obdclass: variable llog chunk size")
 Signed-off-by: Oleg Drokin <green@whamcloud.com>
 Assisted-by: ClaudeCode:Opus-5 llm_code_and_review_tools
@@ -443,3 +392,43 @@ Patch Set 6:
 Patch Set 6:
 
 (1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-04 19:33:47.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+The code looks correct: the tail is bounded by each caller's real buffer and the lrh_type gate keeps the other record swabbers off the header. The main open item is the commit message (inline); the rest are optional nits for the next refresh.
+
+--- Message (patrick bot, 2026-11-04 19:50:15.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-04 19:50:21.000000000) ---
+Patch Set 6:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-11-04 19:51:49.000000000) ---
+Patch Set 7:
+
+(4 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-04 20:12:06.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-04 23:45:56.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135434/ : SUCCESS

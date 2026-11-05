@@ -1,0 +1,86 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21127] HSM dirty change not reported in changelog when a client is evicted while holding a file open for write</title>
+                <link>https://jira.whamcloud.com/browse/LU-21127</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;When a client is evicted by the MDT while it holds an archived file open for write, the final modifications made by that client are never reported to changelog consumers (e.g. a copytool policy engine), so the archive copy stays stale.
+  
+  Sequence:
+  1. Client opens file F for write, writes data. F is archived while open (hsm_state: exists archived).
+  2. MDT evicts the client (e.g. lock callback timeout, or lctl set_param mdt.*.evict_client=nid:&amp;lt;client&amp;gt;). mdt_export_cleanup() -&amp;gt; mdt_ctxt_add_dirty_flag() sets HS_DIRTY on F (LU-3677), but the session ucred is zero-initialized, so uc_enable_audit == 0 and mdd_changelog_enabled() suppresses the CL_HSM record. F becomes "exists dirty archived" with no changelog record.
+  3. The client reconnects; the application keeps writing (data goes to OSTs) and then closes F.
+  4. The close RPC carries MDS_DATA_MODIFIED with the pre-eviction open handle. mdt_close_internal() returns -ESTALE ("no handle for file close"). mdc_close() resets -ESTALE to 0 because the open was committed (bug 3633 logic). ll_prepare_close() already cleared LLIF_DATA_MODIFIED, so the modification is lost. Even if the MDT had processed the close, HS_DIRTY is already set, so no CL_HSM record would be emitted.
+     
+  Result: no CL_HSM (dirty) record is ever written for the post-archive writes;  a changelog-driven archiver never re-archives F. Archive copy size &amp;lt; file size.
+  
+  Reproduced on 2.15.6 client / 2.15 server:
+    before: archive 8192 B, file 70656 B after close, state 0xb, no changelog after eviction
+    with proposed patch: "mdc close failed: rc = -116" logged, CL_HSM dirty emitted on
+    close, re-archived 59392 B == file size, state 0x9
+
+  Proposed fix (client side):
+  - mdc_close(): do not reset -ESTALE to 0 when the close carries MDS_DATA_MODIFIED.
+  - ll_close_inode_openhandle(): on close failure, restore LLIF_DATA_MODIFIED.
+  - ll_md_close(): on last write close, if LLIF_DATA_MODIFIED is still set, clear and
+    then set HS_DIRTY via ll_hsm_state_set() so a CL_HSM record is emitted.
+
+  Alternative considered: set uc_enable_audit = 1 in mdt_ctxt_add_dirty_flag() so the
+  eviction-time dirty is logged. Rejected as the only fix: it triggers a re-archive while
+  the client may still be writing, and still misses writes made after the eviction.
+
+  Patch and sanity-hsm test to follow.
+
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</description>
+                <environment>Client: lustre-client 2.15.6 on Linux 6.18 (x86_64). Servers: Lustre 2.15, ZFS-backed MDT, HSM with changelog-driven copytool/archiver.</environment>
+        <key id="100327">LU-21127</key>
+            <summary>HSM dirty change not reported in changelog when a client is evicted while holding a file open for write</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="gaurani">Anirudh Gaur</assignee>
+                                    <reporter username="gaurani">Anirudh Gaur</reporter>
+                        <labels>
+                            <label>HSM</label>
+                    </labels>
+                <created>Wed, 4 Nov 2026 22:30:16 +0000</created>
+                <updated>Wed, 4 Nov 2026 22:30:16 +0000</updated>
+                                            <version>Lustre 2.15.8</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072mn:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>
