@@ -1,0 +1,148 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21135] ldiskfs: mb_groups reads wrong group descriptor, ldiskfs_error() on last group (6.10+)</title>
+                <link>https://jira.whamcloud.com/browse/LU-21135</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Reported by Chris Walker.&lt;/p&gt;
+
+&lt;p&gt;Reading /proc/fs/ldiskfs/&amp;lt;dev&amp;gt;/mb_groups on a 6.10+ kernel triggers ldiskfs_error() for the last group. With errors=panic the server panics; otherwise the journal is aborted and the target is remounted read-only.&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LDISKFS-fs error (device dm-1): ldiskfs_get_group_desc:280: comm cat: block_group &amp;gt;= groups_count - block_group = 4, groups_count = 4
+LDISKFS-fs (dm-1): Remounting filesystem read-only
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;In the field this was seen as:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;LDISKFS-fs error (device nvme1n1): ldiskfs_get_group_desc:280: comm grep: block_group &amp;gt;= groups_count - block_group = 6400, groups_count = 6400
+Aborting journal on device nvme1n1-8.
+Kernel panic - not syncing: LDISKFS-fs (device nvme1n1): panic forced after error
+ ldiskfs_handle_error.cold+0x13/0x13 [ldiskfs]
+ __ldiskfs_error+0xed/0x160 [ldiskfs]
+ ldiskfs_get_group_desc+0x78/0xb0 [ldiskfs]
+ ldiskfs_mb_seq_groups_show+0x46/0x210 [ldiskfs]
+ seq_read_iter+0x26f/0x3f0
+ proc_reg_read_iter+0x43/0x80
+ vfs_read+0x205/0x320
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Rootcause"&gt;&lt;/a&gt;Root cause&lt;/h3&gt;
+
+&lt;p&gt;The mb_groups seq_file iterator passes v = group + 1, and ext4_mb_seq_groups_show() does group-- before using it. When ext4-mballoc-extra-checks.patch was ported to 6.10 (&lt;a href="https://jira.whamcloud.com/browse/LU-16350" title="Updated server support for new linux releases" class="issue-link" data-issue-key="LU-16350"&gt;&lt;del&gt;LU-16350&lt;/del&gt;&lt;/a&gt;, commit cb8761fa4e), the ext4_get_group_desc() call was moved into the variable declaration, i.e. before the group--:&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;	ext4_group_t group = (ext4_group_t) ((unsigned &lt;span class="code-object"&gt;long&lt;/span&gt;) v);
+	struct ext4_group_desc *gdp = ext4_get_group_desc(sb, group, NULL);
+	...
+	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (gdp)
+		free = ext4_free_group_clusters(sb, gdp);
+
+	group--;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;As a result:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;the "gfree" column of row N shows the descriptor free count of group N+1;&lt;/li&gt;
+	&lt;li&gt;the last row looks up group == groups_count, which fails the bounds check in ext4_get_group_desc() and calls ext4_error().&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;All older versions of the patch (rhel8/9, ubuntu, linux-5.x, 6.1, 6.6) do the lookup after group-- and are not affected.&lt;/p&gt;
+
+&lt;p&gt;Affected patches and series:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;linux-6.10/ext4-mballoc-extra-checks.patch: 6.10-ml, 6.11-ml, 6.12-ml, 6.12-rhel10.0, 6.12-rhel10.1&lt;/li&gt;
+	&lt;li&gt;linux-6.15/ext4-mballoc-extra-checks.patch: 6.18-ml, 6.12-rhel10.2 (added in &lt;a href="https://jira.whamcloud.com/browse/LU-19135" title="ldiskfs updates for next LTS" class="issue-link" data-issue-key="LU-19135"&gt;&lt;del&gt;LU-19135&lt;/del&gt;&lt;/a&gt;)&lt;/li&gt;
+	&lt;li&gt;linux-6.19/ext4-mballoc-extra-checks.patch: 7.0-ml, 7.0.0-14-ubuntu26 (added in &lt;a href="https://jira.whamcloud.com/browse/LU-19250" title="Support for ldiskfs kernel 7.0" class="issue-link" data-issue-key="LU-19250"&gt;&lt;del&gt;LU-19250&lt;/del&gt;&lt;/a&gt;)&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;p&gt;On any 6.10+ ldiskfs MDT/OST:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;cat /proc/fs/ldiskfs/*/mb_groups &amp;gt; /dev/null; dmesg | grep groups_count
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h3&gt;
+
+&lt;p&gt;Declare gdp without initialising it and do the lookup after group--, as the pre-6.10 patches do:&lt;/p&gt;
+
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;	group--;
+	gdp = ext4_get_group_desc(sb, group, NULL);
+	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (gdp)
+		free = ext4_free_group_clusters(sb, gdp);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</description>
+                <environment />
+        <key id="100335">LU-21135</key>
+            <summary>ldiskfs: mb_groups reads wrong group descriptor, ldiskfs_error() on last group (6.10+)</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="ablagodarenko">Artem Blagodarenko</assignee>
+                                    <reporter username="ablagodarenko">Artem Blagodarenko</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 5 Nov 2026 20:02:17 +0000</created>
+                <updated>Fri, 6 Nov 2026 00:06:28 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="505269" author="gerrit" created="Fri, 6 Nov 2026 00:06:28 +0000">&lt;p&gt;"Artem Blagodarenko &amp;lt;ablagodarenko@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70513" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70513&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21135" title="ldiskfs: mb_groups reads wrong group descriptor, ldiskfs_error() on last group (6.10+)" class="issue-link" data-issue-key="LU-21135"&gt;LU-21135&lt;/a&gt; ldiskfs: fix group desc lookup in mb_groups&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 07550c4867b8c8d1c4f732e9cf59d67cf0f01e67&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="73421">LU-16350</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072of:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

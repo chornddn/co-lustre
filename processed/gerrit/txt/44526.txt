@@ -7,54 +7,120 @@ Branch:     master
 Status:     NEW
 Owner:      Patrick Farrell
 Created:    2021-08-06 16:28:36.000000000
-Updated:    2025-08-04 17:54:39.000000000
-Patch Set:  26
-Insertions: +228
-Deletions:  -11
-Comments:   93 (0 unresolved)
+Updated:    2026-11-06 06:47:17.000000000
+Patch Set:  28
+Insertions: +424
+Deletions:  -34
+Comments:   95 (0 unresolved)
 
 --- Labels ---
-  Code-Review: Lustre Gerrit Janitor: -1; Patrick Farrell: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  REVIEWER: Zhenyu Xu, Andreas Dilger, Qian Yingjin, Patrick Farrell
+  CC: Patrick Farrell
+  REVIEWER: Zhenyu Xu, Andreas Dilger, Qian Yingjin, Jinshan Xiong, Patrick Farrell
 
 --- Commit Message ---
 LU-14917 llite: Switch mmap readahead logic
 
-The mmap readahead logic has shown to be badly suited for
-certain workloads (kdb).  Experimentation showed that for
-these workloads, the standard readahead algorithm works
-better.
+The mmap specific readahead logic does badly for some workloads,
+e.g. kdb and clustered reads such as vLLM loading model weights
+from safetensors files through mmap.  Add the tunable
+llite.*.mmap_read_ahead_logic (default 1) to let page faults use
+the read() readahead logic instead.
 
-This patch allows switching the readahead algorithm for
-mmap to the 'standard' readahead algorithm.
+With mmap_read_ahead_logic=0:
+- ll_fault() feeds each fault to ll_ras_enter_fault(), but skips
+  faults retried after VM_FAULT_RETRY (FAULT_FLAG_TRIED).  Faults
+  on pages still being read ahead are retried, and the retry looked
+  like a backward seek that reset stride detection.
+- ll_ras_enter_fault() holds back one fault away from the stream
+  and drops it if the next fault continues the stream, so a single
+  b-tree interior page does not reset the window twice.
+  ras_update() keeps the window for the held page.
+- ll_read_ahead_pages() skips pages already in the page cache
+  instead of giving up after 3 busy pages, as processes faulting
+  on the same file read ahead over each other's pages.
+- The fast fault path does not add an LCC_MMAP context, which only
+  carries LL_RAS_MMAP, unless the thread has one already: adding it
+  took lli_lock for write twice per fault, and 30% of the CPU time
+  was spent spinning on it with 16 processes on one file.
+- ll_io_read_page() and do_read_folio() do not pass LL_RAS_MMAP,
+  and ll_io_read_page() does not apply the skip index.
 
-The added tunable is:
-mmap_read_ahead_logic in llite
-(lctl get_param llite.*.mmap_read_ahead_logic)
+For every reader, is_loose_seq_read() now treats a read that starts
+less than 128KiB (RAS_LOOSE_GAP_BYTES) past the end of the previous
+one as continuing the sequential stream, instead of 8 pages, and
+readahead reads the gap too.  A vLLM tensor parallel rank reads 1/TP
+of every row of a row parallel tensor, skipping 42-49KiB of every
+56KiB row of Llama-3-70B; as a stride, readahead sent RPCs full of
+holes and the OSTs did a 16KiB disk I/O per hole.  Larger gaps are
+still detected as a stride.  A single process reading small chunks
+with gaps below 128KiB now reads the gaps as well.
 
-It defaults to '1', which is the special mmap readahead
-logic.
+Also check the fault offset before blocking signals in ll_fault(),
+so the VM_FAULT_SIGBUS return does not leave them blocked.
 
-Setting it to 0 switches mmap readahead to use the standard
-readahead logic.
+Fix sanity/101f, which hid iozone failures: check the return codes
+and use a record size of at least PAGE_SIZE.  Add sanity/101k,
+which compares misses with both settings using multiop, and 101n,
+which checks that a strided mmap read skips 192KiB gaps and that a
+strided read() reads through 60KiB gaps.  101f stays excluded until
+LU-14921 is fixed.  Add the man page llite.mmap_read_ahead_logic.4.
 
-This patch also fixes the existing mmap readahead test,
-which was not running.
+Results: one client (24 cores, 87GiB, 50Gb/s TCP), 8 ldiskfs OSTs
+on 2 OSSs, 4MiB stripes and RPCs, cold client cache.
 
-Note the results for the existing test are better with the
-standard readahead logic, ie, with mmap readahead logic
-disabled.  This suggests we should default to non-mmap
-readahead logic.
+vLLM-like load of a Llama-3-70B-like checkpoint: 27 safetensors-like
+shards, 139GB in total, more than the client memory.  Each tensor
+parallel rank maps one shard at a time and reads a 1/TP block of
+rows of q/k/v/gate/up and 1/TP of every row of o/down.  Time of the
+slowest rank; 8 processes reading 8 shards each in order (no TP)
+reach 5.7GB/s.  "before" is this patch without the 128KiB gap rule
+and the fault fixes, i.e. the original change rebased:
 
-However, the mmap readahead logic was carefully tuned for
-certain workloads, and this would be a large change.  So,
-this question is deferred until we can do a larger look at
-readahead behavior.
+  ranks  mmap logic=1  mmap logic=0  pread() of the same slices
+         before/after  before/after  before/after
+    4     110s/ 56s     349s/36s     101s/40s
+    8     319s/ 71s        -/32s     235s/41s
+
+Other workloads through mmap, median of 2 runs, values for
+logic=1/logic=0.  "secs" is the run time and "Actual Data Read" the
+data the client read from the OSTs (sum of read_bytes in
+osc.*.stats).  It shows how much a setting reads ahead that the
+workload never uses:
+
+  workload                     secs      Actual Data Read (MiB)
+  sequential 8GiB                 3.48/2.84        8192/8192
+  4 x 2GiB sequential             2.01/1.55        8192/8192
+  strided, 64KiB of 256KiB        1.53/1.65        2048/2132
+  strided, 4KiB of 64KiB          4.56/5.44        8192/8192
+  random, 2% of 8GiB             27.86/28.28        162/162
+  clustered, pages shuffled in
+    256KiB windows               31.04/12.04       8192/8192
+  kdb-like, scan 8 columns        4.80/4.43        8192/8192
+  kdb-like, filter and fetch      3.05/2.68        8192/8192
+  SQLite full table scan          3.87/1.43        1744/1856
+  SQLite covering index range     0.07/0.05          85/151
+  SQLite 20000 point lookups     19.51/19.98        143/142
+  SQLite index range + fetch     49.22/49.38        345/351
+  LMDB cursor scan of 4GiB        2.90/2.76        3924/3924
+  LMDB 20000 random gets         16.02/16.46         99/157
+  LMDB 500 scans of 1000 keys     4.54/1.69         673/3924
+  Llama-3-8B-like load, TP=4      5.55/3.69        8320/8320
+  Llama-3-8B-like load, TP=8      6.55/3.76        8320/8320
+
+With the gap rule the default mmap logic and read() are 2-6x faster
+on the 70B load; mmap_read_ahead_logic=0 is a further 1.5-2.2x
+faster there, 2.7x on SQLite table scans and 2.6x on clustered
+access.  The 4KiB of 64KiB stride read 512MiB before the gap rule
+and takes 1.57s with either setting.  Short scans at random offsets
+read up to 6x more, since the window is rounded up to full RPCs.
+So the default stays 1 until more mmap workloads are measured.
 
 Signed-off-by: Patrick Farrell <pfarrell@whamcloud.com>
+Signed-off-by: Jinshan Xiong <jinshanx@google.com>
 Change-Id: Ib34297f1dd0498356b21580224f4b954bb10cb14
 
 --- Review History ---
@@ -845,3 +911,56 @@ Patch Set 26: -Code-Review
 
 8 style warning(s).
 For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Jinshan Xiong, 2026-11-06 04:01:32.000000000) ---
+Uploaded patch set 27.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-06 04:10:55.000000000) ---
+Patch Set 27:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-06 04:40:52.000000000) ---
+Patch Set 27: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135549/ : SUCCESS
+
+--- Message (Jinshan Xiong, 2026-11-06 05:42:14.000000000) ---
+Uploaded patch set 28.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-06 05:43:08.000000000) ---
+Patch Set 28:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-06 05:55:43.000000000) ---
+Patch Set 27:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-06 06:04:54.000000000) ---
+Patch Set 28:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-06 06:46:56.000000000) ---
+Patch Set 28: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135555/ : SUCCESS

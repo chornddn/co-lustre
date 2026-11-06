@@ -1,0 +1,89 @@
+Key:        LU-21135
+Summary:    ldiskfs: mb_groups reads wrong group descriptor, ldiskfs_error() on last group (6.10+)
+Link:       https://jira.whamcloud.com/browse/LU-21135
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Artem Blagodarenko
+Reporter:   Artem Blagodarenko
+Created:    Thu, 5 Nov 2026 20:02:17 +0000
+Updated:    Fri, 6 Nov 2026 00:06:28 +0000
+Links:      Related: is related to  LU-16350
+
+--- Description ---
+Reported by Chris Walker.
+
+Reading /proc/fs/ldiskfs//mb_groups on a 6.10+ kernel triggers ldiskfs_error() for the last group. With errors=panic the server panics; otherwise the journal is aborted and the target is remounted read-only.
+
+LDISKFS-fs error (device dm-1): ldiskfs_get_group_desc:280: comm cat: block_group >= groups_count - block_group = 4, groups_count = 4
+LDISKFS-fs (dm-1): Remounting filesystem read-only
+
+In the field this was seen as:
+
+LDISKFS-fs error (device nvme1n1): ldiskfs_get_group_desc:280: comm grep: block_group >= groups_count - block_group = 6400, groups_count = 6400
+Aborting journal on device nvme1n1-8.
+Kernel panic - not syncing: LDISKFS-fs (device nvme1n1): panic forced after error
+ ldiskfs_handle_error.cold+0x13/0x13 [ldiskfs]
+ __ldiskfs_error+0xed/0x160 [ldiskfs]
+ ldiskfs_get_group_desc+0x78/0xb0 [ldiskfs]
+ ldiskfs_mb_seq_groups_show+0x46/0x210 [ldiskfs]
+ seq_read_iter+0x26f/0x3f0
+ proc_reg_read_iter+0x43/0x80
+ vfs_read+0x205/0x320
+
+Root cause
+
+The mb_groups seq_file iterator passes v = group + 1, and ext4_mb_seq_groups_show() does group-- before using it. When ext4-mballoc-extra-checks.patch was ported to 6.10 (LU-16350, commit cb8761fa4e), the ext4_get_group_desc() call was moved into the variable declaration, i.e. before the group--:
+
+	ext4_group_t group = (ext4_group_t) ((unsigned long) v);
+	struct ext4_group_desc *gdp = ext4_get_group_desc(sb, group, NULL);
+	...
+	if (gdp)
+		free = ext4_free_group_clusters(sb, gdp);
+
+	group--;
+
+As a result:
+
+	the "gfree" column of row N shows the descriptor free count of group N+1;
+
+	the last row looks up group == groups_count, which fails the bounds check in ext4_get_group_desc() and calls ext4_error().
+
+All older versions of the patch (rhel8/9, ubuntu, linux-5.x, 6.1, 6.6) do the lookup after group-- and are not affected.
+
+Affected patches and series:
+
+	linux-6.10/ext4-mballoc-extra-checks.patch: 6.10-ml, 6.11-ml, 6.12-ml, 6.12-rhel10.0, 6.12-rhel10.1
+
+	linux-6.15/ext4-mballoc-extra-checks.patch: 6.18-ml, 6.12-rhel10.2 (added in LU-19135)
+
+	linux-6.19/ext4-mballoc-extra-checks.patch: 7.0-ml, 7.0.0-14-ubuntu26 (added in LU-19250)
+
+Reproducer
+
+On any 6.10+ ldiskfs MDT/OST:
+
+cat /proc/fs/ldiskfs/*/mb_groups > /dev/null; dmesg | grep groups_count
+
+Fix
+
+Declare gdp without initialising it and do the lookup after group--, as the pre-6.10 patches do:
+
+	group--;
+	gdp = ext4_get_group_desc(sb, group, NULL);
+	if (gdp)
+		free = ext4_free_group_clusters(sb, gdp);
+
+--- Comment (gerrit, Fri, 6 Nov 2026 00:06:28 +0000) ---
+"Artem Blagodarenko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70513
+
+Subject: LU-21135 ldiskfs: fix group desc lookup in mb_groups
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 07550c4867b8c8d1c4f732e9cf59d67cf0f01e67
