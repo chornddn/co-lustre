@@ -1,0 +1,38 @@
+Key:        LU-21161
+Summary:    ldiskfs: fstrim thread hit BUG_ON at umount and was not started/stopped at remount (fstrim/nofstrim/ro)
+Link:       https://jira.whamcloud.com/browse/LU-21161
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Xiao Yang
+Reporter:   Xiao Yang
+Created:    Mon, 9 Nov 2026 04:58:31 +0000
+Updated:    Mon, 9 Nov 2026 08:17:19 +0000
+
+--- Description ---
+Issue1: thread hit BUG_ON(JBD2_UNMOUNT) at umount
+
+The fstrim thread added by LU-17980 can start a journal handle while the journal is being destroyed at umount:
+
+  kernel BUG at fs/jbd2/transaction.c:369!
+  CPU: 4 PID: 1649839 Comm: fstrim-sdb 6.12.0-124.28.1.el10_1.x86_64
+  RIP: 0010:start_this_handle+0x226/0x500 [jbd2]
+  Call Trace:
+   jbd2__journal_start+0xfb/0x1f0 [jbd2]
+   ldiskfs_try_to_trim_range+0x5ec/0x7e0 [ldiskfs]
+   ldiskfs_trim_all_free+0x168/0x1c0 [ldiskfs]
+   ldiskfs_mb_fstrim_thread+0x418/0x550 [ldiskfs]
+   kthread+0xfd/0x240
+
+The thread is started in ext4_mb_init() and stopped in ext4_mb_release(), but ext4_put_super() destroys the journal before calling ext4_mb_release(). While trimming, the thread starts a
+
+journal handle (ldiskfs_try_to_trim_range() -> jbd2__journal_start()) to record the trimmed groups, so if it is still running when jbd2_journal_destroy() has set JBD2_UNMOUNT, start_this_handle() hits the BUG_ON. The same placement also leaks the thread when mount fails after ext4_mb_init() (the failed_mount5 path does not stop it), and leaves it running after "remount,nofstrim", since ext4_mb_release() skips the stop when the option is cleared.
+
+ 
+
+issue2: thread was not started/stopped at remount:
+
+a) "remount,fstrim" on a filesystem mounted without fstrim sets the option but never starts the thread. Queued groups are never trimmed, and the allocator keeps skipping them in the fast scan passes.
+b) "remount,nofstrim" leaves the thread running until umount.
+c) "remount,ro" leaves the thread running. Trimming then hits WARN_ON_ONCE(sb_rdonly(sb)) in ext4_journal_check_start() and gets -EROFS, after which the thread never trims again, even after "remount,rw".

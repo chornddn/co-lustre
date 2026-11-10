@@ -1,0 +1,49 @@
+Key:        LU-21171
+Summary:    ofd: lock_zero_regions() reads past the FIEMAP reply when fm_extent_count is 0
+Link:       https://jira.whamcloud.com/browse/LU-21171
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Hiroshi Nishida
+Created:    Mon, 9 Nov 2026 23:13:59 +0000
+Updated:    Mon, 9 Nov 2026 23:19:30 +0000
+Links:      Related: is related to  LU-19463; Related: is related to  LU-17110
+
+--- Description ---
+Problem
+On a kernel with KASAN, sanity test_44f fails with "Error in dmesg detected". The OSS log has:
+
+BUG: KASAN: slab-out-of-bounds in lock_zero_regions+0x706 [ofd]
+
+It is an 8-byte read just past the end of a 600-byte reply buffer. The buffer was allocated by null_alloc_rs(), from ofd_get_info_hdl() -> req_capsule_server_pack(), in an ll_ost thread. Without KASAN the test passes, because nothing checks the read.
+
+Cause
+multiop's do_fiemap() (the "I" command in test_44f) first sends a count-only probe: fm_extent_count = 0 with FIEMAP_FLAG_SYNC. With FIEMAP_FLAG_SYNC the client sets OBD_FL_SRVLOCK.
+
+In ofd_get_info_hdl() (KEY_FIEMAP):
+
+	The reply is sized from fm_extent_count, so it only holds the struct fiemap header (no extents).
+
+	ofd_fiemap_get() sets fm_mapped_extents to the real number of extents, as FIEMAP does for a count-only call.
+
+	Because OBD_FL_SRVLOCK is set (LU-3219), lock_zero_regions() runs. It loops "i fm_mapped_extents" and reads fm_extents[i].fe_logical, which is past the end of the reply.
+
+The values read are also used as lock ranges, so the locked regions are wrong too.
+
+Possible fix
+Only walk the extents that are in the buffer:
+
+for (i = 0; i fm_mapped_extents, fiemap->fm_extent_count); i++) {
+
+With fm_extent_count = 0 the loop is skipped and [fm_start, fm_start + fm_length) is locked once, which is what a count-only query with SYNC needs.
+
+Environment
+Found on a 2.17.57-based build, single node, Rocky 9.8 debug kernel (5.14.0-687 with KASAN, lockdep and debug objects). lock_zero_regions() and the FIEMAP handler are the same in master (2.17.61).
+
+Related
+
+	LU-19463: the same 44f probe (fm_extent_count = 0) causes a usercopy failure on the client. This ticket is the server side.
+
+	LU-17110: client slab corruption with fm_extent_count = 0 (resolved).

@@ -1,0 +1,54 @@
+Key:        LU-21148
+Summary:    socklnd: optionally verify the HELLO source NID matching the remote endpoint
+Link:       https://jira.whamcloud.com/browse/LU-21148
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Serguei Smirnov
+Reporter:   Serguei Smirnov
+Created:    Sat, 7 Nov 2026 01:11:00 +0000
+Updated:    Sat, 7 Nov 2026 01:11:00 +0000
+
+--- Description ---
+Socklnd identifies the remote peer by the NID in its HELLO (kshm_src_nid) and never relates that NID to the connection it arrived on. 
+
+	Passive: for connections from a reserved source port (the accept=secure default), ksocknal_recv_hello() uses kshm_src_nid verbatim. Only the accept=all branch derives the identity from the socket address.
+
+	Active: ksocknal_recv_hello() checks that the HELLO NID equals the NID that was dialed, not that the connection's peer address belongs to that NID.
+
+	The claimed NID's network is not checked against the receiving NI's network.
+
+	lnet_connect() binds to an address chosen by choose_ipv4_src() on the interface, not necessarily the NI's own address, so a NID cannot be reliably derived from a connection's source address.
+
+The claimed NID becomes the key of the peer table, and traffic subsequently selected for that NID may be sent over the connections that claimed it.
+
+Threat scenario:
+
+Attacker: a node that can reach a socklnd listener and run arbitrary code with enough privilege to bind a reserved source port (e.g. root on its own host or VM). It can send a HELLO claiming any NID.
+
+Assumption: the network (fabric, hypervisor or SDN) prevents a node from sending packets from, or receiving packets addressed to, an IP address it does not own. Strict mode relies on this; where it does not hold, the check provides no protection.
+
+ 
+
+Out of scope: on-path and L2 attackers, NAT/proxies, forged LNet headers and peer-membership manipulation.
+
+Proposal:
+
+Add an opt-in policy, off by default, with three modes:
+
+	off: current behavior.
+
+	warn: log and count connections that fail verification but accept them; outgoing source selection is unchanged.
+
+	enforce: bind outgoing connections to the NI's address and reject connections that fail verification, on both active and passive paths.
+
+A connection passes verification when both hold:
+
+	the claimed NID's network equals the receiving NI's network
+
+	the claimed NID's address equals the connection's peer address
+
+The policy is a read-only (0444) module parameter, so every connection in a module's lifetime is created under the same policy.
+
+In enforce mode, peers that source from a non-NID address (e.g. secondary addresses in the same subnet) or sit behind NAT are rejected; warn mode shows which connections would be affected.

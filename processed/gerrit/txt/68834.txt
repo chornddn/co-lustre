@@ -7,14 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Shivaji Kant
 Created:    2026-09-11 08:49:07.000000000
-Updated:    2026-11-06 02:34:28.000000000
-Patch Set:  2
-Insertions: +55
-Deletions:  -9
-Comments:   13 (4 unresolved)
+Updated:    2026-11-09 23:42:09.000000000
+Patch Set:  3
+Insertions: +79
+Deletions:  -22
+Comments:   19 (1 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: James Simmons: +1
   Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
@@ -24,20 +25,25 @@ Comments:   13 (4 unresolved)
 --- Commit Message ---
 LU-20438 clio: eagerly evaluate P2P DMA capability via layout
 
-Evaluating P2P DMA support per-stripe sequentially inside cl_io_loop via
-osc_io_init() suffers from partial-IO discovery failure on heterogeneous
-storage pools. Specifically, if a file's first stripe supports P2P DMA
-but a subsequent stripe does not, ll_direct_IO will submit successfully,
-map ZONE_DEVICE memory for the first chunk, and then fail abruptly midway
-resulting in an unexpected -EFAULT and a non-atomic file state.
+Evaluating P2P DMA support in osc_io_init()/mdc_io_init() is too late:
+lov_io_rw_iter_init() limits each cl_io_loop() pass to one stripe
+chunk, and the sub-IO of a stripe is only created in that pass. If the
+first stripe an I/O touches supports P2P DMA but a later one does not,
+cl_dio_pages_init() pins and submits P2P pages for the first chunks,
+then fails to pin the pages of the next chunk, leaving a partial I/O.
 
-This patch cleanly shifts the capability interrogation from the OSC loop
-up to the LOV composite initialization phase (lov_io_init_composite).
-By looping through the entire layout initially (safely exempting
-Data-on-MDT components which never support P2P DMA), we guarantee
-ci_p2pdma_unsupported is set before cl_dio_pages_init runs on the
-first slice, thereby ensuring an immediate and graceful error before
-any I/O is dispatched.
+Move the check into lov_io_init_composite(), after lov_io_slice_init()
+has set the I/O extent and selected the mirror. Check the OSC/MDC
+import of every instantiated stripe of the selected mirror that
+intersects the I/O extent (the whole file for O_APPEND), so
+ci_p2pdma_unsupported is set before the first page is pinned, while an
+I/O confined to P2P-capable stripes can still use P2P DMA. DoM and all
+RAID0-based patterns (overstriping, parity, compression) are covered,
+and stale components are included for designated mirror (resync) I/O.
+
+Remove the now-redundant check in mdc_io_init(). The osc_dio_submit()
+fast-fail remains as a last resort, e.g. for an import that reconnects
+during the I/O.
 
 Fixes: 83142c39b087 ("LU-20438 clio: Enable P2P DMA in client Direct I/O path")
 Signed-off-by: Shivaji Kant <shivajikant@google.com>
@@ -129,3 +135,51 @@ Problematic, see inline comments. As written the layout walk reads ld_obd from t
 Patch Set 2:
 
 (1 comment)
+
+--- Message (patrick bot, 2026-11-06 21:38:12.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Shivaji Kant, 2026-11-09 09:34:30.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Shivaji Kant, 2026-11-09 09:34:44.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-09 09:37:21.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (Shivaji Kant, 2026-11-09 09:40:11.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-09 09:42:31.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-09 10:00:26.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135758/ : SUCCESS
+
+--- Message (James Simmons, 2026-11-09 15:23:32.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-11-09 23:42:09.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+One concern inline about DIO reads that extend past EOF; otherwise the move to lov_io_init_composite() looks correct.

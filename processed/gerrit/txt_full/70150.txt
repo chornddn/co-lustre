@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-29 08:07:14.000000000
-Updated:    2026-11-05 16:32:11.000000000
-Patch Set:  2
-Insertions: +339
-Deletions:  -124
-Comments:   13 (6 unresolved)
-Hashtags:   pw_shepherd, 218_review_priority, pt_ecro
+Updated:    2026-11-08 20:38:08.000000000
+Patch Set:  3
+Insertions: +631
+Deletions:  -170
+Comments:   20 (0 unresolved)
+Hashtags:   218_review_priority, pw_shepherd, pt_ecro
 
 --- Labels ---
-  Code-Review: Keguang Xu: +1
+  Code-Review: (no votes)
   Verified: jenkins: +1; Maloo: -1
 
 --- Reviewers ---
@@ -35,11 +35,18 @@ earlier tests.
 lod_ec_fit_fdoms() already fits the raid sets to the failure domains
 before either allocator places the data.  Without failure domains,
 count each active OST as a domain of its own, so RR and QoS fit the
-same K.  A -c component wider than the active OSTs is fitted by the
-stripes it can place, and keeps that stripe count.  If its raid sets
-must shrink, it is still to at least 3/4 of the requested K.  As with
-domains, a layout may be stored with the smaller K of its raid sets.
-Describe this in lfs-setstripe.1.
+same K.  Make the fit depend only on the stripe count that fits the
+OSTs: a -c count is reduced to the active OSTs first.  If the largest
+raid set of that count does not fit into the domains with its parity,
+or a -c holds data on all OSTs in raid sets smaller than K, use raid
+sets as large as fit, at most K and at least 3/4 of K, as many as
+there are data stripes for, and leave out the other data stripes
+rather than use more, smaller raid sets, e.g. "-c 16 --ec 8+2" on 9
+OSTs is 7+2 rather than {5, 4}+2, and on 12 OSTs {6, 6}+2.  Below 3/4
+of K, keep the smaller raid sets if they fit, otherwise fail with
+ENOSPC, as with too few domains.  As with domains, a layout may
+be stored with the smaller K of its raid sets.  Describe this in
+lfs-setstripe.1, ec.txt and failure-domain.txt.
 
 ec_split_stripes() split an odd number of data stripes with K=2 into
 raid sets of 2 and one set with a single data stripe, e.g. {2, 2, 1}
@@ -64,7 +71,8 @@ lod_ec_shrink_data_geometry() reduced the split one data stripe at a
 time when fewer OSTs were available, which could leave a single-stripe
 raid set, e.g. {2, 2, 1} for 5 of 6 stripes, unlike the split that
 clients compute from the layout.  Use ec_split_stripes() for the
-reduced count instead, also for the RR shrink to 75% of the stripes.
+reduced count instead, and use lod_ec_shrink_data_geometry() for the
+RR shrink to 75% of the stripes too.
 Since the fitted raid sets were checked against the failure domains,
 never make a raid set larger when shrinking: use the largest raid set
 as K if a single raid set of K would be larger, and leave out one more
@@ -72,19 +80,45 @@ stripe if an odd count with K=2 would make a raid set of 3.  Move
 lod_ec_shrink_data_geometry() after lod_comp_find_linked(), which it
 now uses to set the smaller K in the parity component too.
 lod_stripe_count_min() counted every kept raid set as esc_k0 stripes,
-so "-c 9 --ec 2+1", {3, 2, 2, 2}, could not shrink at all.  Leave out
-the smallest raid sets instead.
+so with the new split "-c 9 --ec 2+1", {3, 2, 2, 2}, could not shrink
+at all.  Leave out the smallest raid sets instead.
+
+The parity mirror has the same extent and stripe size as the data, so
+the parity of all raid sets must fit into the data stripes, as checked
+at setstripe and again at resync.  Smaller raid sets need more parity,
+so a fitted layout could break this, e.g. "-c 9 --ec 3+3" on 7 OSTs
+as {3, 2, 2} with 9 parity stripes for 7 data stripes.  The file would
+be created, but every resync would fail with "too many parities", so
+its parity would never be written.  Add lod_ec_fit_parity(), used when
+fitting to the OSTs or failure domains and by
+lod_ec_shrink_data_geometry(), which leaves out up to 1/4 of the data
+stripes to make the raid sets large enough, as other fits already
+leave out data stripes, so the example is two raid sets of 3+3.  If
+that is not enough, e.g. "-c 4 --ec 4+4" on 7 OSTs as 3+4, fail the
+create with ENOSPC, also when it would be shrunk at allocation, and
+have the QoS shrink of a single raid set keep at least as many data
+stripes as parity.
+
+A data component that has K but no linked parity component, which
+llapi does not create, has no raid set split for a shrink to keep to,
+so split it by its own K, and do not shrink a component without raid
+sets.  A parity component that is already instantiated, which llapi
+does not create either, keeps its raid sets, so its data component is
+not fitted or shrunk.
 
 Have sanity-ec test_27h check that a layout which can't fit fails, and
 one that can gets fewer data stripes, with both the RR and QoS
-allocators.  Add test_31h to check the new raid sets with --ec-map and
-that "-c 5 --ec 2+2" works, test_31i for "-c 5 --ec 2+2" with 4 and 5
-failure domains, and test_65e for recovery of a 3-stripe raid set.
+allocators, in a pool of at most 12 OSTs.  Add test_31h to check the
+new raid sets with --ec-map and that "-c 5 --ec 2+2" works, test_27i
+for the parity fit of the two examples above with both allocators,
+test_27j for a shrink at allocation without a 1-stripe raid set,
+test_27k for the raid sets of a -c wider than the OSTs, and test_65e
+for recovery of a 3-stripe raid set.
 
 Test-Parameters: trivial testlist=sanity-ec
 Fixes: c53abca9f9ee ("LU-19852 lod: raidset aware stripe allocator")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
-Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
+Assisted-by: ClaudeCode:claude-opus-5.5 ltvm llm_code_and_review_tools
 Change-Id: Ief45b5df095e03fd96065b85eb6b1008bd3ebbe5
 
 --- Review History ---
@@ -403,3 +437,99 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The two defects need a refresh; the kernel-doc comment can be fixed in the same cycle.
+
+--- Message (Andreas Dilger, 2026-11-08 01:18:03.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-08 01:18:26.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+PS3 is now split in two, as discussed: this patch makes RR and QoS fit the same layout and fixes the easy cases without changing M, and https://review.whamcloud.com/70595 ("LU-19823 lod: lower EC parity and fill parity to fit OSTs") lowers M where needed and rewrites lod_ec_add_parities(), which fixes the intermittent test_31i/test_35a ENOSPC.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-08 01:22:27.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-08 01:31:08.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-08 01:42:24.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135694/ : SUCCESS
+
+--- Message (Maloo, 2026-11-08 01:43:19.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 135694 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135694&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135694#redirect
+
+--- Message (Maloo, 2026-11-08 16:05:57.000000000) ---
+Patch Set 3:
+
+Failed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest from onyx-157vm57: https://testing.whamcloud.com/test_sessions/ae72df54-a578-43a2-8f1f-1bf54a22fa41 ran 3 tests.  1 tests failed: sanity-ec.
+
+--- Message (patrick bot, 2026-11-08 16:41:26.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-08 20:18:56.000000000) ---
+Patch Set 3: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest from onyx-154vm27: https://testing.whamcloud.com/test_sessions/009fe5ca-c49e-4f57-b5a4-74e132947795 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-08 20:38:08.000000000) ---
+Patch Set 3:
+
+Looks good to me.

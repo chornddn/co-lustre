@@ -1,0 +1,56 @@
+Key:        LU-21141
+Summary:    nodemap: nodemap_clear_dynamic_nodemaps() walks nm_list without the lock
+Link:       https://jira.whamcloud.com/browse/LU-21141
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Fri, 6 Nov 2026 16:12:37 +0000
+Updated:    Fri, 6 Nov 2026 16:20:48 +0000
+Links:      Related: is related to  LU-19478
+
+--- Description ---
+Problem
+
+nodemap_clear_dynamic_nodemaps() links the nodemaps through nm_list under active_config_lock. It then drops the lock and walks the list. Other code relinks nm_list under that lock, and a concurrent call of the function does the same. The walk then follows a list that it does not own.
+
+mgs_iocontrol_nodemap() calls this function after a nodemap change when dynamic nodemaps exist and the MGS has a local target. Thus two concurrent nodemap commands on such an MGS can crash or hang the node. LU-19478 added the function, so all branches with that change have the defect.
+
+Reproduction
+
+On a VM, I added a delay between the unlock and the walk. One nodemap change waited at the delay, and a second change then ran. The node crashed as soon as the delay ended:
+
+Unable to handle kernel paging request at virtual address 0000ffff9906144c
+Internal error: Oops: 0000000096000006 [#1] SMP
+pc : nodemap_clear_dynamic_nodemaps+0x12c/0x230 [ptlrpc]
+
+The delay widens the window. I did not reproduce the crash without the delay.
+
+Fix
+
+	Copy the dynamic nodemap names under active_config_lock, and delete by name after the unlock.
+
+	Let only one call of the function delete at a time, because nodemap_del() walks nm_subnodemaps without the lock.
+
+	Move the nm_parent_entry unlink in nodemap_destroy() under active_config_lock.
+
+Remaining gaps
+
+	An explicit nodemap_del that runs with a clear still walks nm_subnodemaps without the lock.
+
+	The check that a name is dynamic and the delete are not atomic. If an administrator removes a dynamic nodemap and adds a persistent nodemap with that name in this window, the clear removes the persistent nodemap. The earlier code has the same window.
+
+--- Comment (gerrit, Fri, 6 Nov 2026 16:13:48 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70538
+
+Subject: LU-21141 nodemap: do not walk nm_list without the lock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f60b3fa1e6ec467ea63356baf15cfdf63693748f

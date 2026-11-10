@@ -1,0 +1,40 @@
+Key:        LU-21164
+Summary:    Linux 7.3: kernel threads cannot open debug and checksum dump files (nullfs root)
+Link:       https://jira.whamcloud.com/browse/LU-21164
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   John Grasso
+Reporter:   John Grasso
+Created:    Mon, 9 Nov 2026 15:17:57 +0000
+Updated:    Mon, 9 Nov 2026 15:28:52 +0000
+Links:      Related: is related to  LU-20861
+
+--- Description ---
+Linux 7.3 merged "fs: start all kthreads in nullfs" (32750c77e811), and "fs: add scoped_with_init_fs()" (67c54d1d730a) in the same series. init_task's root and pwd now point at a private, empty nullfs, and every kthread shares it. Path lookups from kthread context fail with -ENOENT unless the caller wraps them in scoped_with_init_fs(). Usermodehelpers are unaffected as they use userspace_init_fs.
+
+Lustre opens files by absolute path from kthreads in several places, and none of them produce output on 7.3:
+
+	lnet/libcfs/debug.c libcfs_debug_dumplog_internal() -> cfs_tracefile_dump_all_pages(): the debug log dump to debug_path (dumplog thread, and the LBUG path)
+
+	lnet/libcfs/tracefile.c tracefiled(): the debug daemon file ("lctl debug_daemon start")
+
+	lustre/osc/osc_request.c dump_all_bulk_pages(): checksum error page dump (ptlrpcd)
+
+	lustre/target/tgt_handler.c: server-side checksum error page dump (service threads)
+
+	lustre/kunit/kinode.c stat_thread(): kinode test kthread
+
+Seen with the 2.15 client on kernel 7.3.1 (x86_64, aarch64 with 4K and 64K pages):
+
+LustreError: dumping log to /tmp/f60f.sanity.1793998958.261983
+LustreError: can't open /tmp/f60f.sanity.1793998958.261983 for dump: rc = -2
+Lustre: couldn't open /tmp/f170.sanity_log_good: rc = -2
+osc_request.c:2003:dump_all_bulk_pages() ... can't open to dump pages with checksum error: rc = -2
+
+sanity test_60f, test_77c and test_170 fail deterministically. "lctl dk " still works, because it opens the file in the caller's process context. In the same test run, the server-side checksum dump succeeded on a 5.10 OSS.
+
+Impact: no data-path or correctness impact, but debug logs are lost on LBUG, eviction and timeout dumps, which hurts field debugging.
+
+Fix: wrap these lookups in scoped_with_init_fs() (with a configure check, and a no-op fallback for older kernels). Dumps requested through "lctl dk" still resolve the path in the caller's context.

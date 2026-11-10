@@ -1,0 +1,160 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21144] Fast unplanned MDT recovery at scale</title>
+                <link>https://jira.whamcloud.com/browse/LU-21144</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h3&gt;&lt;a name="ProblemStatement"&gt;&lt;/a&gt;Problem Statement&lt;/h3&gt;
+
+&lt;p&gt;In large-scale AI/ML and HPC Lustre deployments (3,000+ clients and 10+ DNE MDTs), unplanned MDT recovery (&lt;tt&gt;target_recovery_thread()&lt;/tt&gt;) experiences severe wall-clock stalls and quadratic CPU bottlenecks:&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;&lt;b&gt;Stage 0 Dead-Client Wait (250-300s stall)&lt;/b&gt;: &lt;tt&gt;struct lsd_client_data&lt;/tt&gt; in &lt;tt&gt;last_rcvd&lt;/tt&gt; (&lt;tt&gt;LR_CLIENT_SIZE = 128&lt;/tt&gt;) persists &lt;tt&gt;lcd_uuid&lt;/tt&gt; but not the client's &lt;tt&gt;struct lnet_nid&lt;/tt&gt;. If even one client node crashes concurrently with an MDT restart, the recovering MDT cannot actively probe unconnected exports and stalls Stage 1 replay for the full passive &lt;tt&gt;obd_recovery_timeout&lt;/tt&gt; (2.5 * &lt;tt&gt;obd_timeout&lt;/tt&gt;).&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Stage 1 Server Request Replay Queue (O(R^2) CPU)&lt;/b&gt;: &lt;tt&gt;target_queue_recovery_request()&lt;/tt&gt; linearly scans &lt;tt&gt;exp_req_replay_queue&lt;/tt&gt; and &lt;tt&gt;obd_req_replay_queue&lt;/tt&gt; on every out-of-order replay RPC insertion.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Stage 1 Client Committed-Open Replay (O * RTT latency)&lt;/b&gt;: &lt;tt&gt;ptlrpc_replay_next()&lt;/tt&gt; replays committed open handles on &lt;tt&gt;imp_committed_list&lt;/tt&gt; one RPC at a time (&lt;tt&gt;*inflight = 1&lt;/tt&gt;), even though committed opens (&lt;tt&gt;transno &amp;lt; obd_next_recovery_transno&lt;/tt&gt;) are independent in-memory handle reconstructions on the server.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Stage 1 DNE Cross-MDT Update Recovery (O(U^2) CPU)&lt;/b&gt;: &lt;tt&gt;update_recovery.c&lt;/tt&gt; allocates replay structures for already-committed batches (&lt;tt&gt;ur_batchid &amp;lt;= tdtd_committed_batchid&lt;/tt&gt;) and performs linear O(U) list scans for &lt;tt&gt;batchid&lt;/tt&gt; and &lt;tt&gt;transno&lt;/tt&gt; lookups.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Stage 2 Server Lock Replay (Single-Threaded Serialization)&lt;/b&gt;: After Stage 1 completes, all &lt;tt&gt;MSG_REQ_REPLAY_DONE&lt;/tt&gt; lock replay RPCs are queued onto &lt;tt&gt;obd_lock_replay_queue&lt;/tt&gt; and processed serially by the single &lt;tt&gt;target_recovery_thread&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h3&gt;&lt;a name="ProposedSolution"&gt;&lt;/a&gt;Proposed Solution&lt;/h3&gt;
+
+&lt;p&gt;This improvement addresses all five bottlenecks across a 5-patch series without modifying the Lustre wire protocol or changing the 128-byte &lt;tt&gt;last_rcvd&lt;/tt&gt; client slot layout:&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;&lt;b&gt;&lt;tt&gt;recovery: use rbtree for target req replay queue&lt;/tt&gt;&lt;/b&gt;: Index queued Stage 1 replay requests in an &lt;tt&gt;rb_root_cached&lt;/tt&gt; (&lt;tt&gt;obd_req_replay_rbtree&lt;/tt&gt;) for O(log R) sorted insertion and duplicate &lt;tt&gt;transno&lt;/tt&gt; detection, while keeping O(1) in-flight resent duplicate detection at the head of &lt;tt&gt;exp_req_replay_queue&lt;/tt&gt;. Adds &lt;tt&gt;OBD_FAIL_TGT_LEGACY_RECOVERY&lt;/tt&gt; (&lt;tt&gt;0x728&lt;/tt&gt;) for runtime A/B fallback.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;&lt;tt&gt;ptlrpc: pipeline client committed-open replays&lt;/tt&gt;&lt;/b&gt;: Pipeline up to 16 concurrent committed-open replay RPCs (&lt;tt&gt;PTLRPC_MAX_COMMITTED_REPLAY_INFLIGHT = 16&lt;/tt&gt;) from &lt;tt&gt;imp_committed_list&lt;/tt&gt;, with monotonic &lt;tt&gt;imp_last_replay_transno&lt;/tt&gt; tracking, error-rewind on timeout, and a strict &lt;tt&gt;imp_replay_inflight == 0&lt;/tt&gt; barrier before uncommitted &lt;tt&gt;imp_replay_list&lt;/tt&gt; replay.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;&lt;tt&gt;target: optimize DNE distributed txn recovery&lt;/tt&gt;&lt;/b&gt;: Skip committed DNE update log records (&lt;tt&gt;ur_batchid &amp;lt;= tdtd_committed_batchid&lt;/tt&gt;, including &lt;tt&gt;UPDATE_RECORD_CONTINUE&lt;/tt&gt; chunks) in O(1) time and index active/finished DNE replay items via red-black trees (&lt;tt&gt;tdtd_replay_batchid_root&lt;/tt&gt;, &lt;tt&gt;tdtd_replay_transno_root&lt;/tt&gt;, &lt;tt&gt;tdtd_finish_transno_root&lt;/tt&gt;) for O(log U) lookups.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;&lt;tt&gt;ldlm: execute Stage 2 lock replays in parallel&lt;/tt&gt;&lt;/b&gt;: Set &lt;tt&gt;obd_req_replay_done&lt;/tt&gt; once Stage 1 finishes so Stage 2 &lt;tt&gt;MSG_REQ_REPLAY_DONE&lt;/tt&gt; lock replay RPCs execute in parallel on PTLRPC worker threads, gated before Stage 3 by an &lt;tt&gt;obd_lock_replay_inflight == 0&lt;/tt&gt; barrier in &lt;tt&gt;check_for_next_lock()&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;&lt;tt&gt;target: probe unconnected client NIDs in recovery&lt;/tt&gt;&lt;/b&gt;: Persist each client export's &lt;tt&gt;struct lnet_nid&lt;/tt&gt; in a sidecar local object (&lt;tt&gt;CLIENT_NIDS_OID = 4126UL&lt;/tt&gt;, &lt;tt&gt;"client_nids"&lt;/tt&gt;, indexed by &lt;tt&gt;ted_lr_idx&lt;/tt&gt;) within the same local OSD transaction as &lt;tt&gt;last_rcvd&lt;/tt&gt;. Export &lt;tt&gt;LNetPingPeer()&lt;/tt&gt; and schedule asynchronous workqueue probes for unconnected exports after &lt;tt&gt;obd_recovery_probe_delay&lt;/tt&gt; so unreachable clients are evicted in ~7-10s (enabling VBR) instead of blocking Stage 1 for 250-300s.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h3&gt;&lt;a name="Interoperability%26UpgradeCompatibility"&gt;&lt;/a&gt;Interoperability &amp;amp; Upgrade Compatibility&lt;/h3&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;Wire Protocol&lt;/b&gt;: Zero RPC or connect-flag changes; old clients interoperate transparently with new servers and vice versa.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;On-Disk Format&lt;/b&gt;: &lt;tt&gt;last_rcvd&lt;/tt&gt; is unchanged. On upgrade, &lt;tt&gt;tgt_init()&lt;/tt&gt; creates &lt;tt&gt;client_nids&lt;/tt&gt; (&lt;tt&gt;OID 4126&lt;/tt&gt;) and &lt;tt&gt;tgt_clients_data_init()&lt;/tt&gt; ignores EOF for pre-upgrade slots until clients reconnect. On downgrade, older releases ignore &lt;tt&gt;OID 4126&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="BenchmarkResults%283%2C000Clientsx11DNEMDTs%2C10DeadClients%29"&gt;&lt;/a&gt;Benchmark Results (3,000 Clients x 11 DNE MDTs, 10 Dead Clients)&lt;/h3&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt; Recovery Phase &lt;/th&gt;
+&lt;th class='confluenceTh'&gt; Legacy Baseline &lt;/th&gt;
+&lt;th class='confluenceTh'&gt; Fast Recovery &lt;/th&gt;
+&lt;th class='confluenceTh'&gt; Speedup &lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Stage 0: Dead-Client Eviction Wait (10/3,000 dead) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 300.0 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 10.0 s &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;30.0x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Stage 1: 11-MDT Request Replay Queue (5,990 reqs) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 33.40 ms &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 3.04 ms &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;11.0x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Stage 1: 11-MDT Committed Opens (352 opens) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 36.07 ms (352 RTT) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 7.59 ms (22 RTT) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;4.8x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Stage 1: 11-MDT Cross-MDT DNE Recovery (4,000 txns) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 320.51 ms &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 3.17 ms &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;101.2x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; Stage 2: 3,000-Client Lock Replay (2,990 locks) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 30.96 ms (2,990 waves) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; 2.15 ms (47 waves) &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;14.4x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;Total Active Replay Execution (Stages 1-2)&lt;/b&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;420.93 ms&lt;/b&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;15.94 ms&lt;/b&gt; &lt;/td&gt;
+&lt;td class='confluenceTd'&gt; &lt;b&gt;26.4x&lt;/b&gt; &lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+</description>
+                <environment />
+        <key id="100345">LU-21144</key>
+            <summary>Fast unplanned MDT recovery at scale</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="mironikolov">Miro Nikolov</reporter>
+                        <labels>
+                    </labels>
+                <created>Fri, 6 Nov 2026 18:36:37 +0000</created>
+                <updated>Sat, 7 Nov 2026 10:57:08 +0000</updated>
+                                            <version>Lustre 2.16.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>5</watches>
+                                                                            <comments>
+                            <comment id="505429" author="JIRAUSER21301" created="Fri, 6 Nov 2026 20:48:50 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=mironikolov" class="user-hover" rel="mironikolov"&gt;mironikolov&lt;/a&gt; are you working on a patch to implement your proposed solution?&lt;/p&gt;</comment>
+                            <comment id="505433" author="JIRAUSER19596" created="Fri, 6 Nov 2026 20:53:01 +0000">&lt;p&gt;Yes I am working on a patch with the proposed solution&lt;/p&gt;</comment>
+                            <comment id="505469" author="adilger" created="Sat, 7 Nov 2026 10:57:08 +0000">&lt;blockquote&gt;
+&lt;p&gt;&lt;tt&gt;struct lsd_client_data&lt;/tt&gt; in &lt;tt&gt;last_rcvd&lt;/tt&gt; (&lt;tt&gt;LR_CLIENT_SIZE = 128&lt;/tt&gt;) persists &lt;tt&gt;lcd_uuid&lt;/tt&gt; but not the client's &lt;tt&gt;struct lnet_nid&lt;/tt&gt;&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;We have implemented the same for the maintenance mode in &lt;a href="https://jira.whamcloud.com/browse/LU-20359" title="partially quiesce clients before maintenance for bounded recovery" class="issue-link" data-issue-key="LU-20359"&gt;LU-20359&lt;/a&gt;, for basically the same reason - to allow the server to contact clients after recovery.  I can provide a patch with the on-disk format next week.&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="98036">LU-20359</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                                <inwardlinks description="is related to">
+                                        <issuelink>
+            <issuekey id="91146">LU-19199</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072qn:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

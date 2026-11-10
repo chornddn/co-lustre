@@ -1,0 +1,95 @@
+Key:        LU-21144
+Summary:    Fast unplanned MDT recovery at scale
+Link:       https://jira.whamcloud.com/browse/LU-21144
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Miro Nikolov
+Created:    Fri, 6 Nov 2026 18:36:37 +0000
+Updated:    Sat, 7 Nov 2026 10:57:08 +0000
+Links:      Related: is related to  LU-20359; Related: is related to LU-19199
+
+--- Description ---
+Problem Statement
+
+In large-scale AI/ML and HPC Lustre deployments (3,000+ clients and 10+ DNE MDTs), unplanned MDT recovery (target_recovery_thread()) experiences severe wall-clock stalls and quadratic CPU bottlenecks:
+
+	Stage 0 Dead-Client Wait (250-300s stall): struct lsd_client_data in last_rcvd (LR_CLIENT_SIZE = 128) persists lcd_uuid but not the client's struct lnet_nid. If even one client node crashes concurrently with an MDT restart, the recovering MDT cannot actively probe unconnected exports and stalls Stage 1 replay for the full passive obd_recovery_timeout (2.5 * obd_timeout).
+
+	Stage 1 Server Request Replay Queue (O(R^2) CPU): target_queue_recovery_request() linearly scans exp_req_replay_queue and obd_req_replay_queue on every out-of-order replay RPC insertion.
+
+	Stage 1 Client Committed-Open Replay (O * RTT latency): ptlrpc_replay_next() replays committed open handles on imp_committed_list one RPC at a time (*inflight = 1), even though committed opens (transno ) are independent in-memory handle reconstructions on the server.
+
+	Stage 1 DNE Cross-MDT Update Recovery (O(U^2) CPU): update_recovery.c allocates replay structures for already-committed batches (ur_batchid ) and performs linear O(U) list scans for batchid and transno lookups.
+
+	Stage 2 Server Lock Replay (Single-Threaded Serialization): After Stage 1 completes, all MSG_REQ_REPLAY_DONE lock replay RPCs are queued onto obd_lock_replay_queue and processed serially by the single target_recovery_thread.
+
+Proposed Solution
+
+This improvement addresses all five bottlenecks across a 5-patch series without modifying the Lustre wire protocol or changing the 128-byte last_rcvd client slot layout:
+
+	recovery: use rbtree for target req replay queue: Index queued Stage 1 replay requests in an rb_root_cached (obd_req_replay_rbtree) for O(log R) sorted insertion and duplicate transno detection, while keeping O(1) in-flight resent duplicate detection at the head of exp_req_replay_queue. Adds OBD_FAIL_TGT_LEGACY_RECOVERY (0x728) for runtime A/B fallback.
+
+	ptlrpc: pipeline client committed-open replays: Pipeline up to 16 concurrent committed-open replay RPCs (PTLRPC_MAX_COMMITTED_REPLAY_INFLIGHT = 16) from imp_committed_list, with monotonic imp_last_replay_transno tracking, error-rewind on timeout, and a strict imp_replay_inflight == 0 barrier before uncommitted imp_replay_list replay.
+
+	target: optimize DNE distributed txn recovery: Skip committed DNE update log records (ur_batchid , including UPDATE_RECORD_CONTINUE chunks) in O(1) time and index active/finished DNE replay items via red-black trees (tdtd_replay_batchid_root, tdtd_replay_transno_root, tdtd_finish_transno_root) for O(log U) lookups.
+
+	ldlm: execute Stage 2 lock replays in parallel: Set obd_req_replay_done once Stage 1 finishes so Stage 2 MSG_REQ_REPLAY_DONE lock replay RPCs execute in parallel on PTLRPC worker threads, gated before Stage 3 by an obd_lock_replay_inflight == 0 barrier in check_for_next_lock().
+
+	target: probe unconnected client NIDs in recovery: Persist each client export's struct lnet_nid in a sidecar local object (CLIENT_NIDS_OID = 4126UL, "client_nids", indexed by ted_lr_idx) within the same local OSD transaction as last_rcvd. Export LNetPingPeer() and schedule asynchronous workqueue probes for unconnected exports after obd_recovery_probe_delay so unreachable clients are evicted in ~7-10s (enabling VBR) instead of blocking Stage 1 for 250-300s.
+
+Interoperability & Upgrade Compatibility
+
+	Wire Protocol: Zero RPC or connect-flag changes; old clients interoperate transparently with new servers and vice versa.
+
+	On-Disk Format: last_rcvd is unchanged. On upgrade, tgt_init() creates client_nids (OID 4126) and tgt_clients_data_init() ignores EOF for pre-upgrade slots until clients reconnect. On downgrade, older releases ignore OID 4126.
+
+Benchmark Results (3,000 Clients x 11 DNE MDTs, 10 Dead Clients)
+
+ Recovery Phase 
+ Legacy Baseline 
+ Fast Recovery 
+ Speedup 
+
+ Stage 0: Dead-Client Eviction Wait (10/3,000 dead) 
+ 300.0 s 
+ 10.0 s 
+ 30.0x 
+
+ Stage 1: 11-MDT Request Replay Queue (5,990 reqs) 
+ 33.40 ms 
+ 3.04 ms 
+ 11.0x 
+
+ Stage 1: 11-MDT Committed Opens (352 opens) 
+ 36.07 ms (352 RTT) 
+ 7.59 ms (22 RTT) 
+ 4.8x 
+
+ Stage 1: 11-MDT Cross-MDT DNE Recovery (4,000 txns) 
+ 320.51 ms 
+ 3.17 ms 
+ 101.2x 
+
+ Stage 2: 3,000-Client Lock Replay (2,990 locks) 
+ 30.96 ms (2,990 waves) 
+ 2.15 ms (47 waves) 
+ 14.4x 
+
+ Total Active Replay Execution (Stages 1-2) 
+ 420.93 ms 
+ 15.94 ms 
+ 26.4x
+
+--- Comment (JIRAUSER21301, Fri, 6 Nov 2026 20:48:50 +0000) ---
+mironikolov are you working on a patch to implement your proposed solution?
+
+--- Comment (JIRAUSER19596, Fri, 6 Nov 2026 20:53:01 +0000) ---
+Yes I am working on a patch with the proposed solution
+
+--- Comment (adilger, Sat, 7 Nov 2026 10:57:08 +0000) ---
+struct lsd_client_data in last_rcvd (LR_CLIENT_SIZE = 128) persists lcd_uuid but not the client's struct lnet_nid
+
+We have implemented the same for the maintenance mode in LU-20359, for basically the same reason - to allow the server to contact clients after recovery.  I can provide a patch with the on-disk format next week.

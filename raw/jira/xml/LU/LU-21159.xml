@@ -1,0 +1,143 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21159] hybrid IO: buffered read()/write() fails with ENOMEM or EINVAL when the DIO bounce page pool is short</title>
+                <link>https://jira.whamcloud.com/browse/LU-21159</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;An unaligned buffered read()/write() that hybrid IO switches to DIO fails when the bounce page pool cannot supply the whole sub-DIO, although buffered IO of the same call would succeed:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;EINVAL&lt;/tt&gt; when one sub-DIO needs more pages than the pool can ever hold (about 260 MiB on a 4 GB client). This is the &lt;tt&gt;np.save()&lt;/tt&gt; failure in &lt;a href="https://jira.whamcloud.com/browse/LU-19932" title="client write hang in osc_extent_wait()" class="issue-link" data-issue-key="LU-19932"&gt;LU-19932&lt;/a&gt;.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;ENOMEM&lt;/tt&gt; when other processes hold the pool's pages. A few concurrent large unaligned IOs are enough.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;p&gt;Client with 4 GB RAM and 4 KiB pages, default tunables, ldiskfs OSTs:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lfs setstripe -c 1 /mnt/lustre/d; cd /mnt/lustre/d
+# 1. one write at file offset 1, larger than the pool (pool_4k max_objects 66814 = 261 MiB here)
+dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=/dev/zero of=f0 bs=300M count=1 seek=1 oflag=seek_bytes
+# 2. four writes at file offset 1 at the same time, each smaller than the pool
+&lt;span class="code-keyword"&gt;for&lt;/span&gt; i in 1 2 3 4; &lt;span class="code-keyword"&gt;do&lt;/span&gt; dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=/dev/zero of=f$i bs=100M count=1 seek=1 oflag=seek_bytes status=none &amp;amp; done; wait
+# 3. any client: the existing fail_loc OBD_FAIL_LLITE_DIO_BUFFER_ALLOC, one 4 MiB write
+lctl set_param fail_loc=0x1438
+dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=/dev/zero of=f5 bs=4M count=1 seek=1 oflag=seek_bytes
+lctl set_param fail_loc=0
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Output on master 8a35ae662e (client and servers 2.17.61, EL9.8 client, kernel 5.14.0-687.66.1.el9_8):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;# dd if=/dev/zero of=f0 bs=300M count=1 seek=1 oflag=seek_bytes
+dd: error writing 'f0': Invalid argument
+0 bytes copied, 0.0291946 s, 0.0 kB/s
+# for i in 1 2 3 4; do dd ... bs=100M count=1 seek=1 oflag=seek_bytes ... &amp;amp; done; wait
+dd: error writing 'f1': Cannot allocate memory
+dd: error writing 'f3': Cannot allocate memory
+# lctl get_param -n sptlrpc.page_pools   (pool_4k)
+    max_objects: 66814
+    total_objects: 66814
+# lctl set_param fail_loc=0x1438
+# dd if=/dev/zero of=f5 bs=4M count=1 seek=1 oflag=seek_bytes
+dd: error writing 'f5': Cannot allocate memory
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The same for reads: four concurrent 100 MiB &lt;tt&gt;dd&lt;/tt&gt; reads at offset 1 gave 2 x "error reading: Cannot allocate memory", and an 8 MiB read at offset 1 with &lt;tt&gt;fail_loc=0x1438&lt;/tt&gt; also fails with ENOMEM. A 300 MiB &lt;tt&gt;os.write()&lt;/tt&gt; from an unaligned Python buffer at file offset 0 fails with &lt;tt&gt;OSError: &lt;span class="error"&gt;&amp;#91;Errno 22&amp;#93;&lt;/span&gt; Invalid argument&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;All three succeed with &lt;tt&gt;lctl set_param llite.*.hybrid_io=0&lt;/tt&gt;, and with aligned writes (offset 0) with hybrid IO on. With &lt;tt&gt;oflag=direct&lt;/tt&gt; the ENOMEM of case 3 is expected, the application asked for DIO.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Analysis%28master8a35ae662e%29"&gt;&lt;/a&gt;Analysis (master 8a35ae662e)&lt;/h3&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;&lt;tt&gt;ll_hybrid_bio_dio_switch_check()&lt;/tt&gt; (&lt;tt&gt;lustre/llite/file.c:2114&lt;/tt&gt;, thresholds at 2163-2173) switches the IO, &lt;tt&gt;do_file_write_iter()&lt;/tt&gt; (&lt;tt&gt;file.c:2872&lt;/tt&gt;) and &lt;tt&gt;do_file_read_iter()&lt;/tt&gt; (&lt;tt&gt;file.c:2719&lt;/tt&gt;) set &lt;tt&gt;IOCB_DIRECT&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;ll_direct_IO()&lt;/tt&gt; (&lt;tt&gt;lustre/llite/rw26.c:333&lt;/tt&gt;) sees an unaligned offset or iovec (rw26.c:365-368) and builds sub-DIOs of up to &lt;tt&gt;MAX_DIO_SIZE&lt;/tt&gt; (rw26.c:473, about 576 MiB on x86_64). &lt;tt&gt;cl_dio_pages_init()&lt;/tt&gt; calls &lt;tt&gt;ll_allocate_dio_buffer()&lt;/tt&gt; (&lt;tt&gt;lustre/obdclass/cl_page.c:223&lt;/tt&gt;, &lt;tt&gt;lustre/obdclass/cl_io.c:1491&lt;/tt&gt;), which takes all bounce pages of the sub-DIO at once with &lt;tt&gt;obd_pool_get_folios_array()&lt;/tt&gt; (cl_io.c:1524).&lt;/li&gt;
+	&lt;li&gt;The pool holds at most &lt;tt&gt;totalram_pages() / POOLS_COUNT&lt;/tt&gt; pages (&lt;tt&gt;lustre/obdclass/page_pools.c:1049&lt;/tt&gt;, 1079). &lt;tt&gt;__obd_pool_get_objects()&lt;/tt&gt; returns &lt;tt&gt;-EINVAL&lt;/tt&gt; for a request above that (page_pools.c:700), and &lt;tt&gt;-ENOMEM&lt;/tt&gt; without waiting when the pool is at its maximum and nobody is growing it (page_pools.c:725-751). Not waiting is on purpose for ptlrpcd, but here the caller is the user process.&lt;/li&gt;
+	&lt;li&gt;The drain and retry of &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt; (rw26.c:506-542) retries only when earlier sub-DIOs of the same call are in flight (&lt;tt&gt;tot_bytes &amp;gt; bytes_at_drain&lt;/tt&gt;, rw26.c:507-508). For the first sub-DIO, or when the pages are held by other processes, the error is returned through &lt;tt&gt;ll_file_io_generic()&lt;/tt&gt; to &lt;tt&gt;write()&lt;/tt&gt;/&lt;tt&gt;read()&lt;/tt&gt;. &lt;tt&gt;-EINVAL&lt;/tt&gt; is never retried.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h3&gt;&lt;a name="Related"&gt;&lt;/a&gt;Related&lt;/h3&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19932" title="client write hang in osc_extent_wait()" class="issue-link" data-issue-key="LU-19932"&gt;LU-19932&lt;/a&gt;: the &lt;tt&gt;np.save()&lt;/tt&gt; EINVAL on aarch64 (comment of 2026-08-14) is case 1.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;LU-19536&lt;/a&gt; (64351, drain and retry on ENOMEM): covers only later sub-DIOs of one call.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://review.whamcloud.com/68541" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/68541&lt;/a&gt; (&lt;a href="https://jira.whamcloud.com/browse/LU-19895" title="implement large folio support" class="issue-link" data-issue-key="LU-19895"&gt;LU-19895&lt;/a&gt;, open): caps the bounce buffer at half the pool. With PS23 case 1 passes, cases 2 and 3 still fail.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Suggestedfix"&gt;&lt;/a&gt;Suggested fix&lt;/h3&gt;
+
+&lt;p&gt;A hybrid-switched IO that gets &lt;tt&gt;-ENOMEM&lt;/tt&gt; (or &lt;tt&gt;-EINVAL&lt;/tt&gt;) from the bounce buffer allocation should be done as buffered IO, which is what the application asked for. Returning 0 from &lt;tt&gt;ll_direct_IO()&lt;/tt&gt; (rw26.c:447) is not enough, since the switched DIO is lockless and took no extent lock for a buffered fallback inside it. A prototype redoes the IO from &lt;tt&gt;do_file_write_iter()&lt;/tt&gt;/&lt;tt&gt;do_file_read_iter()&lt;/tt&gt; through &lt;tt&gt;ll_file_io_generic()&lt;/tt&gt; without &lt;tt&gt;IOCB_DIRECT&lt;/tt&gt;, from the saved iterator and &lt;tt&gt;ki_pos&lt;/tt&gt; (a failed DIO reports no bytes even when earlier stripe chunks were done), leaves out &lt;tt&gt;O_APPEND&lt;/tt&gt; writes, and caps an unaligned sub-DIO at a fraction of the pool, as 68541 does, so that one call never exceeds the pool. With it all of the above pass, an &lt;tt&gt;O_DIRECT&lt;/tt&gt; write still gets ENOMEM, and a new sanity test using &lt;tt&gt;fail_loc=0x1438&lt;/tt&gt; passes.&lt;/p&gt;</description>
+                <environment>master 8a35ae662e (2.17.61) client and servers, EL9.8 client (5.14.0-687.66.1.el9_8), x86_64, 4 GB RAM, ldiskfs OSTs; also 2.17.0</environment>
+        <key id="100385">LU-21159</key>
+            <summary>hybrid IO: buffered read()/write() fails with ENOMEM or EINVAL when the DIO bounce page pool is short</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="markus.hilger">Markus Hilger</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 9 Nov 2026 01:15:52 +0000</created>
+                <updated>Mon, 9 Nov 2026 22:06:35 +0000</updated>
+                                            <version>Lustre 2.17.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505607" author="JIRAUSER19234" created="Mon, 9 Nov 2026 22:04:03 +0000">&lt;p&gt;Attempting to do some benchmark testing locally running MLPerf storage and came across this issue as well. is there an open gerrit ticket I can cherrypick to see if that fixes my issue?&lt;/p&gt;
+
+&lt;p&gt;If not I will look into opening one.&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="93248">LU-19536</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="95986">LU-19932</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="95770">LU-19895</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i072tz:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

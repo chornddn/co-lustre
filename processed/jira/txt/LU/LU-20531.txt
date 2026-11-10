@@ -8,7 +8,7 @@ Resolution: Unresolved
 Assignee:   Vandana Rungta
 Reporter:   Vandana Rungta
 Created:    Tue, 28 Jul 2026 15:26:36 +0000
-Updated:    Fri, 30 Oct 2026 23:49:56 +0000
+Updated:    Tue, 10 Nov 2026 01:00:05 +0000
 
 --- Environment ---
 16-MDT DNE filesystem, ~535 TiB, Lustre 2.15, EL9 kernel (5.14.x). Triggered during failover/recovery of a single MDT.
@@ -614,3 +614,48 @@ also removes only the demonstrated trigger, not the whole class - the untimed
 wait in obd_get_mod_rpc_slot() and the inline Data-on-MDT flush in
 
 ll_lock_cancel_bits() are untouched and remain separate blocking points.
+
+--- Comment (JIRAUSER19474, Tue, 10 Nov 2026 01:00:05 +0000) ---
+Update: root cause of the reported stack, and a fix that has been tested against it.
+
+The hung ldlm_bl threads in the report are doing ordinary LRU cancellation.
+
+The close comes from evicting the PARENT directory of a pruned dentry:
+
+d_prune_aliases() drops the dentry's reference on its parent, and if that was
+
+the parent's last reference the parent is evicted and ll_clear_inode() closes
+
+its cached open handle synchronously. If that handle's MDT is down, the
+
+ldlm_bl thread waits for as long as the MDT is away. The pool is shared by
+
+every namespace on the node, so cancellation for healthy MDTs stops too. With
+
+DNE the lock and the open handle can be on different MDTs.
+
+Reproduced on mainline, matching the reported stack frame for frame. One lab
+
+assist: the parent must be evicted on its last iput, forced here with
+
+llite.*.inode_cache=0.
+
+The earlier theory that the replay thread issues the close is wrong for these
+
+trees: the pre-replay cancel uses the no-wait policy and mdc_cancel_weight()
+
+refuses OPEN locks.
+
+Fix posted as https://review.whamcloud.com/67599 patchset 17 (llite only):
+
+closes and eviction iputs from the cancel path run in a per-sb workqueue; the
+
+cancelling thread keeps the old ordering while the MDT is reachable and stops
+
+waiting once it is not. Two new recovery-small tests, test_172 and test_173,
+
+fail without the fix and pass with it. Full recovery-small passes except
+
+test_156 (tot_granted after OST eviction), which fails the same way unpatched
+
+on this setup.

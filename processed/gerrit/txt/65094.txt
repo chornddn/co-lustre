@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Shaun Tancheff
 Created:    2026-04-04 14:40:09.000000000
-Updated:    2026-11-06 06:10:35.000000000
-Patch Set:  60
-Insertions: +2763
-Deletions:  -1177
-Comments:   3120 (0 unresolved)
+Updated:    2026-11-10 02:39:49.000000000
+Patch Set:  64
+Insertions: +2888
+Deletions:  -1192
+Comments:   3366 (0 unresolved)
 Hashtags:   pw_own
 
 --- Labels ---
@@ -19,7 +19,7 @@ Hashtags:   pw_own
   Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Nikitas Angelinas, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Nikitas Angelinas, Shuichi Ihara, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, James Simmons, Qian Yingjin, Shaun Tancheff, Patrick Farrell, Timothy Day, patrick bot
 
 --- Commit Message ---
@@ -47,7 +47,9 @@ chunk they start in. An mmap write to a cached folio that no
 longer fits one RPC drops it and refaults. Files whose layout
 has a parity component keep base pages until EC recovery
 handles folios, and EC recovery drops a large folio a fault
-left there.
+left there. Base pages are also used while enable_mlock_pages
+is set, since the kernel mlocks a large folio only at reclaim
+and the OSC LRU would evict it.
 
 Preserve partial folios when punching holes, and drop them
 if the server does not punch. Keep a tail punch's leading
@@ -55,8 +57,11 @@ valid range in cp_off/cp_len instead of the punched range
 itself. Protect mmap writes against
 filesystem freeze and lock and commit the whole folio.
 Readahead advances by folio size and counts base pages,
-including for random reads. Restore encrypted offsets when
-RPC preparation fails.
+including for random reads. It creates folios as large as
+its DLM lock, stripe, RPC, window and reserved pages allow,
+and base pages for strided reads, so cold reads use large
+folios too. Restore encrypted offsets when RPC preparation
+fails.
 
 Grow RPC asynchronous metadata to hold the folio descriptors.
 Make sanity/277 use 4 KiB writes and a failure-injection delay
@@ -65,7 +70,8 @@ intended state.
 Add sanity/857 for the tunables and buffered and mmap I/O.
 
 Reset the queued count if direct I/O or buffered page queuing
-fails.
+fails, and complete the direct I/O pages not yet queued with the
+error.
 Skip an empty RPC's folio-less placeholder when undoing
 encryption bounce pages on a failed request pack, since it
 has no folio to check.
@@ -80,7 +86,11 @@ a folio that is not uptodate is retried, so the folio never
 holds unread bytes. A partial write to a clean large folio
 drops it and writes base pages, so clean data is not sent
 again, as does one to a folio that is not uptodate and
-reaches outside the write's lock.
+reaches outside the write's lock. A write that starts inside a
+page begins with a base page, so only that page is read first.
+
+While PCC mmap hands the mapping to the PCC backing file, the
+mapping takes that file's folio order range.
 
 DoM open drops an unread large folio from the cache before
 filling it from the inline data.
@@ -92,13 +102,21 @@ Dump each page of a folio on a checksum mismatch, and unmap
 the page with the pointer that was mapped, not one advanced
 by a short kernel_write().
 
-Count the osc_extent_expand() size against the server's
-maximum by the expanded range, so a large folio near that
-maximum does not start a needless new extent.
+Expand an extent to the chunk holding a folio's last page and
+check that against the server's maximum extent size, so a large
+folio near that maximum does not start a needless new extent.
 
 A cached folio that spans grant chunks must start on one in
 its stripe object, and grant is reserved for each chunk a
 queued range spans, so grant still bounds what is cached.
+
+The OSC LRU still counts one slot per folio. The follow-on
+change "LU-19895 osc: account cached folios in base pages"
+counts base pages instead.
+
+Make recovery-small/108 ping the OST to discover an eviction
+that lands after dd finished, which faster buffered writes make
+the common case.
 
 Test-Parameters: optional clientdistro=el10.0
 Test-Parameters: clientdistro=el10.1
@@ -2726,3 +2744,241 @@ Patch Set 60: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/135548/ : SUCCESS
+
+--- Message (Patrick Farrell, 2026-11-06 16:27:09.000000000) ---
+Patch Set 60:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-06 16:27:48.000000000) ---
+Patch Set 60:
+
+(1 comment)
+
+--- Message (James Simmons, 2026-11-06 20:45:41.000000000) ---
+Patch Set 60: Code-Review+1
+
+--- Message (Autotest, 2026-11-07 20:00:12.000000000) ---
+Patch Set 60:
+
+Trevis Autotest retesting enforced review-dne-zfs-part-5 session on el10.2-x86_64/zfs servers and clients for build 135548 patch 60. Requested by Patrickbot because of LU-10139.
+
+--- Message (Autotest, 2026-11-07 20:34:41.000000000) ---
+Patch Set 60:
+
+Onyx Autotest retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 135548 patch 60. Requested by Patrickbot because of LU-10139.
+
+--- Message (Autotest, 2026-11-07 20:54:19.000000000) ---
+Patch Set 60:
+
+Onyx Autotest retesting enforced review-dne-zfs-part-4 session on el10.2-x86_64/zfs servers and clients for build 135548 patch 60. Requested by Patrickbot because of LU-21081.
+
+--- Message (patrick bot, 2026-11-08 09:53:14.000000000) ---
+Patch Set 60:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-08 10:28:05.000000000) ---
+Patch Set 60:
+
+(14 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that the OSC LRU still counts one slot per folio, so max_cached_mb is not enforced with large folios (on by default) until 69731 lands. Consider squashing that fix in, or landing the two together. The rest are minor and can go in the same refresh.
+
+--- Message (patrick bot, 2026-11-08 10:57:55.000000000) ---
+Uploaded patch set 61.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-08 10:58:32.000000000) ---
+Patch Set 60:
+
+(14 comments)
+
+--- Message (patrick bot, 2026-11-08 10:58:57.000000000) ---
+Patch Set 60:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-08 11:00:28.000000000) ---
+Patch Set 61:
+
+(45 comments)
+
+46 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-08 11:01:22.000000000) ---
+Patch Set 61:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (jenkins, 2026-11-08 11:27:41.000000000) ---
+Patch Set 61: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135702/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-08 20:53:05.000000000) ---
+Patch Set 61:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-08 20:53:10.000000000) ---
+Patch Set 61:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.8-x86_64/ldiskfs servers and clients for build 135702 patch 61. Requested by Patrickbot because of LU-21157.
+
+--- Message (Shuichi Ihara, 2026-11-08 22:35:27.000000000) ---
+Patch Set 61:
+
+(1 comment)
+
+--- Message (Shuichi Ihara, 2026-11-08 22:41:07.000000000) ---
+Patch Set 61:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-09 00:16:46.000000000) ---
+Uploaded patch set 62.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-09 00:17:09.000000000) ---
+Patch Set 61:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-09 00:19:36.000000000) ---
+Patch Set 62:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (wc-checkpatch, 2026-11-09 00:29:38.000000000) ---
+Patch Set 62:
+
+(45 comments)
+
+46 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-09 00:41:53.000000000) ---
+Patch Set 62: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135727/ : SUCCESS
+
+--- Message (Autotest, 2026-11-09 00:42:32.000000000) ---
+Patch Set 61:
+
+Trevis Autotest is abandoning the following sessions because: later build 135727 found
+- Enforced review-dne-part-3 on el10.2-x86_64/ldiskfs servers and clients
+
+--- Message (Shuichi Ihara, 2026-11-09 03:45:09.000000000) ---
+Patch Set 62:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-09 06:28:00.000000000) ---
+Uploaded patch set 63.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-09 06:28:35.000000000) ---
+Patch Set 62:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-09 06:31:23.000000000) ---
+Patch Set 63:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (wc-checkpatch, 2026-11-09 06:38:18.000000000) ---
+Patch Set 63:
+
+(45 comments)
+
+46 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-09 06:56:42.000000000) ---
+Patch Set 63: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135753/ : SUCCESS
+
+--- Message (James Simmons, 2026-11-09 15:09:39.000000000) ---
+Patch Set 63: Code-Review+1
+
+--- Message (Autotest, 2026-11-09 16:06:34.000000000) ---
+Patch Set 63:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 135753 patch 63. Requested by Patrickbot because of LU-20873.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-10 00:55:09.000000000) ---
+Patch Set 63:
+
+(13 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments; the huge-page fault path and the PCC mmap interaction look worth a refresh, and the inline minors can ride along. sanity/857 exercises the tunables and I/O paths but never checks that a large folio was actually created (e.g. via rpc_stats or a folio-size probe), so it would still pass with large folios silently disabled; could it assert that?
+
+--- Message (patrick bot, 2026-11-10 01:36:41.000000000) ---
+Uploaded patch set 64.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-10 01:36:48.000000000) ---
+Patch Set 63:
+
+(13 comments)
+
+--- Message (wc-checkpatch, 2026-11-10 01:42:15.000000000) ---
+Patch Set 64:
+
+(45 comments)
+
+46 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-10 01:46:02.000000000) ---
+Patch Set 64:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (jenkins, 2026-11-10 02:03:07.000000000) ---
+Patch Set 64: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/135812/ : FAILURE
+
+--- Message (patrick bot, 2026-11-10 02:08:41.000000000) ---
+Patch Set 64:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-10 02:08:58.000000000) ---
+Patch Set 64:
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-10 02:38:23.000000000) ---
+Patch Set 64: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135816/ : SUCCESS

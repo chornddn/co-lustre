@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-11-04 19:26:54.000000000
-Updated:    2026-11-06 03:10:31.000000000
-Patch Set:  2
-Insertions: +291
-Deletions:  -20
-Comments:   14 (12 unresolved)
+Updated:    2026-11-08 11:39:33.000000000
+Patch Set:  3
+Insertions: +402
+Deletions:  -29
+Comments:   40 (4 unresolved)
 Hashtags:   218_review_blocker, pt_ecro
 
 --- Labels ---
@@ -26,54 +26,65 @@ Hashtags:   218_review_blocker, pt_ecro
 LU-12187 lod: add an EC layout version to lcme_cstripe_count
 
 The EC parity stripe count lcme_cstripe_count is limited to
-LOV_EC_MAX_CODING_STRIPES (15), so only the low 4 bits of the
-byte are needed.  Make it a 4-bit field and use the high 4 bits
-as lcme_ec_version, before the EC layout format is in a release.
-The fields are reversed under __BIG_ENDIAN_BITFIELD so the count
-is in the low 4 bits of the on-disk byte on every host.
+LOV_EC_MAX_CODING_STRIPES (15), so only the low 4 bits of the byte are
+needed.  Make it a 4-bit field and use the high 4 bits as
+lcme_ec_version, before the EC layout format is in a release.  The
+fields are reversed under __BIG_ENDIAN_BITFIELD so the count is in the
+low 4 bits of the on-disk byte on every host.
 
-Every reader recomputes which data stripes a parity stripe covers
-from the layout: the raid-set split from ec_split_stripes(), the
-parity stripe placement and the encoding matrix.  Any later change
-to these would make an older client silently pair parity with the
-wrong data, so the version names the whole mapping.  Version 0
-(LCME_EC_VERSION_0) is the mapping 2.18.0 is released with, and
-LCME_EC_VERSION_MAX is the latest one this code knows.
+Every reader recomputes which data stripes a parity stripe covers from
+the layout: the raid-set split from ec_split_stripes(), the parity
+stripe placement and the encoding matrix.  Any later change to these
+would make an older client silently pair parity with the wrong data,
+so the version names the whole mapping.  Version 1 (LCME_EC_VERSION_1)
+is the mapping 2.18.0 is released with, and LCME_EC_VERSION_MAX is the
+latest one this code knows.  LCME_EC_NONE (0) is used in data
+components, and a parity written before the version existed also has
+it, with the version 1 mapping.
 
-The version is kept in the parity component, which defines the
-mapping for its pair; it is zero in data components.  The MDS sets
-it when it allocates the parity stripes in lod_comp_prep_create():
-a new parity gets the version asked for in a template or in a
-layout from a user, limited to LCME_EC_VERSION_MAX, so clients
-never need to negotiate one.  A parity without objects is also
-stored with at most LCME_EC_VERSION_MAX, since this MDS will map
-it when it is instantiated.  A later MDS can keep writing an
-older version until its clients understand the new one, e.g. with
-a connect flag or a tunable.
+The version is kept in the parity component, which defines the mapping
+for its pair.  The MDS sets it when it allocates the parity stripes in
+lod_comp_prep_create(): a new parity gets the version asked for in a
+template or in a layout from a user, or the latest one it knows if
+none was asked for or the version is later, so clients never need to
+negotiate one.  This includes a layout copied from another file, e.g.
+by 'lfs migrate', 'lfs setstripe --copy', or tar or rsync restoring
+lustre.lov, which gets new parity objects.  A parity without objects
+is also stored with at most LCME_EC_VERSION_MAX, since this MDS will
+map it when it is instantiated.  A later MDS can keep writing an older
+version until its clients understand the new one, e.g. with a connect
+flag or a tunable.
 
 For a parity with a later version than LCME_EC_VERSION_MAX:
-- the LOV client treats its data as unlinked, so the data stripes
-  are read as plain RAID0 and never reconstructed from parity;
+- the LOV client marks its data (lsme_ec_unknown), so the data
+  stripes are read as plain RAID0 and never reconstructed from
+  parity, but keeps their EC fields for a copy of the layout, and
+  leaves such parity components out of the parity EOF;
 - llapi leaves the parity stale when it resyncs the rest of the
-  file, refuses to verify it with -EOPNOTSUPP, and 'lfs getstripe
-  --ec-map' prints the version instead of a raid-set split it
-  would compute wrongly;
+  file, does not verify it and returns -EOPNOTSUPP if nothing else
+  failed, and 'lfs getstripe --ec-map' prints the version instead
+  of a raid-set split it would compute wrongly.  'lfs mirror
+  resync' of an in-sync file does not report it as inconsistent,
+  and reads the layout again after taking the resync lease, as the
+  MDS may instantiate a parity of a version lfs does not know then;
 - LOD keeps the layout as loaded from disk and writes the version
-  back unchanged once the parity has objects, does not resize or
-  re-stamp the parity when its objects are given by a layout swap or
-  open replay, and lod_verify_striping() rejects such a version for
-  a parity with objects in a layout from a user.
+  back unchanged once the parity has objects, and does not resize
+  or re-stamp the parity when its objects are given by a layout
+  swap or open replay.
 
-The in-memory llc_cstripe_count (LOD and llapi) and
-lsme_cstripe_count (LOV) become 4-bit fields, with the version
-in llc_ec_version and lsme_ec_version.
+The in-memory llc_cstripe_count (LOD and llapi) and lsme_cstripe_count
+(LOV) become 4-bit fields, with the version in llc_ec_version and
+lsme_ec_version, which llapi_layout_merge() also copies.  Document the
+version in lfs-getstripe.1, lfs-mirror-verify.1 and
+Documentation/ec.txt.
 
-Add sanity-ec test_1m to check that the MDS limits a later version
-in a template to the one it knows for a new parity, and test_1n
-(ldiskfs) to check that a file whose parity has an unknown version
-on disk is still readable and writable, that its parity is not
-verified or resynced and keeps its version, and that a parity
-instantiated later in the same file gets the MDS version.
+Add sanity-ec test_1m to check that the MDS limits a later version in
+a template to the one it knows for a new parity, and test_1n (ldiskfs)
+to check that a file whose parity has an unknown version on disk is
+still readable and writable, that its parity is not verified or
+resynced and keeps its version, that an in-sync file resyncs without
+error, that a copy of its layout gets the MDS version, and that a
+parity instantiated later in the same file gets the MDS version.
 
 Test-Parameters: trivial testlist=sanity-ec
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
@@ -210,3 +221,86 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments; a refresh looks warranted, and the minor items can go in with it.  Test coverage: sanity-ec test_1n runs `lfs mirror verify` after overwriting the file, so verify fails with -ESTALE on the stale parity and the new -EOPNOTSUPP path is never reached.  Should the test also run verify and `lfs mirror resync` on the file while it is in sync, and `lfs migrate` it?
+
+--- Message (Andreas Dilger, 2026-11-06 16:09:32.000000000) ---
+Patch Set 2:
+
+(10 comments)
+
+--- Message (Andreas Dilger, 2026-11-06 17:47:29.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-06 17:47:39.000000000) ---
+Patch Set 2:
+
+(12 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-06 17:50:37.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-06 17:51:16.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-06 18:12:22.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135613/ : SUCCESS
+
+--- Message (Maloo, 2026-11-06 18:13:22.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 135613 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135613&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135613#redirect
+
+--- Message (Ronnie Sahlberg, 2026-11-06 20:43:33.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Maloo, 2026-11-08 11:26:56.000000000) ---
+Patch Set 3: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest from onyx-180vm36: https://testing.whamcloud.com/test_sessions/30fc52d0-2b13-4aa6-ab45-266344fc02bb ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-08 11:39:33.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The on-disk nibble layout, the LOD stamping and keeping of the version, and the LOV RAID0 fallback all check out. There are a few optional userspace items inline for the next refresh; no need to re-spin for them.

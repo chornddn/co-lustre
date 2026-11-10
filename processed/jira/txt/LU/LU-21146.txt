@@ -1,0 +1,113 @@
+Key:        LU-21146
+Summary:    ldiskfs: large-folio journal-mode check causes missing revokes and OST data corruption after replay
+Link:       https://jira.whamcloud.com/browse/LU-21146
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   Emoly Liu
+Reporter:   Andreas Krause
+Created:    Fri, 6 Nov 2026 20:23:22 +0000
+Updated:    Fri, 6 Nov 2026 20:42:12 +0000
+
+--- Environment ---
+Lustre v2_17_60 (6325870717); Ubuntu kernel 6.17.0 arm64, 64 KiB pages; custom ldiskfs build using the 6.12-rhel10.2 series; e2fsprogs 1.47.3.wc3. Source review: Lustre master 8a35ae662e9a1515ef76421e35831bc28b6f7626 (2.17.61), Linux 6.18.y. Components: ldiskfs and osd-ldiskfs. Exact development versions are recorded here because Jira has no matching Affects Version entries.
+
+--- Description ---
+Summary
+
+On affected Linux 6.16-6.18 configurations, osd-ldiskfs can free journalled llog blocks without revoke records. If those blocks are reused for OST object data, a later crash or failover can replay the old llog images over data that the client already wrote and fsync'ed. The observed damage was silent: file data was replaced by llog headers, config records and zero blocks.
+
+This is a regression of the protection added by LU-13416, caused by the large-folio condition added to ext4's journal-mode selection in Linux 6.16.
+
+This report provides the defect analysis, reproducer evidence and a possible fix direction. We ask the community ldiskfs maintainers to assess the approach and take ownership of patch preparation, affected-kernel coverage and validation. The experimental change below is diagnostic evidence, not a patch submission.
+
+Demonstrated environment and scope
+
+The standalone reproducer ran on Lustre v2_17_60 (6325870717), Ubuntu kernel 6.17.0, arm64 with 64 KiB pages, and e2fsprogs 1.47.3.wc3. The ldiskfs build used the 6.12-rhel10.2 series against that kernel, with a local series selection override. The compared runs changed ldiskfs.ko. These experimental 6.17 builds do not validate a fix for the supported 6.18 series.
+
+Source review also found the affected condition in the current 6.18.y kernel source. The Lustre source reviewed was master 8a35ae662e9a1515ef76421e35831bc28b6f7626 (2.17.61). Exposure depends on the mapping permitting large folios when the inode is created. It is not universal across all 6.16-6.18 builds or filesystem feature combinations. For example, CONFIG_TRANSPARENT_HUGEPAGE=n prevents this mapping condition. DoM exposure is plausible through the same mechanism but has not been tested.
+
+Root cause
+
+LU-13416 / change 38281 made osd-ldiskfs set LDISKFS_INODE_JOURNAL_DATA on objects written through the journal. This lets ext4 free their blocks with EXT4_FREE_BLOCKS_FORGET and create revoke records.
+
+Linux commit 7ac67301e82f ("ext4: enable large folio for regular file"), introduced in 6.16, added this condition in ext4_inode_journal_mode():
+
+(ext4_test_inode_flag(inode, EXT4_INODE_JOURNAL_DATA) &&
+ !test_opt(inode->i_sb, DELALLOC) &&
+ !mapping_large_folio_support(inode->i_mapping))
+
+ext4 sets the inode mapping order when it creates or loads the inode. osd-ldiskfs sets the journal-data flag later, on the first journalled write of a local object, including the osd_ldiskfs_write() path. For an eligible newly created regular file, the mapping already allows large folios. The added condition makes ext4_should_journal_data() false despite the flag. The normal free path then omits EXT4_FREE_BLOCKS_FORGET, so the old journalled images are not revoked.
+
+In the inspected journal, older local llogs loaded with the flag already set were revoked, while newly created temporary llog copies were freed without revoke records.
+
+The MGC copies config llogs into CONFIGS/ during target startup and config-log reprocessing. This creates and deletes temporary journalled files. The reproducer uses repeated lctl conf_param updates to trigger these copies. On an inspected quiet OST, unrevoked images of deleted temporary llog blocks remained in the replay window 7.5 hours after mount.
+
+LU-19862 / change 67335 synchronizes a_ops after changing the inode flag. It does not remove this condition: ldiskfs_set_aops() also selects operations through the inode journal mode.
+
+Observed evidence
+
+In the original failover incident, 8838 of 8839 acknowledged 64 KiB records read back intact. Three 4 KiB blocks of the damaged record matched the header, config record and zero-filled block of a config llog copy.
+
+During 24 config-log re-copies on the unpatched build, tracing recorded 97 llog block ranges freed without FORGET and no revokes for those llog blocks. This statement is specific to llog blocks, not all journal activity.
+
+The standalone reproducer results were:
+
+Run
+Test file
+Journal blocks logged
+Revoked blocks
+Damage after replay
+
+Unpatched
+458752 bytes / 112 x 4 KiB blocks
+203
+0
+64 blocks; exactly the 64 predicted from unrevoked journal images
+
+Experimental condition removal
+458752 bytes / 112 x 4 KiB blocks
+219
+200
+0 blocks; client data intact
+
+The unpatched client comparison found 261128 differing bytes. This byte count is separate from the count of damaged 4 KiB blocks. A trace with the experimental change, covering one config-log re-copy, showed FORGET and revokes on the llog frees.
+
+Reproducer outline
+
+Use an isolated native Linux test VM. The test formats its own small filesystem and deliberately drops OST writes.
+
+	Create an MGS/MDT and a 1 GiB OST behind a dm-linear device. Set the OST reserved-block count and reserved_clusters to zero so clients can use the remaining free space.
+
+	Create the data file before exhausting space. Fill the OST, then remove eight 64 KiB files and wait for their destruction.
+
+	Request 24 config-log re-copies with lctl conf_param .sys.timeout=100, 12 seconds apart in the standalone run.
+
+	Write random 64 KiB records to the data file with O_DIRECT until ENOSPC. Fsync it and verify the written prefix. Inspect the journal and map unrevoked logged blocks to the data file to predict damage.
+
+	Free 8 MiB from the filler file so the OST can restart. Use dmsetup suspend --nolockfs, switch to a dm-flakey table with drop_writes, unmount the OST, and restore the linear table. Using a filesystem-freezing suspend can empty the journal and defeat the reproducer.
+
+	Mount the OST to replay the journal and compare the object and client data with the saved pattern. In the unpatched run, the damaged blocks exactly matched the prediction.
+
+Possible fix direction for maintainer evaluation
+
+Linux commit 58fd191f99f3 ("ext4: make data=journal support large block size") removed the large-folio condition in 6.19. The live 6.18.y source still contained it when checked on 2026-11-06.
+
+A possible fix direction is to restore journal-data handling for these inodes, using the upstream change as a starting point. Removing the large-folio condition in the experimental 6.17 build prevented the reproduced corruption. This does not establish that the hunk alone is safe for every affected path. The full upstream change also flushes/truncates page cache and resets mapping folio order to constrain journal credits. Partial llog truncation can reach ldiskfs_block_truncate_page() and dirty page-cache data. The ldiskfs maintainers should assess the required changes, including partial truncation, writeback, eviction and journal-flag changes, before choosing a backport.
+
+The community ldiskfs maintainers should determine the supported kernel and patch-series coverage, including whether and how to address affected 6.16/6.17 builds.
+
+A draft replay-ost-single test_14 recorded 534431 differing bytes in a different, 2097152-byte file without the fix, and a reported PASS with the experimental hunk. These framework logs are supporting evidence, not final acceptance: both include mcreate: command not found. Review also found that the final cmp | wc -l check discards comparison errors, cleanup does not restore all original settings on every failure path, and waiting on a host-global timeout does not prove ost1 completed each log copy. The draft's 2.17.62 version guard would skip on the stated 2.17.60/2.17.61 builds, so those logs do not verify the final test unchanged.
+
+No production patch has been validated: a matching 6.18 kernel/series build, compiler checks, Smatch, Sparse and repeated runs of a corrected regression test are not established by the supplied evidence. We leave patch development, test integration and validation to the community ldiskfs maintainers. No Gerrit change has been submitted for this report.
+
+Related work
+
+LU-13416 is the direct predecessor: the same missing-revoke corruption mechanism, fixed before the large-folio change.
+
+LU-19460 is the kernel-support context. Its merged commit is 46b152fd1b6e6443def2b2a443bfdb8ede527c89 ("LU-19460 ldiskfs: server support for v6.18 LTS").
+
+LU-19862 fixes related a_ops handling but does not fix this journal-mode condition.
+
+A live Jira and Gerrit search on 2026-11-06 found no existing report or change for this specific large-folio regression.

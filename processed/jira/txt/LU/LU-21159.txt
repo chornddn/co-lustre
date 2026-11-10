@@ -1,0 +1,82 @@
+Key:        LU-21159
+Summary:    hybrid IO: buffered read()/write() fails with ENOMEM or EINVAL when the DIO bounce page pool is short
+Link:       https://jira.whamcloud.com/browse/LU-21159
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Markus Hilger
+Created:    Mon, 9 Nov 2026 01:15:52 +0000
+Updated:    Mon, 9 Nov 2026 22:06:35 +0000
+Links:      Related: is related to  LU-19536; Related: is related to  LU-19932; Related: is related to  LU-19895
+
+--- Environment ---
+master 8a35ae662e (2.17.61) client and servers, EL9.8 client (5.14.0-687.66.1.el9_8), x86_64, 4 GB RAM, ldiskfs OSTs; also 2.17.0
+
+--- Description ---
+An unaligned buffered read()/write() that hybrid IO switches to DIO fails when the bounce page pool cannot supply the whole sub-DIO, although buffered IO of the same call would succeed:
+
+	EINVAL when one sub-DIO needs more pages than the pool can ever hold (about 260 MiB on a 4 GB client). This is the np.save() failure in LU-19932.
+
+	ENOMEM when other processes hold the pool's pages. A few concurrent large unaligned IOs are enough.
+
+Reproducer
+
+Client with 4 GB RAM and 4 KiB pages, default tunables, ldiskfs OSTs:
+
+lfs setstripe -c 1 /mnt/lustre/d; cd /mnt/lustre/d
+# 1. one write at file offset 1, larger than the pool (pool_4k max_objects 66814 = 261 MiB here)
+dd if=/dev/zero of=f0 bs=300M count=1 seek=1 oflag=seek_bytes
+# 2. four writes at file offset 1 at the same time, each smaller than the pool
+for i in 1 2 3 4; do dd if=/dev/zero of=f$i bs=100M count=1 seek=1 oflag=seek_bytes status=none & done; wait
+# 3. any client: the existing fail_loc OBD_FAIL_LLITE_DIO_BUFFER_ALLOC, one 4 MiB write
+lctl set_param fail_loc=0x1438
+dd if=/dev/zero of=f5 bs=4M count=1 seek=1 oflag=seek_bytes
+lctl set_param fail_loc=0
+
+Output on master 8a35ae662e (client and servers 2.17.61, EL9.8 client, kernel 5.14.0-687.66.1.el9_8):
+
+# dd if=/dev/zero of=f0 bs=300M count=1 seek=1 oflag=seek_bytes
+dd: error writing 'f0': Invalid argument
+0 bytes copied, 0.0291946 s, 0.0 kB/s
+# for i in 1 2 3 4; do dd ... bs=100M count=1 seek=1 oflag=seek_bytes ... & done; wait
+dd: error writing 'f1': Cannot allocate memory
+dd: error writing 'f3': Cannot allocate memory
+# lctl get_param -n sptlrpc.page_pools   (pool_4k)
+    max_objects: 66814
+    total_objects: 66814
+# lctl set_param fail_loc=0x1438
+# dd if=/dev/zero of=f5 bs=4M count=1 seek=1 oflag=seek_bytes
+dd: error writing 'f5': Cannot allocate memory
+
+The same for reads: four concurrent 100 MiB dd reads at offset 1 gave 2 x "error reading: Cannot allocate memory", and an 8 MiB read at offset 1 with fail_loc=0x1438 also fails with ENOMEM. A 300 MiB os.write() from an unaligned Python buffer at file offset 0 fails with OSError: [Errno 22] Invalid argument.
+
+All three succeed with lctl set_param llite.*.hybrid_io=0, and with aligned writes (offset 0) with hybrid IO on. With oflag=direct the ENOMEM of case 3 is expected, the application asked for DIO.
+
+Analysis (master 8a35ae662e)
+
+	ll_hybrid_bio_dio_switch_check() (lustre/llite/file.c:2114, thresholds at 2163-2173) switches the IO, do_file_write_iter() (file.c:2872) and do_file_read_iter() (file.c:2719) set IOCB_DIRECT.
+
+	ll_direct_IO() (lustre/llite/rw26.c:333) sees an unaligned offset or iovec (rw26.c:365-368) and builds sub-DIOs of up to MAX_DIO_SIZE (rw26.c:473, about 576 MiB on x86_64). cl_dio_pages_init() calls ll_allocate_dio_buffer() (lustre/obdclass/cl_page.c:223, lustre/obdclass/cl_io.c:1491), which takes all bounce pages of the sub-DIO at once with obd_pool_get_folios_array() (cl_io.c:1524).
+
+	The pool holds at most totalram_pages() / POOLS_COUNT pages (lustre/obdclass/page_pools.c:1049, 1079). __obd_pool_get_objects() returns -EINVAL for a request above that (page_pools.c:700), and -ENOMEM without waiting when the pool is at its maximum and nobody is growing it (page_pools.c:725-751). Not waiting is on purpose for ptlrpcd, but here the caller is the user process.
+
+	The drain and retry of LU-19536 (rw26.c:506-542) retries only when earlier sub-DIOs of the same call are in flight (tot_bytes > bytes_at_drain, rw26.c:507-508). For the first sub-DIO, or when the pages are held by other processes, the error is returned through ll_file_io_generic() to write()/read(). -EINVAL is never retried.
+
+Related
+
+	LU-19932: the np.save() EINVAL on aarch64 (comment of 2026-08-14) is case 1.
+
+	LU-19536 (64351, drain and retry on ENOMEM): covers only later sub-DIOs of one call.
+
+	https://review.whamcloud.com/68541 (LU-19895, open): caps the bounce buffer at half the pool. With PS23 case 1 passes, cases 2 and 3 still fail.
+
+Suggested fix
+
+A hybrid-switched IO that gets -ENOMEM (or -EINVAL) from the bounce buffer allocation should be done as buffered IO, which is what the application asked for. Returning 0 from ll_direct_IO() (rw26.c:447) is not enough, since the switched DIO is lockless and took no extent lock for a buffered fallback inside it. A prototype redoes the IO from do_file_write_iter()/do_file_read_iter() through ll_file_io_generic() without IOCB_DIRECT, from the saved iterator and ki_pos (a failed DIO reports no bytes even when earlier stripe chunks were done), leaves out O_APPEND writes, and caps an unaligned sub-DIO at a fraction of the pool, as 68541 does, so that one call never exceeds the pool. With it all of the above pass, an O_DIRECT write still gets ENOMEM, and a new sanity test using fail_loc=0x1438 passes.
+
+--- Comment (JIRAUSER19234, Mon, 9 Nov 2026 22:04:03 +0000) ---
+Attempting to do some benchmark testing locally running MLPerf storage and came across this issue as well. is there an open gerrit ticket I can cherrypick to see if that fixes my issue?
+
+If not I will look into opening one.

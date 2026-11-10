@@ -1,0 +1,78 @@
+Key:        LU-21160
+Summary:    lod: multi-raidset parity allocation fails when earlier sets take more unique OSTs than they need
+Link:       https://jira.whamcloud.com/browse/LU-21160
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Keguang Xu
+Created:    Mon, 9 Nov 2026 04:23:49 +0000
+Updated:    Mon, 9 Nov 2026 04:23:49 +0000
+
+--- Description ---
+Problem
+
+Parity for a multi-raidset EC component is allocated in two phases in lustre/lod/lod_qos.c:
+
+	lod_ost_alloc_rr() / lod_ost_alloc_qos() collect unique OSTs (not used by any data stripe of the component, not used anywhere in the parity component) and store them sequentially in stripe[0..nfound-1]. Raid set j owns slots [j*p, (j+1)*p), so set 0 is filled first.
+
+	lod_ec_add_parities() fills the remaining slots from nfound onward by reusing data OSTs of other raid sets. Its candidate pool is only data_comp->llc_ost_indices[]; a set with k data stripes can get at most c - k OSTs from it.
+
+Each set therefore needs d = max(0, p - (c - k)) unique OSTs. LU-19823 made lod_stripe_count_min() return Σ d so the allocator keeps searching (raising RR speed) until that many unique OSTs exist.
+
+That bound is correct but not sufficient because of sequential filling: phase 1 hands set 0 up to p unique OSTs even if it only needs d, and phase 2 cannot move them to later sets. When the number of unique OSTs found lands between Σ d and (n - 1) * p + d_last, the last set is short and create/resync fails with -ENOSPC even though enough OSTs exist.
+
+Examples
+
+(All -c 4, 2 sets of k = 2 unless noted.)
+
+	-ec 2+3, 10 OSTs, one sibling -c 4 mirror already placed: 2 free OSTs. Σ d = 2, so RR stops at speed 0 with 2 unique OSTs. Set 0 takes both plus 1 reused data OST; set 1 can reuse only 2 data OSTs and is one short.
+
+	-ec 1+4 (4 sets, k = 1, p = 4), 8 OSTs, data on 4: c - k = 3, d = 1, Σ d = 4. Set 0 takes all 4 unique OSTs; sets 1–3 get 3 reused data OSTs each and fail. A valid layout exists: each set uses 1 unique OST + 3 data OSTs of other sets.
+
+Raising the minimum to the sequential bound (n - 1) * p + d_last is not a fix: it inflates stripe_count_min to O(n·p) (13 for 1+4), makes lod_ost_alloc_qos() fall back to RR (good_osts ), and drives RR to speed 2 (degraded / conflicting-mirror OSTs) in cases where the free OSTs at speed 0 are sufficient if spread across sets.
+
+Proposed fix
+
+Make phase 2 able to finish any set that still has free candidates, instead of depending on how phase 1 distributed the unique OSTs.
+
+In lod_ec_add_parities(), extend the candidate pool for raid set cur_rs from "data OSTs of other sets" to:
+
+data OSTs of other sets + parity OSTs already placed in earlier sets (ost_indices[0 .. cur_rs*p))
+
+Apply the same checks already used for data reuse:
+
+	no identity collision with this set's data or with parity already placed in this set
+
+	failure-domain checks as today (-C: current set, -c: whole component)
+
+	skip the candidate's own entry in the FD scan the way pos is skipped for data
+
+Rationale
+
+EC fault tolerance is a per-raidset property (the k + p stripes of one set must be on distinct OSTs/FDs). Sharing an OST between different sets is already allowed for data OSTs; a unique parity OST of set 0 is just another OST that is not data of set 1, so reusing it in set 1 is the same case.
+
+With this:
+
+	-c 4 --ec 1+4 on 8 OSTs succeeds (set 0: U1–U4; sets 1–3: three data OSTs + one of U1–U4)
+
+	test_8q on 10/11 OSTs succeeds at speed 0 without touching the sibling mirror's OSTs
+
+Prefer distinct unique OSTs where they exist: iterate the new pool only after the data-OST candidates are exhausted, so cross-set sharing of a parity OST happens only when strictly needed. This keeps the layout the same as today whenever today's allocation succeeds.
+
+Both lod_ost_alloc_rr() and lod_ost_alloc_qos() call lod_ec_add_parities(), so one change covers both paths. lod_stripe_count_min() can stay at Σ d (still a valid, slightly conservative bound); it could later be relaxed to max_j d_j, since with cross-set reuse the sets no longer need disjoint unique OSTs.
+
+Alternative (not preferred)
+
+Cap phase 1 at d_j unique OSTs per set (or redistribute the collected unique OSTs across sets before reuse). It achieves the same result but requires moving entries in stripe[] / ost_indices[] and re-validating -C failure-domain constraints per set, so it is more invasive than extending the pool in lod_ec_add_parities().
+
+Verification
+
+	sanity-ec test_8q (-c 4 --ec 2+3 resync with sibling mirrors) on 8, 10 and 11 OSTs; today 10/11 fail at speed 0.
+
+	New subtest: -c 4 --ec 1+4 on 8 OSTs (create, write, resync, verify) — fails with -ENOSPC today, must pass.
+
+	Regression: sanity-ec 27b (data reuse across sets), 8p, and the single-raidset cases, to confirm layouts are unchanged when no shortfall exists.
+
+	Failure-domain variant: with failure_domain set on OSTs, confirm no two stripes of the same raid set share an FD after the fix.

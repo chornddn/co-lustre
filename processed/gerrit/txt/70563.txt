@@ -1,0 +1,151 @@
+Change:     70563
+Subject:    LU-10948 mdt: grant write open locks without LOOKUP
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70563
+Change-Id:  Ice6aac15e14e064d048db117c9cf00b5543ebbe5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-11-07 11:21:47.000000000
+Updated:    2026-11-09 05:48:58.000000000
+Patch Set:  2
+Insertions: +210
+Deletions:  -11
+Comments:   10 (3 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+
+--- Commit Message ---
+LU-10948 mdt: grant write open locks without LOOKUP
+
+With the default opencache tunables, repeated opens of a file for
+write never used the cached open handle.  The CW LOOKUP|OPEN open lock
+conflicted with the PR LOOKUP lock that the client itself held from
+the earlier lookup, and cancelling that lock invalidated the dentry.
+Every later open then went through ll_atomic_open(), which sent an
+open RPC and closed the duplicate handle, so 20 appends to one file
+needed 20 lock enqueues and 20 close RPCs, as with opencache disabled.
+A lookup of the name from another client also revoked the cached
+write handle.
+
+Grant the CW open lock with only the OPEN bit, and LOOKUP as a try
+bit, so it does not revoke PR LOOKUP locks of this or other clients.
+If the LOOKUP bit is granted, a lookup from another client still
+revokes the cached handle, as before.
+
+The LOOKUP bit of the open lock was also what made an unlink, a
+rename over the file or an rmfid close cached write handles on other
+clients.  Add the OPEN bit to the EX lock on such a victim if it is a
+regular file, so that a removed file does not stay an orphan until the
+client drops the handle, and rmfid does not fail with -EBUSY.  This
+also breaks leases on the file, even if other links to it remain.
+
+An exec of a file with cached write handles revokes them since
+LU-21074 "mdt: revoke cached open handles on exec conflict", so it
+does not fail with -ETXTBSY.
+
+A getattr of the file by the copytool also used to revoke the cached
+write handle when an HSM archive started.  Without it, the close that
+reports the data as modified arrived only after the archive completed,
+so the file was marked dirty and could not be released.  Revoke cached
+write handles explicitly when the copytool starts an archive.
+
+Add sanity test_441a to check that appends use the cached open handle,
+sanityn test_124 to check that unlink and rename close it, and
+sanityn test_14e to check that an exec from another client is not
+denied by it.
+
+Test-Parameters: trivial testlist=sanityn,sanity-hsm
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
+Change-Id: Ice6aac15e14e064d048db117c9cf00b5543ebbe5
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-11-07 11:21:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-07 11:29:04.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-07 11:29:38.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-07 12:04:03.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135668/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-08 18:18:25.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Andreas Dilger, 2026-11-08 18:19:44.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-08 18:20:04.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The new victim helper can hit an LASSERT on a child that does not exist; the other items are minor and only worth fixing in the same refresh.
+
+--- Message (patrick bot, 2026-11-08 21:43:10.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-08 22:04:07.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-09 00:24:58.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-09 00:25:31.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+PS2: revoke cached write open handles when the copytool starts an archive, which fixes sanity-hsm test_408 (fails without, passes with on a VM).
+
+--- Message (wc-checkpatch, 2026-11-09 00:29:13.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-09 00:30:56.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-09 01:04:04.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135730/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-09 05:48:58.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The locking changes themselves look consistent (no new lock-ordering or self-conflict issues found in unlink/rename/rmfid or the archive revoke), but cached write handles now outlive lookups from other clients, and one HSM consumer of the close still depends on the old behaviour.

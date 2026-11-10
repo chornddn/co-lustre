@@ -1,5 +1,5 @@
 Change:     67599
-Subject:    LU-20531 mdc: do not delay MDS_CLOSE for import recovery
+Subject:    LU-20531 llite: don't park lock cancel on a close to a down MDT
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67599
 Change-Id:  I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 Project:    fs/lustre-release
@@ -7,87 +7,74 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-11-01 07:32:18.000000000
-Patch Set:  16
-Insertions: +110
-Deletions:  -0
+Updated:    2026-11-10 03:04:09.000000000
+Patch Set:  18
+Insertions: +320
+Deletions:  -5
 Comments:   87 (5 unresolved)
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Qian Yingjin, Timothy Day, Duncan Vogel, Keguang Xu
 
 --- Commit Message ---
-LU-20531 mdc: do not delay MDS_CLOSE for import recovery
+LU-20531 llite: don't park lock cancel on a close to a down MDT
 
-Ten ldlm_bl threads on an MDS that also carries a client mount were
-reported blocked for over 122 seconds, all with the same stack:
+Lock cancellation callbacks run on ldlm_bl threads, a pool shared by
+every namespace on the node.  ll_lock_cancel_bits() can send a
+synchronous MDS_CLOSE from there in two ways:
 
-  obd_get_mod_rpc_slot <- ptlrpc_get_mod_rpc_slot <- mdc_close
-  <- lmv_close <- ll_close_inode_openhandle <- ll_md_real_close
-  <- ll_clear_inode <- ll_delete_inode <- evict <- iput
-  <- d_prune_aliases <- ll_prune_aliases <- ll_lock_cancel_bits
-  <- ll_md_blocking_ast <- ldlm_cancel_callback
-  <- ldlm_cli_cancel_local <- ldlm_cli_cancel_list_local
-  <- ldlm_bl_thread_blwi
+- directly, when an OPEN lock is cancelled (ll_md_real_close());
+- through eviction: ll_prune_aliases() -> d_prune_aliases() drops the
+  pruned dentry's reference on its parent, and that dput() kills every
+  ancestor left unused and invalid.  Evicting one closes its cached open
+  handle from ll_clear_inode().  This is the stack in the report.
 
-A close can be driven from lock cancellation, and that path is also
-walked inline on the import's own lock replay thread, by
-ldlm_cancel_unused_locks_for_replay().  Cancelling a LOOKUP or PERM
-lock runs ll_prune_aliases(), which can drop the last dentry of an
-inode whose open handle is still cached by an OPEN lock, so the inode
-is evicted and ll_clear_inode() has to issue MDS_CLOSE.
+If the MDT holding that handle is down, ptlrpc_import_delay_req() parks
+the close until the MDT returns, and the ldlm_bl thread with it.  The
+eviction route is cross-MDT: cancelling a lock from a healthy MDT can
+evict a directory whose open handle is on the down one, so cancellation
+for the healthy MDT stops.  The direct route ties up one ldlm_bl thread
+per cancelled OPEN lock for the length of the outage, until the pool,
+shared by every namespace on the node, runs out.
 
-MDS_CLOSE keeps the default rq_send_state of LUSTRE_IMP_FULL, so
-ptlrpc_import_delay_req() parks it on imp_delayed_list.  That is a
-deadlock: mdc_close() holds the reserved close modify-RPC slot across
-ptlrpc_queue_wait(), and the import cannot leave recovery until the
-same thread returns, so the close waits for a recovery that is waiting
-for the close.  It cannot time out either - a non-FULL import is not
-pinged, ptlrpc_set_import_discon() requires FULL, and
-ptlrpc_abort_inflight() skips requests of the current generation.
-Every other close then blocks in obd_get_mod_rpc_slot(), which waits
-uninterruptibly with no timeout, so each ldlm_bl thread that picks up
-an LRU cancel batch is consumed and lock revocation on the node stops.
+Send these closes from a per-superblock workqueue instead:
 
-A target already handles MDS_CLOSE while it is recovering:
-tgt_filter_recovery_request() lists it, and
-target_queue_recovery_request() processes rather than queues a request
-with no transno, which a fresh close has.  So set rq_allow_replay on
-the close, as ldlm_cli_cancel_req() already does for a cross-MDT
-LDLM_CANCEL to avoid an analogous deadlock; that guard is gated on
-OBD_CONNECT_MDS_MDS and so never covers a close issued through llite.
-Should a close ever overtake its own open's replay, mdc_close()
-already maps -ESTALE on a committed open to success.
+- OPEN-lock cancel: the close always runs in the workqueue and the
+  cancelling thread waits for it, so it still reaches the MDT before
+  what the cancel lets through (an ELC'd conflicting open, the cancel
+  reply).  A kernel thread stops waiting once the import is not FULL; a
+  user thread (ELC) waits as before.  If the MDT is reachable but the
+  queue has not started the close, the waiter sends it itself, so closes
+  parked on a down MDT cannot hold up closes to healthy ones.
+- eviction: ll_prune_aliases() pins the aliases' parent dentries, and
+  drops the pins from the workqueue when that can kill them, so the
+  whole cascade runs there.  The cancel's own final iput, and two other
+  iputs on the cancel path, go through ll_iput_later(), which defers
+  the iput when the inode has a cached open handle.
 
-Measured with a matched A/B on real hardware, same harness, this one
-line as the only variable:
+The closes are still sent, so no open handle or setattr is lost.  The
+queue is flushed in ll_kill_super(), before the dcache is shrunk, and
+in ll_put_super(), before the MDC export is torn down.
 
-                                   unpatched      patched
-  o35 "req waiting for recovery"       1             0
-  o35 "allow during recovery"          0            26
-  ldlm_bl parked (state S)           727 samples    0 of 730
-  imp_replay_inflight              stuck at 10    drained to 0
-  recovery outcome                  COMPLETE      COMPLETE
+Measured on a 2-MDT filesystem with MDT0001 stopped:
+- test_172 (lru_size=1 on MDT0001): unpatched, an ldlm_bl thread waits
+  in mdc_close() for MDT0001; patched, the closes wait in the workqueue
+  and no ldlm_bl thread does.
+- test_173 (lru_size=clear on MDT0000 evicts a directory whose open
+  handle is on MDT0001): unpatched, the cancel never completes and
+  ldlm_bl parks in ll_clear_inode() -> mdc_close(); patched, it
+  completes and the close waits in the workqueue.
+On a healthy filesystem the RPC order for exec-then-truncate of the
+same file is unchanged.
 
-This removes the demonstrated trigger, not the whole class: the
-untimed wait in obd_get_mod_rpc_slot() and the inline Data-on-MDT
-flush in ll_lock_cancel_bits() are unchanged and remain separate
-blocking points.
-
-The new subtest is a regression guard, not a reproducer.  It passes
-with and without the fix.  See the ticket for why there is no
-reproducer: the condition is not observable through any stable
-interface, so a test would have to assert on the debug text emitted by
-the two branches of the very "if" that rq_allow_replay controls.
-
-Test-Parameters: mdscount=2 testlist=recovery-small
-Signed-off-by: Vandana Rungta <vrungta@amazon.com>
+Test-Parameters: mdscount=2 mdtcount=4 testlist=recovery-small env=ONLY=172,173
 Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
+Signed-off-by: Vandana Rungta <vrungta@amazon.com>
 
 --- Review History ---
 
@@ -2496,3 +2483,277 @@ Patch Set 16:
 AI code review results below, please doublecheck
 
 Problematic, see inline comments. The deadlock is real, but setting rq_allow_replay on every MDS_CLOSE lets fresh closes from any thread reach the MDT in the middle of recovery. That breaks two things recovery relies on: open handles are fixed up before a delayed close is sent, and only replays carry transnos until recovery ends. A narrower fix that keeps the close off the lock replay thread (defer the iput()/close, or skip locks whose cancel would evict an inode with a cached open handle) may avoid both. test_171 doesn't exercise either case. A test that keeps a file open across failover and closes it while replay is paused would show whether the close leaks the server open handle.
+
+--- Message (Vandana Rungta, 2026-11-10 00:51:23.000000000) ---
+Uploaded patch set 17.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-11-10 00:51:25.000000000) ---
+Patch Set 17:
+
+This patchset replaces the approach. mdc_close() is untouched; the fix is
+in llite, and rq_allow_replay is gone - the review of patchset 16 was right
+on both counts (a fresh close during REPLAY can find no handle, and its
+transno can collide with another client's replay).
+
+What the bl thread was actually doing. The reported stack is an ordinary
+ldlm_bl LRU cancel, not the replay thread (ldlm_cancel_unused_locks_for_replay()
+uses the no-wait policy, and mdc_cancel_weight() refuses OPEN locks, so replay
+never closes a handle). It reaches mdc_close() through eviction:
+
+  ll_lock_cancel_bits -> ll_prune_aliases -> d_prune_aliases -> dput(parent)
+  -> evict -> ll_clear_inode -> ll_md_real_close -> mdc_close
+
+The evicted inode is not the lock's inode - that one is held by
+ll_inode_from_resource_lock(). It is the parent directory, whose last dentry
+reference is the one d_prune_aliases() drops. If that directory has a cached
+open handle on an MDT that is down, the bl thread parks. With DNE this is
+cross-MDT: cancelling a lock from a healthy MDT parks on the down one.
+
+Reproduced on mainline, 2 MDTs, MDT0001 stopped: D on MDT0001 with a cached
+open handle, E on MDT0000 inside D, lru_size=clear on MDT0000's namespace.
+Unpatched, ldlm_bl parks with exactly the reported stack and the cancel never
+completes. This needs the parent to be evicted on its last iput; in the lab I
+force that with llite.*.inode_cache=0.
+
+The patch:
+- eviction: ll_prune_aliases() pins the aliases' parent dentries and drops
+  the pins from a per-sb workqueue when that can kill them, so the whole
+  dput cascade (and any close) runs there. The cancel's own final iput goes
+  through ll_iput_later(), which defers only when the inode has a cached och.
+- OPEN-lock cancel: the close always runs in the workqueue, and the
+  cancelling thread waits for it, so it still precedes what the cancel lets
+  through (an ELC'd conflicting open, the cancel reply). A kernel thread stops
+  waiting when the import leaves FULL; a user thread waits as before. If the
+  MDT is reachable but the queue has not started the close, the waiter sends
+  it itself.
+- the queue is flushed in ll_kill_super() and ll_put_super().
+
+An earlier version deferred only when the import was not FULL at dispatch.
+That was flaky: a close dispatched while the import still looked FULL, just
+after the MDT died, parked the bl thread.
+
+Tests (new, recovery-small):
+- test_172: MDT0001 down, lru_size=1 on its namespace; asserts no ldlm_bl
+  thread waits in mdc_close(). Unpatched FAIL; patched PASS. Needs no module
+  options. (With the pool capped to one thread, ldlm_num_threads=2, the
+  stall also reaches healthy MDTs: MDT0000 lock_count 25 -> 25 in 60s
+  unpatched, 25 -> 2 in 1s patched. I did not put the cap in the test:
+  restoring the modules at the end hung MDT teardown in
+  obd_exports_barrier on a single node, with and without the patch.)
+- test_173: the eviction route above. Unpatched FAIL; patched PASS.
+
+Also: RPC order for exec-then-truncate of one file is identical with and
+without the patch; umount with closes queued for a down MDT behaves as before
+(blocks until it returns, 0 busy inodes); full recovery-small passes
+except test_156 (tot_granted after OST eviction), which fails the same way
+unpatched on this setup.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-10 00:55:10.000000000) ---
+Patch Set 17:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-10 00:55:38.000000000) ---
+Patch Set 17:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-10 01:16:00.000000000) ---
+Patch Set 17: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135807/ : SUCCESS
+
+--- Message (Maloo, 2026-11-10 01:16:29.000000000) ---
+Patch Set 17:
+
+#### The following sessions will be run for Build 135807 (patch #17):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135807&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135807#redirect
+
+--- Message (Vandana Rungta, 2026-11-10 02:38:15.000000000) ---
+Uploaded patch set 18.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-11-10 02:38:17.000000000) ---
+Patch Set 18:
+
+Rebased to current master (8a35ae662e, 2.17.61): the only conflict was the insertion point for the new tests in recovery-small.sh, next to the new test_190. Retested on the new base: test_172 and test_173 fail without the fix and pass with it; full recovery-small passes except test_156, which also fails without the fix on this setup.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-10 02:42:43.000000000) ---
+Patch Set 18:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-10 02:43:24.000000000) ---
+Patch Set 18:
+
+Looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-10 02:48:18.000000000) ---
+Patch Set 17: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (jenkins, 2026-11-10 03:03:41.000000000) ---
+Patch Set 18: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135817/ : SUCCESS
+
+--- Message (Autotest, 2026-11-10 03:04:09.000000000) ---
+Patch Set 17:
+
+Trevis Autotest 2 is abandoning the following sessions because: later build 135817 found
+- Optional review-dne-part-1 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-2 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-4 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-6 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-8 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-zfs-part-2 on el9.8-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-4 on el9.8-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-6 on el9.8-x86_64/zfs servers and clients
+- Enforced review-dne-ipv6 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-2 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-4 on el10.2-x86_64/ldiskfs servers and clients
+- Optional review-dne-part-6 on el10.2-x86_64/ldiskfs servers and clients
+- Enforced review-dne-part-8 on el10.2-x86_64/ldiskfs servers and clients
+- Enforced review-dne-zfs-part-2 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-3 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-5 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-zfs-part-7 on el10.2-x86_64/zfs servers and clients
+- Optional review-dne-part-9 on el9.8-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-1 on el8.10-x86_64/ldiskfs servers and clients
+- Enforced review-dne-selinux-ssk-part-2 on el8.10-x86_64/ldiskfs servers and clients
+- Optional review-dne-selinux-ssk-part-1 on el9.8-x86_64/ldiskfs servers and clients
+- Optional review-dne-selinux-ssk-part-1 on el10.2-x86_64/ldiskfs servers and clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and el9.8-x86_64/ldiskfs clients
+- Enforced review-ldiskfs on el8.10-x86_64/ldiskfs servers and sles15sp7-x86_64/ldiskfs clients
+- Optional review-ldiskfs-ubuntu on el8.10-x86_64/ldiskfs servers and ubuntu2604-x86_64/ldiskfs clients

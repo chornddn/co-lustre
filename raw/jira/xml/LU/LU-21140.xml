@@ -38,12 +38,135 @@
                         <labels>
                     </labels>
                 <created>Fri, 6 Nov 2026 14:28:12 +0000</created>
-                <updated>Fri, 6 Nov 2026 14:28:12 +0000</updated>
+                <updated>Tue, 10 Nov 2026 00:33:02 +0000</updated>
                                             <version>Lustre 2.18.0</version>
                                                         <due />
                             <votes>0</votes>
-                                    <watches>1</watches>
-                                                                                    <attachments>
+                                    <watches>7</watches>
+                                                                            <comments>
+                            <comment id="505419" author="gerrit" created="Fri, 6 Nov 2026 19:39:03 +0000">&lt;p&gt;"Manhong &amp;lt;manhong.dai@netapp.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70548" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70548&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21140" title="readdir of a directory that is splitting or migrating can return the same name twice" class="issue-link" data-issue-key="LU-21140"&gt;LU-21140&lt;/a&gt; llite: list each name once in a splitting directory&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: eed89fb0f721b888732e6f51dabfcd2f3681a56d&lt;/p&gt;</comment>
+                            <comment id="505436" author="paf0186" created="Fri, 6 Nov 2026 21:11:28 +0000">&lt;p&gt;I looked at this while reviewing &lt;a href="https://review.whamcloud.com/70548" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/70548&lt;/a&gt;. The duplicates are half of the problem: the same cause also makes readdir skip names, and client-side deduplication can't fix that.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Cause:&lt;/b&gt; LMV merges stripes by &lt;tt&gt;lde_hash&lt;/tt&gt;, but that is each MDT's own htree hash, and every MDT has its own random hash seed (ZAP salt on ZFS). When the restriper moves a name to another MDT, its position in the merged order jumps. A name that moves from behind the readdir cursor to ahead of it is returned twice; one that moves from ahead to behind is never returned.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Measured&lt;/b&gt; (2 MDTs, auto-split, master vs. 70548):&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Case&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;master&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;with 70548&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;ls -U&lt;/tt&gt; during split, 20k files&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;up to 104 dup, up to 45 missing per listing&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0 dup, up to 109 missing&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;one listing open across the split, 100k files&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;~21% missing&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;~21% missing&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;&lt;tt&gt;rm -rf&lt;/tt&gt; while splitting&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ENOTEMPTY&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ENOTEMPTY&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;(Also: test_230D uses &lt;tt&gt;dir_split_delta=1&lt;/tt&gt;, so its plain directory never actually splits.)&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Options:&lt;/b&gt;&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Use one htree hash seed for all MDTs. A name then hashes the same in every stripe and keeps its position; any duplicate lands next to its other copy and is trivial to drop. Doesn't cover existing filesystems (they'd need a rehash) or ZFS.&lt;/li&gt;
+	&lt;li&gt;Second choice: lock out moves with the UPDATE lock. Readdir of a directory whose layout is changing holds PR UPDATE locks on all stripes for the whole listing, so the restriper can't move a name under it. Exact, and works for ZFS and existing filesystems. The cost is performance: the restriper, and every create/unlink in the directory, waits behind any open listing, and a slow or idle reader can hold that up indefinitely. It would probably need a timeout, or a dedicated ibit so only the restriper waits. (Holding the locks only while each merged page is built isn't enough, since names can still move between pages.)&lt;/li&gt;
+	&lt;li&gt;Restripe in two phases: copy the names to the target stripes, then delete the source names in bulk, with readers skipping the copies.&lt;/li&gt;
+	&lt;li&gt;Snapshot the directory on the client while its layout is changing. Needs 2 to be consistent.&lt;/li&gt;
+	&lt;li&gt;Client-side deduplication (70548): drops duplicates only, and keeps about 1 KB of kernel memory per name for each open fd.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=adilger" class="user-hover" rel="adilger"&gt;adilger&lt;/a&gt; &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=diwa" class="user-hover" rel="diwa"&gt;diwa&lt;/a&gt; Is there a reason the MDTs can't share a hash seed? Or a better approach?&lt;/p&gt;</comment>
+                            <comment id="505448" author="adilger" created="Fri, 6 Nov 2026 23:11:18 +0000">&lt;p&gt;IIRC the hash seed is per-directory, to avoid pathological workloads/DOS from being able to cause huge hash-chain collisions.  I'm not against using the same hash seed for a striped directory in DNE, and seems like a good idea going forward if we can pass it in easily from a client (RNG and into the backend OSDs).  It seems unlikely we could get a consistent hashing to work with a directory striped across ldiskfs AND ZFS, but I think the risk of of striped directories, a filesystem with different MDT backends PLUS a concurrent migration is vanishingly small (though I guess MDT backend migration might &lt;em&gt;increase&lt;/em&gt; the probability rather than decrease it).&lt;/p&gt;
+
+&lt;p&gt;The "snapshot on client" is almost free by allowing the client file descriptor to cache the directory contents until the readdir is finished, see &lt;a href="https://jira.whamcloud.com/browse/LU-3308" title="large readdir chunk size slows unlink/&amp;quot;rm -r&amp;quot; performance" class="issue-link" data-issue-key="LU-3308"&gt;LU-3308&lt;/a&gt; (&lt;a href="https://jira.whamcloud.com/browse/LU-5232" title="cache directory contents on file descriptor on lock revocation" class="issue-link" data-issue-key="LU-5232"&gt;&lt;del&gt;LU-5232&lt;/del&gt;&lt;/a&gt; actually provides a more concise description), and is POSIX compliant.  We slurp in the directory stripes in large chunks, cache them/refcount pages on the file descriptor, but don't invalidate the file descriptor cache until the readdir file handle is closed.&lt;/p&gt;
+
+&lt;p&gt;We would obviously not want to cache the directory pages &lt;b&gt;only&lt;/b&gt; on the file descriptor, but share/refcount them on the FD if the DLM lock is revoked, or cache them on the inode under the DLM lock if the FD is closed.  &lt;/p&gt;
+
+&lt;p&gt;That largely decouples what happens in the backend from the readdir lifetime, and should improve performance at the same time.&lt;/p&gt;</comment>
+                            <comment id="505449" author="JIRAUSER24000" created="Fri, 6 Nov 2026 23:15:25 +0000">&lt;p&gt;&amp;gt;Is there a reason the MDTs can't share a hash seed?&lt;/p&gt;
+
+
+
+&lt;p&gt;IMHO, ldiskfs can share the seed, though need remember hash_seed for adding new MDT later, but it does not work for ZFS anyway? Or is there easy to change ZFS to unify the hash for all ZAP objects?&lt;/p&gt;
+
+&lt;p&gt;IMHO, 3 is probably the right way to go, though seems complicate. 2 might be the cheapest option?&lt;/p&gt;</comment>
+                            <comment id="505451" author="adilger" created="Fri, 6 Nov 2026 23:39:20 +0000">&lt;p&gt;The hash seeds are unique per directory, so it would only matter for new striped directories or during restriping (essentially also a new directory as well).  This wouldn't be needed when creating single-striped directories. It wouldn't retroactively fix &lt;em&gt;existing&lt;/em&gt; striped directories, but there are few of those, and it could be fixed during the restripe to pick the hash seed of the original parent directory.&lt;/p&gt;
+
+&lt;p&gt;There wouldn't be any value to retroactively fix the hash seeds of existing directories, since this is only an issue during restriping, and the only way to fix it would be to restripe the directory.&lt;/p&gt;</comment>
+                            <comment id="505463" author="JIRAUSER24000" created="Sat, 7 Nov 2026 03:47:28 +0000">&lt;p&gt;&amp;gt;The "snapshot on client" is almost free by allowing the client file descriptor to cache the directory contents until the readdir is finished,&lt;/p&gt;
+
+&lt;p&gt;Does this mean the fd cache needs to read all entries pages from all stripes before returning the first entry? &lt;/p&gt;</comment>
+                            <comment id="505606" author="JIRAUSER24002" created="Mon, 9 Nov 2026 21:43:42 +0000">&lt;p&gt;Here is an update on what I found today.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Hash seed&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;I checked the seed on a RHEL 9.8 test setup with two ldiskfs MDTs. It is per filesystem (the ldiskfs superblock &lt;tt&gt;s_hash_seed&lt;/tt&gt;), not per directory. This is what I looked at:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;In &lt;tt&gt;ldiskfs/kernel_patches/patches/linux-6.11/ext4-kill-dx-root.patch&lt;/tt&gt; (used by the rhel9.6/9.7/9.8 series), &lt;tt&gt;dx_probe()&lt;/tt&gt; and &lt;tt&gt;make_indexed_dir()&lt;/tt&gt; both set &lt;tt&gt;hinfo-&amp;gt;seed = EXT4_SB(dir-&amp;gt;i_sb)-&amp;gt;s_hash_seed;&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;I added debug printks in &lt;tt&gt;dx_probe()&lt;/tt&gt; and &lt;tt&gt;osd_mount()&lt;/tt&gt; on the test setup:
+	&lt;ul&gt;
+		&lt;li&gt;&lt;tt&gt;pfs-MDT0000-osd&lt;/tt&gt; mount: htree hash seed &lt;tt&gt;641cd9cb-7940aeae-18a93482-c582e86d&lt;/tt&gt;. &lt;tt&gt;dx_probe()&lt;/tt&gt; on dirs ino 259 and ino 2263 on MDT0000 used the same seed as the device.&lt;/li&gt;
+		&lt;li&gt;&lt;tt&gt;pfs-MDT0001-osd&lt;/tt&gt; mount: htree hash seed &lt;tt&gt;c50a22d6-93463bd9-5caf00a6-19809131&lt;/tt&gt;. &lt;tt&gt;dx_probe()&lt;/tt&gt; on dir ino 32271 on MDT0001 used the same seed as that device.&lt;/li&gt;
+	&lt;/ul&gt;
+	&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;So different directories on one MDT use that MDT’s seed, and the two MDTs use different seeds. I did not look at ZFS.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;My patch (client-side deduplication, 70548)&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;I fully agree it should be ranked lowest of Patrick’s options. It only drops duplicates and does not solve the missing-name case.&lt;/p&gt;
+
+&lt;p&gt;I modified my test and redid it today, and names can also go missing from the listing while the directory is splitting. The same race can leave a name in neither stripe at the moment each stripe is read. Deduplication cannot help there, because the name is never read. A shared seed would make the two copies adjacent, but it does not close that window either.&lt;/p&gt;
+
+&lt;p&gt;Only a consistent snapshot (or locking out the moves) fixes both problems.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Snapshot option&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Di Wang’s question is right. To be consistent across a changing layout, all stripes (at least the old and new ones) have to be read before the first entry is returned, and the reads must not race with a name move. Caching the pages on the fd after they were read lazily does not close this, because the race is in the first read of each stripe.&lt;/p&gt;</comment>
+                            <comment id="505611" author="adilger" created="Tue, 10 Nov 2026 00:33:02 +0000">&lt;blockquote&gt;
+&lt;p&gt;different directories on one MDT use that MDT’s seed, and the two MDTs use different seeds&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;You are right and I misremembered the details here. That would have been very convenient though...  I guess the directory hash seed could be specified at mkfs time from the MDT0000 hash seed, and a full &lt;tt&gt;e2fsck -D&lt;/tt&gt; could re-index all of the directories with the new seed. That would help new filesystems going forward, or existing filesystems with an offline e2fsck.&lt;/p&gt;
+
+&lt;p&gt;It would be nice to handle this for existing filesystems as well, if possible, but maybe the condition is uncommon enough that this would be an acceptable long-term solution?&lt;/p&gt;
+
+&lt;blockquote&gt;
+&lt;p&gt;Does this mean the fd cache needs to read all entries pages from all stripes before returning the first entry?&lt;/p&gt;&lt;/blockquote&gt;
+&lt;p&gt;Probably yes, but that is still much less overhead than actually blocking the migrate during readdir (or the reverse) or doing some kind of persistent snapshot on the MDT (which would be complex and overkill for this). This has other performance benefits, like "rm -r" in a directory not ping-ponging the directory cache and DLM locks around.  Once the client has read all of the directory blocks then it doesn't need the directory locks anymore (the readdir is only cached in the FD if an unlink invalidates the DLM lock).&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                                                <inwardlinks description="is related to">
+                                        <issuelink>
+            <issuekey id="18787">LU-3308</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="25224">LU-5232</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
+                    </issuelinks>
+                <attachments>
                     </attachments>
                 <subtasks>
                     </subtasks>

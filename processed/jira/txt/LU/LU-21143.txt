@@ -1,0 +1,28 @@
+Key:        LU-21143
+Summary:    FLR-ECRO: copying an EC layout loses the data component's EC pairing
+Link:       https://jira.whamcloud.com/browse/LU-21143
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Fri, 6 Nov 2026 17:56:22 +0000
+Updated:    Fri, 6 Nov 2026 17:56:22 +0000
+Labels:     FLR-EC-backlog
+
+--- Description ---
+Copying the layout of an EC file to a new file through the lustre.lov xattr (as tar --xattrs or rsync -X restore it, or setfattr) gives the copy new parity objects, but the data components of the copy lose their mirror link id and lcme_dstripe_count/lcme_cstripe_count.  The copy's data is then no longer treated as EC data: the client never switches to CIT_EC_RD for it and reads are not split by raid set, so degraded reads of the copy are not reconstructed from parity, while 'lfs mirror verify' still passes, since llapi pairs parity with data by mirror id.
+
+Reproducer on master (v2_17_61), as root with EC enabled:
+
+lfs setstripe -E 4M -c 2 --ec 2+1 -E -1 -c 2 --ec 2+1 /mnt/lustre/ec
+dd if=/dev/zero of=/mnt/lustre/ec bs=1M count=1
+lfs mirror resync /mnt/lustre/ec
+v=$(getfattr -e hex -n lustre.lov /mnt/lustre/ec | sed -n 's/^lustre.lov=//p')
+mcreate /mnt/lustre/ec.copy
+setfattr -n lustre.lov -v $v /mnt/lustre/ec.copy
+
+Bytes 40-47 of the first (data) entry are 0000020002010000 in the source (lcme_dstripe_count 2, lcme_cstripe_count 1) and all zero in the copy; the parity entries are kept.
+
+The likely cause is lod_layout_scrub(), which keeps a data component's link id and stripe counts only while a parity component links to mirror_id_of(comp->llc_id).  For a layout copied from a user, lod_qos_parse_config() runs it before the copied components get their new ids in lod_striped_create(), so no data component matches its parity.  'lfs mirror extend --ec' and 'lfs setstripe --ec' are not affected, since llapi sends those with LCME_FL_IS_LINK_ID, which lod_bind_data_parity() resolves at create.  'lfs migrate' and 'lfs setstripe --copy' of an EC file would hit the same path once the copied layout reaches the MDS (they currently fail earlier, see LU-21130).
