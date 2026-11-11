@@ -1,0 +1,212 @@
+Change:     70712
+Subject:    LU-20640 pcc: do not wait for active ios in fault path
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70712
+Change-Id:  Idc9421bbf3459227a40e5044463abc4068430c68
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sohei Koyama
+Created:    2026-11-11 09:01:56.000000000
+Updated:    2026-11-11 17:31:19.000000000
+Patch Set:  1
+Insertions: +120
+Deletions:  -4
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-20640 pcc: do not wait for active ios in fault path
+
+pcc_mmap_io_init() is called from ->fault() and ->page_mkwrite()
+with mmap_lock held for read. When it detaches the file from PCC
+(e.g. a store into a MAP_SHARED mapping of a PCC-RO file) or
+switches the mapping to the PCC copy, it waits for all active I/Os
+on the PCC copy to finish under pcc_inode_lock() and mmap_lock.
+This can deadlock:
+
+P1: PCC read
+->pcc_file_read_iter()
+  ->pcc_io_init(): increase pcci_active_ios
+  ->copy_page_to_iter()
+    ->page_fault(): waits for read mmap_lock, queued behind P3
+
+P2: mmap write fault
+->ll_page_mkwrite(): holds read mmap_lock
+  ->pcc_page_mkwrite()
+    ->pcc_mmap_io_init()
+      ->pcc_inode_detach_put()
+        ->pcc_inode_mapping_reset()
+          -> waits for pcci_active_ios == 0
+
+P3: mmap()/munmap() waits for write mmap_lock held by P2
+
+Before waiting there, if there are active I/Os, back off instead of
+waiting under mmap_lock:
+- if the fault may be retried, drop pcc_inode_lock() and mmap_lock,
+  wait for the active I/Os to finish without them, and return
+  VM_FAULT_RETRY, in the same way as filemap_fault() waits for a
+  locked page;
+- otherwise, e.g. ->page_mkwrite() which is called without
+  FAULT_FLAG_ALLOW_RETRY, return VM_FAULT_NOPAGE so that the caller
+  releases mmap_lock and the access faults again.
+Lustre file mappings have no ->map_pages(), so these handlers are
+always called with mmap_lock held, not a per-VMA lock.
+
+Add sanity-pcc test_104 to reproduce the deadlock with
+OBD_FAIL_LLITE_PCC_MKWRITE_PAUSE.
+
+Test-Parameters: testlist=sanity-pcc env=ONLY="103 104",ONLY_REPEAT=10
+Fixes: e4c01fbcc541 ("LU-14003 pcc: rework PCC mmap implementation")
+Signed-off-by: Sohei Koyama <skoyama@ddn.com>
+Change-Id: Idc9421bbf3459227a40e5044463abc4068430c68
+
+--- Review History ---
+
+--- Message (Sohei Koyama, 2026-11-11 09:01:56.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 09:06:00.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 09:18:31.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-11 11:50:37.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135937/ : SUCCESS
+
+--- Message (Maloo, 2026-11-11 11:51:00.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 135937 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=135937&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=135937#redirect
+
+--- Message (Maloo, 2026-11-11 17:31:19.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm223: https://testing.whamcloud.com/test_sessions/04ce5849-bfd6-4456-bfa2-f526a91a4944 ran 5 tests.  1 tests failed: sanity-sec.

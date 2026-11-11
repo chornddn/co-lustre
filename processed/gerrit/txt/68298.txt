@@ -7,38 +7,38 @@ Branch:     master
 Status:     NEW
 Owner:      Qian Yingjin
 Created:    2026-08-25 03:57:28.000000000
-Updated:    2026-10-21 01:30:10.000000000
-Patch Set:  7
-Insertions: +28
-Deletions:  -2
-Comments:   19 (10 unresolved)
+Updated:    2026-11-11 11:32:53.000000000
+Patch Set:  9
+Insertions: +294
+Deletions:  -4
+Comments:   21 (10 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Andreas Dilger, Yang Sheng
+  REVIEWER: Andreas Dilger, Yang Sheng, Sohei Koyama
 
 --- Commit Message ---
 LU-20640 pcc: fix deadlock between mmap_lock and active ios
 
-It exists the following deadlock between mmap_lock and active ios:
+There is the following deadlock between mmap_lock and active ios:
 
 P1: PCC read
 ->ll_file_read_iter()
   ->pcc_file_read_iter()
-  ->pcc_io_init(): increase pcci_active_ios
-   ->xfs_file_buffered_read()
-    ->generic_file_buffered_read()
-     ->copy_page_to_iter()
-      ->page_fault()
-       ->do_page_fault()
-        -> try to acquire mmap_lock
+    ->pcc_io_init(): increase pcci_active_ios
+    ->xfs_file_buffered_read()
+      ->generic_file_buffered_read()
+        ->copy_page_to_iter()
+          ->page_fault()
+            ->do_page_fault()
+              -> try to acquire mmap_lock
 
 P2: PCC mmap
-->vm_mmap_pgoff(): hole write mmap_lock
+->vm_mmap_pgoff(): holds write mmap_lock
  ->ll_file_mmap()
   ->pcc_file_mmap()
    ->pcc_mmap_mapping_set()
@@ -48,16 +48,33 @@ More precisely, P1 waits for P2 to release mmap_lock, and P2 waits
 for P1 to complete and so that @pcci_active_ios changes from 1 to
 0.
 
-This patch simply fixes the bug by skipping mmap switching in
+This patch fixes the bug by skipping mmap switching in
 pcc_file_mmap() and pcc_vm_close() when found that there are any
-active IOs not finished before switch or reset mapping.
+active IOs not finished before switch or reset mapping. As
+pcci_active_ios is only increased under pcc_inode_lock(), checking
+it under the same lock in pcc_file_mmap() guarantees that the wait
+in pcc_mmap_mapping_set() returns immediately. In that case
+pcc_file_mmap() returns -EBUSY with @cached unset, so the mmap()
+falls back to the normal Lustre I/O path. Any other error after
+that point is still returned to the caller with @cached set.
 
-This patch alos moves "*cache = true" past the backend ->mmap()
-call, so that we can fallback to normal Lustre I/O path when
-mmap() fails.
+This patch also restores @vma->vm_file to the Lustre file before
+dropping the PCC file reference when the backend ->mmap() fails.
+Newer kernels put @vma->vm_file on ->mmap() failure (instead of
+the file passed to mmap_region()), so leaving it pointing at the
+PCC file put the PCC file twice and leaked the Lustre file, which
+then kept the file open and the client mount busy.
 
+Add sanity-pcc test_103 to reproduce the deadlock: a PCC read is
+paused with an active I/O held by the new fail_loc
+OBD_FAIL_LLITE_PCC_READ_PAUSE, then the file is mmap()ed while the
+read faults on its user buffer.
+
+Test-Parameters: testlist=sanity-pcc env=ONLY=103,ONLY_REPEAT=10
+Fixes: e4c01fbcc541 ("LU-14003 pcc: rework PCC mmap implementation")
 Change-Id: Ic4a7c1ad9302c3d13e32b7694b4cb20f49e5784b
 Signed-off-by: Yingjin Qian <qian@ddn.com>
+Signed-off-by: Sohei Koyama <skoyama@ddn.com>
 
 --- Review History ---
 
@@ -327,3 +344,57 @@ Patch Set 7: Code-Review-1
 The deadlock is real: ->mmap() is called with mmap_lock held for write, and pcc_mmap_mapping_set() waits uninterruptibly for pcci_active_ios while a PCC read holding an active IO faults on its user buffer and waits for mmap_lock. Checking pcci_active_ios under pcc_inode_lock in pcc_file_mmap() closes that, since pcc_io_init() takes the same lock to start an IO, and the -EBUSY case falls back to a normal Lustre mmap because *cached is still false. Skipping the mapping reset in pcc_inode_mmap_put() is OK since detach resets it later.
 
 However, moving "*cached = true" changes all of the later error paths in pcc_file_mmap() from returning an error into a fallback to generic_file_mmap(), and those paths are not ready for that (see inline). Also, pcc_mmap_io_init() still calls pcc_mmap_mapping_set() from the fault path with mmap_lock held for read; a writer queued on mmap_lock blocks the faulting read in pcc_file_read_iter(), which gives the same kind of deadlock. Please also add a sanity-pcc test that reproduces the original deadlock (read into a buffer mmapped from another file while the PCC file is mmapped).
+
+--- Message (Sohei Koyama, 2026-11-11 07:53:11.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Sohei Koyama, 2026-11-11 07:54:27.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 07:58:27.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 07:59:29.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (Sohei Koyama, 2026-11-11 08:04:21.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Sohei Koyama, 2026-11-11 09:01:56.000000000) ---
+Uploaded patch set 9.
+
+--- Message (jenkins, 2026-11-11 09:01:58.000000000) ---
+Patch Set 8: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/135927/ : ABORTED
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 09:05:55.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 09:18:42.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-11 11:32:17.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135936/ : SUCCESS

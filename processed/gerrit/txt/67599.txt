@@ -7,15 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Vandana Rungta
 Created:    2026-07-28 17:49:43.000000000
-Updated:    2026-11-10 03:04:09.000000000
-Patch Set:  18
-Insertions: +320
+Updated:    2026-11-11 21:11:37.000000000
+Patch Set:  19
+Insertions: +349
 Deletions:  -5
-Comments:   87 (5 unresolved)
+Comments:   93 (10 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: kg.xu, Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
@@ -48,12 +49,13 @@ Send these closes from a per-superblock workqueue instead:
   cancelling thread waits for it, so it still reaches the MDT before
   what the cancel lets through (an ELC'd conflicting open, the cancel
   reply).  A kernel thread stops waiting once the import is not FULL; a
-  user thread (ELC) waits as before.  If the MDT is reachable but the
-  queue has not started the close, the waiter sends it itself, so closes
-  parked on a down MDT cannot hold up closes to healthy ones.
+  user thread or nfsd (ELC) waits as before.  If the MDT is reachable
+  but the queue has not started the close, the waiter sends it itself,
+  so closes parked on a down MDT cannot hold up closes to healthy ones.
 - eviction: ll_prune_aliases() pins the aliases' parent dentries, and
-  drops the pins from the workqueue when that can kill them, so the
-  whole cascade runs there.  The cancel's own final iput, and two other
+  ll_prune_negative_children() the directory's own alias, and drops
+  the pins from the workqueue when that can kill them, so the whole
+  cascade runs there.  The cancel's own final iput, and two other
   iputs on the cancel path, go through ll_iput_later(), which defers
   the iput when the inode has a cached open handle.
 
@@ -72,6 +74,7 @@ Measured on a 2-MDT filesystem with MDT0001 stopped:
 On a healthy filesystem the RPC order for exec-then-truncate of the
 same file is unchanged.
 
+Fixes: 1f0b2a0dca6a ("LU-13909 llite: prune invalid dentries")
 Test-Parameters: mdscount=2 mdtcount=4 testlist=recovery-small env=ONLY=172,173
 Change-Id: I88beb57e6fe4ee49cc7741187ea5fc9f85117dbf
 Signed-off-by: Vandana Rungta <vrungta@amazon.com>
@@ -966,3 +969,76 @@ Patch Set 18: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/135817/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-10 14:33:40.000000000) ---
+Patch Set 18:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The workqueue approach looks sound overall, but the eviction cascade still has an uncovered entry point, and the kernel-thread heuristic also applies to nfsd.
+
+--- Message (patrick bot, 2026-11-10 21:38:30.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-10 22:14:24.000000000) ---
+Patch Set 18:
+
+(1 comment)
+
+--- Message (Vandana Rungta, 2026-11-11 20:59:55.000000000) ---
+Uploaded patch set 19.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Vandana Rungta, 2026-11-11 20:59:57.000000000) ---
+Patch Set 19:
+
+Patchset 19.
+
+sanityn test_76 timeouts on patchset 18 (4 of 4 runs): caused by the new
+tests, not the fix. test_172 and test_173 saved lru_size and restored it on
+exit, but with LRU resize lru_size reads back the current lock count, so the
+restore pinned a small fixed lru_size on the client (8 and 21 here). In
+sanityn test_76, with about 1000 unused locks against that limit, every lock
+added to the LRU was cancelled before it could be matched, and the client
+re-enqueued forever. test_172 now uses lru_resize_disable(), whose cleanup
+re-enables LRU resize; test_173 restores nothing, since lru_size=clear
+changes no setting.
+
+Lab, recovery-small 172,173 followed by sanityn 76, 4 MDTs:
+  old tests:   test_76 stalled (4 of 32 progress dots in 64 min)
+  new tests:   test_76 PASS 56s, lru_size back to dynamic; ps18 and ps19
+  unpatched:   test_172 and test_173 FAIL as before, test_76 PASS
+
+Also in this patchset: the review fixes (nfsd keeps waiting, the alias pins in
+ll_prune_aliases(), the negative-children alias, the Fixes: tag).
+
+Replies to the AI review comments on patchset 18:
+
+[1] Fixes: tag
+Done in patchset 19: Fixes: 1f0b2a0dca6a ("LU-13909 llite: prune invalid dentries"). That commit added the d_prune_aliases() call in ll_prune_aliases() that the eviction route goes through.
+
+[2] dget_parent() under inode->i_lock
+Agreed: dget_parent() can dput() on a d_seq retry and sleep under the spinlock. Patchset 19 takes only dget_dlock() on the aliases under i_lock, then does dget_parent() and drops the alias references after the unlock.
+
+[3] separate cleanup label instead of the NULL check
+Left as is. A separate label means retargeting the three later GOTO(out_destroy_ra) sites, for no change in behaviour; the NULL check matches the NULL-checked destroy of ll_readahead_wq in the teardown path.
+
+[4] PF_KTHREAD also matches nfsd
+Agreed: nfsd opens through ELC itself and relies on the close preceding the open. Patchset 19 excludes it the way llite_nfs.c already identifies it (PF_KTHREAD and comm "nfsd"), so nfsd keeps waiting like a user thread.
+
+[5] cascade from ll_prune_negative_children() / master_inode
+Agreed. Patchset 19 holds the directory's alias across ll_prune_negative_children() and drops it with ll_dentry_put_later(), so a dput() that kills it runs in ll-close-wq; the striped master_inode put already goes through ll_iput_later().
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 21:03:47.000000000) ---
+Patch Set 19:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 21:11:37.000000000) ---
+Patch Set 19:
+
+Looks good to me.

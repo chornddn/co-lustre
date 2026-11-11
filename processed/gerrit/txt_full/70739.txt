@@ -1,0 +1,79 @@
+Change:     70739
+Subject:    LU-19921 ptlrpc: handle IMP_DISCON in SEC_CTX_INIT fallback
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70739
+Change-Id:  Ief122e893b424b37e308ffad32d4fccbc0eef9ee
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Sudheer Dantuluri
+Created:    2026-11-11 19:00:14.000000000
+Updated:    2026-11-11 19:07:15.000000000
+Patch Set:  1
+Insertions: +25
+Deletions:  -9
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: (no votes)
+
+--- Commit Message ---
+LU-19921 ptlrpc: handle IMP_DISCON in SEC_CTX_INIT fallback
+
+Commit 665df8ab7f08 ("LU-19921 ptlrpc: fix SEC_CTX_INIT timeout on
+undiscovered peer") returns an uncached, non-uptodate context from
+gssiam_lookup_ctx() when SEC_CTX_INIT times out during
+LUSTRE_IMP_CONNECTING, allowing ptlrpc_connect_import_locked() to
+queue MDS_CONNECT asynchronously to ptlrpcd and return 0 to the
+mount thread.
+
+Immediately after obd_connect() returns 0, the mount thread issues
+MDS_STATFS via lmv_statfs_check_update() and
+client_common_fill_super() -> obd_statfs() -> mdc_statfs(). Because
+gssiam->gis_ctx is still NULL, ptlrpc_request_alloc_pack() for
+MDS_STATFS enters gssiam_lookup_ctx() -> gssiam_send_init_rpc()
+before MDS_STATFS can reach ptlrpc_import_delay_req() and wait on
+imp->imp_delayed_list.
+
+Meanwhile, when the initial MDS_CONNECT fails in
+ptlrpc_connect_interpret(), imp->imp_state transitions to
+LUSTRE_IMP_DISCON until ptlrpc_pinger starts the next
+LUSTRE_IMP_CONNECTING pass. If LNet peer discovery takes longer
+than the initial attempts (or ptlrpc_pinger is busy processing
+other imports under pinger_mutex), MDS_STATFS can hit this
+LUSTRE_IMP_DISCON window:
+- In ptl_send_rpc(), SEC_CTX_INIT (rq_ctx_init == 1, which bypasses
+  ptlrpc_import_delay_req()) is neither refreshed via
+  LNetPeerDiscovered() nor fast-dropped in 1s over a non-uptodate
+  peer while imp->imp_state == LUSTRE_IMP_DISCON.
+- In gssiam_lookup_ctx(), imp->imp_state == LUSTRE_IMP_CONNECTING
+  is false during LUSTRE_IMP_DISCON, returning -ETIMEDOUT to
+  mdc_statfs() and aborting the mount instead of letting MDS_STATFS
+  wait on imp->imp_delayed_list.
+
+Fix both places:
+1. In gssiam_lookup_ctx(), check imp->imp_state under imp->imp_lock
+   for either LUSTRE_IMP_CONNECTING or LUSTRE_IMP_DISCON (when
+   IMPF_DEACTIVE is not set) upon SEC_CTX_INIT RPC timeout, and
+   clear PTLRPC_CTX_CACHED_BIT on the uncached fallback context.
+2. In ptl_send_rpc(), extend the oic_uptodate <= 0 check to include
+   request->rq_ctx_init when imp->imp_state == LUSTRE_IMP_DISCON.
+
+Fixes: 665df8ab7f08 ("LU-19921 ptlrpc: fix SEC_CTX_INIT timeout on undiscovered peer")
+Signed-off-by: Sudheer Dantuluri <dantuluris@google.com>
+Change-Id: Ief122e893b424b37e308ffad32d4fccbc0eef9ee
+
+--- Review History ---
+
+--- Message (Sudheer Dantuluri, 2026-11-11 19:00:14.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 19:04:55.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 19:07:15.000000000) ---
+Patch Set 1:
+
+Looks good to me.

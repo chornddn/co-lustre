@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-11-07 11:21:47.000000000
-Updated:    2026-11-09 05:48:58.000000000
-Patch Set:  2
-Insertions: +210
+Updated:    2026-11-11 17:46:15.000000000
+Patch Set:  3
+Insertions: +268
 Deletions:  -11
-Comments:   10 (3 unresolved)
+Comments:   13 (0 unresolved)
 Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
@@ -24,44 +24,53 @@ Hashtags:   pw_shepherd
 --- Commit Message ---
 LU-10948 mdt: grant write open locks without LOOKUP
 
-With the default opencache tunables, repeated opens of a file for
+With the default opencache tunables
+(`llite.*.opencache_threshold_count`), repeated opens of a file for
 write never used the cached open handle.  The CW LOOKUP|OPEN open lock
 conflicted with the PR LOOKUP lock that the client itself held from
 the earlier lookup, and cancelling that lock invalidated the dentry.
 Every later open then went through ll_atomic_open(), which sent an
 open RPC and closed the duplicate handle, so 20 appends to one file
 needed 20 lock enqueues and 20 close RPCs, as with opencache disabled.
-A lookup of the name from another client also revoked the cached
-write handle.
+A lookup of the name from another client also revoked the cached write
+handle.
 
 Grant the CW open lock with only the OPEN bit, and LOOKUP as a try
 bit, so it does not revoke PR LOOKUP locks of this or other clients.
 If the LOOKUP bit is granted, a lookup from another client still
 revokes the cached handle, as before.
 
-The LOOKUP bit of the open lock was also what made an unlink, a
-rename over the file or an rmfid close cached write handles on other
-clients.  Add the OPEN bit to the EX lock on such a victim if it is a
-regular file, so that a removed file does not stay an orphan until the
-client drops the handle, and rmfid does not fail with -EBUSY.  This
-also breaks leases on the file, even if other links to it remain.
+The LOOKUP bit of the open lock was also what made an unlink, a rename
+over the file or an rmfid close cached write handles on other clients.
+Add the OPEN bit to the EX lock on such a victim if it is a regular
+file in mdt_victim_open_ibits(), so that a removed file does not stay
+an orphan until the client drops the handle, and rmfid does not fail
+with -EBUSY.  This also breaks leases on the file, even if other links
+to it remain.
 
 An exec of a file with cached write handles revokes them since
 LU-21074 "mdt: revoke cached open handles on exec conflict", so it
 does not fail with -ETXTBSY.
 
-A getattr of the file by the copytool also used to revoke the cached
-write handle when an HSM archive started.  Without it, the close that
-reports the data as modified arrived only after the archive completed,
-so the file was marked dirty and could not be released.  Revoke cached
-write handles explicitly when the copytool starts an archive.
+The lookup of the file by "lfs hsm_archive" and the getattr by the
+copytool also used to revoke the cached write handle.  Without that,
+the close that reports the data as modified, and marks the file dirty,
+arrives later: an archive request for an already archived file is
+skipped as not needed, a close after the archive completes marks the
+new copy dirty, so the file cannot be released, and a file whose
+archive failed because it was written is not marked dirty.  Revoke
+cached write handles with mdt_hsm_revoke_open() when an archive of an
+archived clean file is requested, when the copytool starts an archive
+and when an archive fails.
 
 Add sanity test_441a to check that appends use the cached open handle,
-sanityn test_124 to check that unlink and rename close it, and
-sanityn test_14e to check that an exec from another client is not
-denied by it.
+sanityn test_124 to check that unlink and rename close it, sanityn
+test_14e to check that an exec from another client is not denied by
+it, and sanity-hsm test_413 to check that it does not hide changes
+from an archive request.
 
 Test-Parameters: trivial testlist=sanityn,sanity-hsm
+Fixes: 41d99c490283 ("LU-10948 llite: Introduce inode open heat counter")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: Ice6aac15e14e064d048db117c9cf00b5543ebbe5
@@ -149,3 +158,31 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The locking changes themselves look consistent (no new lock-ordering or self-conflict issues found in unlink/rename/rmfid or the archive revoke), but cached write handles now outlive lookups from other clients, and one HSM consumer of the close still depends on the old behaviour.
+
+--- Message (Andreas Dilger, 2026-11-11 09:45:07.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-11 09:45:26.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 09:48:54.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 09:52:03.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-11 17:45:53.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135950/ : SUCCESS

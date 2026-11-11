@@ -1,0 +1,79 @@
+Change:     70664
+Subject:    LU-21177 mdc: keep parent UPDATE lock for volatile create
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70664
+Change-Id:  I9369edcce841271a06011ca1ec3125131f5dea4d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Markus Hilger
+Created:    2026-11-10 12:09:52.000000000
+Updated:    2026-11-11 01:12:10.000000000
+Patch Set:  1
+Insertions: +14
+Deletions:  -8
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1; Maloo: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-21177 mdc: keep parent UPDATE lock for volatile create
+
+mdc_intent_open_pack() cancels the client's UPDATE lock on the
+parent directory by early lock cancel before every create. A
+volatile file is not linked into its parent, and since 2.14.52
+(LU-14693) the MDT takes no DLM lock on the parent for it, so the
+lock stays valid and the cancel only costs: it runs
+ll_prune_negative_children(), which walks all cached children of
+the parent under its d_lock. Tools working by FID (lfs migrate,
+lfs mirror extend or split on .lustre/fid/[FID]) create their
+volatile files in .lustre/fid, which caches one dentry per FID
+looked up. With 400k of them, one volatile create spends about
+5 ms in the walk, and path walks through .lustre/fid on the same
+client spin on its d_lock meanwhile.
+
+Do not cancel the parent's UPDATE lock for a volatile create. An
+older MDT still locks the parent and revokes the lock by a
+blocking callback, as for any create without early lock cancel.
+
+Users of liblustreapi's volatile helpers, such as the HSM copytool
+restore, also unlink the volatile name after the open, which
+cancels the lock in mdc_unlink(). The change "llapi: don't unlink
+volatile file opened on Lustre" removes that unlink.
+
+Fixes: 8c04afb5236f ("LU-14693 mdt: skip DLM when opening volatile files")
+Signed-off-by: Markus Hilger <markus.hilger@megware.com>
+Change-Id: I9369edcce841271a06011ca1ec3125131f5dea4d
+
+--- Review History ---
+
+--- Message (Markus Hilger, 2026-11-10 12:09:52.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-10 12:14:16.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-10 12:24:06.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-10 12:35:35.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135836/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-11 01:12:10.000000000) ---
+Patch Set 1:
+
+AI code review results below, please doublecheck
+
+Looks good; no need to re-spin. (suggestion) There is no test for the new behaviour. sanity test_120b ("Early Lock Cancel: create test") already checks the ELC and blocking-AST counters around a create. A sibling test could open(O_CREAT) a LUSTRE_VOLATILE_HDR name in a directory whose UPDATE lock is cached, then check that the parent's mdc lock is still cached and that no cancel or blocking AST was sent. That would catch a later change that brings the cancel back. Fine to add with the llapi patch in this series or on a refresh.

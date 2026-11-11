@@ -1,5 +1,5 @@
 Change:     70548
-Subject:    LU-21140 llite: list each name once in a splitting directory
+Subject:    LU-21140 lmv: snapshot a changing directory for readdir
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70548
 Change-Id:  Ic0113b6ce14e7396c4b2cfd565498b867c87c08d
 Project:    fs/lustre-release
@@ -7,37 +7,47 @@ Branch:     master
 Status:     NEW
 Owner:      Manhong
 Created:    2026-11-06 19:39:01.000000000
-Updated:    2026-11-08 18:22:36.000000000
-Patch Set:  1
-Insertions: +176
-Deletions:  -5
-Comments:   4 (3 unresolved)
+Updated:    2026-11-11 04:49:49.000000000
+Patch Set:  2
+Insertions: +517
+Deletions:  -25
+Comments:   10 (8 unresolved)
 
 --- Labels ---
-  Code-Review: Patrick Farrell: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
-  CC: Gerrit AI review for Lustre
-  REVIEWER: Cory Spitz, Patrick Farrell
+  CC: Andreas Dilger, Gerrit AI review for Lustre
+  REVIEWER: Cory Spitz, wangdi, Patrick Farrell
 
 --- Commit Message ---
-LU-21140 llite: list each name once in a splitting directory
+LU-21140 lmv: snapshot a changing directory for readdir
 
 While a striped directory is being split or migrated, readdir can
-return the same name twice: LMV reads each stripe in its own RPC and
-merges the pages by hash without comparing names, so an entry read
-from the old stripe before it moves and from the new stripe after it
-is listed twice. A parallel "lfs find | xargs rm" of a directory
-that is auto-splitting then fails with ENOENT on the second removal.
+list a name twice or not at all. LMV reads each stripe in its own
+RPCs, at different times, and merges the pages by hash, so a name
+that moves from an old stripe to a new one between two reads is
+seen in both or in neither.
 
-Keep the names returned by an open directory in an xarray while its
-layout is changing, and drop a name already returned. A name is
-recorded only after dir_emit() accepts it, so an entry that did not
-fit in the user buffer is read again, and the set is cleared on
-seek or end of directory and freed on close. A listing that
-starts before the split begins is not covered, as its names were not
-recorded.
+While a directory auto-splits, "ls -U dir | sort | uniq -d" prints
+duplicated names, and "ls -U dir | sort -u | wc -l" returns fewer
+files than were created.
+
+Read every stripe of a directory whose layout is changing into pages
+kept on the open file, when the first entries are requested, and
+serve the listing from them. Each stripe is read under a PR UPDATE
+lock that is kept until the last stripe has been read, so no name
+can move between the stripes in the meantime. A move takes a
+conflicting lock on both stripes, in stripe index order, so the
+locks are taken in that order too. Only the first page of a stripe
+enqueues the lock; reading the other pages under the lock already
+held avoids a new request queuing behind a conflicting lock that is
+waiting for ours to be cancelled.
+
+Add the lock hand-over to md_readdir_info and mdc_read_page(). The
+snapshot is dropped at EOF, on seek and on close. If it cannot be
+taken, readdir reads the stripes directly as before.
 
 Add sanity test_230D, which lists a directory while it auto-splits.
 
@@ -82,3 +92,38 @@ Patch Set 1:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. Even for the duplicate case the patch is meant to fix, dedupe stops as soon as the split finishes, and the per-open name set can grow very large on big migrating directories.
+
+--- Message (Manhong, 2026-11-11 00:03:36.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 00:06:51.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-11 00:11:07.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-11 00:27:14.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/135878/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-11 04:49:49.000000000) ---
+Patch Set 2:
+
+(4 comments)

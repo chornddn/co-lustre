@@ -1,5 +1,5 @@
 <rss version="0.92"><channel><item>
-            <title>[LU-21140] readdir of a directory that is splitting or migrating can return the same name twice</title>
+            <title>[LU-21140] readdir of a migrating striped directory lists names twice or misses them</title>
                 <link>https://jira.whamcloud.com/browse/LU-21140</link>
                 <project id="10000" key="LU">Lustre</project>
                     <description>&lt;p&gt;While a striped directory is being auto-split or migrated, a readdir on a client can return the same name twice, once from the old stripe and once from the new stripe.&lt;/p&gt;
@@ -27,7 +27,7 @@
 &lt;p&gt;Any output is a name that was listed more than once. The migrating flag in lfs getdirstripe $TestDir shows whether a migration is in progress.&lt;/p&gt;</description>
                 <environment />
         <key id="100341">LU-21140</key>
-            <summary>readdir of a directory that is splitting or migrating can return the same name twice</summary>
+            <summary>readdir of a migrating striped directory lists names twice or misses them</summary>
                 <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
                                             <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
                         <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
@@ -38,14 +38,14 @@
                         <labels>
                     </labels>
                 <created>Fri, 6 Nov 2026 14:28:12 +0000</created>
-                <updated>Tue, 10 Nov 2026 00:33:02 +0000</updated>
+                <updated>Wed, 11 Nov 2026 17:48:31 +0000</updated>
                                             <version>Lustre 2.18.0</version>
                                                         <due />
                             <votes>0</votes>
                                     <watches>7</watches>
                                                                             <comments>
                             <comment id="505419" author="gerrit" created="Fri, 6 Nov 2026 19:39:03 +0000">&lt;p&gt;"Manhong &amp;lt;manhong.dai@netapp.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70548" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70548&lt;/a&gt;&lt;br/&gt;
-Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21140" title="readdir of a directory that is splitting or migrating can return the same name twice" class="issue-link" data-issue-key="LU-21140"&gt;LU-21140&lt;/a&gt; llite: list each name once in a splitting directory&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21140" title="readdir of a migrating striped directory lists names twice or misses them" class="issue-link" data-issue-key="LU-21140"&gt;LU-21140&lt;/a&gt; llite: list each name once in a splitting directory&lt;br/&gt;
 Project: fs/lustre-release&lt;br/&gt;
 Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
@@ -152,6 +152,94 @@ Commit: eed89fb0f721b888732e6f51dabfcd2f3681a56d&lt;/p&gt;</comment>
 &lt;blockquote&gt;
 &lt;p&gt;Does this mean the fd cache needs to read all entries pages from all stripes before returning the first entry?&lt;/p&gt;&lt;/blockquote&gt;
 &lt;p&gt;Probably yes, but that is still much less overhead than actually blocking the migrate during readdir (or the reverse) or doing some kind of persistent snapshot on the MDT (which would be complex and overkill for this). This has other performance benefits, like "rm -r" in a directory not ping-ponging the directory cache and DLM locks around.  Once the client has read all of the directory blocks then it doesn't need the directory locks anymore (the readdir is only cached in the FD if an unlink invalidates the DLM lock).&lt;/p&gt;</comment>
+                            <comment id="505620" author="JIRAUSER24002" created="Tue, 10 Nov 2026 13:18:03 +0000">&lt;p&gt;&lt;b&gt;Progress on the snapshot approach&lt;/b&gt; (the snapshot option in Patrick’s list, and Andreas’s fd cache idea), and why I am trying it this way.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;What I tried, and why it failed&lt;/b&gt;&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;&lt;b&gt;Client-side dedup (70548) is not enough.&lt;/b&gt; In my new test, names are missing from the listing, not only listed twice. Dedup cannot fix that, because the name is never read. I am no longer pursuing client-side dedup.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Optimistic snapshot.&lt;/b&gt; The client reads all stripes, then checks that none changed (the stripe inode &lt;tt&gt;i_version&lt;/tt&gt;, and the same DLM lock cookie for every page of a stripe), and retries on a change. During an active split, names move continuously, so every attempt saw a change. The client log showed the snapshot failing with &lt;tt&gt;-EAGAIN&lt;/tt&gt;, the code fell back to the old path, and the duplicates stayed. It succeeded only in the quiet gaps between moves, so it cannot work during a sustained migration.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;&lt;b&gt;What I am testing now&lt;/b&gt;&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;&lt;b&gt;Lock-holding snapshot (client only).&lt;/b&gt; This is the snapshot option, with the locking it needs to be consistent (Patrick’s second option), but held only while the pages are read. At the first &lt;tt&gt;readdir&lt;/tt&gt; of a directory whose layout is changing, LMV reads every stripe completely into pages kept on the open file. It takes the stripe’s PR UPDATE lock on the first page of each stripe and keeps it until the last stripe has been read. Then it drops all the locks and serves the listing from the pages.
+	&lt;ul&gt;
+		&lt;li&gt;&lt;b&gt;Why this should be consistent:&lt;/b&gt; a name can move between two stripes only by taking PW/CW on both (&lt;tt&gt;mdt_lock_pdo_mode()&lt;/tt&gt; takes the whole-dir UPDATE lock in CW to flush client readdir caches). While we hold PR on a stripe, no name can move into or out of it. So each stripe is frozen from the moment we lock it until the snapshot is complete.&lt;/li&gt;
+		&lt;li&gt;&lt;b&gt;Why not hold the locks for the whole listing:&lt;/b&gt; that would block the restriper and every create and unlink in the directory behind a slow or idle reader. Here the locks are held only while the pages are read.&lt;/li&gt;
+		&lt;li&gt;&lt;b&gt;Deadlock:&lt;/b&gt; the client takes the stripe locks in stripe index order. &lt;tt&gt;mdt_reint_migrate()&lt;/tt&gt; also locks the source and target parent stripes in stripe index order, so we never wait for a stripe that a move holds while that move waits for one we hold. I have not audited other paths that lock two stripes (rename, for example).&lt;b&gt;Answer to Di Wang’s question:&lt;/b&gt; yes, for a changing layout the snapshot has to read all stripes before the first entry is returned. Caching the pages on the fd as they are read lazily does not help, because the race is in the first read of each stripe. Directories whose layout is not changing keep the lazy path.&lt;/li&gt;
+	&lt;/ul&gt;
+	&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;&lt;b&gt;Costs and limits&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;The first &lt;tt&gt;getdents&lt;/tt&gt; of a splitting directory waits for the whole read, and moves, creates and unlinks in that directory wait for the same time.&lt;/li&gt;
+	&lt;li&gt;Memory: every page of the directory is kept until EOF, seek or close. There is no cap.&lt;/li&gt;
+	&lt;li&gt;A listing that started before the layout became “changing” is not covered.&lt;/li&gt;
+	&lt;li&gt;Names created or removed during the listing may not show up (POSIX allows that).&lt;/li&gt;
+	&lt;li&gt;If the snapshot cannot be taken (an error on a stripe), it falls back to the current behaviour.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Status&lt;/b&gt;&lt;/p&gt;
+
+&lt;p&gt;Prototype only. The lock-holding version has not been tested yet. I will post the result.&lt;/p&gt;
+
+&lt;p&gt;Any opinions on this approach are greatly appreciated.&lt;/p&gt;</comment>
+                            <comment id="505638" author="JIRAUSER24002" created="Wed, 11 Nov 2026 00:19:34 +0000">&lt;p&gt;Just pushed the snapshot approach to the same patch (70548)&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-21140" title="readdir of a migrating striped directory lists names twice or misses them" class="issue-link" data-issue-key="LU-21140"&gt;LU-21140&lt;/a&gt; lmv: snapshot a changing directory for readdir&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;How it works&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;On the first readdir of a directory whose layout is changing (a split or migration is in progress), LMV reads every stripe completely into pages kept on the open file, then serves the listing from those pages. Directories whose layout is not changing keep the lazy path.&lt;/li&gt;
+	&lt;li&gt;Each stripe is read under a PR UPDATE lock. The lock is enqueued on the first page of the stripe and held until the last stripe has been read. A name can only move between stripes under a conflicting lock (CW/PW) on both, so while we hold the locks no name can move in or out of a stripe, and the stripes are consistent with each other.&lt;/li&gt;
+	&lt;li&gt;Locks are taken in stripe index order, the same order &lt;tt&gt;mdt_reint_migrate()&lt;/tt&gt; uses for the source and target parent stripes. This avoids waiting for a stripe that a move holds while that move waits for one of ours.&lt;/li&gt;
+	&lt;li&gt;Only the first page of a stripe enqueues the lock. The remaining pages are read under the lock already held, using a new lock hand-over in &lt;tt&gt;md_readdir_info&lt;/tt&gt; and &lt;tt&gt;mdc_read_page()&lt;/tt&gt;. Requesting the lock again for each page let the request queue behind a conflicting lock that was itself waiting for ours to be cancelled, and the MDS then evicted the client (“lock callback timer expired”).&lt;/li&gt;
+	&lt;li&gt;The snapshot is dropped at EOF, on seek, and on close. If it cannot be taken (for example, an error on a stripe), readdir falls back to reading the stripes directly, as before.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Test&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;New sanity test_230D lists a directory while it auto-splits (2 MDTs, &lt;tt&gt;dir_split_count&lt;/tt&gt; lowered) and checks for duplicated and missing names. A background process keeps adding and removing files during the listing.&lt;/li&gt;
+	&lt;li&gt;With the patch, 100 runs passed.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;&lt;b&gt;Limitations&lt;/b&gt;&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;The first getdents on a splitting directory waits for the whole read. Moves, creates and unlinks in that directory wait for the same time.&lt;/li&gt;
+	&lt;li&gt;Memory: every page of the directory is kept until EOF, seek or close. There is no cap.&lt;/li&gt;
+	&lt;li&gt;A listing that started before the layout became “changing” is not covered.&lt;/li&gt;
+	&lt;li&gt;Names created or removed during the listing may not show up (POSIX allows this).&lt;/li&gt;
+	&lt;li&gt;Other paths that lock two stripes (rename, for example) have not been audited for lock order.&lt;/li&gt;
+	&lt;li&gt;Tested on ldiskfs with two MDTs only.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Feedback on the approach is welcome.&lt;/p&gt;</comment>
+                            <comment id="505642" author="adilger" created="Wed, 11 Nov 2026 04:01:29 +0000">&lt;p&gt;Hi &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=manhongdai" class="user-hover" rel="manhongdai"&gt;manhongdai&lt;/a&gt;, this sounds mostly good, but you wrote that the locking is done only if the directory is already being modified, but if the readdir starts before the migration then the output may still be inconsistent. I'm wondering if we could do something to cover this case as well.&lt;/p&gt;
+
+&lt;p&gt;For example, if the migration thread got a full PW lock on all the stripes in order, then set &lt;tt&gt;LMV_HASH_FLAG_MIGRATION&lt;/tt&gt; on the LMV before it started migrating entries, and dropped the full-dir PW locks, then the client can check for &lt;tt&gt;LMV_HASH_FLAG_MIGRATION&lt;/tt&gt; on the lock refresh and execute the "lock first stripe and read all pages" process to fetch all of the remaining pages.&lt;/p&gt;
+
+&lt;p&gt;The other issue that the "read all pages first" should help with is a thread doing "rm -r" in a large directory (whether striped or not).  In the current code the DLM lock on the directory (stripe) will ping-pong every time the userspace process is reading some entries and then the next entry is removed and revokes the lock(s) again, repeat.  Reading all of the entries at the start (or at least a few MB at a time, enough for 99% of directories) and caching them on the file descriptor allows userspace to continue processing entries without the lock ping-pong and re-reading the same directory contents multiple times.&lt;/p&gt;</comment>
+                            <comment id="505685" author="JIRAUSER24000" created="Wed, 11 Nov 2026 17:18:57 +0000">&lt;p&gt;&amp;gt; This has other performance benefits, like "rm -r" in a directory not ping-ponging the directory cache and DLM locks around. Once the client has read all of the directory blocks then it doesn't need the directory locks anymore (the readdir is only cached in the FD if an unlink invalidates the DLM lock).&lt;/p&gt;
+
+&lt;p&gt;&amp;gt;The lock is enqueued on the first page of the stripe and held until the last stripe has been read. &lt;/p&gt;
+
+
+&lt;p&gt;For large directory, the client may easily be evicted if there are other operations causing lock conflicts,  especially the entry page is being fetched by single thread, page by page. Any optimization there? Thanks&lt;/p&gt;</comment>
+                            <comment id="505686" author="paf0186" created="Wed, 11 Nov 2026 17:28:00 +0000">&lt;p&gt;A note about performance concerns:&lt;br/&gt;
+Directory migration is &lt;em&gt;relatively&lt;/em&gt; rare, so while we shouldn't ignore performance, some cost is inevitable and we probably shouldn't take on a lot of complexity to avoid it.  FWIW, the current suggested solution sounds like it's hitting the right balance.&lt;/p&gt;</comment>
+                            <comment id="505689" author="paf0186" created="Wed, 11 Nov 2026 17:32:15 +0000">&lt;p&gt;I guess that depends on how large the directory is, but I don't see a way around locking the stripes...?  So the issue is when a stripe moves, its contents changes order. So you could lock the stripe, read the stripe, then unlock the stripe.  So long as you did that for all the stripes, that would be fine - lock, read, unlock...?  Maybe you'd need some way to identify a stripe?  I thought that was what was being suggested, but I maybe misunderstood.&lt;/p&gt;
+
+&lt;p&gt;Note that if there are actual fs modifications going on - rather than just restriping - then that can change what's in the readdir, right?  No requirement to exclude other actors entirely.&lt;/p&gt;</comment>
+                            <comment id="505690" author="JIRAUSER24000" created="Wed, 11 Nov 2026 17:48:31 +0000">&lt;p&gt;&amp;gt; So long as you did that for all the stripes, that would be fine - lock, read, unlock...?  &lt;/p&gt;
+
+&lt;p&gt;If there are migration happening between read stripes, the snapshot may be ruined, i.e. including duplicate entries etc ?  Note: this lock &amp;amp; fetching all entries are needed for every "ls" on a striped directory, and each stripes are relative large in real world, though I agree this is rare case.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

@@ -1,0 +1,73 @@
+Change:     70741
+Subject:    LU-21016 llite: complete hybrid DIO writes before commit
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70741
+Change-Id:  I57045b82fc2c7ad212fb9088ff2500e26a6a6964
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Timothy Day
+Created:    2026-11-11 20:35:52.000000000
+Updated:    2026-11-11 20:39:54.000000000
+Patch Set:  1
+Insertions: +260
+Deletions:  -8
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: (no votes)
+
+--- Commit Message ---
+LU-21016 llite: complete hybrid DIO writes before commit
+
+Hybrid IO sends large buffered writes as direct IO.  A direct IO
+write is committed by the OST before it is acknowledged, since the
+client sends the application's own pages and has nothing to resend
+if the OST fails first: ofd_commitrw_write() sets th_sync for any
+niobuf without OBD_BRW_ASYNC.  On osd-zfs that is txg_wait_synced()
+for every RPC, so a switched write runs at a small fraction of
+buffered speed, and on ldiskfs it is a journal commit per RPC.
+
+The application asked for a buffered write, so give the switched
+write buffered semantics: acknowledge it before commit and replay it
+after an OST failure.  Copy the data into kernel pages, as the
+unaligned DIO path already does, and send them with OBD_BRW_ASYNC.
+The OST then replies with an uncommitted transno, ptlrpc keeps the
+request on the replay list with the bulk pinning those pages, as it
+does for a cached write, and brw_commit() lets them go when the OST
+reports the commit.  The pages come from the page allocator rather
+than the DIO page pool, which recycles pages regardless of their
+refcount, so the bulk's pin is honoured.  fsync() still sends
+OST_SYNC, so durability is that of buffered IO.
+
+Bound the pinned memory as dirty pages are bounded:
+osc_unstable_wait() holds a switched write while the OSC's unstable
+pages reach max_dirty_mb or the global dirty limit, and after the
+osc_enter_cache() timeout sends the rest of the IO as synchronous
+DIO writes instead.  Such writes carry SOFT_SYNC once the OSC is
+halfway to that limit, so the OST commits early.  On the OST, a
+replayed niobuf with OBD_BRW_ASYNC but no OBD_BRW_FROM_GRANT had its
+space accounted when first written, so tgt_grant_check() grants it
+like a FROM_GRANT one instead of charging the free space again.
+
+Add sanity 119v, which checks that switched writes leave unstable
+pages until fsync, and replay-ost-single 14, which writes across a
+replay barrier and checks the data after OST failover.
+
+Signed-off-by: Timothy Day <timday@thelustrecollective.com>
+Change-Id: I57045b82fc2c7ad212fb9088ff2500e26a6a6964
+
+--- Review History ---
+
+--- Message (Timothy Day, 2026-11-11 20:35:52.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 20:39:16.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-11 20:39:54.000000000) ---
+Patch Set 1:
+
+Looks good to me.

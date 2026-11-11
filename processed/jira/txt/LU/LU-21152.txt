@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   WC Triage
 Reporter:   Hiroshi Nishida
 Created:    Sat, 7 Nov 2026 21:16:02 +0000
-Updated:    Sat, 7 Nov 2026 21:16:08 +0000
-Links:      Related: is related to  LU-17048; Related: is related to  LU-21151
+Updated:    Tue, 10 Nov 2026 21:17:29 +0000
+Links:      Related: is related to  LU-18466; Related: is related to  LU-17048; Related: is related to  LU-21151
 
 --- Description ---
 lfs mirror split -d first tries to destroy the mirror in place: the victim fd is the file itself (fd == fdv, the "purge" path). On master the MDS refuses that with -EINVAL:
@@ -22,3 +22,44 @@ The check comes from LU-17048 (2023). The split modifies the layout of the same 
 lfs hides this. On -EINVAL or -EBUSY it assumes an old MDS ("could be old MDS which prohibit fd==fdv") and retries with a volatile file in the parent directory. So the in-place path, which needs no parent directory access, never works on a current MDS. A caller without a lfs-style fallback gets -EINVAL.
 
 Found while writing llapi_mirror_split() for lfu-purge (LU-20462), on master with a 2-mirror file.
+
+--- Comment (JIRAUSER20201, Tue, 10 Nov 2026 13:59:32 +0000) ---
+We see this with plain lfs on a running system, so it is not only a problem for new callers of the in-place path.
+
+MDS: 2.17.60_119_g7183418 (master, commit 7183418602), osd-zfs, two MDTs. Client: lfs 2.17.61
+
+# dd if=/dev/urandom of=$F bs=1M count=64
+# lfs mirror extend -N -o 258 $F
+# lfs mirror delete --mirror-id 1 $F
+lfs mirror mirror: cannot get UNLOCK lease, ext 8 for [0x240000402:0x60a0:0x0]: Invalid argument (22)
+
+The mirror is gone afterwards (lcm_mirror_count: 1), so lfs prints an error and then succeeds through the volatile file. A program of ours that asks for   
+
+the in-place split itself (llapi_lease_set() with LL_LEASE_LAYOUT_SPLIT and the file as its own victim) and had no fallback simply got -EINVAL, as the 
+
+description says.
+
+There is already a patch for this in Gerrit. It is filed under LU-18466, so it is not linked here:
+
+https://review.whamcloud.com/c/fs/lustre-release/+/68696 "LU-18466 mdd: declare layout split before purge"
+
+It declares LU_XATTR_SPLIT before LU_XATTR_PURGE in mdd_xattr_split(), so that the generation which lod_save_layout_gen_intrans() records is   
+
+already the bumped one. It still applies to master (v2_17_61). I have not run it myself.
+
+The test logs show both the bug and the effect of that patch. sanity-quota test_58 calls lfs mirror delete four times. In runs of unrelated changes it     
+
+prints the lease error all four times and passes, on zfs and on ldiskfs+DNE:
+
+https://testing.whamcloud.com/gerrit-janitor/69778/testresults/sanity-quota-zfs-rocky8.10_x86_64-rocky8.10_x86_64/sanity-quota.test_58.test_log.oleg446-client.log
+
+https://testing.whamcloud.com/gerrit-janitor/69778/testresults/sanity-quota-ldiskfs-DNE-rocky8.10_x86_64-rocky8.10_x86_64/sanity-quota.test_58.test_log.oleg311-client.log
+
+In the run of 68696 the message does not appear:
+
+https://testing.whamcloud.com/gerrit-janitor/69777/testresults/sanity-quota-zfs-rocky8.10_x86_64-rocky8.10_x86_64/sanity-quota.test_58.test_log.oleg243-client.log
+
+Because lfs falls back silently, no test fails on this. A check in sanity-flr that lfs mirror delete prints nothing would catch it.
+
+--- Comment (JIRAUSER21604, Tue, 10 Nov 2026 21:17:29 +0000) ---
+Thanks. Agreed, 68696 fixes this: the split declares the LOV change twice on the same object and the second declare sees the bumped generation, so the order matters. Linked LU-18466.

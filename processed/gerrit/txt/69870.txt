@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-21 16:08:05.000000000
-Updated:    2026-11-08 21:45:03.000000000
-Patch Set:  9
-Insertions: +1160
-Deletions:  -98
-Comments:   122 (5 unresolved)
-Hashtags:   pt_ecro, 218_review_priority
+Updated:    2026-11-11 13:16:32.000000000
+Patch Set:  10
+Insertions: +1327
+Deletions:  -95
+Comments:   131 (3 unresolved)
+Hashtags:   218_review_priority, pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: (no votes)
 
 --- Reviewers ---
   CC: Maximilian Dilger, Gerrit AI review for Lustre, patrick bot
@@ -34,39 +34,46 @@ defeats the purpose of the mirror.
 Add a "lustre.lov.extend" layout operation that adds the components
 of one new mirror to the file as a stale mirror without objects, and
 llapi_mirror_extend() to send it.  A plain file is converted to a
-mirrored file first.  The resync of the new mirror then instantiates
-it while all other mirrors are in view, so the existing OST, OSS and
-failure domain avoidance applies.  A parity mirror is bound to the
-data mirror named by its link id, as a merge does.
+mirrored file first, and the OST objects of a file without mirrors
+get the component ids of mirror 1, as after a merge.  The resync of
+the new mirror then instantiates it while all other mirrors are in
+view, so the existing OST, OSS and failure domain avoidance applies.
+A parity mirror is bound to the data mirror named by its link id, and
+the new components are numbered, as a merge does.
 
 "lfs mirror extend" uses it for data and EC parity mirrors when the
 MDT has OBD_CONNECT2_FLR_EC, and falls back to the volatile file and
 merge otherwise, or when the new mirror names its OSTs, since the OST
 list of a component without objects is not stored until the resync,
-has an extension component, which only a write instantiates, is
-copied with --non-direct, as the resync uses O_DIRECT, or the file is
-released by HSM, which the read of the copy restores, or is cached by
-PCC-RO, as the resync is refused until that is cleared.  A component
-of the new mirror without a pool gets the pool of the default layout
-of the parent directory or the root, as the copy created there did,
+has an extension component, which only a write instantiates, or a
+foreign or released component, is copied with --non-direct, as the
+resync uses O_DIRECT, or the file is released by HSM, which the read
+of the copy restores, is cached by PCC-RO, as the resync is refused
+until that is cleared, or is in SYNC_PENDING, where the resync does
+not instantiate the new mirror.  The client refuses an EC mirror when
+erasure coding is disabled on it, as for a new file.  A component of
+the new mirror without a pool gets the pool of the default layout of
+the parent directory or the root, as the copy created there did,
 unless it is a DoM component or has a fixed OST index outside that
-pool, and the new mirror is checked like the copy was, e.g. for a pool
-that does not exist.  llapi_mirror_extend() then takes and releases a
-lease, which refreshes the client's layout, as a getxattr of the
-layout would return the cached one.
+pool, and the new mirror is checked like the copy was, e.g. for a
+pool that does not exist.  llapi_mirror_extend() then takes and
+releases a lease, which refreshes the client's layout, as a getxattr
+of the layout would return the cached one.
 
 The extend fails before it changes the layout if the file is open
 for write elsewhere, as the resync could not start.  An interrupted
-extend leaves a stale mirror, like "--no-sync", instead of an orphan
-volatile file.
+extend leaves a stale mirror, like "--no-resync", instead of an orphan
+volatile file, but a data mirror that would get EC parity is removed.
+With "--no-resync", the new mirror has no objects until "lfs mirror
+resync" allocates them.  A resync that lost its lease now fails.
 
 A resync instantiated every stale component within the extent that
 the in-sync mirrors had instantiated, which is the whole file once
 one mirror covers [0, EOF), so a new PFL mirror of a small file got
 objects for all of its components.  Send the file size in rs_size of
 MDS_REINT_RESYNC, flagged by MDS_RESYNC_SIZE in rs_bias, and stop the
-resync instantiation there, keeping at least the first component as
-a create does.
+resync instantiation with the component that holds the file size,
+which the truncate at the end of the resync accesses.
 
 lod_verify_layout() verifies the new mirror as a layout of its own,
 not as a continuation of the file's layout as for "lustre.lov.add".
@@ -74,16 +81,23 @@ A mirror whose DoM size differs from that of the file is refused, as
 lod_parse_striping() would refuse the layout.
 
 Add sanity-flr test_8a to check that the new mirror avoids the OSTs of
-the existing mirrors, based on the test from Bobi Jam's patch, that a
-busy file or one with another DoM size is left unchanged, and that a
-self-extending mirror is added.
+the existing mirrors, based on the test from Bobi Jam's patch, that
+the component at the file size is instantiated, that a busy file, one
+with another DoM size or one with only stale mirrors is left
+unchanged, that a self-extending mirror is added, that a file in
+sync_pending gets a merged mirror, and that a mirror with an HSM
+component is refused by "lustre.lov.extend".
 Add sanity-flr test_8b to check that the new mirror gets the default
 pool of the directory, but not for a DoM component or a fixed OST
-index outside the pool, and that a pool that does not exist is
-refused.
+index outside the pool, that a pool that does not exist is refused,
+and that a relative file name gets the pool of the root default.
 sanity-flr test_0f accepts 3/4 of the OSTs for a "-c -1" mirror, as
 the in-place mirror avoids the OSTs of the other mirrors like "lfs
 mirror create", where the merged copy got all of them.
+sanity-flr test_204b expects the component beyond the file size to
+stay uninstantiated after the resync, and test_210a and test_210b
+inject the bad OST index at a later layout change, as the extend
+allocates no objects.
 sanity-flr test_61b and test_61d skip their timestamp checks after a
 split of an in-place extended file, as the resynced objects keep the
 time of the copy until a time-only setattr reaches every mirror
@@ -92,6 +106,7 @@ time of the copy until a time-only setattr reaches every mirror
 Test-Parameters: serverversion=2.17 testlist=sanity-flr
 Test-Parameters: clientversion=2.17 testlist=sanity-flr
 Test-Parameters: testlist=sanity-pcc env=ONLY=21h,ONLY_MINUTES=30
+Test-Parameters: testlist=sanity-ec
 Fixes: 125f98fb5c10 ("LU-9771 flr: lfs mirror create and extend commands")
 Fixes: 5999c0b881e8 ("LU-9771 flr: resync support and test tool")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
@@ -542,3 +557,49 @@ Patch Set 9:
 AI code review results below, please doublecheck
 
 Some concerns, see the inline comment on lod_declare_layout_extend().
+
+--- Message (Keguang Xu, 2026-11-11 01:08:28.000000000) ---
+Patch Set 9: Code-Review+1
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-11-11 08:49:39.000000000) ---
+Patch Set 9: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2026-11-11 13:12:39.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-11 13:12:59.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+--- Message (Andreas Dilger, 2026-11-11 13:13:00.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-11 13:13:01.000000000) ---
+Patch Set 10:
+
+PS10: rebased on master (kept mlc_source from LU-20211 next to mlc_resync_end; --no-resync from LU-17531 now also adds the mirror in place). Refuse foreign/released components and SYNC_PENDING files in place (lfs merges instead), and a file whose mirrors are all stale; probe a lease before --no-resync too; number new components and update the OST PFIDs as a merge does; resync up to and including the file size; realpath() for the pool lookup; new test_8a/8b cases.
+
+--- Message (wc-checkpatch, 2026-11-11 13:13:48.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-11 13:16:32.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.

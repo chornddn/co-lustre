@@ -1,0 +1,32 @@
+Key:        LU-21182
+Summary:    osd-ldiskfs: write to the last page of an object fails with -EFBIG on 64KiB-page servers
+Link:       https://jira.whamcloud.com/browse/LU-21182
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Di Wang
+Reporter:   Di Wang
+Created:    Wed, 11 Nov 2026 00:19:39 +0000
+Updated:    Wed, 11 Nov 2026 17:01:03 +0000
+Labels:     arm, arm-server
+
+--- Description ---
+On an OSS with PAGE_SIZE of 64KiB (aarch64,  5.14 kernel), a write that reaches the last page of an ldiskfs object fails with -EFBIG. sanity tests 44b, 44c and 44e fail:
+
+44b: FAIL: wrong size
+44c: FAIL: wrong size  (/mnt/lustre/f44c.sanity has size 0, not 17592186040320)
+44e: FAIL: dd failed   (dd: error writing '...': File too large)
+
+The OSS debug log shows osd_ldiskfs_map_inode_pages() leaving through the -EFBIG cleanup at osd_io.c:1066, which propagates up through osd_write_prep(), ofd_preprw_write() and tgt_brw_write(). The client’s dd still succeeds because the data is only in its cache. The failure appears when the cache is flushed, and the file size stays 0.
+
+Cause:
+
+The maximum object size is s_maxbytes, which for ldiskfs with 4096-byte blocks is 2^44 - 4096. That is a multiple of the block size but not of 64KiB. osd_ldiskfs_map_inode_pages() computes max_page_index = s_maxbytes >> PAGE_SHIFT and rejects any page extent where index + clen > max_page_index.
+
+With 4KiB pages the limit is page aligned, so the check is exact.
+
+With 64KiB pages, max_page_index is 2^28 - 1. The last byte (offset 2^44 - 4097) is in page 2^28 - 1, so index + clen is 2^28 and the page is rejected. Only 15 of the page’s 16 blocks are addressable, so the check refuses the whole page even though the data is valid.
+
+--- Comment (JIRAUSER24000, Wed, 11 Nov 2026 17:01:03 +0000) ---
+https://review.whamcloud.com/c/fs/lustre-release/+/70687
