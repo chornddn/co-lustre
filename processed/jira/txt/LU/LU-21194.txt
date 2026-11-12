@@ -1,0 +1,42 @@
+Key:        LU-21194
+Summary:    sanity: 151, 156 and 150f fail with 64KiB page size
+Link:       https://jira.whamcloud.com/browse/LU-21194
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Di Wang
+Reporter:   Di Wang
+Created:    Thu, 12 Nov 2026 03:35:32 +0000
+Updated:    Thu, 12 Nov 2026 03:50:57 +0000
+Labels:     arm-server
+
+--- Description ---
+Running sanity on aarch64 clients and servers with 64KiB pages (RHEL 9 kernel 5.14, getconf PAGE_SIZE = 65536, ldiskfs with 4096-byte blocks) shows test failures that come from 4KiB-page assumptions in the tests themselves. The Lustre code behaves correctly.
+
+Failure 1: sanity 151 and 156
+
+roc_hit_init(), test_151 and test_156 write the file with bs=4k and expect the OSS cache_access and cache_hit counters to rise by one per 4KiB page. The OSD counts per page. With 64KiB pages, a 16KiB file is one page, so the counter rises by 1 instead of 4. test_151 and test_156 use the same bs=4k count=$CPAGES pattern and fail for the same reason.
+
+Fix: write whole $PAGE_SIZE blocks, so the number of pages written, and the expected counter change, is the same for any page size.
+
+Failure 2: sanity 150f
+
+The test expects a 20KiB file to use 40 sectors, and 24 after punching 8KiB. The OSD maps and writes whole pages (osd_ldiskfs_map_inode_pages() maps clen * blocks_per_page blocks). With 64KiB pages, a 20KiB file therefore has its last page fully allocated: 128 sectors after sync, 112 after the punch. This is how the write path works, so the test’s expected block counts are wrong, not the OSD.
+
+Fix: derive the expected block counts from PAGE_SIZE. In the second sub-case (a 3000-byte punch, which frees no whole block) the allocation is unchanged, so it expects the full allocation.
+
+Verification
+
+64K-page cluster (2 MDS with 4 MDTs, 1 OSS with 6 OSTs, 2 clients): all three tests fail before the fix and pass after.
+
+4K-page VM: all three pass after the fix, so 4K behaviour is unchanged.
+
+Notes
+
+Other failures seen in the same full-sanity run on 64K pages were TCG load flakes: 160a, 248a, 413b and the ssh cascade from 248a to 270f. They passed when rerun (160a, 248a, 413b) or are unconfirmed (the cascade tests).
+
+432 (nodemap sync to a second MDS) still fails on the multi-node 64K cluster. The cause is unknown and probably timing under emulation.
+
+--- Comment (JIRAUSER24000, Thu, 12 Nov 2026 03:48:20 +0000) ---
+https://review.whamcloud.com/c/fs/lustre-release/+/70750

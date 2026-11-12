@@ -18,7 +18,7 @@
                             <label>test_script_improvements</label>
                     </labels>
                 <created>Thu, 2 Apr 2026 23:51:00 +0000</created>
-                <updated>Wed, 11 Nov 2026 18:47:30 +0000</updated>
+                <updated>Thu, 12 Nov 2026 04:44:25 +0000</updated>
                                                             <fixVersion>Lustre 2.19.0</fixVersion>
                                         <due />
                             <votes>0</votes>
@@ -451,6 +451,71 @@ free_before: 1665024 free_after: 1624064
                             <comment id="505691" author="JIRAUSER24100" created="Wed, 11 Nov 2026 18:47:30 +0000">&lt;p&gt;Patrick-Bot: &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=paf0186" class="user-hover" rel="paf0186"&gt;paf0186&lt;/a&gt; Uploaded &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70738" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70738&lt;/a&gt; for replay-single 89 on ZFS (about 10% of review-zfs runs since e5911ebb15). Free space read within 2 s of the forced TXG commit comes from the 1 s statfs caches. On ZFS, 88+89 read free_before 2 MB stale in 5 of 5 runs; with the patch both readings matched in 5 of 5.&lt;/p&gt;
 
 &lt;p&gt;(run pw-ticket-&lt;a href="https://jira.whamcloud.com/browse/LU-20076" title="reduce testing time by optimizing test and test-framework.sh" class="issue-link" data-issue-key="LU-20076"&gt;LU-20076&lt;/a&gt;-16b95fcae583)&lt;/p&gt;</comment>
+                            <comment id="505705" author="bzzz" created="Thu, 12 Nov 2026 04:40:31 +0000">&lt;p&gt;with &lt;a href="https://jira.whamcloud.com/browse/LU-20076" title="reduce testing time by optimizing test and test-framework.sh" class="issue-link" data-issue-key="LU-20076"&gt;LU-20076&lt;/a&gt; target: sync before waiting for exports at umount landed few began to fail, like sanity-quota/91:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+03ab8d3cd9	1	0	1	BAD	LU-20869 tests: shorten recovery-small test_50
+d64b47a637	1	1	0		LU-20869 tests: shorten sanityn 43k and 45j
+ae1b0a7097	1	0	1	BAD	LU-20076 target: sync before waiting &lt;span class="code-keyword"&gt;for&lt;/span&gt; exports at umount
+c0783e0c33	15	15	0	GOOD	LU-20869 tests: shorten sanity-quota test_3a and test_3b
+fb585e134e	15	15	0	GOOD	LU-20869 tests: speed up conf-sanity test_46a
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;test output:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Start mds1: mount -t lustre -o localrecov  /dev/mapper/mds1_flakey /mnt/lustre-mds1
+Started lustre-MDT0000
+tmp.A1RmDaf6cl: executing wait_import_state_mount FULL mdc.lustre-MDT0000-mdc-*.mds_server_uuid 1475 0
+mdc.lustre-MDT0000-mdc-*.mds_server_uuid in FULL state after 0 sec
+mkdir: cannot create directory &lt;span class="code-quote"&gt;'/mnt/lustre/d91.sanity-quota'&lt;/span&gt;: Input/output error
+ sanity-quota test_91: @@@@@@ FAIL: mkdir failed 
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;it seems the problem is that now client has no time to detect eviction so the very first request hits "no export" and gets evicted returning an error to userspace.&lt;/p&gt;
+
+&lt;p&gt;something like this should help:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+diff --git a/lustre/tests/test-framework.sh b/lustre/tests/test-framework.sh
+index 9b61b7c868..0dd5825fa3 100755
+--- a/lustre/tests/test-framework.sh
++++ b/lustre/tests/test-framework.sh
+@@ -9699,6 +9699,7 @@ wait_clients_import_state () {
+        local expected=&lt;span class="code-quote"&gt;"$3"&lt;/span&gt;
+        local maxtime=${4:-$(max_recovery_time)}
+        local facets=&lt;span class="code-quote"&gt;"$facet"&lt;/span&gt;
++       local ping_path
+ 
+        &lt;span class="code-keyword"&gt;if&lt;/span&gt; [ &lt;span class="code-quote"&gt;"$FAILURE_MODE"&lt;/span&gt; = HARD ]; then
+                facets=$(&lt;span class="code-keyword"&gt;for&lt;/span&gt; f in ${facet&lt;span class="code-comment"&gt;//,/ }; &lt;span class="code-keyword"&gt;do&lt;/span&gt;
+&lt;/span&gt;@@ -9713,7 +9714,9 @@ wait_clients_import_state () {
+                &lt;span class="code-keyword"&gt;case&lt;/span&gt; $facet in
+                ost* ) proc_path="osc.$(get_clientosc_proc_path \
+                                        $label).ost_server_uuid" ;;
+-               mds* ) proc_path=&lt;span class="code-quote"&gt;"mdc.$label-mdc-*.mds_server_uuid"&lt;/span&gt; ;;
++               mds* ) proc_path=&lt;span class="code-quote"&gt;"mdc.$label-mdc-*.mds_server_uuid"&lt;/span&gt;
++                       ping_path=&lt;span class="code-quote"&gt;"mdc.$label-mdc-*.ping"&lt;/span&gt;
++                       ;;
+                mgs* ) proc_path=&lt;span class="code-quote"&gt;"mgc.*.mgs_server_uuid"&lt;/span&gt; ;;
+                *) error &lt;span class="code-quote"&gt;"unknown facet!"&lt;/span&gt; ;;
+                esac
+@@ -9721,6 +9724,9 @@ wait_clients_import_state () {
+                local params=$(expand_list $params $proc_path)
+        done
+ 
++       [[ $expected == *FULL* &amp;amp;&amp;amp; -n $ping_path ]] &amp;amp;&amp;amp;
++               do_rpc_nodes &lt;span class="code-quote"&gt;"$list"&lt;/span&gt; $LCTL get_param $ping_path
++
+        &lt;span class="code-keyword"&gt;if&lt;/span&gt; ! do_rpc_nodes &lt;span class="code-quote"&gt;"$list"&lt;/span&gt; wait_import_state_mount &lt;span class="code-quote"&gt;"$expected"&lt;/span&gt; $params $maxtime 0;
+        then
+                error &lt;span class="code-quote"&gt;"&lt;span class="code-keyword"&gt;import&lt;/span&gt; is not in ${expected} state"&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;</comment>
+                            <comment id="505706" author="bzzz" created="Thu, 12 Nov 2026 04:40:48 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=patrickbot" class="user-hover" rel="patrickbot"&gt;patrickbot&lt;/a&gt; please check the comment above&lt;/p&gt;</comment>
+                            <comment id="505707" author="JIRAUSER24100" created="Thu, 12 Nov 2026 04:44:25 +0000">&lt;p&gt;Patrick-Bot: &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt; Sorry, I did not understand what you are asking me to do, so I have not started anything. Could you say it again in other words?&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

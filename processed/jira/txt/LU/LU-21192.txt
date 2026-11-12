@@ -1,0 +1,35 @@
+Key:        LU-21192
+Summary:    OST objects that are never written have no parent FID
+Link:       https://jira.whamcloud.com/browse/LU-21192
+Type:       Improvement
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Artem Blagodarenko
+Reporter:   Artem Blagodarenko
+Created:    Wed, 11 Nov 2026 23:13:41 +0000
+Updated:    Wed, 11 Nov 2026 23:29:58 +0000
+Links:      Related: is related to  LU-20908; Related: is related to  LU-11628
+
+--- Description ---
+An OST object records the FID of the file it belongs to (its parent FID, in trusted.fid) only when a client sends it with a write, punch, fallocate or setattr. An object that is never written never gets one: the objects of empty files, of instantiated PFL components past the end of a file, and of files created and never written.
+
+Such objects cannot be mapped back to their file:
+
+	lfs fid2path of the OST object FID fails, which matters for objects found corrupted, or removed by e2fsck.
+
+	A tool that reads an OST to find the files on it, such as lfs drain (LU-20908), cannot tell these objects from precreated ones, and has to walk the whole namespace to find their files, which is expensive.
+
+	Layout LFSCK takes an object with no parent FID as consistent and leaves it so (LU-11628; its patch, change 33591, was abandoned).
+
+The OSS cannot fix this on its own: no RPC that reaches an unwritten object carries the parent FID (a read of an empty file is answered from the glimpse, and OST_GETATTR carries none), and the resource ID repair of LU-18756 skips objects that were never written. Only the MDT knows the owner.
+
+Fix, in two patches:
+
+	This ticket, Gerrit change 70746 (LU-21192 osp: send the parent FID of new OST objects): when LOD creates the objects of a layout, it passes the parent FID and stripe index to OSP, which queues a setattr record per object in its sync llog, in the create transaction. The sync thread sends it as an OST_SETATTR with OBD_MD_FLFID, as it already does for ownership changes, so creates do not wait for it. The parent FID goes in the padding of llog_setattr64_rec_v2. The OST stores it only if the object has none, since a record can arrive after a layout swap has given the object another parent. osp.*.create_pfid=0 turns it off.
+
+	LU-11628, Gerrit change 70747 (LU-11628 lfsck: give OST objects a missing parent FID): layout LFSCK gives an object with no parent FID the FID, stripe index and owner of the MDT-object that references it, as for an unmatched pair, so files created before 70746 are fixed too.
+
+lfs drain (LU-20908, changes 70470 and 70471) is rebased on both and no longer walks the namespace.
+
+Objects precreated and not yet used (at or above the MDT's prealloc_next_id) need no parent FID.

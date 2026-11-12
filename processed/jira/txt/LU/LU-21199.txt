@@ -1,0 +1,107 @@
+Key:        LU-21199
+Summary:    llite: lli_lock write lock contention on mmap page cache hit
+Link:       https://jira.whamcloud.com/browse/LU-21199
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Hui Chen
+Created:    Thu, 12 Nov 2026 08:52:57 +0000
+Updated:    Thu, 12 Nov 2026 09:30:18 +0000
+
+--- Description ---
+We're running a 16-thread mmap read on a single file with all pages already
+
+in page cache, and the client is spending about 73% of CPU in
+
+queued_write_lock_slowpath. The lock comes from ll_cl_add/ll_cl_remove, and
+
+perf record -a -g -F 99 shows it clearly while the workload runs.
+
+Looking at ll_cl_add() in lustre/llite/rw.c:1575, every fault does a
+
+list_add/list_del of an lcc on lli_lccs under write_lock(&lli->lli_lock).
+
+Since the list is per-inode, on a cache hit - which is basically just a
+
+page table walk - all threads on one file pile up on this single write
+
+lock. That part I think I understand.
+
+What I'm less sure about is whether the hit path really needs all of this.
+
+The fast fault path in ll_fault0() (lustre/llite/llite_mmap.c:304) wraps
+
+ll_filemap_fault() with an LCC_MMAP context:
+
+    ll_cl_add(inode, env, NULL, LCC_MMAP);
+    fault_ret = ll_filemap_fault(vma, vmf);
+    ll_cl_remove(inode, env);
+
+As far as I can tell the LCC_MMAP entry is only there so ll_readpage() can
+
+tell a fast-fault miss from an external caller. On an actual hit it never
+
+reaches the slow cl_io path. Same question for the cl_env_get() at the top
+
+of ll_fault0() (llite_mmap.c:152) and the signal masking in ll_fault()
+
+(llite_mmap.c:387) - do they serve any purpose on a cache hit, or are they
+
+only needed once we go down the slow path?
+
+I'd like to hear whether there's a reason these can't be moved/removed for
+
+the hit path, or if I'm missing something about why the lcc list needs to
+
+be per-inode in the first place. FWIW I tried removing the lcc add/remove from
+
+the hit path locally, and the next hotspot became cfs_block_sigsinv/
+
+cfs_restore_sigs (the sighand siglock) at ~71%, then cl_env_get/cl_env_put
+
+(the cec_guard read lock) at ~5-6%. So it looks like a stack of per-fault
+
+lock work that a cache hit doesn't need, but I could be missing something.
+
+The directions I'm considering:
+
+1. move cl_env_get/cl_env_put into the slow path, after the fast fault
+
+   miss;
+
+2. replace the LCC_MMAP ll_cl_add/ll_cl_remove in the fast fault path with
+
+   a per-file flag, so the hit path stops touching lli_lock;
+
+3. move cfs_block_sigsinv/cfs_restore_sigs from ll_fault() to the slow
+
+   path.
+
+Let me know if any of these is a bad idea, or if there's history here
+
+I should look at. This is a scalability thing only - no data corruption
+
+or crash that I've hit.
+
+--- Comment (JIRAUSER17600, Thu, 12 Nov 2026 09:28:33 +0000) ---
+Correction - a few references in my original report were wrong because I'd been looking at our internal fork, which differs a bit from master.
+
+  The fast fault path is in __ll_fault(), not ll_fault0(). The ll_cl_add(LCC_MMAP) / ll_cl_remove around ll_filemap_fault() is at llite_mmap.c:304-305, and cl_env_get() is at llite_mmap.c:288 (152 is
+
+  __ll_page_mkwrite). The signal masking in ll_fault() is plain sigprocmask() at llite_mmap.c:390, not cfs_block_sigsinv.
+
+  I also rebuilt master (dd48e6b096, 7.0.0 client) and re-ran the test to make sure. Same result:
+
+      73.85%  [k] __pv_queued_spin_lock_slowpath
+              |--72.99%--queued_write_lock_slowpath
+              |          _raw_write_lock
+              |          |--36.77%--ll_cl_remove
+              |           --36.22%--ll_cl_add
+               --0.83%--_raw_spin_lock_irq
+                         sigprocmask
+
+  lli_lock is ~73% on master, matching what I reported. The sigprocmask siglock only shows ~0.8% here because it's hidden behind the lli_lock contention; once the lcc add/remove comes off the hit path it becomes
+
+  the next hotspot (~71%), as described. Happy to attach the perf data or the reproducer.

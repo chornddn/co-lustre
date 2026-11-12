@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-17 09:33:08.000000000
-Updated:    2026-11-10 22:13:26.000000000
-Patch Set:  10
-Insertions: +679
+Updated:    2026-11-12 09:35:04.000000000
+Patch Set:  11
+Insertions: +732
 Deletions:  -82
-Comments:   119 (2 unresolved)
-Hashtags:   pw_shepherd, pw_halt
+Comments:   122 (0 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: -1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
@@ -29,42 +29,48 @@ When renaming a file into a directory with the project inherit flag,
 it will inherit the new project ID, then the project quota should be
 enforced on this project ID.
 
-This patch reserves the quota space before the rename and releases it
-after the rename completes. If the rename overwrites the last link of
-a file charged to the same project, the space freed by unlinking that
-file in the same transaction is credited to the reservation.
+This patch reserves the quota space before the rename and releases
+it after the rename completes. If the rename overwrites the last
+link of a file charged to the same project, the space freed by
+unlinking that file in the same transaction is credited to the
+reservation.
 
-The size and blocks of the object are not known on the MDT, since the
-data lives on the OSTs, so the client sends them in the rename
+The size and blocks of the object are not known on the MDT, since
+the data lives on the OSTs, so the client sends them in the rename
 request, but only for the renames that are charged. The MDT then
-charges the largest of the client values, the MDT inode attributes and
-the lazy SOM (LSOM) attributes read from trusted.som, which are only
-the minimum size that a client could have reported. A strict SOM is
-exact and is used instead of all of them. The blocks the MDT inode
-holds itself are already reserved by the projid change declared on the
-object, so they are not charged twice. An old client which sends
-nothing is covered by the same rules, its request then carries the MDT
-inode and LSOM values on their own.
+charges the largest of the client values, the MDT inode attributes
+and the lazy SOM (LSOM) attributes read from trusted.som, which are
+only the minimum size that a client could have reported. A strict
+SOM is exact and is used instead of all of them. The blocks the MDT
+inode holds itself are already reserved by the projid change
+declared on the object, so they are not charged twice. An old client
+which sends nothing is covered by the same rules, its request then
+carries the MDT inode and LSOM values on their own.
 
-A file released by HSM has no data in the filesystem anymore, only the
-size and blocks of what was archived are kept in the inode and in the
-SOM, so moving it does not consume any project space. The state is
-read from trusted.hsm and the space is charged again when the file
-is recalled.
+A file released by HSM has no data in the filesystem anymore, only
+the size and blocks of what was archived are kept in the inode and
+in the SOM, so moving it does not consume any project space. The
+state is read from trusted.hsm and the space is charged again when
+the file is recalled.
 
 The client glimpses the OSTs before the rename if its cached size or
 block count is 0, which means either an empty file, a file written
-locally that was not looked up since, or a file whose data was written
-by another client. The values it sends are also used to refresh the
-LSOM of the source object once the rename has gone through, in a
-separate transaction as the close path does. A remote source is
-skipped, its LSOM is left to the MDT that owns the object, which
-updates it on the next close.
+locally that was not looked up since, or a file whose data was
+written by another client.
+
+The size and blocks the client sends also raise the lazy SOM of the
+source object, in the same transaction as the rename: a rename can
+not be replayed if only part of it was committed, so the update can
+not run in a transaction of its own. A strict or stale SOM is left
+alone, and a file without a SOM gets one from its next close, as
+mdt_lsom_update() does. The values are the cached ones of the
+client, without a lock, so they can leave the lazy SOM larger than
+the real size until the next truncate.
 
 MDS_RENAME_SIZE_VALID reuses the bit of the obsolete MDS_SOM flag
-instead of taking a new one, since a rename request never carries the
-close-time meaning of that bit, so no additional bit of the 32-bit
-mds_op_bias is consumed.
+instead of taking a new one, since a rename request never carries
+the close-time meaning of that bit, so no additional bit of the
+32-bit mds_op_bias is consumed.
 
 The mdd_attr_set() group quota code is refactored onto the new
 mdd_quota_reserve()/mdd_quota_commit_or_release() helpers, which are
@@ -73,10 +79,11 @@ bypass so that root renames charged to a project ID are not enforced
 against PRJQUOTA when the active nodemap grants ignore_root_prjquota
 role and the QSD's root_prj_enable is off.
 
-The test_99 is added in sanity-quota.
+The test_99 is added in sanity-quota, it also checks that a rename
+raises the LSOM of the source object.
 
 Fixes: 88c26912a323 ("LU-13176 mdd: rename file with different project ID")
-Test-Parameters: testlist=sanity-quota serverversion=2.16
+Test-Parameters: testlist=sanity-quota serverversion=2.16 envdefinitions=ONLY=99
 Test-Parameters: testlist=sanity-quota
 Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
 Assisted-by: DeepSeek:V4.1-Flash-1017 llm_code_and_review_tools
@@ -521,3 +528,39 @@ Patch Set 10:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The LSOM refresh adds a second transaction to the rename RPC, which looks like it can break recovery and should be looked at before landing. Separately, test_99 does not reach the overwrite credit, the HSM-released case or the LSOM refresh, so a case for each of these would help.
+
+--- Message (Hongchao Zhang, 2026-11-12 08:57:37.000000000) ---
+Uploaded patch set 11.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-11-12 08:58:00.000000000) ---
+Patch Set 10:
+
+(2 comments)
+
+--- Message (patrick bot, 2026-11-12 08:59:01.000000000) ---
+Patch Set 11:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-12 09:00:37.000000000) ---
+Patch Set 11:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-12 09:02:28.000000000) ---
+Patch Set 11:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-12 09:03:57.000000000) ---
+Hashtag removed: pw_halt
+
+--- Message (jenkins, 2026-11-12 09:33:45.000000000) ---
+Patch Set 11: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136066/ : SUCCESS

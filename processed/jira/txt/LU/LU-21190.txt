@@ -1,0 +1,49 @@
+Key:        LU-21190
+Summary:    sanity test_27P: WARNING in lock_two_nondirectories() renaming foreign_symlink dir
+Link:       https://jira.whamcloud.com/browse/LU-21190
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Wed, 11 Nov 2026 21:29:50 +0000
+Updated:    Wed, 11 Nov 2026 21:29:50 +0000
+
+--- Description ---
+Renaming a foreign directory of type symlink (foreign_symlink_enable=1) triggers a kernel WARNING on clients with newer kernels:
+
+WARNING: CPU: 3 PID: 118487 at fs/inode.c:1273 lock_two_nondirectories+0xb8/0xd8
+CPU: 3 UID: 0 PID: 118487 Comm: mv Kdump: loaded Tainted: G OE ------ --- 6.12.0-211.47.1.el10_2_lustre #1
+pc : lock_two_nondirectories+0xb8/0xd8
+lr : vfs_rename+0x3ac/0xa80
+Call trace:
+ lock_two_nondirectories+0xb8/0xd8 (P)
+ vfs_rename+0x3ac/0xa80
+ do_renameat2+0x3c4/0x4e8
+ __arm64_sys_renameat2+0x88/0xd8
+ invoke_syscall.constprop.0+0x74/0xd0
+
+The rename itself succeeds and the test passes, so this does not show up as a test failure, only in the client console log.
+
+Reproducer
+sanity test_27P "basic ops on foreign dir of foreign_symlink type", at the step:
+
+lctl set_param llite/$FSNAME-*/foreign_symlink_enable=1
+lfs mkdir --foreign=symlink --xattr="${uuid1}/${uuid2}" --flags=0xda05 $DIR/$tdir/$tdir
+mv $DIR/$tdir/$tdir $DIR/$tdir/${tdir}.new
+
+Seen on every run of sanity 0a-135 on the configuration below (3 of 3 runs, 2026-11-11).
+
+Configuration
+
+	client: Rocky Linux 10.2 aarch64, 16KiB PAGE_SIZE kernel 6.12.0-211.47.1.el10_2 (ltvm rocky10-16k target), 4 vCPU VM
+
+	servers: rocky10 and rocky9, ldiskfs, 4 MDT / 4 OST on one node
+
+	Lustre: master v2_17_61 plus unrelated client folio patches (65094, 69731), which do not touch rename or foreign symlink code
+
+Analysis
+Since kernel v6.5 (v6.4-rc2-6-g2454ad83b90a "fs: Restrict lock_two_nondirectories() to non-directory inodes"), lock_two_nondirectories() does WARN_ON_ONCE(S_ISDIR(inode->i_mode)). vfs_rename() only calls it when d_is_dir(old_dentry) is false, so for this rename the source dentry's type and the inode's i_mode disagree: the inode is still S_IFDIR, but the dentry is not typed as a directory. ll_manage_foreign_dir() switches the inode to ll_foreign_dir_symlink_inode_operations (with get_link) to fake a symlink, while i_mode stays S_IFDIR, and ll_foreign_symlink_getattr() reports S_IFLNK. On older kernels (RHEL8/RHEL9) lock_two_nondirectories() silently skipped directories, so this was not visible there.
+
+The faked symlink type should be consistent between the dentry type and i_mode for foreign symlink directories, or rename of such a directory should go through the directory locking path.
