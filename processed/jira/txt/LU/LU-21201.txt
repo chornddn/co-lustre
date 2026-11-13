@@ -1,0 +1,22 @@
+Key:        LU-21201
+Summary:    lnet: net add waits for in-flight Pushes in ping target update
+Link:       https://jira.whamcloud.com/browse/LU-21201
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Thu, 12 Nov 2026 20:05:50 +0000
+Updated:    Thu, 12 Nov 2026 20:05:50 +0000
+
+--- Description ---
+Adding a net (lnetctl net add) can block for a full LND timeout (49 s with the default lnet_transaction_timeout) when a Push to a peer is slow to complete.
+
+lnet_ping_target_update() installs the new ping buffer, unlinks the old ping MD and then waits ("Still waiting for ping data MD to unlink") until every reference on the old buffer is dropped. A Push in flight to a multi-rail peer holds such a reference until the Push completes. If that Push is queued behind socklnd connd threads that are busy with connects to unreachable NIDs, it only completes when it times out, and the net add waits for it:
+
+lnet_ping_md_unlink 
+
+This is the main cost of conf-sanity test_73c, which takes 880-1090 s in CI: test_73b leaves about 100 configured peers on unreachable 111.222.x.x NIDs on ost1, and 17 of 73c's 36 net adds each wait 50-60 s. Reproduced on master 7c3c9f8814 (73c 1146 s); a standalone reproducer with 60 peers on unreachable NIDs and one reachable multi-rail peer gives net adds of 0.03, 0.03, 62.5 and 51.0 s.
+
+The wait is not needed: the ping buffer is reference counted (the MD holds a reference until its unlink event, each Push holds one until it completes), and whoever drops the last reference frees it, as lnet_push_target_resize() already does for the push target. Dropping the wait also removes the ln_api_mutex unlock/relock added by LU-17103 to avoid a deadlock in it. With that change 73c takes 150 s; sanity-lnet passes, including test_500 (the LU-17103 case).

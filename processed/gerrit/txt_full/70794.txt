@@ -1,0 +1,185 @@
+Change:     70794
+Subject:    LU-21201 lnet: don't wait for Pushes in ping target update
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70794
+Change-Id:  I59ba75c6212fa3356f908c6e328bc8de2caf642d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      patrick bot
+Created:    2026-11-12 20:08:00.000000000
+Updated:    2026-11-13 11:43:21.000000000
+Patch Set:  3
+Insertions: +18
+Deletions:  -9
+Comments:   4 (0 unresolved)
+Hashtags:   pw_own
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Patrick Farrell
+
+--- Commit Message ---
+LU-21201 lnet: don't wait for Pushes in ping target update
+
+lnet_ping_target_update() waits for every reference on the old
+ping buffer to drop before it returns. Each Push in flight holds
+one, until the Push completes. A Push to a peer that has no
+connection yet completes only when the LND times it out (49 s by
+default) if the connection is not made in time. Each
+"lnetctl net add" or "net del" then blocks for that long.
+
+conf-sanity test_73c hits this in every CI run. test_73b leaves
+about 100 configured peers with unreachable NIDs on ost1. Their
+discovery pings keep the socklnd connd threads blocked in
+connect(). The Push of each new ping buffer to a reachable peer
+that needs a new connection waits in the connd queue until it
+times out, and each of the 36 "net add" commands takes ~50 s.
+
+The wait is not needed. The ping buffer is reference counted.
+The ping MD holds a reference until its unlink event and each
+Push holds one until its MD is unlinked. Whoever drops the last
+one frees the buffer, as lnet_push_target_resize() already does
+for the push target. So unlink the old MD and drop our reference
+without waiting. This also removes the ln_api_mutex drop that
+LU-17103 added to avoid a deadlock in that wait.
+
+An old ping MD that is still sending a GET reply stays linked
+until the reply completes. Count the ping target MDs not yet
+unlinked, and have ping target cleanup wait for all of them
+before it checks that none is left.
+
+On a 2-node VM cluster, 73b then 73c as in CI: 73c took 1146 s
+before, with 17 net adds of 51-61 s, and 150 s after, about 10 s
+for all 36 net adds. That is 15-19 minutes of each conf-sanity
+run, ldiskfs and ZFS. sanity-lnet passes (136 pass, 51 skip),
+including test_500 for the LU-17103 deadlock.
+
+Test-Parameters: trivial testlist=sanity-lnet
+Test-Parameters: testlist=conf-sanity env=ONLY=73
+Fixes: 0f1aaad4c1b4 ("LU-9480 lnet: implement Peer Discovery")
+Assisted-by: ClaudeCode:claude-opus-5-5
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Change-Id: I59ba75c6212fa3356f908c6e328bc8de2caf642d
+
+--- Review History ---
+
+--- Message (patrick bot, 2026-11-12 20:08:00.000000000) ---
+Uploaded patch set 1.
+
+--- Message (patrick bot, 2026-11-12 20:13:38.000000000) ---
+Hashtag added: pw_own
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-12 20:17:37.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-12 20:21:57.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-12 22:16:41.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136092/ : SUCCESS
+
+--- Message (Maloo, 2026-11-12 22:16:52.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 136092 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136092&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136092#redirect
+
+--- Message (Maloo, 2026-11-13 02:33:40.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm7: https://testing.whamcloud.com/test_sessions/b6dcdfb4-e19a-414d-8f7c-f545db2ef21d ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-13 02:41:41.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Dropping the wait looks right for the Push refs, but the old ping MD itself can now outlive lnet_ping_target_update(), and LNet shutdown asserts that no MD with the ping target handler is left.
+
+--- Message (patrick bot, 2026-11-13 05:03:57.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-13 05:03:58.000000000) ---
+Patch Set 3: Commit message was updated.
+
+--- Message (patrick bot, 2026-11-13 05:04:11.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-13 05:06:52.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-13 05:14:32.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-13 11:42:45.000000000) ---
+Patch Set 2: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 3 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136147/ : SUCCESS
+
+--- Message (Maloo, 2026-11-13 11:43:21.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 136147 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136147&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136147#redirect

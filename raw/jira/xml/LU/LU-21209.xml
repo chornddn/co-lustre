@@ -1,0 +1,144 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21209] autotest: shorten rolling-upgrade/downgrade chains on master builds</title>
+                <link>https://jira.whamcloud.com/browse/LU-21209</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;The autotest rolling-upgrade/rolling-downgrade sessions run on lustre-master and lustre-master-next builds are the last sessions to finish, about 21h after every other session of the build. They are an autotest construct, not test scripts of that name.&lt;/p&gt;
+
+&lt;p&gt;Each "rolling-*" Maloo session is one step of a 9-step chain run back-to-back on the same cluster (same test host and queue idx):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;upgrade-init -&amp;gt; upgrade-oss -&amp;gt; upgrade-mds -&amp;gt; upgrade-client1 -&amp;gt; upgrade-client2
+  -&amp;gt; downgrade-client2 -&amp;gt; downgrade-client1 -&amp;gt; downgrade-mds -&amp;gt; downgrade-oss
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Every step reprovisions the nodes (median 16 min), runs lustre-initialization (2 min) and then the full sanity suite (872 subtests, median 222 min), so one chain takes 9 x ~4h: median 37-38h, up to 62h. Chains are started about 2h after the build starts, so queue priority is not the issue; the chain length is.&lt;/p&gt;
+
+&lt;p&gt;Data from 4000 lustre-master/lustre-master-next sessions over 2026-10-23..2026-11-13, 9 builds with complete chains (medians):&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;rolling chains start after build start       1.9h
+all other sessions of the build finished    26.8h
+last rolling chain finished                 49.2h
+extra time added by rolling chains only    +21.4h
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Variants per build cover b2_15 and b2_16 as the old version, ldiskfs and zfs, and several new-version distros; the clean-upgrade/clean-downgrade chains (3 steps, ~1.4h) are not a problem.&lt;/p&gt;
+
+&lt;p&gt;Options to shorten the critical path (autotest test-group configuration):&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;Split each chain into an upgrade chain and a downgrade chain on separate clusters, run in parallel. The downgrade chain starts with old-version init + clean upgrade of all nodes (~0.9h, as clean-upgrade does), then the 4 downgrade steps. Longest chain ~37h -&amp;gt; ~20h, below the other sessions; costs ~1h of extra test time per chain.&lt;/li&gt;
+	&lt;li&gt;Do not run full sanity in the all-old upgrade-init step: the old version is already tested on its own branch, the step only needs to format and create data. Saves ~3.7h per chain.&lt;/li&gt;
+	&lt;li&gt;Run full sanity only in the states that matter for deployments (e.g. new servers with old clients, and the final state) and a 30-60 min interop subset in the transient mixed states (oss-only, mds-only, one client upgraded). Running the subset everywhere would bring a chain from ~37h to ~12h, with some loss of coverage.&lt;/li&gt;
+	&lt;li&gt;Reprovision only the node being up/downgraded in each step instead of the whole cluster: saves ~2h per chain.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Options 1+2 alone would bring the chains to ~16h and the build completion from ~49h to ~27h.&lt;/p&gt;
+
+&lt;p&gt;The step failures (sanity test_77c, 120e/f, 56xk, 66, 160a/i, 807, mostly already ticketed interop issues) do not stop the chain and are not the cause of the run time.&lt;/p&gt;
+
+&lt;p&gt;Related to &lt;a href="https://jira.whamcloud.com/browse/LU-20869" title="reduce run time of long-running tests" class="issue-link" data-issue-key="LU-20869"&gt;LU-20869&lt;/a&gt; (reduce run time of long-running tests).&lt;/p&gt;</description>
+                <environment />
+        <key id="100442">LU-21209</key>
+            <summary>autotest: shorten rolling-upgrade/downgrade chains on master builds</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="colmstea">Charlie Olmstead</assignee>
+                                    <reporter username="adilger">Andreas Dilger</reporter>
+                        <labels>
+                    </labels>
+                <created>Fri, 13 Nov 2026 17:49:36 +0000</created>
+                <updated>Fri, 13 Nov 2026 18:14:00 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                            <comments>
+                            <comment id="505771" author="adilger" created="Fri, 13 Nov 2026 18:14:00 +0000">&lt;p&gt;The chain length is set almost entirely by the Autotest wrapper, not by the Lustre tree:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;Each step runs &lt;tt&gt;run_test_up_down.sh&lt;/tt&gt;, which calls &lt;tt&gt;auster &lt;del&gt;vk -f autotest_config -g test-groups/rolling&lt;/del&gt;&amp;lt;step&amp;gt;&lt;/tt&gt; with &lt;tt&gt;SLOW=yes&lt;/tt&gt;. The &lt;tt&gt;test-groups/rolling-*&lt;/tt&gt; files are not in master, b2_15 or b2_16 (only &lt;tt&gt;regression&lt;/tt&gt; and &lt;tt&gt;regression-mpi&lt;/tt&gt; are), so the step contents and SLOW mode come from Autotest.&lt;/li&gt;
+	&lt;li&gt;The tests run from the client's installed lustre-tests package. Only 3 of the 9 steps (upgrade-client1, upgrade-client2, downgrade-client2) run master's sanity.sh; the other 6 run the b2_15/b2_16 sanity.sh. Test-script speedups on master (&lt;a href="https://jira.whamcloud.com/browse/LU-20869" title="reduce run time of long-running tests" class="issue-link" data-issue-key="LU-20869"&gt;LU-20869&lt;/a&gt;) therefore shorten only a third of each chain.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;So the changes in the description (split the upgrade/downgrade chains, drop full sanity from upgrade-init, a shorter suite or SLOW=no for the transient mixed states, reprovision only the changed node) need to be made in the Autotest configuration.&lt;/p&gt;
+
+&lt;p&gt;Failures seen in the rolling steps over 2026-10-23..2026-11-13 (392 failed step sessions); the ticketed ones are linked to this ticket:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;sanity test_77c: &lt;a href="https://jira.whamcloud.com/browse/LU-17047" title="interop rolling-downgrade-client2 sanity test_77c: no checksum dump file on OSS" class="issue-link" data-issue-key="LU-17047"&gt;LU-17047&lt;/a&gt; (103)&lt;/li&gt;
+	&lt;li&gt;sanity test_120b/e/f: &lt;a href="https://jira.whamcloud.com/browse/LU-19357" title="sanity test_120f: FAIL: 10 cancel RPC occured" class="issue-link" data-issue-key="LU-19357"&gt;LU-19357&lt;/a&gt; (39)&lt;/li&gt;
+	&lt;li&gt;sanity test_123ac: &lt;a href="https://jira.whamcloud.com/browse/LU-18312" title="interop: sanity test_123ac: FAIL: statx -c &amp;quot;%n %i %A %h %u %g %W %X %Z&amp;quot; -D 100000 files is slower with statahead!" class="issue-link" data-issue-key="LU-18312"&gt;LU-18312&lt;/a&gt; (21)&lt;/li&gt;
+	&lt;li&gt;lustre-initialization: &lt;a href="https://jira.whamcloud.com/browse/LU-18041" title="struct obd_uuid is too small for MGC&amp;quot;NID&amp;quot; uuid with IPv6" class="issue-link" data-issue-key="LU-18041"&gt;LU-18041&lt;/a&gt; (21)&lt;/li&gt;
+	&lt;li&gt;sanity test_119p: &lt;a href="https://jira.whamcloud.com/browse/LU-19942" title="sanity test_119p: matching packet too big leads to timeout (interop)" class="issue-link" data-issue-key="LU-19942"&gt;LU-19942&lt;/a&gt; (8), test_119f: &lt;a href="https://jira.whamcloud.com/browse/LU-19725" title="sanity test_119f: packet is too big, leading to timeout" class="issue-link" data-issue-key="LU-19725"&gt;LU-19725&lt;/a&gt; (4), test_277: &lt;a href="https://jira.whamcloud.com/browse/LU-20780" title="interop: sanity test_277: expected mb 1 got 2" class="issue-link" data-issue-key="LU-20780"&gt;LU-20780&lt;/a&gt; (4), test_116a: &lt;a href="https://jira.whamcloud.com/browse/LU-17827" title="sanity test_116a: Failed with &amp;quot;test_116a returned 1&amp;quot; " class="issue-link" data-issue-key="LU-17827"&gt;LU-17827&lt;/a&gt; (4)&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Recurring failures with no ticket linked: sanity test_56xk (79), test_66 (55), test_360 (24), test_807 (39), test_160i/160s and test_256 (changelogs, ~50), and 57 "sanity (suite fail)" results. None of these stop the chain, so they do not affect its run time.&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="83427">LU-18041</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="96097">LU-19942</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="92189">LU-19357</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="99434">LU-20780</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="82338">LU-17827</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="84977">LU-18312</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="94184">LU-19725</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="77545">LU-17047</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="99626">LU-20869</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0736f:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

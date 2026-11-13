@@ -1,0 +1,70 @@
+Key:        LU-21209
+Summary:    autotest: shorten rolling-upgrade/downgrade chains on master builds
+Link:       https://jira.whamcloud.com/browse/LU-21209
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Charlie Olmstead
+Reporter:   Andreas Dilger
+Created:    Fri, 13 Nov 2026 17:49:36 +0000
+Updated:    Fri, 13 Nov 2026 18:14:00 +0000
+Links:      Related: is related to  LU-18041; Related: is related to  LU-19942; Related: is related to  LU-19357; Related: is related to  LU-20780; Related: is related to  LU-17827; Related: is related to  LU-18312; Related: is related to  LU-19725; Related: is related to  LU-17047; Related: is related to  LU-20869
+
+--- Description ---
+The autotest rolling-upgrade/rolling-downgrade sessions run on lustre-master and lustre-master-next builds are the last sessions to finish, about 21h after every other session of the build. They are an autotest construct, not test scripts of that name.
+
+Each "rolling-*" Maloo session is one step of a 9-step chain run back-to-back on the same cluster (same test host and queue idx):
+
+upgrade-init -> upgrade-oss -> upgrade-mds -> upgrade-client1 -> upgrade-client2
+  -> downgrade-client2 -> downgrade-client1 -> downgrade-mds -> downgrade-oss
+
+Every step reprovisions the nodes (median 16 min), runs lustre-initialization (2 min) and then the full sanity suite (872 subtests, median 222 min), so one chain takes 9 x ~4h: median 37-38h, up to 62h. Chains are started about 2h after the build starts, so queue priority is not the issue; the chain length is.
+
+Data from 4000 lustre-master/lustre-master-next sessions over 2026-10-23..2026-11-13, 9 builds with complete chains (medians):
+
+rolling chains start after build start       1.9h
+all other sessions of the build finished    26.8h
+last rolling chain finished                 49.2h
+extra time added by rolling chains only    +21.4h
+
+Variants per build cover b2_15 and b2_16 as the old version, ldiskfs and zfs, and several new-version distros; the clean-upgrade/clean-downgrade chains (3 steps, ~1.4h) are not a problem.
+
+Options to shorten the critical path (autotest test-group configuration):
+
+	Split each chain into an upgrade chain and a downgrade chain on separate clusters, run in parallel. The downgrade chain starts with old-version init + clean upgrade of all nodes (~0.9h, as clean-upgrade does), then the 4 downgrade steps. Longest chain ~37h -> ~20h, below the other sessions; costs ~1h of extra test time per chain.
+
+	Do not run full sanity in the all-old upgrade-init step: the old version is already tested on its own branch, the step only needs to format and create data. Saves ~3.7h per chain.
+
+	Run full sanity only in the states that matter for deployments (e.g. new servers with old clients, and the final state) and a 30-60 min interop subset in the transient mixed states (oss-only, mds-only, one client upgraded). Running the subset everywhere would bring a chain from ~37h to ~12h, with some loss of coverage.
+
+	Reprovision only the node being up/downgraded in each step instead of the whole cluster: saves ~2h per chain.
+
+Options 1+2 alone would bring the chains to ~16h and the build completion from ~49h to ~27h.
+
+The step failures (sanity test_77c, 120e/f, 56xk, 66, 160a/i, 807, mostly already ticketed interop issues) do not stop the chain and are not the cause of the run time.
+
+Related to LU-20869 (reduce run time of long-running tests).
+
+--- Comment (adilger, Fri, 13 Nov 2026 18:14:00 +0000) ---
+The chain length is set almost entirely by the Autotest wrapper, not by the Lustre tree:
+
+	Each step runs run_test_up_down.sh, which calls auster vk -f autotest_config -g test-groups/rolling with SLOW=yes. The test-groups/rolling-* files are not in master, b2_15 or b2_16 (only regression and regression-mpi are), so the step contents and SLOW mode come from Autotest.
+
+	The tests run from the client's installed lustre-tests package. Only 3 of the 9 steps (upgrade-client1, upgrade-client2, downgrade-client2) run master's sanity.sh; the other 6 run the b2_15/b2_16 sanity.sh. Test-script speedups on master (LU-20869) therefore shorten only a third of each chain.
+
+So the changes in the description (split the upgrade/downgrade chains, drop full sanity from upgrade-init, a shorter suite or SLOW=no for the transient mixed states, reprovision only the changed node) need to be made in the Autotest configuration.
+
+Failures seen in the rolling steps over 2026-10-23..2026-11-13 (392 failed step sessions); the ticketed ones are linked to this ticket:
+
+	sanity test_77c: LU-17047 (103)
+
+	sanity test_120b/e/f: LU-19357 (39)
+
+	sanity test_123ac: LU-18312 (21)
+
+	lustre-initialization: LU-18041 (21)
+
+	sanity test_119p: LU-19942 (8), test_119f: LU-19725 (4), test_277: LU-20780 (4), test_116a: LU-17827 (4)
+
+Recurring failures with no ticket linked: sanity test_56xk (79), test_66 (55), test_360 (24), test_807 (39), test_160i/160s and test_256 (changelogs, ~50), and 57 "sanity (suite fail)" results. None of these stop the chain, so they do not affect its run time.

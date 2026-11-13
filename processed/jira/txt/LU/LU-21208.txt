@@ -1,0 +1,103 @@
+Key:        LU-21208
+Summary:    lod_alloc_ost_list() can read past end of ltd_tgt_bitmap for an   unregistered OST index, causing LBUG
+Link:       https://jira.whamcloud.com/browse/LU-21208
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Ronnie Sahlberg
+Reporter:   Ronnie Sahlberg
+Created:    Fri, 13 Nov 2026 10:28:22 +0000
+Updated:    Fri, 13 Nov 2026 10:36:09 +0000
+
+--- Description ---
+lod_alloc_ost_list() (lustre/lod/lod_qos.c) validates each OST index
+
+  from a user-supplied specific-OST striping with:
+
+  if (!test_bit(ost_idx, m->lod_ost_bitmap)) 
+
+{
+          rc = -EINVAL;
+          break;
+  }
+
+  lod_ost_bitmap is lod_ost_descs.ltd_tgt_bitmap. This bitmap is
+
+  allocated by lu_tgt_descs_init() at a fixed initial size of
+
+  BITS_PER_LONG (64) bits, and is only grown by ltd_add_tgt() up to the
+
+  highest index actually registered so far (ltd_tgts_size). Nothing in
+
+  lod_alloc_ost_list() (or the similar unguarded test_bit() calls at
+
+  lustre/lod/lod_lov.c:1142 and lod_lov.c:1995) checks ost_idx ltd_tgts_size before calling test_bit().
+
+  If a caller supplies an OST index at or beyond ltd_tgts_size (e.g. a
+
+  stale, mistyped, or otherwise-never-registered OST index in a
+
+  user-defined striping), test_bit() reads past the end of the allocated
+
+   bitmap. This out-of-bounds read can return a non-zero (garbage) bit,
+
+  letting an invalid/unregistered ost_idx pass the check. The code then
+
+  proceeds to LTD_TGT(ltd, ost_idx), which is NULL because the
+
+  corresponding target-pointer block was never allocated, and passes
+
+  that NULL into lod_statfs_and_check():
+
+  rc = lod_statfs_and_check(env, m, &m->lod_ost_descs,
+
+                             LTD_TGT(&m->lod_ost_descs, ost_idx),
+
+                             reserve);
+
+  lod_statfs_and_check() asserts the target is non-NULL (LASSERT(tgt)),
+
+  so this crashes the node with an LBUG rather than returning -EINVAL as
+
+   intended:
+
+  LustreError: ...(lod_qos.c:86:lod_statfs_and_check()) ASSERTION( tgt
+
+   ) failed:
+
+  LustreError: ...(lod_qos.c:86:lod_statfs_and_check()) LBUG
+
+  Call Trace:
+
+   lod_statfs_and_check+0x551/0x940 [lod]
+
+   lod_alloc_ost_list+0x28f/0x7b0 [lod]
+
+   lod_comp_prep_create+0x1144/0x1950 [lod]
+
+  Reproduction: A KUnit test (lod_comp_ostlist_bad_ost_test, LU-21180
+
+  series) exercises lod_comp_prep_create()/lod_alloc_ost_list() with a
+
+  user-defined OST list containing an index (99) that was never added to
+
+   a small (8-OST) test cluster, expecting -EINVAL. Instead it panics
+
+  the kernel.
+
+  Likely fix: Bounds-check ost_idx (and any other caller-supplied
+
+  OST/MDT index used with test_bit() against ltd_tgt_bitmap) against
+
+  ltd->ltd_tgts_size before calling test_bit(), treating an out-of-range
+
+   index the same as an unset bit (-EINVAL), at minimum in
+
+  lod_alloc_ost_list() and the two call sites in lod_lov.c.
+
+  Impact: A client or admin specifying an out-of-range/stale OST index
+
+  in a user-defined (specific) striping layout, FID affinity hint, or
+
+  similar can crash the MDS, rather than getting a clean -EINVAL error.

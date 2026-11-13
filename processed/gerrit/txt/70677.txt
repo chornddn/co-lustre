@@ -1,5 +1,5 @@
 Change:     70677
-Subject:    LU-21127 llite: set HSM dirty if close is lost by eviction
+Subject:    LU-21127 mdt: set HSM dirty on close of a lost open handle
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70677
 Change-Id:  I90eb71131e3e7c40ab8aa0c1f7eee0453cedb1d4
 Project:    fs/lustre-release
@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Anirudh
 Created:    2026-11-10 17:17:42.000000000
-Updated:    2026-11-12 13:36:50.000000000
-Patch Set:  2
-Insertions: +136
-Deletions:  -17
-Comments:   15 (5 unresolved)
+Updated:    2026-11-13 08:44:37.000000000
+Patch Set:  3
+Insertions: +128
+Deletions:  -2
+Comments:   26 (5 unresolved)
 Hashtags:   pw_shepherd
 
 --- Labels ---
@@ -22,28 +22,27 @@ Hashtags:   pw_shepherd
   CC: Nikitas Angelinas, Gerrit AI review for Lustre, patrick bot
 
 --- Commit Message ---
-LU-21127 llite: set HSM dirty if close is lost by eviction
+LU-21127 mdt: set HSM dirty on close of a lost open handle
 
 When a client is evicted while holding an archived file open for
 write, mdt_export_cleanup() sets HS_DIRTY without a changelog record
-(uc_enable_audit == 0). The final close then gets -ESTALE, which
-mdc_close() maps to success, and LLIF_DATA_MODIFIED is already
-cleared, so changelog-driven archivers never see the change.
+(uc_enable_audit == 0). The client keeps writing, and its final close
+then uses the lost open handle: mdt_close_internal() returns -ESTALE
+and MDS_DATA_MODIFIED is ignored, so changelog-driven archivers never
+see the change.
 
-Keep -ESTALE in mdc_close() when the close carries MDS_DATA_MODIFIED,
-restore LLIF_DATA_MODIFIED when the close fails, and on the last write
-close report it with ll_hsm_report_dirty(): skip files that were never
-archived, otherwise set HS_DIRTY, clearing it first if already set, so
-a CL_HSM record is logged. Factor out ll_hsm_state_get() for this.
-Other closes keep the bug 3633 -ESTALE handling (used by LU-20531).
+When a close of an unknown handle carries MDS_DATA_MODIFIED, have
+mdt_close() set HS_DIRTY on an archived file the caller may write,
+raising CAP_FOWNER as mdt_add_dirty_flag() does so that non-owner
+writers are covered. If HS_DIRTY is already set, clear it first so
+that a CL_HSM dirty record is logged. Closes that never reach the MDT
+(the client never closes, or the close fails before the import
+recovers) are not covered.
 
-Closes from lock cancellation (ll_md_blocking_ast()) restore the bit
-but do not report it, as that path cannot safely send an RPC.
-
-Add sanity-hsm test_52b and rename test_52 to test_52a.
+Add sanity-hsm test_52b for owner, non-owner and never archived files;
+rename test_52 to test_52a.
 
 Test-Parameters: testlist=sanity-hsm
-Test-Parameters: testlist=sanity-sec env=ONLY=81b,ONLY_MINUTES=30
 Signed-off-by: Anirudh Gaur <gaurani@amazon.com>
 Assisted-by: Claude:claude-opus-5-5 claude-code
 Change-Id: I90eb71131e3e7c40ab8aa0c1f7eee0453cedb1d4
@@ -150,3 +149,40 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The non-owner writer case means the new close-time report silently fails for shared files, which seems worth addressing in this patch.
+
+--- Message (Anirudh, 2026-11-12 17:38:20.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-12 17:44:24.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-12 17:44:30.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Anirudh, 2026-11-12 18:16:12.000000000) ---
+Patch Set 3:
+
+(6 comments)
+
+--- Message (jenkins, 2026-11-12 19:02:31.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136087/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-13 08:44:37.000000000) ---
+Patch Set 3:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The approach of handling the unknown-handle close on the MDT looks reasonable, but the -ESTALE test also matches closes of known handles, and the clear-then-set update is not atomic.
