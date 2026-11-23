@@ -1,0 +1,357 @@
+Change:     71185
+Subject:    LU-21253 ofd: skip forced commit for DIO overwrite
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71185
+Change-Id:  I02512323d694988b20fefbc58b151ec9b461a801
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Shriram Pore
+Created:    2026-11-19 12:32:31.000000000
+Updated:    2026-11-23 12:10:09.000000000
+Patch Set:  7
+Insertions: +1029
+Deletions:  -6
+Comments:   37 (6 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Mikhail Pershin, Alex Zhuravlev
+
+--- Commit Message ---
+LU-21253 ofd: skip forced commit for DIO overwrite
+
+`ofd_commitrw_write()` forces a journal commit for every write whose
+pages lack OBD_BRW_ASYNC, so each O_DIRECT write waits for a jbd2
+commit even when it only overwrites blocks that are already
+allocated, written and committed.
+
+Add `obdfilter.*.dio_overwrite_nosync` (default 0).  When set, such
+a write skips the commit if osd-ldiskfs reports th_overwrite, the
+object has no uncommitted replayable change (ofo_dirty_transno, set
+after write, punch, fallocate and truncate), no attribute had to be
+set for the write, and the request is neither retried nor replayed
+and the target is not in recovery.  The write is made a local
+transaction, so the client keeps no request to replay from pages it
+has returned to the application, and the object version is advanced
+with the new `tgt_obj_version_bump()` so data_version still changes.
+If the OST crashes before the next commit, the timestamps of such a
+write and its object version can fall back to older values although
+the data is new, so the tunable must not be enabled on a file system
+that uses HSM.  With this patch alone the timestamps can roll back
+after an OST crash when the tunable is enabled; the following patch
+keeps the commit for a write that changes a timestamp.
+The client sends no OST_SYNC after an O_DIRECT write, also with
+O_SYNC (`ll_direct_IO()` returns -EIOCBQUEUED, so
+`vvp_io_write_start()` skips `generic_write_sync()`), so
+O_DIRECT|O_SYNC writes get fdatasync semantics in this mode;
+fsync() still commits.  With the tunable at 0 (the default) the
+write path is unchanged apart from the in-memory ofo_dirty_transno
+bookkeeping.
+
+`tgt_obj_version_bump()` takes the version from lut_last_transno, so
+no later transno can reuse it: after every restart
+`tgt_boot_epoch_update()` moves lut_last_transno past the epoch of
+every transno restored from disk, which includes the boot epoch
+start and the last committed transno, before any new transno is
+assigned.  A version above both the boot epoch and the epoch of the
+last committed transno keeps its commit; the first such forced write
+commits a transno in the new epoch and re-enables the skip.  A
+refused bump consumes no transno.
+
+The dirty mark of a write or fallocate is set at the end of the
+request, also when a restarted pass failed or the write failed after
+a nosync decision.  A request without transno marks the object dirty
+until a later transno commits, as its handle may commit after the
+last assigned transno.  A newly cached object starts the same way.
+
+Add `dio_overwrite_nosync_count` and `dio_overwrite_sync_count`, and
+the obdfilter.dio_overwrite_nosync(4) man page.
+Add sanity 398w, 398x and replay-ost-single 14.
+
+Test-Parameters: testlist=sanity env=ONLY="398w 398x"
+Test-Parameters: testlist=replay-ost-single env=ONLY=14
+Signed-off-by: Shriram Pore <spore@ddn.com>
+Assisted-by: Claude:claude-opus-5-5
+Change-Id: I02512323d694988b20fefbc58b151ec9b461a801
+
+--- Review History ---
+
+--- Message (Shriram Pore, 2026-11-19 12:32:31.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-11-19 12:39:57.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 12:40:09.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Shriram Pore, 2026-11-19 12:43:19.000000000) ---
+Removed reviewer <GERRIT_ACCOUNT_808>.
+
+--- Message (jenkins, 2026-11-19 14:06:56.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137092/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-19 19:51:38.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-19 19:56:43.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 19:59:15.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (jenkins, 2026-11-19 20:36:58.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137121/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-19 20:45:00.000000000) ---
+Patch Set 2:
+
+smatch "possible ERR_PTR()" at lproc_ofd.c:767 (dio_overwrite_nosync_show) and :799 (dio_overwrite_nosync_store): false positive, no change. Both handlers use the same ofd_dev(obd->obd_lu_dev) lookup as the existing sysfs show/store handlers in this file; at the parent commit, 30 of them use it without an IS_ERR() check (only brw_size_show/store check it). These attributes exist only while the OFD device is set up, so obd_lu_dev is a valid ofd_device there. Kept consistent with the neighbouring handlers.
+
+--- Message (Shriram Pore, 2026-11-19 21:10:56.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Shriram Pore, 2026-11-19 22:06:50.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 22:14:30.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-19 22:19:29.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-19 23:08:55.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137133/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-20 04:40:12.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+--- Message (patrick bot, 2026-11-20 14:23:14.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 14:46:13.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional documentation-accuracy notes inline for whenever the patch is next refreshed. No need to re-spin for them.
+
+--- Message (Shriram Pore, 2026-11-20 14:53:05.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 15:01:36.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-20 15:03:56.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-21 03:16:59.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137254/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-21 04:00:11.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Shriram Pore, 2026-11-21 04:01:02.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-11-21 04:02:58.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-21 04:05:56.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (Shriram Pore, 2026-11-21 15:32:26.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (jenkins, 2026-11-21 20:43:23.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137429/ : SUCCESS
+
+--- Message (Autotest, 2026-11-22 00:36:28.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137429 patch 5. Requested by Patrickbot because of LU-18304.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 07:23:13.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The data-safety logic looks sound; the main issue is that the nosync path turns itself off for the rest of the boot once the transno counter passes the epoch boundary.
+
+--- Message (Shriram Pore, 2026-11-22 10:59:11.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-22 11:04:26.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-22 11:11:09.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-22 11:34:26.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137497/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-22 11:36:23.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (Shriram Pore, 2026-11-22 11:36:23.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 20:31:32.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; the data-safety logic holds up under tracing. One optional note inline for whenever the patch is next refreshed, no need to re-spin for it.
+
+--- Message (Shriram Pore, 2026-11-23 06:32:10.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Shriram Pore, 2026-11-23 06:53:02.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 06:58:57.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-23 07:08:03.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Shriram Pore, 2026-11-23 07:12:17.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+--- Message (jenkins, 2026-11-23 07:22:23.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137532/ : SUCCESS
+
+--- Message (Autotest, 2026-11-23 11:15:28.000000000) ---
+Patch Set 7:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137532 patch 7. Requested by Patrickbot because of LU-18304.
+
+--- Message (patrick bot, 2026-11-23 11:28:30.000000000) ---
+Patch Set 7:
+
+(1 comment)

@@ -1,0 +1,147 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21281] ldlm: cancelling many extent locks on one object is quadratic in ldlm_extent_shift_kms()</title>
+                <link>https://jira.whamcloud.com/browse/LU-21281</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;b&gt;Description&lt;/b&gt;&lt;br/&gt;
+When a client holds many PR extent locks on one object, cancelling them is       &lt;br/&gt;
+quadratic in the number of locks. ldlm_extent_shift_kms() runs for every         &lt;br/&gt;
+cancel, under lock_res_and_lock(), and walks every lock in the extent tree       &lt;br/&gt;
+whenever no remaining lock protects the old KMS.                                 &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+With 20000 adjacent one-page PR locks, cancelling them all takes about 5.6 s     &lt;br/&gt;
+on average on test clients, and 0.19 s with the patch below (30x faster, see     &lt;br/&gt;
+"Measurements"). The cost grows with the square of the lock count, so it         &lt;br/&gt;
+gets much worse at the lock counts seen on shared files.                         &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+The same problem was seen together with client evictions during shared-file      &lt;br/&gt;
+IOR with unaligned records ("Observed in the field", below). The link to         &lt;br/&gt;
+the evictions is likely, but it is not proven. This ticket is about the          &lt;br/&gt;
+cancel cost, which is measured.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Analysis&lt;/b&gt;                                                                                                                                              &lt;br/&gt;
+__osc_dlm_blocking_ast() calls ldlm_extent_shift_kms() for every cancel, under   &lt;br/&gt;
+lock_res_and_lock(). When no remaining lock protects the old KMS, the            &lt;br/&gt;
+function walks every lock in the extent tree. That is O(N) per cancel and        &lt;br/&gt;
+O(N^2) for a burst of N cancels. Other threads that need the resource lock       &lt;br/&gt;
+spin behind it.                                                                  &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+The client cancels its unused locks from the newest to the oldest. Locks taken   &lt;br/&gt;
+from low to high offsets are therefore cancelled highest first, which is the     &lt;br/&gt;
+worst case.                                                                      &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+Related tickets: &lt;a href="https://jira.whamcloud.com/browse/LU-12832" title="soft lockup in ldlm_bl_xx threads at read for a single shared strided file" class="issue-link" data-issue-key="LU-12832"&gt;&lt;del&gt;LU-12832&lt;/del&gt;&lt;/a&gt; and &lt;a href="https://jira.whamcloud.com/browse/LU-12377" title="stuck in ldlm thread on client when large amount of locks were canceled" class="issue-link" data-issue-key="LU-12377"&gt;&lt;del&gt;LU-12377&lt;/del&gt;&lt;/a&gt; show the same symptoms. The               &lt;br/&gt;
+"end + 1 &amp;gt;= old_kms" change discussed in &lt;a href="https://jira.whamcloud.com/browse/LU-12832" title="soft lockup in ldlm_bl_xx threads at read for a single shared strided file" class="issue-link" data-issue-key="LU-12832"&gt;&lt;del&gt;LU-12832&lt;/del&gt;&lt;/a&gt; is already in the tree         &lt;br/&gt;
+(&lt;a href="https://jira.whamcloud.com/browse/LU-13312" title="Optimized RA for stride read under memory pressure" class="issue-link" data-issue-key="LU-13312"&gt;&lt;del&gt;LU-13312&lt;/del&gt;&lt;/a&gt;), and the stacks below still show the scan. It is not &lt;a href="https://jira.whamcloud.com/browse/LU-19721" title="Lustre 2.17 client causes -EIO during SSF read" class="issue-link" data-issue-key="LU-19721"&gt;LU-19721&lt;/a&gt;:        &lt;br/&gt;
+the client build has no invalidate_lock code in llite or osc.   &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Measurements&lt;/b&gt;                                                                     &lt;br/&gt;
+Seven clients sharing one striped file. Each client takes 20000 adjacent         &lt;br/&gt;
+one-page PR locks on the same object with "lfs ladvise -a lockahead", lowest     &lt;br/&gt;
+offset first, so the locks are cancelled highest first. The time is from         &lt;br/&gt;
+"lru_size=clear" to lock_count reaching 0 on that client. One run per build.     &lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;                                                                       
+cancel 20000 locks    unpatched    patched    ratio                              
+  sles160               5574 ms     130 ms     43x                               
+  sles157               6518 ms     126 ms     52x                               
+  rhel98                5245 ms     158 ms     33x                               
+  rhel102               6435 ms     233 ms     28x                               
+  debian137             5146 ms     214 ms     24x                               
+  ubuntu2404            4943 ms     220 ms     22x                               
+  ubuntu2604            5359 ms     219 ms     24x                               
+  mean                  5603 ms     186 ms     30x                               
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;                                                                      &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+The same case on a 4 vCPU rocky9 VM (sanity 255e, new), one run each:            &lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;                                                                       
+  unpatched: lowest first 2083 ms, highest first 6630 ms  -&amp;gt; FAIL                
+  patched:   lowest first 2137 ms, highest first 2137 ms  -&amp;gt; PASS                
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;                                                                      &lt;br/&gt;
+                                                                                 &lt;br/&gt;
+kunit ldlm_extent test 3, cost per iteration (one lock added, the oldest         &lt;br/&gt;
+cancelled, and one ldlm_extent_shift_kms() call), on the same VM:                &lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;                                                                       
+  locks      unpatched   patched                                                 
+  10         9.1 us      9.1 us                                                  
+  1,000      28.1 us     9.3 us                                                  
+  10,000     220.5 us    9.4 us                                                  
+  ~27,000    ~346 us     n/a                                                     
+  100,000    not reached 9.2 us                                                  
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;       &lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Workaround (from &lt;a href="https://jira.whamcloud.com/browse/LU-12832" title="soft lockup in ldlm_bl_xx threads at read for a single shared strided file" class="issue-link" data-issue-key="LU-12832"&gt;&lt;del&gt;LU-12832&lt;/del&gt;&lt;/a&gt;)&lt;/b&gt;                                 &lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;                                                                       
+lctl set_param ldlm.namespaces.*osc*.lru_max_age=30000                           
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;                                                                      &lt;br/&gt;
+This shortens how long idle locks accumulate, at the cost of more lock RPCs      &lt;br/&gt;
+and more re-reads. It does not remove the cost of cancelling many live           &lt;br/&gt;
+locks at once.                                                          &lt;/p&gt;</description>
+                <environment />
+        <key id="100625">LU-21281</key>
+            <summary>ldlm: cancelling many extent locks on one object is quadratic in ldlm_extent_shift_kms()</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="manhongdai">Manhong Dai</assignee>
+                                    <reporter username="manhongdai">Manhong Dai</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 21 Nov 2026 03:06:22 +0000</created>
+                <updated>Sat, 21 Nov 2026 03:44:06 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506412" author="gerrit" created="Sat, 21 Nov 2026 03:24:31 +0000">&lt;p&gt;"Manhong &amp;lt;manhong.dai@netapp.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71262" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71262&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21281" title="ldlm: cancelling many extent locks on one object is quadratic in ldlm_extent_shift_kms()" class="issue-link" data-issue-key="LU-21281"&gt;LU-21281&lt;/a&gt; ldlm: avoid quadratic scan in ldlm_extent_shift_kms()&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 794f53e5f789785e0bb74bb9fbc1a3edcd1fba9f&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073p3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -8,47 +8,60 @@ Resolution: Unresolved
 Assignee:   Serguei Smirnov
 Reporter:   Serguei Smirnov
 Created:    Sat, 7 Nov 2026 01:11:00 +0000
-Updated:    Sat, 7 Nov 2026 01:11:00 +0000
+Updated:    Fri, 20 Nov 2026 19:58:08 +0000
 
 --- Description ---
-Socklnd identifies the remote peer by the NID in its HELLO (kshm_src_nid) and never relates that NID to the connection it arrived on. 
+SockLND identifies a remote peer using the NID supplied in its HELLO (kshm_src_nid). Currently, this NID is not validated against the remote address of the underlying TCP connection.
 
-	Passive: for connections from a reserved source port (the accept=secure default), ksocknal_recv_hello() uses kshm_src_nid verbatim. Only the accept=all branch derives the identity from the socket address.
+	Passive: For connections from a reserved source port (accept=secure, the default), ksocknal_recv_hello() uses kshm_src_nid directly. The accept=all branch instead derives the peer identity from the socket address.
 
-	Active: ksocknal_recv_hello() checks that the HELLO NID equals the NID that was dialed, not that the connection's peer address belongs to that NID.
+	Active: ksocknal_recv_hello() checks that the HELLO NID matches the requested peer NID, but does not verify its consistency with the connection's remote address.
 
-	The claimed NID's network is not checked against the receiving NI's network.
+	The advertised NID's network is not checked against the receiving NI's network.
 
-	lnet_connect() binds to an address chosen by choose_ipv4_src() on the interface, not necessarily the NI's own address, so a NID cannot be reliably derived from a connection's source address.
+	lnet_connect() currently selects a source address using choose_ipv4_src() on the interface, which may differ from the NI's configured address.
 
-The claimed NID becomes the key of the peer table, and traffic subsequently selected for that NID may be sent over the connections that claimed it.
+The advertised NID is subsequently used as the key for SockLND peer lookup and connection management. Inconsistent NID and transport-address information can therefore lead to unexpected peer associations, connection replacement, or traffic delivery over unintended connections.
 
-Threat scenario:
+Proposal
 
-Attacker: a node that can reach a socklnd listener and run arbitrary code with enough privilege to bind a reserved source port (e.g. root on its own host or VM). It can send a HELLO claiming any NID.
+Introduce an optional SockLND connection-address validation policy, disabled by default, with three modes:
 
-Assumption: the network (fabric, hypervisor or SDN) prevents a node from sending packets from, or receiving packets addressed to, an IP address it does not own. Strict mode relies on this; where it does not hold, the check provides no protection.
+	off: Preserve current behavior.
 
- 
+	warn: Log and count connections with inconsistent NID and transport-address information, without rejecting them or changing outgoing source-address selection.
 
-Out of scope: on-path and L2 attackers, NAT/proxies, forged LNet headers and peer-membership manipulation.
+	enforce: Bind outgoing connections to the NI's configured address and reject connections whose advertised NID does not match the observed TCP peer address.
 
-Proposal:
+A connection passes validation when both conditions hold:
 
-Add an opt-in policy, off by default, with three modes:
+	The advertised NID's network matches the receiving NI's network.
 
-	off: current behavior.
+	The advertised NID's address matches the connection's remote IP address.
 
-	warn: log and count connections that fail verification but accept them; outgoing source selection is unchanged.
+Validation applies to both active and passive connections and takes place before the connection is associated with a SockLND peer.
 
-	enforce: bind outgoing connections to the NI's address and reject connections that fail verification, on both active and passive paths.
+The policy is exposed as a read-only (0444) module parameter, ensuring consistent behavior throughout the module's lifetime.
 
-A connection passes verification when both hold:
+Compatibility
 
-	the claimed NID's network equals the receiving NI's network
+The default off mode preserves existing behavior.
 
-	the claimed NID's address equals the connection's peer address
+In enforce mode, configurations that use a TCP source address different from the NI's configured NID address, including some secondary-address and NAT configurations, may no longer establish connections.
 
-The policy is a read-only (0444) module parameter, so every connection in a module's lifetime is created under the same policy.
+The warn mode allows administrators to identify address inconsistencies before enabling enforcement.
 
-In enforce mode, peers that source from a non-NID address (e.g. secondary addresses in the same subnet) or sit behind NAT are rejected; warn mode shows which connections would be affected.
+The change is limited to SockLND connection identity validation. It does not alter LNet message-header source handling, peer discovery, or Multi-Rail membership management.
+
+--- Comment (gerrit, Fri, 20 Nov 2026 19:58:08 +0000) ---
+"Serguei Smirnov " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71258
+
+Subject: LU-21148 socklnd: Validate HELLO NID against TCP addresses
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 1629d6fe90c79f276dac3688f1ff9ef679c51c57

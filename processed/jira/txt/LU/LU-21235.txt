@@ -1,0 +1,161 @@
+Key:        LU-21235
+Summary:    sanity-quota test_91: stale FULL import after rapid MDT restart causes client eviction and EIO
+Link:       https://jira.whamcloud.com/browse/LU-21235
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Maloo
+Created:    Mon, 16 Nov 2026 20:29:30 +0000
+Updated:    Wed, 18 Nov 2026 10:46:04 +0000
+
+--- Description ---
+This issue was created by maloo for Sergey Noskov 
+
+This issue relates to the following test suite run: https://testing.whamcloud.com/test_sets/4c002a58-53cd-459b-9f75-efa31753f840
+
+Test session details:
+
+Client
+
+Lustre: 2.17.61.85
+
+Branch: master
+
+Build: https://build.whamcloud.com/job/lustre-reviews/136544
+
+Kernel: 5.14.0-687.60.1.el9_8.x86_64
+
+Server
+
+Lustre: 2.17.61.85
+
+Branch: master
+
+Build: https://build.whamcloud.com/job/lustre-reviews/136544
+
+Kernel: 5.14.0-687.60.1.el9_8_lustre.x86_64
+
+sanity-quota test_91 intermittently fails after restarting MDT0000.
+
+This was observed in review-dne-part-4 build 136544 while testing
+
+Gerrit change 68030 (LU-20597). The LU-20597 tests passed and the
+
+failure occurred later in unchanged test_91.
+
+Environment:
+
+	Lustre: 2.17.61.85 (Build Version 2.17.61_85_g5f3c869)
+
+	OS: EL 9.8
+
+	Client kernel: 5.14.0-687.60.1.el9_8.x86_64
+
+	Server kernel: 5.14.0-687.60.1.el9_8_lustre.x86_64
+
+	Backend: ldiskfs
+
+	Configuration: 4 MDTs, 8 OSTs
+
+	TIMEOUT=20
+
+	Test session: e6f61f85-d558-44e2-a8b4-5a19e83b135a
+
+test_91 stops MDT0000, removes two quota index files with debugfs,
+
+restarts MDT0000, waits for the client import to become FULL, and
+
+then creates a directory.
+
+Relevant timing on MDT0000:
+
+[13662.143547] server umount lustre-MDT0000 complete
+
+[13666.688768] mount -t lustre_tgt ... /mnt/lustre-mds1
+
+The MDT was therefore unavailable for only about 4.5 seconds, shorter
+
+than the configured timeout.
+
+The client did not log a connection loss during this interval.
+
+After the restart, wait_clients_import_state accepted the existing
+
+FULL state immediately:
+
+mdc.lustre-MDT0000-mdc-*.mds_server_uuid in FULL state after 0 sec
+
+The first subsequent request then failed:
+
+[13672.609612] operation seq_query ... failed: rc = -107
+
+[13672.613953] This client was evicted by lustre-MDT0000
+
+[13672.614197] Cannot allocate new meta-sequence: rc = -5
+
+mkdir consequently returned EIO:
+
+mkdir: cannot create directory '/mnt/lustre/d91.sanity-quota':
+
+Input/output error
+
+Suspected cause:
+
+wait_clients_import_state() only checks the current import state.
+
+Because the outage is shorter than the client timeout, it can observe
+
+the pre-restart FULL state without ensuring that the client first saw
+
+the disconnect and established a new connection.
+
+test_91 then exits before its final:
+
+stopall
+
+formatall
+
+setupall
+
+This leaves only the temporary one-MDT/two-OST configuration running
+
+and causes cascading failures in tests 92 through 300.
+
+Expected result:
+
+The test should wait until the client has observed the MDT disconnect
+
+before restarting the MDT, and then wait for a new FULL connection.
+
+The original filesystem configuration should also be restored through
+
+a cleanup trap when the test fails.
+
+Possible test fix:
+
+1. After "stop mds1 -f", wait for the client MDT0000 import to leave
+
+   FULL or reach DISCONN before restarting MDT0000.
+
+2. After restart, wait for FULL/recovery completion.
+
+3. Register stopall/formatall/setupall as cleanup before the first
+
+   destructive format operation so failures cannot corrupt subsequent
+
+   tests.
+
+--- Comment (gerrit, Wed, 18 Nov 2026 10:46:04 +0000) ---
+"patrick bot " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71100
+
+Subject: LU-21235 tests: wait for MDT disconnect in sanity-quota 91
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bb2acbd62554a1650dc0b05a0c9415513e2e8c36

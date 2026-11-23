@@ -7,49 +7,71 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-15 05:56:52.000000000
-Updated:    2026-11-12 20:36:47.000000000
-Patch Set:  2
-Insertions: +220
-Deletions:  -15
-Comments:   17 (2 unresolved)
-Hashtags:   pw_shepherd, 218_review_priority, pt_ecro
+Updated:    2026-11-22 18:16:52.000000000
+Patch Set:  3
+Insertions: +441
+Deletions:  -44
+Comments:   23 (2 unresolved)
+Hashtags:   pt_ecro, pw_shepherd, 218_review_priority
 
 --- Labels ---
-  Code-Review: Keguang Xu: +1; Ronnie Sahlberg: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: Ronnie Sahlberg: +1
+  Verified: Maloo: -1; jenkins: +1
 
 --- Reviewers ---
-  CC: Gerrit AI review for Lustre, patrick bot
+  CC: Oleg Drokin, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Zhenyu Xu, Patrick Farrell, Maximilian Dilger, Ronnie Sahlberg, Keguang Xu
 
 --- Commit Message ---
 LU-20708 llite: rebuild faulting EC pages from parity
 
 A page fault on an EC file with a data stripe on an unavailable OST,
-e.g. during an OSS failover, waits for the OST in the fault's lock
-enqueue, while read() of the same page is rebuilt from parity at once.
-So mmap readers of the file, such as git or executables, hang.
+e.g. during an OSS failover, would wait for the OST in the fault's
+lock enqueue, while read() of the same page is rebuilt from parity at
+once.  So mmap readers of the file, such as git or executables, would
+hang.  A read fault on an FLR file whose OST is deactivated would get
+-EIO from osc_io_iter_init(), so SIGBUS, though read() of the file
+moves to another mirror.
 
-Do the lock enqueues of read faults without delay like reads, so they
-fail over to another mirror, and switch to CIT_EC_RD after the mirror
-rounds as reads do.  The fault then drops the mmap lock, as
-filemap_fault() does for IO, rebuilds the page, with the rest of the
-aligned 1MiB around it unless the mapping is read randomly, into the
-page cache with a CIT_EC_RD read, where the EC placeholder lock keeps
-the pages Uptodate, and retries, which finds the page through the fast
-fault path.  A fault that cannot be retried, one under a read() or
-write() of the same file, which holds lli_trunc_sem, and one whose
-every mirror has been tried wait for the OST as before.
-The read RPC of a fault is not sent without delay, since a fault
-cannot be restarted once the read fails, so a fault on a page whose
-extent lock is still cached also waits for the OST.
+Do the lock enqueues of read faults without delay, and return -EAGAIN
+for a CIT_FAULT on an unhealthy OSC as for CIT_READ, so that faults
+fail over to another mirror, and for EC switch to CIT_EC_RD after the
+mirror rounds, as reads do.  The fault then drops the mmap lock, as
+filemap_fault() does for IO, and rebuilds the page into the page
+cache with a CIT_EC_RD read into a discard iterator, never switched
+to hybrid DIO, where the EC placeholder lock keeps the page Uptodate.
+Unless the mapping is read randomly, the rest of the aligned 1MiB
+around the page is read after it, and a failure there leaves those
+pages to their own faults.  The retried fault takes the page from the
+page cache, also with fast_read off.
 
-Add sanity-ec test_41o, which stops the OST of a stripe.
+The fault may be in the user copy of a read() or write() of another
+file, which holds lli_trunc_sem of that file and may be recovering EC
+pages.  So the rebuild takes lli_trunc_sem without waiting behind a
+queued truncate, as a fault does, and does not wait for an Uptodate
+page that another EC read is copying out.  A fault that cannot be
+retried, one under a read() or write() of the same file, one through
+a file descriptor with a mirror or stripe I/O scope, and one whose
+page cannot be rebuilt wait for the OST as before.  A fault
+from user mode interrupted by a signal in the mirror rounds faults
+again once the signal is handled.  The read RPC of a fault is not
+sent without delay, since a fault cannot be restarted once its read
+fails, so a fault on a page whose extent lock is still cached, on an
+OST whose import still looks healthy, also waits for the OST.
 
-Test-Parameters: testlist=sanity-ec ostcount=8
+Also return VM_FAULT_OOM from __ll_fault() when cl_env_get() fails,
+not the errno, and stop reading the VMA in the debug message after a
+fault, as it may be gone once the mmap lock was dropped.
+
+Add sanity-ec test_41o and test_49g, which stop or deactivate the OST
+of a data stripe, and sanity-flr test_33d, which deactivates each
+mirror's OST in turn, each reading the file through mmap.
+
+Test-Parameters: testlist=sanity-flr,sanity-ec ostcount=8
 Fixes: 783c13bb0b8f ("LU-12669 ec: recover data from parity")
+Signed-off-by: Maximilian Dilger <mdilger@whamcloud.com>
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
-Assisted-by: ClaudeCode:claude-opus-5.5 ltvm,llm_code_and_review_tools
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: I8d565cbf7d643f026a5fb5e9428b5612e63ebbe5
 
 --- Review History ---
@@ -206,3 +228,82 @@ Patch Set 2:
 Patch Set 2:
 
 (1 comment)
+
+--- Message (Marc Vef, 2026-11-16 09:02:45.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-11-16 09:02:46.000000000) ---
+Patch Set 2:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-11-16 09:02:47.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (patrick bot, 2026-11-16 23:03:08.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (patrick bot, 2026-11-17 22:16:12.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Oleg Drokin, 2026-11-20 02:27:01.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Marc Vef, 2026-11-20 10:43:24.000000000) ---
+Hashtag removed: master-next
+
+--- Message (Marc Vef, 2026-11-20 10:43:25.000000000) ---
+Patch Set 2:
+
+[Marc Bot] Note: This change has been removed from master-next and is no longer considered for landing in its current form.
+
+--- Message (Marc Vef, 2026-11-20 10:43:25.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.
+
+--- Message (Andreas Dilger, 2026-11-22 06:26:41.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-22 06:27:07.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Andreas Dilger, 2026-11-22 06:27:19.000000000) ---
+Patch Set 3:
+
+PS3 answers both AI review threads: the lli_trunc_sem deadlock under another file's IO is fixed, and cl_env_get() failure returns VM_FAULT_OOM. It also folds in https://review.whamcloud.com/69913 ("LU-20708 llite: finish read fault failover for EC and FLR"), which finished the fault failover of this patch, so the two land together, with the -EINTR livelock of a kernel-mode fault that the AI review found there fixed. Rebased on master, including LU-21020.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-22 06:34:16.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-22 06:35:02.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-22 07:15:54.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137489/ : SUCCESS
+
+--- Message (Ronnie Sahlberg, 2026-11-22 17:29:00.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 18:16:52.000000000) ---
+Patch Set 3:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. Two optional comment nits inline for whenever the patch is next refreshed; no need to re-spin for them.

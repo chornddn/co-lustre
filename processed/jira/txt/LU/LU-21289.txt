@@ -1,0 +1,94 @@
+Key:        LU-21289
+Summary:    DNE: live update llog cancel fails a cross-MDT operation in progress with EIO
+Link:       https://jira.whamcloud.com/browse/LU-21289
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Sun, 22 Nov 2026 16:29:42 +0000
+Updated:    Sun, 22 Nov 2026 17:56:44 +0000
+Links:      Related: is related to  LU-21254; Related: is related to  LU-16159
+
+--- Description ---
+lctl --device  llog_cancel on a running MDT can make a cross-MDT operation that is in progress fail with -EIO. The failure can possibly leave the operation partly done. See "Not checked" below.
+
+Trigger
+
+The ioctl goes mdt_iocontrol() -> mdd_iocontrol() -> lod_iocontrol() -> lod_llog_cancel(). LU-16159 added this path. lod_sub_cancel_llog() retains the update catalog of each MDT and installs a new, empty catalog.
+
+A distribute transaction declares its update record writes in top_trans_start() -> prepare_multiple_node_trans() -> declare_updates_write(). The declare reserves the next plain llog in the current catalog. It writes the records later, in top_trans_stop() -> sub_updates_write(). If the cancel replaces the catalog between the declare and the write, the write goes to the new catalog. The new catalog has no declared plain llog, so the write fails.
+
+Reproduction
+
+Master 2.17.62, ldiskfs, 3 MDTs on one VM. The VM had change 71205 applied. That change does not touch this path.
+
+	Add a temporary 10 second CFS_FAIL_TIMEOUT in top_trans_start() after prepare_multiple_node_trans().
+
+	Create dir1 on MDT0001 and dir2 on MDT0000. Create a file in dir1.
+
+	Set the delay on the MDS, then run ln dir1/file dir2/file on the client.
+
+	During the delay, run lctl --device lustre-MDT0000 llog_cancel --catalog=update_log --log_idx=1 on the MDS.
+
+The ln fails with EIO. The MDS console shows:
+
+Lustre: lustre-MDT0000-osd: cancel update llog [0x200000400:0x1:0x0]
+Lustre: lustre-MDT0001-osp-MDT0000: cancel update llog [0x280000402:0x1:0x0]
+Lustre: lustre-MDT0002-osp-MDT0000: cancel update llog [0x240000402:0x1:0x0]
+LustreError: 12962:0:(update_trans.c:799:top_trans_start()) cfs_fail_timeout id 7ff awake
+LustreError: 12962:0:(llog_cat_server.c:407:llog_cat_current_log()) lustre-MDT0000-osd: next log does not exist, catalog [0x200000400:0x4:0x0] rc=-5
+LustreError: 12962:0:(update_trans.c:986:top_trans_stop()) lustre-MDT0000-osd: write updates failed: rc = -5
+
+The delay only makes the race easy to hit. Without it, the window is the operation body between top_trans_start() and top_trans_stop().
+
+Not checked
+
+	The state of the link after the failure: the name entry on MDT0000 and the nlink on MDT0001.
+
+	osd-zfs.
+
+Possible fixes
+
+	Make the cancel wait until no declared update record write is open. This adds a lock to each distribute transaction.
+
+	Refuse the update llog cancel on a running MDT. Allow it only in the recovery thread, which cancels the update llogs on recovery abort.
+
+--- Comment (hornc, Sun, 22 Nov 2026 17:16:29 +0000) ---
+The failed link leaves an inconsistent namespace. Same reproduction as the description:
+
+ln: ... Input/output error
+after the ln:      dir2 has the name, nlink=1
+client remount:    dir2 has the name, nlink=1
+MDT0000 and MDT0001 restart: dir2 has the name, nlink=1
+rm dir2/file:      rc=0
+stat dir1/file:    No such file or directory
+rmdir dir1:        Directory not empty
+
+MDT0000 keeps its local update (the name in dir2). MDT0001 never gets the nlink increment. An unlink of one name then destroys the inode, and the other name stays.
+
+No document describes a live cancel of the update llogs. The recovery thread calls lod_llog_cancel() on recovery abort through the llog_cancel ioctl path. Thus lctl can reach it too. lod_llog_cancel() ignores the catalog name and index, and replaces all update catalogs. LU-15937 asks for a cancel of single records, which this path does not give.
+
+The catalog swap has more hazards (from the source, not tested):
+
+	sub_updates_write() reads ctxt->loc_handle with no reference. llog_cat_close() can free it.
+
+	lod_sub_recreate_llog() leaves loc_handle NULL for a moment. sub_updates_write() then writes no record.
+
+	The commit thread cancels cookies of the old catalog through the new handle.
+
+Proposed fix: allow the update llog cancel only in the recovery thread. On a running MDT, lctl llog_cancel of the update log then fails.
+
+--- Comment (gerrit, Sun, 22 Nov 2026 17:56:44 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71274
+
+Subject: LU-21289 lod: cancel update llogs only in recovery thread
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 7c4e847338a4a748e3449162d25f234395dd5a8e

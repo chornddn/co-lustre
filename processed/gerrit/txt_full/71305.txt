@@ -1,0 +1,204 @@
+Change:     71305
+Subject:    LU-21037 o2iblnd: negotiate path MTU both sides can carry
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71305
+Change-Id:  I91a991c64686845094c7801fb2dc96e7d4312a49
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Xinxia Qu
+Created:    2026-11-23 11:00:30.000000000
+Updated:    2026-11-23 14:08:50.000000000
+Patch Set:  1
+Insertions: +159
+Deletions:  -13
+Comments:   4 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Commit Message ---
+LU-21037 o2iblnd: negotiate path MTU both sides can carry
+
+On RoCE there is no SA to hand out a path record, so the active
+side builds it from its own netdev MTU and the passive side copies
+the path MTU out of the CM REQ. The passive side never compares it
+with what its own netdev can actually carry.
+
+When the two ends run with different netdev MTUs, the connection is
+built with the larger MTU and every message that does not fit into
+the smaller netdev's frames is dropped. Small messages still work,
+so the link looks half dead: a client can fail to mount because the
+~8KB MGC config log read never completes, while lnetctl ping to the
+same peer succeeds, and nothing is logged about the MTU mismatch.
+
+Reject connection requests that the local port cannot carry, and
+let the active side reconnect with a smaller MTU:
+
+- advertise IBLND_REJECT_MTU support and the local port's enum
+  ib_mtu in the unused ibm_credits field of IBLND_MSG_CONNREQ;
+
+- in kiblnd_passive_connect(), compare the path MTU of the CM REQ
+  with the RoCE port's active_mtu and reject it with
+  IBLND_REJECT_MTU when it is too large, returning the local MTU in
+  the byte that used to be ibr_padding, so the wire format does not
+  change;
+
+- in kiblnd_check_reconnect(), remember the peer's limit in the new
+  kib_peer_ni.ibp_max_mtu so that later reconnects are capped
+  straight away, and give up rather than reconnect when the peer's
+  limit does not actually lower the MTU, to avoid a reject loop;
+
+- cap the path MTU in kiblnd_setup_mtu_locked() with the minimum of
+  the path record, ib_mtu and ibp_max_mtu. As part of that, ib_mtu
+  can now only lower the path MTU: raising it above what the route
+  resolved to built a QP larger than the fabric can carry, and
+  would also undo the peer's cap on every reconnect.
+
+Peers that do not set the negotiation bit are still accepted, only
+a warning is logged, so a mixed cluster behaves as before and the
+mismatch becomes visible in dmesg. The check is made only when
+rdma_port_get_link_layer() reports Ethernet, so native IB and iWARP
+are not affected.
+
+mtu_negotiate=0 makes a node opt out completely: it neither rejects
+connection requests nor advertises its port MTU, so it behaves as
+before the patch. A limit learned from a peer is remembered for that
+peer_ni only, and is dropped when its last connection goes away.
+
+Test-Parameters: testlist=sanity-lnet
+Assisted-by: Claude:Opus-5.5
+Signed-off-by: Xinxia Qu <xqu@ddn.com>
+Change-Id: I91a991c64686845094c7801fb2dc96e7d4312a49
+
+--- Review History ---
+
+--- Message (Xinxia Qu, 2026-11-23 11:00:30.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 11:03:32.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 11:06:33.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-23 14:08:03.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137560/ : SUCCESS
+
+--- Message (Maloo, 2026-11-23 14:08:50.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 137560 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137560&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137560#redirect

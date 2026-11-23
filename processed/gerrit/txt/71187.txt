@@ -1,0 +1,365 @@
+Change:     71187
+Subject:    LU-21253 ofd: commit DIO write after data_version sample
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71187
+Change-Id:  Ib65f90ef222181b983bfdeef11c8b16e94400243
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Shriram Pore
+Created:    2026-11-19 12:32:31.000000000
+Updated:    2026-11-23 12:20:44.000000000
+Patch Set:  7
+Insertions: +449
+Deletions:  -26
+Comments:   26 (3 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Mikhail Pershin, Alex Zhuravlev, patrick bot
+
+--- Commit Message ---
+LU-21253 ofd: commit DIO write after data_version sample
+
+A DIO overwrite that skips the forced commit advances the object
+version in a transaction that is not committed and not replayed.
+After an OST crash the version is the old one while the data is
+new.  A tool that read the data version before the write, like the
+HSM copytool, then takes the object for unchanged.
+
+Count the data version reads of an object.  A DIO overwrite keeps
+its forced commit while a read is not known to be older than a
+committed version change, so the first write after a read gets a
+committed, different version.  A forced DIO write covers only the
+reads that had finished before it started to change the version;
+reads in progress are counted separately for this.  A newly cached
+object starts as read.
+
+With `dio_overwrite_nosync` set, a data version read in OST_GETATTR
+or OBD_IOC_GET_OBJ_VERSION commits the object first if its version
+is not committed; if that commit fails, the read returns the error
+and no version.  The OSC marks its data version request with
+OBD_MD_FLDATAVERSION, as the MDC does for Data-on-MDT.  From older
+clients only a flushing read (OBD_FL_SRVLOCK) is known as one:
+their other reads are not committed first, which after an OST crash
+can only make the file appear modified, as no later change gets
+the same version.  Other getattr requests (lctl getattr, the echo
+client) still arm the object but do not commit.  The read counters
+are 64-bit, so they cannot wrap around to equal.
+
+`ofd_write_nosync()` checks ofo_dirty_transno again after the version
+bump and its full barrier.  An `ofd_object_fallocate()` or another
+`ofd_commitrw_write()` that keeps its commit and started after
+ofo_attr_inflight was read may have stopped its transaction in
+between, as both change the object under `ofd_read_lock()`, and the
+write must not skip the commit over that uncommitted change.  A
+setattr or punch cannot get in between: it takes `ofd_write_lock()`
+and waits for the write.  This narrows a window left by the previous
+patches; it uses the barrier added here for data version reads.
+
+Add the reason dv_sampled to `dio_overwrite_sync_reasons`.
+Add sanity 398z and replay-ost-single 15.  The crash check of 15 is
+retried, then skipped, when a journal commit falls in the crash
+window.  398z also checks that a getattr that is not a data version
+read does not commit, and fails the commit of a data version read
+with the new OBD_FAIL_OST_DV_SYNC_ERR (0x259).
+
+Test-Parameters: testlist=sanity env=ONLY=398z
+Test-Parameters: testlist=replay-ost-single env=ONLY=15
+Test-Parameters: testlist=sanity-hsm serverversion=2.17.0 env=SANITY_HSM_EXCEPT="106c"
+Signed-off-by: Shriram Pore <spore@ddn.com>
+Assisted-by: Claude:claude-opus-5-5
+Change-Id: Ib65f90ef222181b983bfdeef11c8b16e94400243
+
+--- Review History ---
+
+--- Message (Shriram Pore, 2026-11-19 12:32:31.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-11-19 12:39:35.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 12:40:20.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (Shriram Pore, 2026-11-19 12:43:37.000000000) ---
+Removed reviewer <GERRIT_ACCOUNT_808>.
+
+--- Message (jenkins, 2026-11-19 14:06:02.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137093/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-19 19:51:38.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-19 19:56:20.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 19:59:26.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-19 20:35:49.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137122/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-19 22:06:50.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 22:14:36.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-19 22:19:06.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-19 23:43:11.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137134/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-20 14:34:11.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 14:37:04.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the ordering between ofd_dv_sample() and ofd_write_nosync() holds up. A few optional minors inline for whenever the patch is next refreshed, no need to re-spin for them.
+
+--- Message (Autotest, 2026-11-20 14:47:38.000000000) ---
+Patch Set 3:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.8-x86_64/ldiskfs servers and clients for build 137134 patch 3. Requested by Patrickbot because of LU-21238.
+
+--- Message (patrick bot, 2026-11-20 14:52:57.000000000) ---
+Patch Set 3: Code-Review-1
+
+(1 comment)
+
+--- Message (Shriram Pore, 2026-11-20 14:53:05.000000000) ---
+Uploaded patch set 4: Patch Set 3 was rebased.
+
+Copied Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Shriram Pore, 2026-11-20 14:56:37.000000000) ---
+Patch Set 4:
+
+@Patrickbot fixed in patch set 4: the test_398y race step (added by parent change 71186) now uses page-sized blocks on the client (bs=$PAGE_SIZE via DIO_NOSYNC_BS, seek=40/41, page-sized data and ref writes), so the two writes are in different client pages. 398w/398x/398y and replay-ost-single 14 use the same page-size block in PS4; every O_DIRECT write was checked page-aligned at 4K/16K/64K. The sanity-pcc 1a/1b failures are LU-21238.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 15:01:47.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 15:03:34.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-21 03:25:30.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137256/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-21 04:00:11.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Shriram Pore, 2026-11-21 04:01:03.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+--- Message (Shriram Pore, 2026-11-21 04:01:03.000000000) ---
+Patch Set 5:
+
+PS5 also changes ofd_dv_sample(): (1) only a data version read commits: the OSC now marks its data version OST_GETATTR with OBD_MD_FLDATAVERSION in o_valid (as the MDC does for DoM), and OBD_FL_SRVLOCK still identifies a flushing data version read from older clients; lctl getattr and the echo client still arm the object but do not commit. (2) A failed dt_object_sync() fails the read with its error instead of returning a version that may not be committed (new OBD_FAIL_OST_DV_SYNC_ERR 0x259, checked in sanity 398z). (3) ofo_dv_samples/ofo_dv_covered are 64-bit, so the inequality cannot wrap to equal. sanity 398z also checks that a non-data-version getattr does not commit.
+
+--- Message (wc-checkpatch, 2026-11-21 04:02:36.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-21 04:06:07.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-21 20:55:32.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137430/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-22 00:41:56.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-22 00:43:32.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137430 patch 5. Requested by Patrickbot because of LU-18304.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 07:16:27.000000000) ---
+Patch Set 5:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The ordering between ofd_dv_sample(), ofd_write_nosync() and the ofo_dv_covered update holds up. A few optional points are inline for whenever the patch is next refreshed; no need to re-spin for them.
+
+--- Message (Shriram Pore, 2026-11-22 10:59:11.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-22 11:04:37.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-22 11:10:47.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-22 11:24:41.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137496/ : SUCCESS
+
+--- Message (Shriram Pore, 2026-11-22 11:33:47.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Shriram Pore, 2026-11-22 11:36:24.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+--- Message (Shriram Pore, 2026-11-22 11:36:24.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-22 13:06:36.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-22 14:18:24.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-22 14:23:22.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (Shriram Pore, 2026-11-22 15:18:14.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-22 15:52:14.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-22 15:57:10.000000000) ---
+Hashtag removed: pw_halt
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 20:12:22.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the ordering between ofd_dv_sample(), ofd_write_nosync() and the ofo_dv_covered update holds up as far as I can trace it. Two optional nits inline for whenever the patch is next refreshed, no need to re-spin for them.
+
+--- Message (Shriram Pore, 2026-11-23 06:32:10.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+--- Message (Shriram Pore, 2026-11-23 06:53:02.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 06:59:08.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+2 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-23 07:07:40.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Shriram Pore, 2026-11-23 07:12:18.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-23 07:29:47.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137533/ : SUCCESS

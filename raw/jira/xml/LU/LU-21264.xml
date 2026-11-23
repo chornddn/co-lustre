@@ -1,0 +1,136 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21264] mdt: identity upcall has no limit on helper processes and does not cache a failed lookup</title>
+                <link>https://jira.whamcloud.com/browse/LU-21264</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+
+&lt;p&gt;When the name service on an MDS does not answer, the MDT starts &lt;tt&gt;l_getidentity&lt;/tt&gt; helper processes with no limit. The MDS can use all its memory and stop.&lt;/p&gt;
+
+&lt;p&gt;At one site, the LDAP client on a new MDS image could not start TLS, so SSSD was offline. Three MDTs mounted on that MDS. The task count went from 870 to 181,214 in 20 minutes. The MDS used 105 GB of its 145 GB of memory, and then it stopped. A second MDS in the same state had 42,491 helper processes in the same time. Its helpers exited, and its task count stayed at approximately 1,350.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Environment"&gt;&lt;/a&gt;Environment&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;Seen on an older branch that is not public, on x86_64 with ldiskfs.&lt;/li&gt;
+	&lt;li&gt;I read the source of master at &lt;tt&gt;v2_17_61&lt;/tt&gt;. The code path is the same.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;identity_upcall&lt;/tt&gt; is &lt;tt&gt;/usr/sbin/l_getidentity&lt;/tt&gt;. The name service is SSSD with LDAP.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+
+&lt;p&gt;Not reproduced on a test system yet. I expect that a VM cluster can reproduce it. I plan that work for the week of 2026-11-23, if no engineer takes this ticket before then.&lt;/p&gt;
+
+&lt;p&gt;The steps that follow from the source are:&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;Set up an MDS where &lt;tt&gt;getpwuid()&lt;/tt&gt; fails or does not return for each UID. One way is &lt;tt&gt;identity_upcall&lt;/tt&gt; set to a script that sends an error downcall.&lt;/li&gt;
+	&lt;li&gt;Mount the MDT, and connect clients that send requests from many UIDs.&lt;/li&gt;
+	&lt;li&gt;Count the &lt;tt&gt;l_getidentity&lt;/tt&gt; processes and the task count on the MDS.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h2&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h2&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;&lt;tt&gt;mdt_identity_do_upcall()&lt;/tt&gt; starts the helper with &lt;tt&gt;call_usermodehelper()&lt;/tt&gt; and &lt;tt&gt;UMH_WAIT_EXEC&lt;/tt&gt;. The kernel waits for the exec only. The MDT does not count the helpers that are in operation, and it has no limit.&lt;/li&gt;
+	&lt;li&gt;A failed lookup is not cached. When the helper sends an error, &lt;tt&gt;upcall_cache_downcall()&lt;/tt&gt; sets the entry to invalid and removes it from the hash. The next request for the same UID starts a new helper.&lt;/li&gt;
+	&lt;li&gt;When a helper does not answer, the request gets &lt;tt&gt;-ETIMEDOUT&lt;/tt&gt; after &lt;tt&gt;identity_acquire_expire&lt;/tt&gt; (30 s). &lt;tt&gt;check_unlink_entry()&lt;/tt&gt; then removes the entry, and the next request starts a new helper. The MDT does not stop the old helper.&lt;/li&gt;
+	&lt;li&gt;The request rate of the clients thus sets the rate of new processes. At the site, the rate was 2,595 new processes each second after 12 minutes.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;The site logs do not show why the helpers did not exit on the first MDS. That part is not known.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Relatedwork"&gt;&lt;/a&gt;Related work&lt;/h2&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-17605" title="Do not wait forever in upcall cache if entry could not be refreshed" class="issue-link" data-issue-key="LU-17605"&gt;&lt;del&gt;LU-17605&lt;/del&gt;&lt;/a&gt; (2.16.0) limits the time that a request waits for a downcall. It does not limit the helpers.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19765" title="High latency in Lustre operations and Permission Denied errors due to Identity Upcall timeouts (rc = -110)" class="issue-link" data-issue-key="LU-19765"&gt;&lt;del&gt;LU-19765&lt;/del&gt;&lt;/a&gt; reports identity upcall timeouts (&lt;tt&gt;rc = -110&lt;/tt&gt;) with latency and &lt;tt&gt;Permission denied&lt;/tt&gt;. It was closed as "Not a Bug".&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-17961" title="Support supplementary groups from client" class="issue-link" data-issue-key="LU-17961"&gt;&lt;del&gt;LU-17961&lt;/del&gt;&lt;/a&gt; added the &lt;tt&gt;INTERNAL&lt;/tt&gt; upcall, which starts no helper. It uses the groups that the client sends.&lt;/li&gt;
+	&lt;li&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20147" title="ptlrpc: replace per-RPC sepol call_usermodehelper with module-level cache" class="issue-link" data-issue-key="LU-20147"&gt;LU-20147&lt;/a&gt; proposes a cache for the &lt;tt&gt;l_getsepol&lt;/tt&gt; helper. That helper has the same pattern of one process for each request.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h2&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h2&gt;
+
+&lt;p&gt;One or more of these changes:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;Cache a failed lookup for a short time, so that one UID starts one helper in that time.&lt;/li&gt;
+	&lt;li&gt;Limit the count of helpers that are in operation for one MDT.&lt;/li&gt;
+	&lt;li&gt;Stop the helper when its acquire time expires.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;I have no patch.&lt;/p&gt;</description>
+                <environment />
+        <key id="100604">LU-21264</key>
+            <summary>mdt: identity upcall has no limit on helper processes and does not cache a failed lookup</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="3" iconUrl="https://jira.whamcloud.com/images/icons/priorities/major.svg">Major</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Fri, 20 Nov 2026 00:27:44 +0000</created>
+                <updated>Fri, 20 Nov 2026 00:30:35 +0000</updated>
+                                            <version>Lustre 2.18.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="94703">LU-19765</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="81219">LU-17605</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="82973">LU-17961</issuekey>
+        </issuelink>
+            <issuelink>
+            <issuekey id="97117">LU-20147</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073lr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -7,19 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-10-16 17:55:20.000000000
-Updated:    2026-11-13 07:17:09.000000000
+Updated:    2026-11-19 22:54:42.000000000
 Patch Set:  1
 Insertions: +11
 Deletions:  -4
-Comments:   4 (1 unresolved)
+Comments:   9 (3 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: +1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: Patrick Farrell: +1; Andreas Dilger: +1; Andrew Perepechko: -1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Andreas Dilger, Alex Zhuravlev, Andrew Perepechko
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, Andrew Perepechko, Patrick Farrell
 
 --- Commit Message ---
 LU-11484 ofd: don't walk extents on count-only FIEMAP
@@ -274,3 +274,43 @@ Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.7-x86_64
 Patch Set 1: Verified+1
 
 Passed enforced test review-dne-zfs-part-5 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm45: https://testing.whamcloud.com/test_sessions/abb7e26f-dd78-4f94-9e18-20c45fe75bdc ran 5 tests.
+
+--- Message (Andrew Perepechko, 2026-11-17 09:46:58.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+This bounds the extent walks in lock_zero_regions() and dom_has_zero_regions() by fm_extent_count, so a count-only FIEMAP with OBD_FL_SRVLOCK locks the whole requested range instead of reading extents past the reply, and it releases the DoM PR lock that mdt_fiemap_get() leaked.
+
+For requests from unmodified clients both parts look right to me. The OSD and the ldiskfs fiemap helper never map more than fm_extent_count extents, so min() changes nothing for a normal walk. For a count-only request the whole-range PR lock flushes at least what a full walk flushes before the second ofd_fiemap_get() counts, so fm_mapped_extents with FIEMAP_FLAG_SYNC stays right, and the lov count-only path (one RPC per object, no continuation) is not affected. There is no wire change, so a server upgrade also fixes older clients.
+
+tgt_data_unlock() after the second mdt_dom_fiemap() drops the reader reference that ldlm_cli_enqueue_local() returned, as the other tgt_mdt_data_lock() callers do; without it the lock could never be cancelled.
+
+One problem is left on the error path, see the inline comment in lock_zero_regions(): when the first ofd_fiemap_get() fails, fm_mapped_extents is still the value from the request and fm_extent_count need not describe the reply, so the walk can still read past the buffer. Skipping the lock and the second call after a failed first call, as mdt_fiemap_get() does, fixes it.
+
+The same fixes are in flight twice more: #70652 (LU-21171) has both loop bounds, the DoM unlock, the rc check above and sanity test_44i, and #68117 (LU-20609, open since August) has the DoM unlock with sanity-dom test_9. The three changes conflict, so it would be good to agree with Hiroshi and Sohei which one lands and to close the duplicate tickets.
+
+[minor] There is no regression test. Since LU-20617 sanity/44f sends the count-only SYNC probe on PFL files, but the read past the reply usually shows only under KASAN; the DoM lock leak can be tested directly, as the two changes above do. A test of this server-side change needs an MDS1_VERSION check (OST1_VERSION for the OFD part) on the patch's own build version, not on the next tag (lustre-test-scripts skill, Version checks for interop).
+
+[minor] Commit message: the AI review comment on the trailer order and the second Signed-off-by is still open, Assisted-by should carry the exact model ID (lustre-commit skill), and the subject names only ofd although the DoM lock leak in mdt is a separate bug with its own ticket (LU-20609).
+
+Tests and CI: jenkins build 133840 passed, and Maloo is +1 after two LU-9827 retests of review-dne-zfs-part-5 (sanityn cleanup, unrelated; FIEMAP is not implemented on ZFS). PS1 is based on 2.17.59-68, before LU-20617 (#68201) made sanity/44f send the count-only probe on PFL files, so its CI did not exercise this path. The patch cherry-picks cleanly onto current master and the touched code is unchanged there. I reviewed the code only, without a testbed run.
+
+--- Message (patrick bot, 2026-11-18 16:59:29.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Patrick Farrell, 2026-11-19 22:30:09.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (Andrew Perepechko, 2026-11-19 22:45:16.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-19 22:48:01.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (patrick bot, 2026-11-19 22:54:42.000000000) ---
+Hashtag removed: pw_shepherd

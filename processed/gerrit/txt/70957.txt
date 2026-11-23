@@ -1,0 +1,265 @@
+Change:     70957
+Subject:    LU-19536 obdclass: fail a short unaligned DIO user copy
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70957
+Change-Id:  If37c2b833645d1410eb0a3094a68c9e6b12d01dc
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      patrick bot
+Created:    2026-11-16 17:03:50.000000000
+Updated:    2026-11-20 10:42:47.000000000
+Patch Set:  12
+Insertions: +154
+Deletions:  -5
+Comments:   9 (2 unresolved)
+Hashtags:   pw_own, 218_review_priority, master-next
+
+--- Labels ---
+  Code-Review: Patrick Farrell: +1; Andrew Perepechko: +1
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Alex Zhuravlev, Andrew Perepechko, Patrick Farrell
+
+--- Commit Message ---
+LU-19536 obdclass: fail a short unaligned DIO user copy
+
+When the copy between userspace and the bounce pages of an
+unaligned DIO stops part way, on EFAULT after repeated short
+copies or on a fatal signal, the copy returned the number of
+bytes copied so far. Its callers only check for a negative
+return, so the short copy was taken as success. A write
+sent the BRW for the whole sub DIO, including bounce pages
+never filled from the user buffer. A read reported the whole
+sub DIO as read, though part of the user buffer was never
+filled.
+
+Treat a short copy as a failure of the sub DIO in both
+directions: return the error, and store it for the other
+threads waiting on a write copy.
+
+Add OBD_FAIL_LLITE_DIO_COPY_SHORT to make the copy short
+from a given bounce page on, sanity test_119v, which checks
+that such a write does not send uncopied bounce page data to the
+OST, and test_119w, which checks that such a read fails.
+
+Fixes: 7194eb6431d2 ("LU-13805 clio: bounce buffer for unaligned DIO")
+Fixes: 9fc5497ecbc2 ("LU-19536 obdclass: use wait queue for DIO copy sync")
+Test-Parameters: testlist=sanity env=ONLY="119v 119w",ONLY_REPEAT=20
+Reported-by: Andrew Perepechko <andrew.perepechko@hpe.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Change-Id: If37c2b833645d1410eb0a3094a68c9e6b12d01dc
+
+--- Review History ---
+
+--- Message (patrick bot, 2026-11-16 17:03:50.000000000) ---
+Uploaded patch set 1.
+
+--- Message (patrick bot, 2026-11-16 17:03:51.000000000) ---
+Patch Set 2: Commit message was updated.
+
+--- Message (Patrick Farrell, 2026-11-16 17:04:19.000000000) ---
+Hashtag added: 218_review_priority
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 17:06:45.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-16 17:08:19.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-16 17:23:57.000000000) ---
+Patch Set 2:
+
+Tested PS2 on a RHEL 9.6 client (5.14.0-570.37.1) on top of master 54dc726b562, together with 65690 (LU-19458) and two local tests of mine, 3 runs each:
+- sanity 119v from this patch: write() = -1 EFAULT and the region keeps the old data (A=24576, C=0). Without the fix the same test gets write() = 24576 with 17384 bytes of another file's data.
+- one unaligned O_DIRECT write from a buffer whose last page is PROT_NONE, with 65690 applied: write() = EFAULT and the region is unchanged. With 65690 alone the write returned 24576 with 4096 bytes of another file's data.
+- the mprotect() race test from LU-19536 (8 MiB writes, delays swept from 0 to 40 ms, 400 iterations): no write left foreign data. The writes in the race window now fail with EFAULT (163-165 failed instead of 140 on master, where 26 of them returned success with other data).
+
+The change looks right to me: a write copy is now all or nothing, the error is stored for the waiters, which return csd_write_status, and the LASSERT() in osc_build_rpc() is only reached on the success path. The only other user of csd_write_copied is the wait loop in __ll_dio_user_copy(), so nothing else takes it as success.
+
+65690 is safe on top of this patch; it may be worth making it depend on this one, so that it cannot land first.
+
+--- Message (Andrew Perepechko, 2026-11-16 17:24:00.000000000) ---
+Patch Set 2: Code-Review+1
+
+--- Message (patrick bot, 2026-11-16 17:24:24.000000000) ---
+Hashtag added: pw_own
+
+--- Message (patrick bot, 2026-11-16 17:24:57.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+
+--- Message (jenkins, 2026-11-16 17:24:59.000000000) ---
+Patch Set 1:
+
+No Builds Executed
+
+--- Message (patrick bot, 2026-11-16 17:24:59.000000000) ---
+Patch Set 4: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 17:28:31.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Alex Zhuravlev, 2026-11-16 17:28:48.000000000) ---
+Patch Set 4: Code-Review+1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-16 17:32:39.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+
+--- Message (jenkins, 2026-11-16 17:32:40.000000000) ---
+Patch Set 3:
+
+No Builds Executed
+
+--- Message (patrick bot, 2026-11-16 17:32:41.000000000) ---
+Patch Set 6: Commit message was updated.
+
+--- Message (patrick bot, 2026-11-16 17:32:46.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 17:35:48.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-16 17:39:10.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-16 17:42:36.000000000) ---
+Patch Set 6:
+
+Rechecked the code of PS4, which PS6 keeps unchanged (PS5 and PS6 only add the client version checks to 119v and 119w), on the same RHEL 9.6 setup (master 54dc726b562 with this patch and 65690), 3 runs each: 119v (write() = -1 EFAULT, region unchanged), 119w (the short read copy fails the read), my PROT_NONE write test (EFAULT, region unchanged) and the mprotect() race test (400 iterations, no foreign data; the writes in the race window fail with EFAULT).
+
+The read change looks right to me: the copy result reaches the DIO through cl_sync_io_note() when the sub DIO ends, so a short read copy now fails the read instead of being counted as complete.
+
+--- Message (Andrew Perepechko, 2026-11-16 17:42:39.000000000) ---
+Patch Set 6: Code-Review+1
+
+--- Message (Alex Zhuravlev, 2026-11-16 18:00:10.000000000) ---
+Patch Set 6: Code-Review+1
+
+--- Message (patrick bot, 2026-11-16 19:00:37.000000000) ---
+Uploaded patch set 7: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+--- Message (patrick bot, 2026-11-16 19:00:39.000000000) ---
+Patch Set 8: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 19:05:58.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-16 19:13:34.000000000) ---
+Patch Set 8:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-17 14:19:40.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-17 14:19:41.000000000) ---
+Patch Set 10: Commit message was updated.
+
+--- Message (patrick bot, 2026-11-17 14:20:13.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-17 14:23:07.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-17 14:23:21.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Patrick Farrell, 2026-11-17 15:25:34.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Andrew Perepechko, 2026-11-17 15:29:35.000000000) ---
+Patch Set 10: Code-Review+1
+
+--- Message (Autotest, 2026-11-17 19:20:28.000000000) ---
+Patch Set 9:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 136908 patch 9. Requested by Patrickbot because of LU-18304.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 01:26:16.000000000) ---
+Patch Set 10:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; the cl_io.c change is correct for both the write and read copy paths. A few optional items inline for whenever the patch is next refreshed, plus one pre-existing problem in the same read path that probably deserves its own change.
+
+--- Message (patrick bot, 2026-11-20 01:32:08.000000000) ---
+Uploaded patch set 11: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (patrick bot, 2026-11-20 01:32:09.000000000) ---
+Patch Set 12: Commit message was updated.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE** OR changekind:TRIVIAL_REBASE OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (patrick bot, 2026-11-20 01:32:20.000000000) ---
+Patch Set 10:
+
+(3 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 01:36:58.000000000) ---
+Patch Set 12:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 01:41:14.000000000) ---
+Patch Set 12:
+
+Looks good to me.
+
+--- Message (Marc Vef, 2026-11-20 10:42:46.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-11-20 10:42:47.000000000) ---
+Patch Set 12:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-11-20 10:42:47.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.

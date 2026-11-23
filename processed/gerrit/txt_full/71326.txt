@@ -1,0 +1,76 @@
+Change:     71326
+Subject:    LU-21278 mgc: retry config log enqueue on ENOTCONN
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71326
+Change-Id:  I9b1fc36da6b51c4553d320ca360eb39035fa4b09
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      John Grasso
+Created:    2026-11-23 15:31:47.000000000
+Updated:    2026-11-23 15:42:00.000000000
+Patch Set:  1
+Insertions: +9
+Deletions:  -3
+Comments:   0 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: (no votes)
+
+--- Commit Message ---
+LU-21278 mgc: retry config log enqueue on ENOTCONN
+
+After the MGS restarted, a client MGC import could still report FULL
+while holding a stale connection handle: nothing sent an MGC RPC in
+between, and the MGC ping is suppressed while imperative recovery is
+in use.  The next MGC RPC was then the config log ldlm_enqueue of a
+new mount.  The MGS did not know the handle and replied -ENOTCONN, so
+after_reply() called ptlrpc_request_handle_notconn(), which
+invalidated the import and bumped its generation, and
+ptlrpc_abort_inflight() flagged the enqueue rq_err, so
+ptlrpc_check_set() completed it with the -ENOTCONN of its own reply.
+Only an enqueue submitted after the import had become invalid gets
+the -ESHUTDOWN of ptlrpc_import_delay_req().
+
+mgc_process_log() retried the enqueue only for -ESHUTDOWN, so the
+-ENOTCONN fell through to the local copy of the config log.  A client
+has none, so mgc_process_cfg_log() returned the -ENOTCONN, which
+lustre_process_log() passed back to ll_fill_super(), and the mount
+failed with it:
+
+  LustreError: MGC<mgs>@tcp: operation ldlm_enqueue to node
+      <mgs>@tcp failed: rc = -107
+  Lustre: Evicted from MGS (at <mgs>@tcp) after server handle changed
+
+Retry the enqueue for -ENOTCONN as well, so that the MGC forces the
+pinger, waits for the import to leave recovery and re-enqueues the
+log on the new connection.  As for -ESHUTDOWN it retries only once.
+The one new cost is when the MGS replies but has no usable export
+for us for another reason, such as while it is unmounting: the mount
+now waits up to obd_timeout before failing with the same error,
+instead of failing immediately.
+
+sanity test_160j mounts a second mount point after 160a and 160h
+restart the MDS of a combined MGS/MDT0000, which leaves exactly this
+stale handle: 7 failures in 15 runs on aarch64 clients, while x86_64
+passed.
+
+Test-Parameters: clientarch=aarch64 testlist=sanity,sanity env=ONLY=160
+Signed-off-by: John Grasso <johgras@amazon.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Change-Id: I9b1fc36da6b51c4553d320ca360eb39035fa4b09
+
+--- Review History ---
+
+--- Message (John Grasso, 2026-11-23 15:31:47.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 15:35:19.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 15:42:00.000000000) ---
+Patch Set 1:
+
+Looks good to me.

@@ -1,5 +1,5 @@
 Change:     70381
-Subject:    LU-20690 lod: write 1+N EC data around a lost OST
+Subject:    LU-20690 lod: write 1+N EC data around lost OST mirror
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70381
 Change-Id:  Iab02681175f14e69d78441647d6f1bd3b53ebbe5
 Project:    fs/lustre-release
@@ -7,23 +7,23 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-11-04 00:10:33.000000000
-Updated:    2026-11-05 19:54:09.000000000
-Patch Set:  2
-Insertions: +289
+Updated:    2026-11-22 22:32:17.000000000
+Patch Set:  4
+Insertions: +474
 Deletions:  -0
-Comments:   7 (3 unresolved)
-Hashtags:   pt_ecro
+Comments:   30 (3 unresolved)
+Hashtags:   pw_shepherd, pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Gerrit AI review for Lustre
-  REVIEWER: Ronnie Sahlberg, Keguang Xu
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Alex Zhuravlev, Maximilian Dilger, Ronnie Sahlberg, Keguang Xu
 
 --- Commit Message ---
-LU-20690 lod: write 1+N EC data around a lost OST
+LU-20690 lod: write 1+N EC data around lost OST mirror
 
 A write to an EC file would fail while the OST of a data stripe in a
 component of 1-data raid sets (--ec 1+N, or one data stripe) was
@@ -33,34 +33,47 @@ parity objects of such a raid set holds a copy of the data object at
 the same object offsets.
 
 When a write era starts (RDONLY -> WRITE_PENDING) the parity is still
-in sync, so lod_ec_swap_unavail() swaps each unavailable data object
-of such a component in the write extent with a parity object of the
-same raid set on an available OST.  The data mirror stays a complete
-write primary, and the parity component, which the write stales as
-before, holds the unavailable object until the next resync rewrites
-it.  The filter_fid of a swapped object is updated from the layout
-that the next write to it carries; until then LFSCK reports an
-unmatched pair and repairs the filter_fid.  The swapped-in object may
-be outside the pool or OST list of the data component.
+in sync, so lod_ec_swap_unavail_data() swaps each data object of such
+a component in the write extent that is on a disconnected or
+deactivated OST with a parity object of the same raid set on an
+available OST.  An OST that is only full or takes no new objects is
+still written.  The data mirror stays a complete write primary, and
+the parity component, which the write stales as before, holds the
+unavailable object until the next resync rewrites it.  The swapped-in
+object may be outside the pool or OST list of the data component.
 
-The swap needs each parity copy to be as large as the data object.
-A copy written by resync with O_DIRECT ended on a page boundary, past
-a file size that is not page aligned, and ended at the last data when
-the file had a trailing hole, so a swapped-in copy would change the
-file size.  The EC resync now truncates the parity mirror to the file
-size when EOF is inside a component of 1-data raid sets, as FLR
-resync does for a mirror.  Parity resynced by an older lfs is not
-trimmed.
+The swapped-in object counts for the file size, so it is only used if
+its size is that of the data object for the file size that the last
+resync stored as strict SOM.  A copy written by resync with O_DIRECT
+ended on a page boundary past a file size that is not page aligned,
+and at the last data when the file had a trailing hole, so the EC
+resync now truncates the parity mirror to the file size when EOF is
+inside a component of 1-data raid sets, as FLR resync does for a
+mirror, and only warns if that fails.  Parity resynced by an older
+lfs, left past EOF when EOF is in a component with larger raid sets,
+or of an EC layout version that the MDS does not know, is not swapped
+in.
+
+After the layout change, the MDD rewrites the filter_fid of the
+swapped-in object with its new stripe index and component in a
+transaction of its own, as after a layout swap, so that it names the
+stripe it now is for LFSCK and lfsck_verify_pfid.  The object swapped
+out to the parity component is on the unavailable OST and keeps its
+old filter_fid.  OSP OST objects can now be invalidated, so that the
+MDS fetches the size of a parity copy from the OST.
 
 Swapping only happens at the start of a write era, while the parity
-component is in sync.  An OST lost during a write era, and a 1-data
-raid set in a component with larger raid sets, whose parity is not
-at the data offsets, still need the OST to return.
+component is in sync, for the components of the extent that the
+first write of the era touches.  An OST lost during a write era, and
+a 1-data raid set in a component with larger raid sets, whose parity
+is not at the data offsets, still need the OST to return.
 
 Add sanity-ec test_313 to write 1+2 files with a data OST unavailable,
 for an unaligned size, a sparse tail, a second PFL component and the
 second stripe of a 2-stripe component, and check the swap, the file
-size and the data before and after resync.
+size and the data before and after resync.  Add test_314 to check that
+stale parity past EOF is not swapped in, and test_315 to swap the
+second stripe of a 2-stripe 1+2 file twice.
 
 Test-Parameters: trivial testlist=sanity-ec,sanity-flr ostcount=8
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
@@ -139,3 +152,104 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The swap itself looks correct, but one case can bring truncated data back, so this needs a refresh. Please add a sanity-ec case to test_313 that shrinks a file below a 1-data component, resyncs, then writes into that component with its data OST down. If the patch is refreshed, Documentation/ec.txt could also describe the swap, including that a swapped-in object may be outside the pool or OST list of the data component.
+
+--- Message (patrick bot, 2026-11-15 21:55:30.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-15 22:02:04.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Keguang Xu, 2026-11-18 02:17:30.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+--- Message (Andreas Dilger, 2026-11-18 12:03:23.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-18 12:03:41.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 12:06:58.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-18 12:08:30.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+3 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Keguang Xu, 2026-11-19 06:38:58.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Andreas Dilger, 2026-11-19 14:28:59.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-20 03:32:55.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-20 04:47:20.000000000) ---
+Patch Set 3: Code-Review-1
+
+This change cannot be cherry-picked to master.
+Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andreas Dilger, 2026-11-20 16:24:00.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+
+--- Message (Andreas Dilger, 2026-11-20 16:24:24.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 16:36:37.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 16:39:27.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-21 08:12:53.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137286/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 19:36:03.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. The swap, the size check against strict SOM and the parity trim look correct; nothing here needs a re-spin on its own.
+
+--- Message (patrick bot, 2026-11-22 22:32:17.000000000) ---
+Patch Set 4:
+
+(1 comment)

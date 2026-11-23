@@ -29,12 +29,12 @@
                         <labels>
                     </labels>
                 <created>Wed, 29 Oct 2025 11:12:21 +0000</created>
-                <updated>Wed, 11 Nov 2026 15:20:27 +0000</updated>
+                <updated>Mon, 16 Nov 2026 19:01:34 +0000</updated>
                             <resolved>Wed, 11 Nov 2026 15:20:27 +0000</resolved>
                                                     <fixVersion>Lustre 2.18.0</fixVersion>
                                         <due />
                             <votes>0</votes>
-                                    <watches>10</watches>
+                                    <watches>11</watches>
                                                                             <comments>
                             <comment id="476584" author="gerrit" created="Wed, 29 Oct 2025 16:10:00 +0000">&lt;p&gt;"Patrick Farrell &amp;lt;pfarrell@whamcloud.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/62095" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/62095&lt;/a&gt;&lt;br/&gt;
 Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;&lt;del&gt;LU-19536&lt;/del&gt;&lt;/a&gt; obdclass: use wait queue for DIO copy sync&lt;br/&gt;
@@ -123,6 +123,461 @@ Branch: master&lt;br/&gt;
 Current Patch Set: 1&lt;br/&gt;
 Commit: 082c551417bdc92e88944874b529c3c0f71bf209&lt;/p&gt;</comment>
                             <comment id="505660" author="pjo" created="Wed, 11 Nov 2026 15:20:27 +0000">&lt;p&gt;Merged for 2.18&lt;/p&gt;</comment>
+                            <comment id="505983" author="panda" created="Mon, 16 Nov 2026 16:27:47 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=paf0186" class="user-hover" rel="paf0186"&gt;paf0186&lt;/a&gt;, I believe 9fc5497ecb ("&lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;&lt;del&gt;LU-19536&lt;/del&gt;&lt;/a&gt; obdclass: use wait queue for DIO copy sync", &lt;a href="https://review.whamcloud.com/62095" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/62095&lt;/a&gt;) lets an unaligned DIO write send bounce pages that were never filled from userspace or zeroed. I found it while reviewing a backport of that patch. Current master (54dc726b562) still has it, and I found no follow-up fix in master or in the open changes on Gerrit. A reproducer with a fail_loc and a sanity test is below.&lt;/p&gt;
+
+&lt;h4&gt;&lt;a name="Whathappens"&gt;&lt;/a&gt;What happens&lt;/h4&gt;
+
+&lt;p&gt;When the copy loop of &lt;tt&gt;__ll_dio_user_copy()&lt;/tt&gt; stops part way for a write, with &lt;tt&gt;&amp;#45;EINTR&lt;/tt&gt; on a fatal signal or with &lt;tt&gt;&amp;#45;EFAULT&lt;/tt&gt; after more than two short copies, the end of the function still marks the copy done and stores and returns the number of bytes copied so far (lustre/obdclass/cl_io.c in master):&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+	&lt;span class="code-comment"&gt;/* For write operations, update state &lt;span class="code-keyword"&gt;and&lt;/span&gt; wake any waiting threads */&lt;/span&gt;
+	if (rw == WRITE) {
+		&lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;unsigned&lt;/span&gt;&lt;/span&gt; &lt;span class="code-keyword"&gt;&lt;span class="code-object"&gt;long&lt;/span&gt;&lt;/span&gt; flags;
+		ssize_t result = original_count - count ?
+			original_count - count : status;
+
+		spin_lock_irqsave(&amp;amp;sdio-&amp;gt;csd_write_lock, flags);
+		&lt;span class="code-comment"&gt;/* Store result (bytes copied &lt;span class="code-keyword"&gt;or&lt;/span&gt; error) &lt;span class="code-keyword"&gt;for&lt;/span&gt; waiting threads */&lt;/span&gt;
+		sdio-&amp;gt;csd_write_status = result;
+		&lt;span class="code-comment"&gt;/* Mark copy as complete (successfully &lt;span class="code-keyword"&gt;or&lt;/span&gt; &lt;span class="code-keyword"&gt;not&lt;/span&gt;) */&lt;/span&gt;
+		sdio-&amp;gt;csd_write_copied = &lt;span class="code-keyword"&gt;true&lt;/span&gt;;
+		...
+	}
+
+	&lt;span class="code-comment"&gt;/* the total bytes copied, &lt;span class="code-keyword"&gt;or&lt;/span&gt; status */&lt;/span&gt;
+	RETURN(original_count - count ? original_count - count : status);
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;tt&gt;osc_build_rpc()&lt;/tt&gt; only checks for a negative return (lustre/osc/osc_request.c):&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-c"&gt;
+		if (sdio &amp;amp;&amp;amp; sdio-&amp;gt;csd_unaligned &amp;amp;&amp;amp; sdio-&amp;gt;csd_write) {
+			rc = ll_dio_user_copy(sdio);
+			if (rc &amp;lt; 0)
+				GOTO(out, rc);
+			...
+			LASSERT(sdio-&amp;gt;csd_write_copied);
+		}
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;So the BRW for the whole sdio is sent with the rest of the bounce pages never copied from userspace, and the DIO reports success. The bounce pages come from the obd page pool (&lt;tt&gt;ll_allocate_dio_buffer()&lt;/tt&gt; calls &lt;tt&gt;obd_pool_get_folios_array()&lt;/tt&gt;), which does not zero them. Before 9fc5497ecb this case left &lt;tt&gt;csd_write_copied&lt;/tt&gt; clear and hit the &lt;tt&gt;LASSERT()&lt;/tt&gt;, so it was at least loud.&lt;/p&gt;
+
+&lt;h4&gt;&lt;a name="Howitcanbereached"&gt;&lt;/a&gt;How it can be reached&lt;/h4&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;&amp;#45;EFAULT&lt;/tt&gt;: part of the user buffer becomes unreadable after the up-front &lt;tt&gt;fault_in_iov_iter_readable()&lt;/tt&gt;, e.g. another thread of the application unmaps or mprotects it (also hwpoison or userfaultfd). For parallel DIO the copy runs later in ptlrpcd with the user's mm.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;&amp;#45;EINTR&lt;/tt&gt;: only when the submitting thread does the copy itself (non-parallel DIO) and gets a fatal signal. In ptlrpcd and in the ll_ucp kthread &lt;tt&gt;fatal_signal_pending(current)&lt;/tt&gt; is false, so a signal to the process does not interrupt the copy there.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h4&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h4&gt;
+
+&lt;p&gt;The patch below (against master 54dc726b562, checkpatch clean) adds &lt;tt&gt;OBD_FAIL_LLITE_DIO_COPY_SHORT&lt;/tt&gt; (0x143b), which makes the write copy into every bounce page from &lt;tt&gt;cfs_fail_val&lt;/tt&gt; on come back short, and sanity test_119v. The test writes pattern A into a one-stripe file; does one unaligned DIO write of pattern C to another file, so that its bounce pages go back to the top of the pool; then, with fail_loc 0x143b and fail_val 2, does one unaligned DIO write of pattern B over A (6 pages at offset 66536, which fill 7 bounce pages), reads the region back from the OST and expects only A or B, and only B if write() reported success.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+diff --git a/lustre/include/obd_support.h b/lustre/include/obd_support.h
+index 9f659b3170..cb79c14709 100644
+--- a/lustre/include/obd_support.h
++++ b/lustre/include/obd_support.h
+@@ -659,6 +659,7 @@ extern bool obd_enable_fname_encoding;
+ #define OBD_FAIL_LLITE_DIO_BUFFER_ALLOC		    0x1438
+ #define OBD_FAIL_LLITE_DIO_DRAIN_RETRY		    0x1439
+ #define OBD_FAIL_LLITE_DIO_FALLBACK		    0x143a
++#define OBD_FAIL_LLITE_DIO_COPY_SHORT		    0x143b
+ 
+ #define OBD_FAIL_FID_INDIR			0x1501
+ #define OBD_FAIL_FID_INLMA			0x1502
+diff --git a/lustre/obdclass/cl_io.c b/lustre/obdclass/cl_io.c
+index 1e9bf5fd4b..b361a629f1 100644
+--- a/lustre/obdclass/cl_io.c
++++ b/lustre/obdclass/cl_io.c
+@@ -1766,7 +1766,13 @@ &lt;span class="code-keyword"&gt;static&lt;/span&gt; ssize_t __ll_dio_user_copy(struct cl_sub_dio *sdio)
+ 		 */
+ 		flush_dcache_folio(folio);
+ 
+-		copied = folio_iter(folio, pgno, offset, bytes, iter, rw);
++		&lt;span class="code-comment"&gt;/* test hook: no data copied from page cfs_fail_val on */&lt;/span&gt;
++		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (rw == WRITE &amp;amp;&amp;amp; i &amp;gt;= cfs_fail_val &amp;amp;&amp;amp;
++		    CFS_FAIL_CHECK(OBD_FAIL_LLITE_DIO_COPY_SHORT))
++			copied = 0;
++		&lt;span class="code-keyword"&gt;else&lt;/span&gt;
++			copied = folio_iter(folio, pgno, offset, bytes, iter,
++					    rw);
+ 		pos += copied;
+ 		count -= copied;
+ 
+diff --git a/lustre/tests/sanity.sh b/lustre/tests/sanity.sh
+index b2f9879851..9b079562ec 100755
+--- a/lustre/tests/sanity.sh
++++ b/lustre/tests/sanity.sh
+@@ -17940,6 +17940,104 @@ test_119u()
+ }
+ run_test 119u &lt;span class="code-quote"&gt;"DIO write fallback over 64MiB"&lt;/span&gt;
+ 
++test_119v()
++{
++	unaligned_dio_or_skip
++	[[ -x $(which strace 2&amp;gt; /dev/&lt;span class="code-keyword"&gt;null&lt;/span&gt;) ]] || skip_env &lt;span class="code-quote"&gt;"no strace"&lt;/span&gt;
++
++	local file=$DIR/$tfile
++	local tmp=$TMP/$tfile
++	# 6 pages written at an unaligned offset fill 7 bounce pages
++	local off=$((16 * PAGE_SIZE + 1000))
++	local len=$((6 * PAGE_SIZE))
++	# the copy into the bounce pages from &lt;span class="code-keyword"&gt;this&lt;/span&gt; one on comes back &lt;span class="code-object"&gt;short&lt;/span&gt;
++	local fail_page=2
++	# SANITY_119V_INJECT=&lt;span class="code-keyword"&gt;false&lt;/span&gt; does the same I/O without the fault
++	local inject=${SANITY_119V_INJECT:-&lt;span class="code-keyword"&gt;true&lt;/span&gt;}
++	local p
++
++	stack_trap &lt;span class="code-quote"&gt;"rm -f $tmp.*"&lt;/span&gt;
++	&lt;span class="code-keyword"&gt;for&lt;/span&gt; p in A B C; &lt;span class="code-keyword"&gt;do&lt;/span&gt;
++		head -c $((1 &amp;lt;&amp;lt; 20)) /dev/zero | tr &lt;span class="code-quote"&gt;'\0'&lt;/span&gt; $p &amp;gt; $tmp.$p ||
++			error &lt;span class="code-quote"&gt;"cannot create pattern $p"&lt;/span&gt;
++	done
++
++	# pattern A in a one-stripe file, written out and dropped from cache
++	$LFS setstripe -c 1 -i 0 $file || error &lt;span class="code-quote"&gt;"setstripe $file failed"&lt;/span&gt;
++	dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=$tmp.A of=$file bs=1M count=1 conv=fsync status=none ||
++		error &lt;span class="code-quote"&gt;"write A failed"&lt;/span&gt;
++	cancel_lru_locks osc
++
++	# put pattern C into the obd page pool: an unaligned DIO write of the
++	# same geometry returns its bounce pages to the top of the pool, and
++	# the next unaligned DIO write gets the same pages in the same order
++	$LFS setstripe -c 1 -i 0 $file.pool ||
++		error &lt;span class="code-quote"&gt;"setstripe $file.pool failed"&lt;/span&gt;
++	dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=$tmp.C of=$file.pool bs=$len count=1 seek=$off \
++		oflag=direct,seek_bytes conv=notrunc status=none ||
++		error &lt;span class="code-quote"&gt;"unaligned DIO write C failed"&lt;/span&gt;
++
++	local saved_debug=$($LCTL get_param -n debug)
++
++	stack_trap &lt;span class="code-quote"&gt;"$LCTL set_param -n debug=&lt;span class="code-quote"&gt;'$saved_debug'&lt;/span&gt;"&lt;/span&gt;
++	$LCTL set_param -n debug=+vfstrace
++	$LCTL clear
++	&lt;span class="code-keyword"&gt;if&lt;/span&gt; $inject; then
++		#define OBD_FAIL_LLITE_DIO_COPY_SHORT	0x143b
++		$LCTL set_param fail_loc=0x143b fail_val=$fail_page
++		stack_trap &lt;span class="code-quote"&gt;"$LCTL set_param fail_loc=0 fail_val=0"&lt;/span&gt;
++	fi
++
++	# one unaligned DIO write() of pattern B over pattern A
++	strace -o $tmp.strace -e trace=write dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=$tmp.B of=$file bs=$len \
++		count=1 seek=$off oflag=direct,seek_bytes conv=notrunc
++	local rc=$?
++	local floc=$($LCTL get_param -n fail_loc)
++
++	&lt;span class="code-keyword"&gt;if&lt;/span&gt; $inject; then
++		$LCTL set_param fail_loc=0 fail_val=0
++	fi
++	$LCTL dk $tmp.dk &amp;gt; /dev/&lt;span class="code-keyword"&gt;null&lt;/span&gt;
++	grep &lt;span class="code-quote"&gt;'^write(1,'&lt;/span&gt; $tmp.strace
++
++	local ret=$(awk -F&lt;span class="code-quote"&gt;' = '&lt;/span&gt; &lt;span class="code-quote"&gt;'/^write\(1,/ { print $2; exit }'&lt;/span&gt; $tmp.strace)
++
++	echo &lt;span class="code-quote"&gt;"dd rc=$rc, write($len bytes at $off) = $ret, fail_loc=$floc"&lt;/span&gt;
++	# the copy into the bounce pages, with the &lt;span class="code-object"&gt;short&lt;/span&gt; copies &lt;span class="code-keyword"&gt;if&lt;/span&gt; injected
++	grep -v &lt;span class="code-quote"&gt;'DEBUG MARKER'&lt;/span&gt; $tmp.dk | grep __ll_dio_user_copy ||
++		error &lt;span class="code-quote"&gt;"write did not go through the DIO bounce pages"&lt;/span&gt;
++	&lt;span class="code-keyword"&gt;if&lt;/span&gt; $inject; then
++		(( floc == (0x40000000 | 0x143b) )) ||
++			error &lt;span class="code-quote"&gt;"fail_loc 0x143b did not fire: fail_loc=$floc"&lt;/span&gt;
++	fi
++
++	# read the region back from the OST, B or the old A are expected
++	cancel_lru_locks osc
++	dd &lt;span class="code-keyword"&gt;if&lt;/span&gt;=$file of=$tmp.region bs=$len count=1 skip=$off \
++		iflag=skip_bytes status=none || error &lt;span class="code-quote"&gt;"read back failed"&lt;/span&gt;
++
++	local nb=$(tr -cd B &amp;lt; $tmp.region | wc -c)
++	local na=$(tr -cd A &amp;lt; $tmp.region | wc -c)
++	local nc=$(tr -cd C &amp;lt; $tmp.region | wc -c)
++	local nz=$(tr -cd &lt;span class="code-quote"&gt;'\000'&lt;/span&gt; &amp;lt; $tmp.region | wc -c)
++	local nx=$((len - nb - na - nc - nz))
++
++	echo &lt;span class="code-quote"&gt;"region $off+$len: B=$nb A=$na C=$nc zero=$nz other=$nx"&lt;/span&gt;
++	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (( nb != len )); then
++		local first=$(cmp -l -n $len $tmp.B $tmp.region |
++			      awk &lt;span class="code-quote"&gt;'{ print $1 - 1; exit }'&lt;/span&gt;)
++		local skip=$((first &amp;gt; 16 ? first - 16 : 0))
++
++		echo &lt;span class="code-quote"&gt;"first non-B &lt;span class="code-object"&gt;byte&lt;/span&gt; at $first (file offset $((off + first)))"&lt;/span&gt;
++		od -A d -t x1z -j $skip -N 64 $tmp.region
++	fi
++	(( na + nb == len )) ||
++		error &lt;span class="code-quote"&gt;"foreign data: C=$nc zero=$nz other=$nx, write() = $ret"&lt;/span&gt;
++	[[ $ret != &lt;span class="code-quote"&gt;"$len"&lt;/span&gt; ]] || (( nb == len )) ||
++		error &lt;span class="code-quote"&gt;"write() = $ret, but only $nb of $len bytes are B"&lt;/span&gt;
++}
++run_test 119v &lt;span class="code-quote"&gt;"unaligned DIO write does not send uncopied data"&lt;/span&gt;
++
+ test_120a() {
+ 	[ $PARALLEL == &lt;span class="code-quote"&gt;"yes"&lt;/span&gt; ] &amp;amp;&amp;amp; skip &lt;span class="code-quote"&gt;"skip parallel run"&lt;/span&gt;
+ 	remote_mds_nodsh &amp;amp;&amp;amp; skip &lt;span class="code-quote"&gt;"remote MDS with nodsh"&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Result on a RHEL 9.6 client (5.14.0-570.37.1), 3 of 3 runs:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;write(1, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"..., 24576) = 24576
+dd rc=0, write(24576 bytes at 66536) = 24576, fail_loc=1073747003
+(cl_io.c:1771:__ll_dio_user_copy()) *** cfs_fail_loc=143b, val=2***
+(cl_io.c:1793:__ll_dio_user_copy()) Unaligned DIO copy repeatedly short, count 17384, offset 0, bytes 4096, copied 0, pos 73728
+(cl_io.c:1837:__ll_dio_user_copy()) Process leaving (rc=7192 : 7192 : 1c18)
+region 66536+24576: B=7192 A=0 C=17384 zero=0 other=0
+first non-B byte at 7192 (file offset 73728)
+0007176 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42 42  &amp;gt;BBBBBBBBBBBBBBBB&amp;lt;
+0007192 43 43 43 43 43 43 43 43 43 43 43 43 43 43 43 43  &amp;gt;CCCCCCCCCCCCCCCC&amp;lt;
+sanity test_119v: @@@@@@ FAIL: foreign data: C=17384 zero=0 other=0, write() = 24576
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;write() returns the full 24576 bytes, but only the first 7192 bytes (the two pages copied before the injected short copies) are the user's data; the other 17384 bytes on the OST are pattern C, which was written earlier to a different file. With the fail_loc unset, the same I/O passes (region B=24576).&lt;/p&gt;
+
+&lt;h4&gt;&lt;a name="Possiblefix"&gt;&lt;/a&gt;Possible fix&lt;/h4&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;For a write the copy is all or nothing, as the BRW covers the whole sdio: if count is not 0 after the loop, store a negative status in &lt;tt&gt;csd_write_status&lt;/tt&gt; (&lt;tt&gt;&amp;#45;EFAULT&lt;/tt&gt; if status is 0) and return it instead of the partial count. Reads can keep the partial count.&lt;/li&gt;
+	&lt;li&gt;Keep "copy finished" apart from "copy succeeded" (a failed flag, or set &lt;tt&gt;csd_write_copied&lt;/tt&gt; only for a full copy), so that waiters return the stored error instead of sending BRWs or redoing the copy from the already advanced &lt;tt&gt;csd_iter&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;In &lt;tt&gt;osc_build_rpc()&lt;/tt&gt;, fail the extent if the return is negative or differs from &lt;tt&gt;csd_bytes&lt;/tt&gt;, and keep the &lt;tt&gt;LASSERT()&lt;/tt&gt; for the success path only.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;With that, test_119v should see write() fail with EFAULT and the region stay A. I can push the reproducer as a test patch, on top of a fix or alone, whichever you prefer.&lt;/p&gt;</comment>
+                            <comment id="505984" author="bzzz" created="Mon, 16 Nov 2026 16:33:51 +0000">&lt;p&gt;probably this can help: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/65690" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/65690&lt;/a&gt;&lt;/p&gt;</comment>
+                            <comment id="505986" author="paf0186" created="Mon, 16 Nov 2026 16:40:19 +0000">&lt;p&gt;Thanks &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=panda" class="user-hover" rel="panda"&gt;panda&lt;/a&gt; , thanks &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;I'll take a closer look...&lt;/p&gt;</comment>
+                            <comment id="505988" author="panda" created="Mon, 16 Nov 2026 16:55:51 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt;, thanks, but 65690 does not fix this; together with it, the problem gets easier to hit. 65690 lets the up-front &lt;tt&gt;fault_in_iov_iter_readable()&lt;/tt&gt; pass when only part of the buffer is readable, and the new check in the loop stops the copy with &lt;tt&gt;&amp;#45;EFAULT&lt;/tt&gt; at the first unreadable page. The end of &lt;tt&gt;__ll_dio_user_copy()&lt;/tt&gt; then still returns the partial count and marks the copy done, so the BRW goes out with the rest of the bounce pages and write() succeeds.&lt;/p&gt;
+
+&lt;p&gt;I checked it without any fail_loc on a RHEL 9.6 client (5.14.0-570.37.1): one unaligned O_DIRECT write of 6 pages of pattern B at offset 66536 from an mmap buffer whose last page is PROT_NONE, after a DIO write of pattern C to another file has left its pages in the pool, as in test_119v above:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;master 54dc726b562: write() returns EFAULT and the region keeps its old data (A=24576), which is correct.&lt;/li&gt;
+	&lt;li&gt;master + 65690 PS14: write() returns 24576, and the region holds B=20480 C=4096, in 3 of 3 runs. The 4096 bytes that should have come from the protected page are the other file's data.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;So with 65690 an application error, a buffer that runs into an unmapped or protected page, becomes a successful write of someone else's data. I think 65690 needs the partial copy handling fixed first, or in the same patch. The test only needs python3 for the mmap and mprotect, and I can add it next to test_119v.&lt;/p&gt;</comment>
+                            <comment id="505989" author="gerrit" created="Mon, 16 Nov 2026 17:03:52 +0000">&lt;p&gt;"patrick bot &amp;lt;patrick-bot@mulberrytree.us&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70957" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70957&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;&lt;del&gt;LU-19536&lt;/del&gt;&lt;/a&gt; obdclass: fail a partial unaligned DIO write copy&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: b60312f5bfe6e64e7b7da15b318459bbc309a61a&lt;/p&gt;</comment>
+                            <comment id="505990" author="paf0186" created="Mon, 16 Nov 2026 17:04:04 +0000">&lt;p&gt;Thanks &lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=panda" class="user-hover" rel="panda"&gt;panda&lt;/a&gt;, I reproduced this: test_119v fails 3 of 3 on master, as you describe.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=bzzz" class="user-hover" rel="bzzz"&gt;bzzz&lt;/a&gt;, I don't think 65690 fixes it. The end of the copy still returns the partial byte count, so test_119v fails the same way with it applied. Worse, with 65690 a plain write from a buffer whose tail is unmapped now reports success for data it never copied from the user buffer. No race or fail_loc is needed for that: an unaligned O_DIRECT pwrite() of 6 pages with the last 3 unmapped returns 24576 although only half of it was copied. Master returns EFAULT for the same write, because the up front fault-in fails.&lt;/p&gt;
+
+&lt;p&gt;I've pushed &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70957" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70957&lt;/a&gt; which fails the write copy as a whole when it comes up short, and stores the error for the other threads waiting on the copy. It includes Andrew's fail_loc and test_119v. With it, test_119v passes and the unmapped tail write gets EFAULT with the file unchanged, with and without 65690 under it. I think it should land before 65690.&lt;/p&gt;
+
+&lt;p&gt;For backports: in 2.16 and 2.17.0 the same partial copy hits LASSERT(sdio-&amp;gt;csd_write_copied) in osc_build_rpc() instead, so anything that picks up 9fc5497ecb needs this fix with it.&lt;/p&gt;</comment>
+                            <comment id="505992" author="panda" created="Mon, 16 Nov 2026 17:10:57 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=paf0186" class="user-hover" rel="paf0186"&gt;paf0186&lt;/a&gt;, one more data point: it also reproduces on plain master, without any fault injection and without 65690, as a race. In the test below one thread does an unaligned O_DIRECT write of 8 MiB of pattern B at file offset 66536 from an mmap buffer, and a second thread makes the last 4 pages of that buffer PROT_NONE after a delay that is swept over the iterations. Before each write the region is filled with pattern A, and an unaligned DIO write of pattern C to another file leaves its pages in the pool; after the write the region is read back with O_DIRECT.&lt;/p&gt;
+
+&lt;p&gt;On a RHEL 9.6 client (5.14.0-570.37.1), master 54dc726b562, 400 iterations with delays from 0 to 40 ms in 100 us steps:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;SUMMARY iterations=400 hits=26 write: full=260 short=0 failed=140
+HIT it=140 delay=14000us write=8388608 A=0 B=8372224 C=16384 other=0
+HIT it=141 delay=14100us write=8388608 A=0 B=8372224 C=16384 other=0
+...
+HIT it=165 delay=16500us write=8388608 A=0 B=8372224 C=16384 other=0
+sanity test_119x: @@@@@@ FAIL: 26 of 400 writes left foreign data
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;With delays below 14 ms the tail is protected before the up-front fault-in and write() fails with EFAULT, which is correct; from 16.6 ms on the copy is already done and the write is complete. All 26 writes in between returned success for the full 8 MiB, while the 16384 bytes of the protected pages in the file are pattern C from the other file. In an application this is a buffer freed or remapped by another thread while an unaligned DIO write is in flight.&lt;/p&gt;
+
+&lt;p&gt;The test compiles its helper at run time, so it needs gcc on the client; its defaults are the 400 iterations and 40 ms used above (the window depends on the node, with a 3 ms sweep nothing hit here):&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;test_119x()
+{
+	unaligned_dio_or_skip
+	[[ -x $(which gcc 2&amp;gt; /dev/&lt;span class="code-keyword"&gt;null&lt;/span&gt;) ]] || skip_env &lt;span class="code-quote"&gt;"no gcc"&lt;/span&gt;
+
+	local file=$DIR/$tfile
+	local src=$TMP/$tfile.c
+	local bin=$TMP/$tfile.bin
+	local iters=${SANITY_119X_ITERS:-400}
+	local maxdelay=${SANITY_119X_MAXDELAY_NS:-40000000}
+
+	stack_trap &lt;span class="code-quote"&gt;"rm -f $src $bin $TMP/$tfile.out"&lt;/span&gt;
+	cat &amp;gt; $src &amp;lt;&amp;lt;&lt;span class="code-quote"&gt;'CEOF'&lt;/span&gt;
+#define _GNU_SOURCE
+#include &amp;lt;errno.h&amp;gt;
+#include &amp;lt;fcntl.h&amp;gt;
+#include &amp;lt;pthread.h&amp;gt;
+#include &amp;lt;stdio.h&amp;gt;
+#include &amp;lt;stdlib.h&amp;gt;
+#include &amp;lt;string.h&amp;gt;
+#include &amp;lt;sys/mman.h&amp;gt;
+#include &amp;lt;time.h&amp;gt;
+#include &amp;lt;unistd.h&amp;gt;
+
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-object"&gt;char&lt;/span&gt; *buf;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; size_t len, tail;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-object"&gt;long&lt;/span&gt; delay_ns;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; pthread_barrier_t bar;
+
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; &lt;span class="code-object"&gt;long&lt;/span&gt; now_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &amp;amp;ts);
+	&lt;span class="code-keyword"&gt;return&lt;/span&gt; ts.tv_sec * 1000000000L + ts.tv_nsec;
+}
+
+&lt;span class="code-comment"&gt;/* make the tail of the buffer unreadable after a delay */&lt;/span&gt;
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; void *prot_thread(void *arg)
+{
+	&lt;span class="code-object"&gt;long&lt;/span&gt; t0;
+
+	pthread_barrier_wait(&amp;amp;bar);
+	t0 = now_ns();
+	&lt;span class="code-keyword"&gt;while&lt;/span&gt; (now_ns() - t0 &amp;lt; delay_ns)
+		;
+	mprotect(buf + len - tail, tail, PROT_NONE);
+	&lt;span class="code-keyword"&gt;return&lt;/span&gt; NULL;
+}
+
+&lt;span class="code-keyword"&gt;static&lt;/span&gt; void fill(&lt;span class="code-keyword"&gt;const&lt;/span&gt; &lt;span class="code-object"&gt;char&lt;/span&gt; *path, &lt;span class="code-object"&gt;int&lt;/span&gt; flags, &lt;span class="code-object"&gt;char&lt;/span&gt; c, off_t off, &lt;span class="code-object"&gt;char&lt;/span&gt; *b)
+{
+	&lt;span class="code-object"&gt;int&lt;/span&gt; fd = open(path, flags);
+
+	memset(b, c, len);
+	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (fd &amp;lt; 0 || pwrite(fd, b, len, off) != (ssize_t)len) {
+		perror(path);
+		exit(2);
+	}
+	fsync(fd);
+	close(fd);
+}
+
+&lt;span class="code-object"&gt;int&lt;/span&gt; main(&lt;span class="code-object"&gt;int&lt;/span&gt; argc, &lt;span class="code-object"&gt;char&lt;/span&gt; **argv)
+{
+	&lt;span class="code-object"&gt;long&lt;/span&gt; pg = sysconf(_SC_PAGESIZE);
+	off_t off = 16 * pg + 1000, aoff;
+	&lt;span class="code-object"&gt;int&lt;/span&gt; iters = atoi(argv[3]), hits = 0, efault = 0, full = 0, part = 0;
+	&lt;span class="code-object"&gt;long&lt;/span&gt; maxdelay = atol(argv[4]);
+	size_t rlen;
+	&lt;span class="code-object"&gt;char&lt;/span&gt; *pat, *rbuf;
+	&lt;span class="code-object"&gt;int&lt;/span&gt; it;
+
+	len = 8 &amp;lt;&amp;lt; 20;
+	tail = 4 * pg;
+	aoff = off / pg * pg;
+	rlen = (off + len + pg - 1) / pg * pg - aoff;
+	pat = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	&lt;span class="code-keyword"&gt;if&lt;/span&gt; (pat == MAP_FAILED || posix_memalign((void **)&amp;amp;rbuf, pg, rlen))
+		&lt;span class="code-keyword"&gt;return&lt;/span&gt; 2;
+
+	&lt;span class="code-keyword"&gt;for&lt;/span&gt; (it = 0; it &amp;lt; iters; it++) {
+		size_t na = 0, nb = 0, nc = 0, nx = 0, i;
+		ssize_t rc;
+		pthread_t t;
+		&lt;span class="code-object"&gt;char&lt;/span&gt; *r;
+		&lt;span class="code-object"&gt;int&lt;/span&gt; fd, err;
+
+		&lt;span class="code-comment"&gt;/* old data A in the region, pattern C left in the pool */&lt;/span&gt;
+		fill(argv[1], O_RDWR, &lt;span class="code-quote"&gt;'A'&lt;/span&gt;, off, pat);
+		fill(argv[2], O_WRONLY | O_DIRECT, &lt;span class="code-quote"&gt;'C'&lt;/span&gt;, off, pat);
+
+		buf = mmap(NULL, len, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (buf == MAP_FAILED)
+			&lt;span class="code-keyword"&gt;return&lt;/span&gt; 2;
+		memset(buf, &lt;span class="code-quote"&gt;'B'&lt;/span&gt;, len);
+		delay_ns = maxdelay * it / iters;
+		pthread_barrier_init(&amp;amp;bar, NULL, 2);
+		pthread_create(&amp;amp;t, NULL, prot_thread, NULL);
+		fd = open(argv[1], O_WRONLY | O_DIRECT);
+		pthread_barrier_wait(&amp;amp;bar);
+		rc = pwrite(fd, buf, len, off);
+		err = errno;
+		pthread_join(t, NULL);
+		close(fd);
+		munmap(buf, len);
+		pthread_barrier_destroy(&amp;amp;bar);
+
+		&lt;span class="code-comment"&gt;/* read the region back from the OST */&lt;/span&gt;
+		fd = open(argv[1], O_RDONLY | O_DIRECT);
+		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (fd &amp;lt; 0 || pread(fd, rbuf, rlen, aoff) &amp;lt; 0) {
+			perror(&lt;span class="code-quote"&gt;"read back"&lt;/span&gt;);
+			&lt;span class="code-keyword"&gt;return&lt;/span&gt; 2;
+		}
+		close(fd);
+		r = rbuf + (off - aoff);
+		&lt;span class="code-keyword"&gt;for&lt;/span&gt; (i = 0; i &amp;lt; len; i++) {
+			&lt;span class="code-keyword"&gt;if&lt;/span&gt; (r[i] == &lt;span class="code-quote"&gt;'A'&lt;/span&gt;)
+				na++;
+			&lt;span class="code-keyword"&gt;else&lt;/span&gt; &lt;span class="code-keyword"&gt;if&lt;/span&gt; (r[i] == &lt;span class="code-quote"&gt;'B'&lt;/span&gt;)
+				nb++;
+			&lt;span class="code-keyword"&gt;else&lt;/span&gt; &lt;span class="code-keyword"&gt;if&lt;/span&gt; (r[i] == &lt;span class="code-quote"&gt;'C'&lt;/span&gt;)
+				nc++;
+			&lt;span class="code-keyword"&gt;else&lt;/span&gt;
+				nx++;
+		}
+		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc &amp;lt; 0)
+			efault++;
+		&lt;span class="code-keyword"&gt;else&lt;/span&gt; &lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc == (ssize_t)len)
+			full++;
+		&lt;span class="code-keyword"&gt;else&lt;/span&gt;
+			part++;
+		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (nc || nx || (rc == (ssize_t)len &amp;amp;&amp;amp; nb != len)) {
+			hits++;
+			printf(&lt;span class="code-quote"&gt;"HIT it=%d delay=%ldus write=%zd A=%zu B=%zu C=%zu other=%zu\n"&lt;/span&gt;,
+			       it, delay_ns / 1000, rc, na, nb, nc, nx);
+		}
+		&lt;span class="code-keyword"&gt;if&lt;/span&gt; (rc &amp;lt; 0 &amp;amp;&amp;amp; err != EFAULT)
+			printf(&lt;span class="code-quote"&gt;"it=%d write errno %d (%s)\n"&lt;/span&gt;, it, err,
+			       strerror(err));
+	}
+	printf(&lt;span class="code-quote"&gt;"SUMMARY iterations=%d hits=%d write: full=%d &lt;span class="code-object"&gt;short&lt;/span&gt;=%d failed=%d\n"&lt;/span&gt;,
+	       iters, hits, full, part, efault);
+	&lt;span class="code-keyword"&gt;return&lt;/span&gt; 0;
+}
+CEOF
+	gcc -O2 -pthread -o $bin $src || error &lt;span class="code-quote"&gt;"cannot compile $src"&lt;/span&gt;
+
+	$LFS setstripe -c 1 -i 0 $file || error &lt;span class="code-quote"&gt;"setstripe $file failed"&lt;/span&gt;
+	$LFS setstripe -c 1 -i 0 $file.pool ||
+		error &lt;span class="code-quote"&gt;"setstripe $file.pool failed"&lt;/span&gt;
+
+	$bin $file $file.pool $iters $maxdelay | tee $TMP/$tfile.out
+	grep -q &lt;span class="code-quote"&gt;'^SUMMARY'&lt;/span&gt; $TMP/$tfile.out || error &lt;span class="code-quote"&gt;"race program failed"&lt;/span&gt;
+	! grep -q &lt;span class="code-quote"&gt;'^HIT'&lt;/span&gt; $TMP/$tfile.out ||
+		error &lt;span class="code-quote"&gt;"$(grep -c &lt;span class="code-quote"&gt;'^HIT'&lt;/span&gt; $TMP/$tfile.out) of $iters writes left foreign data"&lt;/span&gt;
+}
+run_test 119x &lt;span class="code-quote"&gt;"racing mprotect() does not let an unaligned DIO write send other data"&lt;/span&gt;
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;If it helps, I can push test_119v (the deterministic fail_loc test) and this race test to Gerrit, as a test-only patch or together with a fix.&lt;/p&gt;</comment>
+                            <comment id="505993" author="gerrit" created="Mon, 16 Nov 2026 17:24:59 +0000">&lt;p&gt;"patrick bot &amp;lt;patrick-bot@mulberrytree.us&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70959" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70959&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;&lt;del&gt;LU-19536&lt;/del&gt;&lt;/a&gt; obdclass: keep a failed unaligned DIO read error&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 73eb1c6d8f85586312dc8a06084c558ca6020c04&lt;/p&gt;</comment>
+                            <comment id="505995" author="paf0186" created="Mon, 16 Nov 2026 18:03:00 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=panda" class="user-hover" rel="panda"&gt;panda&lt;/a&gt;, thanks for the race test. I ran your program on master and with 70957 and 70959 applied (rocky9, 5.14.0-687, 400 iterations up to 40 ms): on master 18 of 400 writes reported the full 8 MiB written without having copied all of it, and with the fix there were none, the racing writes failed with EFAULT instead (53 of 400).&lt;/p&gt;
+
+&lt;p&gt;The read side had the same problems, and they are fixed in the same series:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;A short copy to the user buffer still reported the whole read. 70957 now fails a short copy in both directions, with test_119w for the read.&lt;/li&gt;
+	&lt;li&gt;When the read RPC of an unaligned DIO fails, cl_sub_dio_end() still copies the bounce pages out to the user and replaces the read error with the copy's result. With parallel DIO that is the only way the error reaches the caller, so the failed read reports success. That goes back to 7194eb6431d2 (2.16). Fixed in &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70959" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70959&lt;/a&gt;, with test_119x, which fails the read on the OST with OBD_FAIL_OST_BRW_READ_BULK.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;test_119v is already in 70957. Your race test would be good to have too, as its own test patch on top of the series. Since test_119x is now taken, maybe 119y? CI clients may not have gcc, so I think it would be better as a helper built with the tree under lustre/tests than compiled at run time.&lt;/p&gt;</comment>
+                            <comment id="505996" author="gerrit" created="Mon, 16 Nov 2026 18:50:15 +0000">&lt;p&gt;"patrick bot &amp;lt;patrick-bot@mulberrytree.us&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70963" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70963&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-19536" title="fault_in_iov_iter_readable() with a spinlock held" class="issue-link" data-issue-key="LU-19536"&gt;&lt;del&gt;LU-19536&lt;/del&gt;&lt;/a&gt; tests: race mprotect with an unaligned DIO write&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 04c7bed9dd1c7746ca38905faf4fd908878f400b&lt;/p&gt;</comment>
+                            <comment id="505997" author="paf0186" created="Mon, 16 Nov 2026 18:50:26 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=panda" class="user-hover" rel="panda"&gt;panda&lt;/a&gt;, I've pushed your race test as &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70963" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70963&lt;/a&gt; (sanity test_119y, on top of 70959), crediting you, so no need to push it yourself. The helper is now dio_mprotect_race, built with the tree. It times an uncontended write first and sweeps the delay over that, since the window was 0.5 to 3 ms on my VMs against your 14 to 16.5 ms. With 100 iterations it found 3 to 11 bad writes per run on master and none with the fix, in about 15 s. It also checks that every byte a short write() reports is B.&lt;/p&gt;</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10010">

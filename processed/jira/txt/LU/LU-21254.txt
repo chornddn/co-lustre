@@ -1,0 +1,152 @@
+Key:        LU-21254
+Summary:    DNE: a stop of an MDT in recovery makes the next recovery execute committed updates again
+Link:       https://jira.whamcloud.com/browse/LU-21254
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Chris Horn
+Reporter:   Chris Horn
+Created:    Thu, 19 Nov 2026 17:34:50 +0000
+Updated:    Sun, 22 Nov 2026 16:29:49 +0000
+Links:      Related: is related to LU-21289
+
+--- Description ---
+Problem
+
+A DNE MDT that stops while it is in recovery cancels only its local update llog. The update records stay on the other MDTs. The next recovery of that MDT then executes updates again that the MDT has already committed.
+
+For the unlink of one of two hard links, the second ref_del takes the link count of the inode to 0 with no destroy:
+
+On master, the MDT does not crash. The other name stays, and stat shows 0 links.
+
+On a branch that has the LASSERT in osd_object_release(), the MDT hits the LBUG at each mount.
+
+LU-13980 changed that LASSERT to a CERROR on master (v2_17_60). That change removes the crash, but the link count still goes to 0.
+
+A failover of an MDT that is in recovery is sufficient. No operator command is necessary.
+
+Environment
+
+master at v2_17_61-119-g54dc726b56, aarch64 VMs, 4 KiB pages, ldiskfs, kernel 5.14.0-611.55.1.el9_7.
+
+3 MDTs on 3 MDS nodes, 1 OSS, 1 client.
+
+I reproduced the LBUG form on an older branch that is not public. That branch has the LU-16159 change and the LASSERT.
+
+b2_16 (v2_16_1) and b2_17 (v2_17_0) also have the LU-16159 change and the LASSERT. I read the source only, and I did not run them.
+
+Reproduction
+
+Create dir1 on MDT0001 and dir2 on MDT0000.
+
+Create a file in dir1, and make a hard link to it in dir2.
+
+Remove the link in dir2.
+
+Set a replay barrier on MDT0001 (replay_barrier_nodf mds2). The unlink is on disk, but its committed batchid is not.
+
+Unmount the client, and stop MDT0001.
+
+Mount MDT0001, and wait for status: RECOVERING. The recovery waits for the client.
+
+Stop MDT0001 while it is in recovery.
+
+Mount MDT0001 again, and wait for the recovery to complete.
+
+Mount the client, and run stat -c %h on the file in dir1.
+
+The correct result is 1 link. Unpatched master gives 0 links.
+
+Console of MDT0001 on master, from the stop in recovery to the end of the next recovery: 
+
+ [ 395.977811] LustreError: 20840:0:(ldlm_lib.c:3126:target_stop_recovery_thread()) lustre-MDT0001: Aborting recovery [ 395.979208] Lustre: lustre-MDT0001-osd: cancel update llog [0x240000400:0x1:0x0] [ 395.981462] Lustre: lustre-MDT0000-osp-MDT0001: cancel update llog [0x200000401:0x1:0x0] [ 395.983178] LustreError: 20529:0:(llog_osd.c:1178:llog_osd_next_block()) lustre-MDT0000-osp-MDT0001: can't read llog block from log [0x200000401:0x1:0x0] offset 32768: rc = -5 [ 395.985684] Lustre: lustre-MDT0002-osp-MDT0001: cancel update llog [0x280000401:0x1:0x0] [ 395.986237] Lustre: lustre-MDT0001: Recovery over after 0:01, of 3 clients 0 recovered and 3 were evicted. [ 480.501316] Lustre: lustre-MDT0001: recovery is timed out, evict stale exports [ 480.510144] LustreError: 21211:0:(osd_handler.c:2575:osd_object_release()) lustre-MDT0001: undestroyed object [0x240000403:0x2:0x0] (155) with nlink = 0 [ 480.512686] Lustre: lustre-MDT0001: Recovery over after 1:10, of 3 clients 2 recovered and 1 was evicted. 
+
+On the branch with the LASSERT, the same steps end with these lines: 
+
+ LustreError: 11775:0:(osd_handler.c:2503:osd_object_release()) ASSERTION( !(o->oo_destroyed == 0 && o->oo_inode && o->oo_inode->i_nlink == 0) ) failed: distribute_txn_replay_handle+0x7ec/0x12b8 [ptlrpc] Kernel panic - not syncing: LBUG 
+
+ The LBUG comes back at each plain mount. A mount with -o abort_recov ends the loop (3 of 3 runs), but the client replay is lost.
+
+Analysis
+
+Update replay has one rule for "committed". update_is_committed() decides that an MDT committed its part of a transaction if the update llog on that MDT has the record.
+
+LU-16159 added a cancel of the update llogs to a recovery abort. lod_llog_cancel() replaces the catalog on each MDT in sequence, and the local catalog is first. It continues after an error, and the caller ignores the result. The cancel is thus not atomic across the MDTs.
+
+A stop of the target also aborts the recovery (target_stop_recovery_thread()). But mdt_fini() calls mdt_stack_pre_fini() before target_recovery_fini(), so the MDT has no connection to the other MDTs at that time. The cancel replaces the local catalog. On the remote catalog it fails with -5, and the record stays.
+
+At the next mount, the record is only on a remote MDT. The rule of step 1 gives "not committed" for the local MDT, and distribute_txn_replay_handle() executes the local updates again.
+
+One more condition is necessary. The batchid of the record must be above the committed batchid on disk. If it is not, the replay marks the transaction as committed and executes nothing.
+
+A second way gives the same state. Run lctl abort_recovery on MDT0001 while a different MDT is stopped. The abort replaces the local catalog, and then it waits for the stopped MDT in lod_sub_cancel_llog() (298 s in one run). If MDT0001 stops during that wait, the record stays on the other MDT. I reproduced this way on the branch that is not public. I did not run it on unpatched master.
+
+A related defect is in distribute_txn_replay_handle(). When one update of a replay fails, the undo loop does not undo update 0. The loop is: 
+
+ while (--i > 0) { 
+
+ The loop in out_tx_end() has i >= 0 as its limit. The replay loop is from LU-3534 (v2_7_56). With the defect above, the replayed unlink of an open file fails with -17 at the orphan insert. The ref_del at index 0 then stays applied, and the result is the same link count 0.
+
+Proposed fix
+
+I have a series of three patches, and I plan to push it for review.
+
+target_recovery_thread() does not cancel the update llogs when the target stops. The next recovery then has all records. tgt_boot_epoch_update() already has the same check.
+
+lod_llog_cancel() first writes a new committed batchid, with a sync, and then replaces the catalogs. A record that stays on an MDT then has a batchid below the committed batchid, and the rule of step 5 does not replay it. The change needs no new disk format and no protocol change.
+
+The undo loop includes update 0.
+
+The series adds two subtests to replay-single, one for each way.
+
+Results on VMs (aarch64, ldiskfs):
+
+With the series, the hard-link case and the open-file case complete, and no committed update executes again. The link count on disk is 1, and a namespace LFSCK dry run reports 0 for each counter on all MDTs.
+
+On master, the two new subtests pass with the series. I also ran 100c, 100d, 119 and 120 there, and they pass.
+
+On the branch that is not public, I ran the DNE subtests of replay-single. The results are the same with and without the series (41 pass, 0 fail).
+
+Not run: x86_64, ZFS and 64 KiB pages.
+
+With patch 2, an explicit abort gives up each older update record of the MDT. That includes a record on an MDT that has no connection at the time of the abort. Without the patch, such a record can replay at a later mount. I think that the new behavior is the intent of LU-16159.
+
+--- Comment (gerrit, Thu, 19 Nov 2026 19:09:46 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71204
+
+Subject: LU-21254 ldlm: keep update llogs when the target stops
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a82ba0d0fcb910a52bd529aa0910e42073363322
+
+--- Comment (gerrit, Thu, 19 Nov 2026 19:09:46 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71205
+
+Subject: LU-21254 lod: give up update replay before the llog cancel
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b3ec1b85aeedcfea1c2d4a073546fa2a5301e411
+
+--- Comment (gerrit, Thu, 19 Nov 2026 19:09:47 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71206
+
+Subject: LU-21254 target: undo the first update of a failed replay
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 54b997579bf3c51dea4c599cc2753926108c3d3e

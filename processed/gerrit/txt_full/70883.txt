@@ -1,0 +1,340 @@
+Change:     70883
+Subject:    LU-21218 ksocklnd: accept connects while own connect is stuck
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70883
+Change-Id:  I6ed41ce88597ef5da8f2b1afe6ed1597a1ba7552
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Jinshan Xiong
+Created:    2026-11-14 23:09:54.000000000
+Updated:    2026-11-19 11:03:58.000000000
+Patch Set:  2
+Insertions: +146
+Deletions:  -9
+Comments:   10 (1 unresolved)
+Hashtags:   pw_shepherd, pw_halt
+
+--- Labels ---
+  Code-Review: Timothy Day: +1; Chris Horn: +1
+  Verified: Maloo: -1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Chris Horn, Timothy Day
+
+--- Commit Message ---
+LU-21218 ksocklnd: accept connects while own connect is stuck
+
+When a server must send to a client it has no connection to (a bulk
+reply, an LDLM callback, an LNet ping), ksocknal_connect() dials the
+client.  If the client side silently drops that SYN, e.g. a firewall
+that only allows client->server connections to the LNet port, the
+blocking connect hangs for the whole SYN retry period (127 s with
+tcp_syn_retries=6) with ksnr_connecting set.  During that time
+ksocknal_create_conn() rejects every connection the client opens as
+"connection race resolution" (EALREADY), because the client NID is
+lower and the server thinks it is already connecting.  CONTROL may
+get through between server dials while BULK_IN/BULK_OUT do not, so
+bulk falls back to CONTROL, the ZC-ACK has no BULK_IN connection to
+use, and the server closes everything on "stale ZC_REQs ...
+resid: 0".  The cycle repeats until the client is evicted:
+
+  Not creating conn 12345-<client>@tcp type 1: connection race
+  resolution
+  Total 4 stale ZC_REQs for peer_ni <client>@tcp detected; ...
+  This client was evicted by <fsname>-OST0000
+
+Resolve the race by whichever side gets through first instead.  Add
+ksnr_race to the conn_cb, reset before each of our connect attempts.
+Once our TCP connect gets through, ksocknal_connect() marks the
+attempt OURS and goes on to HELLO; from then on an incoming
+connection from a lower-NID peer is refused as before.  If the
+peer's connection arrives first, ksocknal_create_conn() accepts it
+and marks the attempt PEER; when our TCP connect gets through later,
+we drop our socket before HELLO and re-check which connection types
+are still wanted.  Both transitions are under ksnd_global_lock, so
+the two connects can never both go on and then refuse each other as
+duplicates, and a connect whose SYN is never answered can no longer
+lock the peer out.  When we drop our socket after TCP is up, the
+peer logs one "Error -104 reading HELLO" for it.
+
+Add sanity-lnet test_239: two NIs on one node with conns_per_peer 1
+and SYNs from the higher NID to the lower one dropped.  While the
+higher NID's connect is stuck, the lower NID must be able to ping it
+at once, and the higher NID's queued ping must complete over the
+lower NID's connections.  Once the SYNs are let through, the higher
+NID must not keep a connection it opened itself, and both directions
+must work.
+
+Without the fix test_239 fails at the first ping; with it, it
+passes.  On a cluster with the client NID lower than the servers',
+inbound SYNs to the client's LNet port dropped, continuous reads, a
+90 s network cut and conflicting writes from a second client:
+
+               race rejects  stale ZC  conns back  evictions
+  unpatched    580-604       4         never       2
+  patched      0             0         ~20 s       0
+
+The sanity-lnet failure set is the same as without the patch.
+
+Test-Parameters: trivial
+Test-Parameters: testlist=recovery-small
+Test-Parameters: testlist=insanity
+Signed-off-by: Jinshan Xiong <jinshanx@google.com>
+Assisted-by: Jetski:gemini-4-argon
+Change-Id: I6ed41ce88597ef5da8f2b1afe6ed1597a1ba7552
+
+--- Review History ---
+
+--- Message (Jinshan Xiong, 2026-11-14 23:09:54.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-11-14 23:15:52.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-14 23:46:05.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-15 01:39:19.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136427/ : SUCCESS
+
+--- Message (Maloo, 2026-11-15 01:40:46.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 136427 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136427&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136427#redirect
+
+--- Message (Maloo, 2026-11-15 02:33:10.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm1: https://testing.whamcloud.com/test_sessions/e545555e-1652-4121-82cc-719acd8c3b92 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-15 05:11:18.000000000) ---
+Patch Set 1: Verified-1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm1: https://testing.whamcloud.com/test_sessions/19e669a6-f9a1-4140-90fb-6fd269b93fed ran 5 tests.
+
+--- Message (Maloo, 2026-11-15 05:11:20.000000000) ---
+Patch Set 1:
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-154vm1: https://testing.whamcloud.com/test_sessions/95656782-6455-4b9f-9353-345c9a012b90 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-15 05:17:39.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The fix for the stuck-SYN case looks right, but the age cutoff also catches real crossing connects, and those can now end up with both connections torn down.
+
+--- Message (patrick bot, 2026-11-15 22:07:27.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Autotest, 2026-11-15 22:14:05.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-subtest-change session on el9.7-x86_64/zfs servers and clients for build 136427 patch 1. Requested by Patrickbot because of LU-20973.
+
+--- Message (Jinshan Xiong, 2026-11-15 22:22:20.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Jinshan Xiong, 2026-11-15 22:22:45.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-11-15 22:44:17.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Maloo, 2026-11-15 23:07:41.000000000) ---
+Patch Set 1: Verified-1
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-106vm1: https://testing.whamcloud.com/test_sessions/17289b17-cb9c-491d-86bc-2f97db19f4b1 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (jenkins, 2026-11-15 23:50:07.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136661/ : SUCCESS
+
+--- Message (Maloo, 2026-11-15 23:50:45.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 136661 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136661&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136661#redirect
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 00:05:14.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (Maloo, 2026-11-16 00:39:37.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm3: https://testing.whamcloud.com/test_sessions/fe298932-df68-4fb0-9212-a580b87d3fd4 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-16 03:13:46.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-154vm4: https://testing.whamcloud.com/test_sessions/b8d63893-4614-44e1-a75a-feff76131ef5 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-16 03:21:26.000000000) ---
+Patch Set 2: Verified-1
+
+Failed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm9: https://testing.whamcloud.com/test_sessions/e1a72d22-3dd7-4fcc-afc9-5765c7ad616d ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-16 03:26:43.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Jinshan Xiong, 2026-11-16 04:00:53.000000000) ---
+Patch Set 2:
+
+The sanity-lnet failures in review-dne-subtest-change and review-dne-zfs-subtest-change are false FAILs, LU-20973:
+
+- fe298932 (PS2, ldiskfs): test_239 passed 35/35, "No sub tests failed", suite complete after 1893 s, no LBUG/oops on any node.
+- e545555e and 17289b17 (PS1, zfs): 39/39 passed in each, suites 1883 s and 1887 s.
+
+With ONLY_MINUTES=30 a subtest that never fails is repeated until the last iteration ends ~31.5 min in, and Autotest then reports the suite as FAIL with no failed subtest. All sanity-lnet *-subtest-change sessions since June show this: those with all subtests passing (764251e3, b957295a, dac8b4b4 on 68164 and 60112, plus the three above) are all FAIL at ~31.5 min; the only other failures are real subtest failures that end in 3-4 min. None passed.
+
+Please waive these as LU-20973.
+
+--- Message (patrick bot, 2026-11-16 06:11:03.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-16 06:16:35.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-subtest-change session on el9.7-x86_64/ldiskfs servers and clients for build 136661 patch 2. Requested by Patrickbot because of LU-20973.
+
+--- Message (Autotest, 2026-11-16 06:26:57.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-dne session on el9.8-x86_64/ldiskfs servers and clients for build 136661 patch 2. Requested by Patrickbot because of LU-21153.
+
+--- Message (Maloo, 2026-11-16 07:11:00.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm27: https://testing.whamcloud.com/test_sessions/d73a8773-0fef-4acf-b037-131bcf9a8431 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (patrick bot, 2026-11-16 07:26:12.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-16 10:39:53.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm43: https://testing.whamcloud.com/test_sessions/9ad4bebb-5032-42a9-93b3-c5d9bb41a3f5 ran 5 tests.
+
+--- Message (Timothy Day, 2026-11-16 15:22:59.000000000) ---
+Patch Set 2: Code-Review+1
+
+(1 comment)
+
+--- Message (Jinshan Xiong, 2026-11-17 22:58:20.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-11-19 05:59:10.000000000) ---
+Patch Set 2: Code-Review+1
+
+--- Message (Autotest, 2026-11-19 06:02:47.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-dne-arm session on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients for build 136661 patch 2. Requested by Chris Horn because of LU-21167.
+
+--- Message (Autotest, 2026-11-19 06:03:23.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-subtest-change session on el9.7-x86_64/ldiskfs servers and clients for build 136661 patch 2. Requested by Chris Horn because of LU-20973.
+
+--- Message (Maloo, 2026-11-19 06:56:25.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm188: https://testing.whamcloud.com/test_sessions/9a9c3fea-83a4-4456-bcda-3bbf9fde539a ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (patrick bot, 2026-11-19 07:11:48.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-19 07:17:36.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-subtest-change session on el9.7-x86_64/ldiskfs servers and clients for build 136661 patch 2. Requested by Patrickbot because of LU-20973.
+
+--- Message (Maloo, 2026-11-19 08:10:32.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm214: https://testing.whamcloud.com/test_sessions/66a04010-4820-4578-81ff-73cd8db48d43 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (patrick bot, 2026-11-19 08:23:18.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-19 08:23:22.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (Maloo, 2026-11-19 11:03:58.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm59: https://testing.whamcloud.com/test_sessions/36b50ad8-81af-4dc2-b781-2e58f88c6724 ran 5 tests.

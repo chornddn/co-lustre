@@ -1,0 +1,51 @@
+Key:        LU-21220
+Summary:    socklnd: nonblk_zcack=0 oopses in ksocknal_queue_tx_msg_v2
+Link:       https://jira.whamcloud.com/browse/LU-21220
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Bot
+Created:    Sat, 14 Nov 2026 22:51:19 +0000
+Updated:    Sun, 15 Nov 2026 00:13:59 +0000
+
+--- Description ---
+Setting the ksocklnd parameter nonblk_zcack=0 crashes a node within seconds of bulk traffic, with a NULL pointer write in ksocknal_queue_tx_msg_v2() (socklnd_proto.c:134 on master 7c3c9f8814). The default, nonblk_zcack=1, never reaches the code, so only sites that change the parameter are hit.
+
+Cause: with nonblk_zcack=0 a ZC-ACK that is waiting on a connection as a NOOP is carried by the next LNet message queued there, which should take the NOOP's place in the transmit queue. That replacement used to be list_add() of the new tx after the NOOP followed by list_del() of the NOOP. LU-9679 ("various: use list_splice and list_splice_init", 45a64335d0, 2.13.53) turned it into list_splice(&tx->tx_list, &tx_msg->tx_list), which treats the NOOP's list entry as a list head and splices into the new message's tx_list, which was never initialised. The other conversions in that patch operate on real list heads and are correct.
+
+Reproduction: two nodes on socklnd, nonblk_zcack=0 on both, lnet_selftest brw of 1 MB transfers. Seen on Rocky 10 VMs (6.12 kernel): oops within seconds.
+
+Fix: list_replace(&tx->tx_list, &tx_msg->tx_list).
+
+--- Comment (gerrit, Sat, 14 Nov 2026 22:51:27 +0000) ---
+"patrick bot " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70882
+
+Subject: LU-21220 socklnd: replace a piggybacked NOOP in the queue
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 5a67796fc7b21276b368a355bd58c9fddc3bd780
+
+--- Comment (JIRAUSER24100, Sat, 14 Nov 2026 22:51:35 +0000) ---
+Patch: https://review.whamcloud.com/c/fs/lustre-release/+/70882. A run with the fix and nonblk_zcack=0 will be added here.
+
+--- Comment (JIRAUSER24100, Sun, 15 Nov 2026 00:13:59 +0000) ---
+Tested 70882 between two Rocky 10 VMs (6.12 kernel) over a fast virtio-net switch, LNet selftest 1 MB writes and reads with 8 and 32 in flight, 30 second windows, two repeats (4 minutes of bulk traffic) with nonblk_zcack=0 on both nodes: no oops, no errors. Without the fix the same setup oopses within 2 seconds.
+
+With the fix, nonblk_zcack=0 is no slower than the default and may be faster for reads, where the ZC-ACK can ride on the LNet ACK (two runs each, GB/s):
+
+```
+
+                 nonblk_zcack=0 + fix   nonblk_zcack=1 + fix   stock, nonblk_zcack=1
+
+write, 8 in flight   2.38 / 2.69            1.96 / 2.47            2.38 / 2.40
+
+read, 8 in flight    2.23 / 2.31            1.89 / 1.85            1.72 / 2.06
+
+```

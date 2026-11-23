@@ -7,19 +7,20 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-15 08:27:21.000000000
-Updated:    2026-11-13 13:58:00.000000000
-Patch Set:  5
-Insertions: +961
-Deletions:  -71
-Comments:   31 (0 unresolved)
-Hashtags:   pt_ecro, pw_shepherd
+Updated:    2026-11-21 22:04:01.000000000
+Patch Set:  9
+Insertions: +1101
+Deletions:  -81
+Comments:   66 (3 unresolved)
+Hashtags:   218_review_priority, pt_ecro
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Maximilian Dilger
 
 --- Commit Message ---
 LU-12669 lov: peer-relative deadline for EC raid set reads
@@ -29,20 +30,22 @@ OST that suddenly stalls, but an OST that is persistently slower
 than its peers moves its own estimate up and is never routed
 around, although a read of a whole raid set waits for it each time.
 
-For a synchronous parallel direct read of an EC file, track each
-raid set it reads.  Once all but as many of its data stripes as the
-parity can stand in for have been read, give the reads of the other
-stripes a soft deadline of osc.*.slow_read_pct percent of the time
-that took, at least osc.*.slow_read_min_ms of their own OSC, so a
-straggler is abandoned and reconstructed from parity.  A stripe with
+For a synchronous parallel direct read of an EC file, track each raid
+set it reads.  Once all but as many of its data stripes as the parity
+can stand in for have been read, give the reads of the other stripes a
+soft deadline of osc.*.slow_read_pct percent of the time that took, at
+least osc.*.slow_read_min_ms of their own OSC, so a straggler is
+abandoned and reconstructed from parity.  Its OST is then avoided as
+long as after missing the deadline of its own latency estimate, so one
+that stays slower than its peers backs off as well.  A stripe with
 more pages to read than any stripe of that quorum, as when the read
 starts near the end of one stripe, gets proportionally longer, and a
 restarted read times its raid sets afresh.  An RPC that carries
-several stripes' pages is tracked for each of them, and ptlrpcd
-rearms its timer when a soft deadline is brought forward
+several stripes' pages is tracked for each of them, and ptlrpcd rearms
+its timer when a soft deadline is brought forward
 (ptlrpc_request::rq_soft_reset).  ptl_send_rpc() arms the soft
-deadline under rq_lock, so one brought forward at the same time is
-not lost.
+deadline under rq_lock, so one brought forward at the same time is not
+lost.
 
 When reconstructing, use the survivor pages that readahead already
 read but no reader used yet (cl_page::cp_defer_uptodate) instead of
@@ -55,12 +58,13 @@ An O_CIPHERTEXT direct read with the encryption key loaded cannot be
 restarted as CIT_EC_RD, which would decrypt the data, so it would fail
 with -EIO when a slow OST missed its soft deadline, e.g. in "lfs
 migrate" of an encrypted EC file.  Mark such a read with
-cl_io::ci_no_ec_switch, give it no soft deadline, and have it wait
-for the stripes it would otherwise rebuild, also those on an OST
-marked slow by another read.
+cl_io::ci_no_ec_switch and give it no soft deadline.  With no intact
+data mirror, it waits for the stripes of the first degraded one,
+also those on an OST marked slow by another read, rather than switch
+to CIT_EC_RD.
 
 Add OBD_FAIL_OST_BRW_PAUSE_READ_IDX to delay the reads of chosen
-OSTs, sanity-ec 54l-54o and sanity-sec 66g.
+OSTs, sanity-ec 54l-54p and sanity-sec 66g and 66h.
 
 Test-Parameters: testlist=sanity-ec ostcount=8
 Test-Parameters: testlist=sanity-sec
@@ -268,3 +272,250 @@ Patch Set 5: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/136173/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-13 21:31:30.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-14 00:31:22.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-14 00:32:52.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and clients for build 136173 patch 5. Requested by Patrickbot because of LU-18601.
+
+--- Message (Autotest, 2026-11-14 04:15:13.000000000) ---
+Patch Set 5:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.2-x86_64/zfs servers and clients for build 136173 patch 5. Requested by Patrickbot because of LU-21149.
+
+--- Message (patrick bot, 2026-11-14 04:19:53.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-14 06:14:36.000000000) ---
+Patch Set 5:
+
+AI code review results below, please doublecheck
+
+Looks good. I traced the request refcounting in osc_ec_set_register()/osc_ec_set_complete(), the hedge lifetime across restarts, the rq_lock handling in ptl_send_rpc(), and the per-stripe anchors in lov_ec_read_stripe_pages() and found no correctness problems. No need to re-spin.
+
+(suggestion) This isn't a bug, but the patch carries three independent changes. If it is refreshed anyway, consider splitting it:
+
+- the peer-relative raid set deadline (cl_ec_set, osc_ec_set_*(), rq_soft_reset);
+- the reconstruction changes: parallel survivor stripe reads via cl_io_submit_start()/cl_io_submit_finish(), and reuse of cp_defer_uptodate readahead pages. Neither depends on the hedge, and they could land on their own;
+- the O_CIPHERTEXT ci_no_ec_switch handling. The commit message says the -EIO comes from the soft deadline added by 64919 ("slow and dead OST detection for degraded reads"), and that change is still open, so the fix may fit better in 64919 itself.
+
+--- Message (Andreas Dilger, 2026-11-14 08:34:14.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-14 08:34:39.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+PS6 fixes the sanity-ec test_54n failures. The zfs OSS had restarted with 3 ost_io threads per CPU partition, and a service with a high-priority handler keeps up to two of them free, so the two delayed survivor reads ran one after the other; an idle thread only adds threads when it wakes up, which nothing did. Writing threads_min to a running service now starts the missing threads at once (ptlrpc_start_threads_min(), documented in ldlm.services.ldlm_cbd.threads_min(4)), and test_54n raises ost.OSS.ost_io.threads_min to 4 per CPU partition. On a VM with 3 ost_io threads, threads_started went from 3 to 7 when threads_min was set, and 54n passed 10/10.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-14 08:37:16.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-14 08:40:59.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-14 08:57:32.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136324/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-14 12:39:27.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-14 12:42:16.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (Gerrit AI review for Lustre, 2026-11-14 17:40:00.000000000) ---
+Patch Set 6:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. One mirror-selection question in lov_io_mirror_init() may need a refresh; the man page item is minor. If the patch is refreshed anyway, consider moving the threads_min change (ptlrpc_start_threads_min(), the ptlrpc_start_thread() srv_is_stopping check and the new threads_min man pages) to its own change. It is a server-side ptlrpc behavior change that is independent of the EC read path, and it could be reviewed and landed separately.
+
+--- Message (Andreas Dilger, 2026-11-15 15:12:44.000000000) ---
+Patch Set 6: Code-Review-1
+
+(2 comments)
+
+--- Message (patrick bot, 2026-11-15 15:19:01.000000000) ---
+Hashtags removed: pw_halt, pw_shepherd
+
+--- Message (Andreas Dilger, 2026-11-15 17:02:12.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-15 17:02:53.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+PS7: the threads_min change is split out into its own patch below this one, https://review.whamcloud.com/70913 ("LU-21229 ptlrpc: start threads when threads_min is raised"), which adds threads_max and threads_started man pages and a conf-sanity 53a/53b check. lov_io_mirror_init() again skips a degraded EC mirror, and only when no intact mirror is left does an O_CIPHERTEXT direct read with the key wait for the stripes of the first degraded one instead of switching to CIT_EC_RD; the FLR backoff no longer switches such a read to CIT_EC_RD either. New sanity-sec test_66h reads a file with a slow-marked EC mirror and an intact plain mirror: 22ms with this patch, 1066ms (fails) without it.
+
+--- Message (wc-checkpatch, 2026-11-15 17:02:57.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-15 17:05:59.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-15 17:30:47.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136536/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-16 02:17:00.000000000) ---
+Patch Set 7:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor questions inline; nothing here needs a re-spin on its own. This isn't a bug, but the patch carries four separable changes: the peer-relative raid set deadline, reuse of read-ahead survivor pages, parallel survivor reads with the cl_io_submit_start()/cl_io_submit_finish() split, and the O_CIPHERTEXT no-switch fix for the soft deadline added earlier in this series. If it is refreshed anyway, consider splitting the last three into their own changes (or folding the O_CIPHERTEXT fix into the patch that added the soft deadline), so each can be tested and bisected on its own.
+
+--- Message (Maximilian Dilger, 2026-11-18 19:30:31.000000000) ---
+Patch Set 7: Code-Review-1 Verified-1
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-18 22:19:01.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Maximilian Dilger, 2026-11-19 02:08:56.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-19 09:37:32.000000000) ---
+Uploaded patch set 8.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-19 09:38:03.000000000) ---
+Patch Set 8:
+
+(11 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 09:41:23.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-19 09:49:38.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-19 10:05:59.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137083/ : SUCCESS
+
+--- Message (Maximilian Dilger, 2026-11-19 18:33:22.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 11:49:41.000000000) ---
+Patch Set 8:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; two optional man page nits inline, no need to re-spin for them.
+
+This isn't a bug, but the patch carries three separable pieces: the peer-relative deadline, the reconstruction changes (reuse of read-ahead survivor pages, parallel survivor reads via cl_io_submit_start()/cl_io_submit_finish()), and the O_CIPHERTEXT handling (ci_no_ec_switch, the lov_io_mirror_init() wait on the first degraded mirror, sanity-sec 66g/66h). The O_CIPHERTEXT part fixes a failure that 64919 can already hit by itself, when an OST misses the soft deadline from its own latency estimate. Would it fit better in 64919, or in its own patch, so 64919 does not land with that failure until this one lands?
+
+--- Message (Marc Vef, 2026-11-20 13:29:16.000000000) ---
+Hashtag added: 218_review_priority
+
+--- Message (Andreas Dilger, 2026-11-20 14:14:34.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-20 16:23:55.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 16:34:10.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 16:39:38.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-21 07:34:18.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137282/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 22:04:01.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good, with one optional minor comment inline. There is no need to re-spin just for it.
+
+This isn't a bug, but the patch combines three independent changes: the peer-relative deadline; the reconstruction changes (parallel survivor reads through cl_io_submit_start()/cl_io_submit_finish() and reuse of pages that readahead already read); and the O_CIPHERTEXT fix (ci_no_ec_switch, the wait on the degraded mirror, and sanity-sec 66g/66h). The O_CIPHERTEXT failure it fixes comes from the soft deadline and the no-intact-mirror switch to CIT_EC_RD, both added by the parent change 64919, which has not landed yet. Could that part be folded into 64919, so that change does not land with the -EIO? The reconstruction changes could then land on their own.

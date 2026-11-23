@@ -1,0 +1,101 @@
+Key:        LU-21284
+Summary:    osd-ldiskfs: preserve unrelated inodes during rm_entry agent cleanup
+Link:       https://jira.whamcloud.com/browse/LU-21284
+Type:       Bug
+Priority:   Critical
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Vadakkumuri Valappil Abooback
+Created:    Sat, 21 Nov 2026 19:12:52 +0000
+Updated:    Sat, 21 Nov 2026 21:54:21 +0000
+
+--- Comment (JIRAUSER19323, Sat, 21 Nov 2026 19:14:13 +0000) ---
+Problem
+
+lfs rm_entry intentionally removes a namespace entry without normal child-object deletion. However, the shared ldiskfs directory-entry deletion path also schedules deferred local-agent inode cleanup. That cleanup can clear the link count of an unrelated inode when a stale directory entry points to a reused backend inode number.
+
+The cleanup does not retain the directory entry's expected FID, compare it with the inode's current LMA self-FID, or require LMAI_AGENT before clear_nlink(). A remote FID is used as the final eligibility check. Remote ownership alone does not establish that this inode is the agent belonging to the removed entry.
+
+Source inspected
+
+The missing identity and agent-role checks are present in upstream fs/lustre-release commit f3cf75d4d6bffe72c418d98bc6aa6343388b0da2 and an older downstream source tree. Latest upstream master and the exact deployed binary have not been verified; the full affected release range is not established.
+
+Relevant path
+
+	mdt_reint_unlink(): the sp_rm_entry branch calls mdo_unlink() with a NULL child, intentionally bypassing normal child lookup and deletion.
+
+	mdd_unlink(): NULL child means delete only the name entry.
+
+	osd_index_ea_delete(): invokes osd_take_care_of_agent() for a non-'..' entry, including this special removal path.
+
+	osd_take_care_of_agent(): can schedule cleanup when the entry FID is remote, its lookup fails, or the entry has no embedded FID.
+
+	osd_schedule_agent_inode_removal(): records only the backend inode number and environment, not the expected FID or inode generation.
+
+	osd_process_scheduled_agent_removals(): obtains the current inode and FID, checks osd_remote_fid(), and calls clear_nlink(), mark_inode_dirty(), and iput(). It does not compare against the removed entry's FID or validate LMAI_AGENT.
+
+Failure scenario
+
+	A stale directory entry contains FID A and backend inode number N.
+
+	N has been reused for a valid local agent whose LMA records remote FID B, where B != A. Another valid directory entry still needs this agent.
+
+	An administrator runs lfs rm_entry on the stale name for A.
+
+	Deferred cleanup loads N, sees that B is remote, and clears N's link count.
+
+	Removing the stale name for A has therefore also destroyed an unrelated agent for B.
+
+This is a source-derived reproducer design, not a completed controlled runtime reproduction on upstream master.
+
+Related observed impact
+
+In an investigation on an older downstream build, 11 EA-value inodes were allocated with link count 1 before stale-entry cleanup. In a copy taken after rm_entry and before e2fsck, those EA inodes were unallocated with link count 0 and size 0, while their allocated owner inodes still referenced them through trusted.lov. Later access produced EA-inode ESTALE errors, journal aborts, and an MDT backend becoming read-only.
+
+The snapshot ordering and subsequent errors were observed. The precise runtime call path responsible for freeing those inodes was not traced, and the exact deployed binary has not been matched to the inspected source.
+
+LU-15542 / commit 716de353b7b65fa506ce7f31f59c187a19f44b64 adds an EA-inode exclusion in osd_iget2(). That is relevant protection for EA-value inodes, but does not address a reused, valid remote agent with a different FID. The identity-check gap above remains in the inspected upstream snapshot.
+
+Expected behavior / proposed fix
+
+	Preserve the directory entry's expected FID in the deferred cleanup record.
+
+	Before changing the inode's link count, read and validate its LMA, require the appropriate local-agent flag, and compare lma_self_fid with the expected FID when the directory entry provides one.
+
+	On FID mismatch, missing/unreadable LMA, or a non-agent inode, leave the inode untouched; removal of the stale name should still be possible.
+
+	Retain the EA-inode exclusion.
+
+	Handle legacy entries without embedded FIDs explicitly. Do not infer agent identity from remote ownership alone; decide and document the safe policy for this case while preserving compatibility where possible.
+
+	Preserve correct cleanup for a matching, genuine agent during normal deletion and rm_entry.
+
+Regression coverage requested
+
+	Stale entry A points to valid agent B: rm_entry removes only A's name; B's inode, link count, LMA, and valid namespace reference survive.
+
+	Matching entry and genuine agent: normal agent cleanup still works.
+
+	Non-agent and missing/unreadable-LMA cases: no inode link-count clearing.
+
+	Legacy entry without an embedded FID: exercise the chosen safe policy.
+
+	EA-value inode: retain existing exclusion and verify no owner-EA damage.
+
+Related issue: https://jira.whamcloud.com/browse/LU-15542
+
+Related change: https://review.whamcloud.com/c/fs/lustre-release/+/46486
+
+--- Comment (gerrit, Sat, 21 Nov 2026 21:54:21 +0000) ---
+"Aboo Valappil " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71267
+
+Subject: LU-21284 osd-ldiskfs: validate agents before cleanup
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: f70ca344a4bed2a297049953f9f5fdb219991657

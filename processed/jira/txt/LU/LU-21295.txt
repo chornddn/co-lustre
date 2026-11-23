@@ -1,0 +1,90 @@
+Key:        LU-21295
+Summary:    ptlrpc: add tracepoints for the RPC lifecycle
+Link:       https://jira.whamcloud.com/browse/LU-21295
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Nikos Papakonstantinou
+Reporter:   Nikos Papakonstantinou
+Created:    Mon, 23 Nov 2026 10:09:47 +0000
+Updated:    Mon, 23 Nov 2026 10:20:46 +0000
+
+--- Description ---
+Why
+
+When a site reports that the filesystem is slow or that RPCs time out, the first questions are which RPCs are slow, for which job, and where their time goes: on the network, waiting in the server's queue, or in the service thread. Today the only per-request source for these answers is the libcfs debug log, which is a poor fit for this:
+
+	rpctrace has to be enabled before the problem happens, on every node involved, and the debug log slows the whole node down. On test VMs, a single-client metadata benchmark ran about 2.5 times slower with a full debug mask left on the servers.
+
+	The log is a ring buffer that wraps under load or is dropped under memory pressure (LU-15917), can only be filtered by mask and subsystem, and is analysed after the fact by dumping text from each node and matching xids by hand.
+
+	The *.stats files and job stats give counts and averages, not distributions, so they hide the slow tail that users notice, and they cannot tie a slow request to its peer or job.
+
+eBPF tools (bpftrace, bcc, libbpf, perf, trace-cmd) can answer these questions on a production system, aggregating in the kernel at low cost: latency histograms per target, opcode and job, queue time against service time on the server, timeouts as they happen. What they lack in Lustre is stable places to attach:
+
+	kprobes and fentry probes on ptlrpc functions break whenever a function is renamed, inlined or refactored, which happens every release, so a script written for one version silently stops working on the next.
+
+	Reading struct ptlrpc_request from a kprobe needs module BTF. LU-17768 embeds it only when the build has a vmlinux, or runs on the target kernel with distilled-base support, so most RHEL 8/9 server packages ship without it.
+
+Kernel tracepoints solve both problems. Their names and fields are an interface kept in the Lustre source, described in tracefs, and usable without BTF or debuginfo, and when nothing is attached they cost one static-key branch. LU-20837 added the first Lustre tracepoints, for debug messages. This ticket adds structured events for the RPC lifecycle on both the client and the server.
+
+Relation to LU-8980
+Proposal
+
+Add trace system "ptlrpc" with five events:
+
+Event
+Fires in
+Fields beyond xid and opcode
+
+ptlrpc_cli_send
+ptl_send_rpc(), just before the request goes on the wire, including every resend
+target, peer NID, jobid, message flags, resent, timeout
+
+ptlrpc_cli_reply
+after_reply(), once the reply is unpacked
+target, status, latency since the last send
+
+ptlrpc_cli_timeout
+ptlrpc_expire_one_request()
+target, send time, resent, network error
+
+ptlrpc_srv_start
+ptlrpc_server_handle_request(), when a service thread takes the request
+service, peer NID, jobid, time queued
+
+ptlrpc_srv_done
+ptlrpc_server_handle_request(), after the handler returns
+service, peer NID, jobid, status, service time, total time
+
+xid, opcode and peer NID let one RPC be followed from the client to the server and back.
+
+Add contrib/eBPF/ptlrpc_latency.bt, which prints client latency histograms per target and opcode, client timeouts, and server queue and service time histograms per service and opcode. Add sanity test 60n, which checks that one RPC is traced on both the client and the MDS.
+
+Examples:
+
+client# bpftrace contrib/eBPF/ptlrpc_latency.bt
+mds#    bpftrace -e 'tracepoint:ptlrpc:ptlrpc_srv_done { @us[args->jobid] = hist(args->total_us); }'
+client# trace-cmd record -e ptlrpc:ptlrpc_cli_timeout
+
+Design notes
+
+	String fields are fixed-size, zero-padded arrays rather than __string(). bpftrace 0.23 on aarch64 reads __data_loc strings as empty, and bpftrace keys maps on the whole array, so trailing bytes would split identical keys. A record takes up to about 300 bytes in the trace buffer, and only while the event is enabled.
+
+	"resent" comes from MSG_RESENT in the request flags, so it is set for every kind of resend: after a timeout, a reconnect, a truncated reply or -EINPROGRESS.
+
+	The events report the latencies that ptlrpc already computes, so they add no new time-keeping.
+
+--- Comment (gerrit, Mon, 23 Nov 2026 10:20:46 +0000) ---
+"Nikos Papakonstantinou " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71296
+
+Subject: LU-21295 ptlrpc: add tracepoints for the RPC lifecycle
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: d344b5b09347b67ced0cbe9699b799c2ca190514

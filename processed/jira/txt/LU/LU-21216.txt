@@ -1,0 +1,49 @@
+Key:        LU-21216
+Summary:    ldiskfs: empty prealloc_table makes mballoc allocate over fs metadata
+Link:       https://jira.whamcloud.com/browse/LU-21216
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andrew Perepechko
+Reporter:   Andrew Perepechko
+Created:    Sat, 14 Nov 2026 10:46:44 +0000
+Updated:    Sat, 14 Nov 2026 13:02:57 +0000
+
+--- Description ---
+An OST whose mballoc preallocation table is empty (echo 0 > /proc/fs/ldiskfs//prealloc_table, which ext4_mb_check_and_update_prealloc() accepts) aborts its journal when a write lands beyond the blocks already allocated to a file:
+
+LDISKFS-fs error (device dm-1): ldiskfs_mb_mark_diskspace_used:3476: comm ll_ost_io00_005: Allocating blocks 1297408-1048576 which overlap fs metadata
+Aborting journal on device dm-1-8.
+LDISKFS-fs (dm-1): Remounting filesystem read-only
+
+With errors=panic the OSS panics, and the OST needs e2fsck before it can be mounted again.
+
+In ext4_mb_normalize_request() as modified by ext4-prealloc.patch, an empty table leaves both wind and last_non_zero at 0, so neither branch sets the goal: start stays 0 and size stays the file size in blocks. The normalized goal then does not necessarily contain the requested blocks and can be larger than a block group. The patch also removes BUG_ON(size > EXT4_BLOCKS_PER_GROUP(sb)), so mballoc allocates a range that runs into the next group's metadata. This code came with LU-12335 (fixed size preallocation table); before that, an empty table caused the divide error of LU-3719. Every ext4-prealloc.patch variant in master has it (RHEL 8/9/10, SLES 15, Ubuntu and mainline series), as does every release since 2.13 (LU-12335).
+
+Reproducer:
+
+OSTCOUNT=1 OSTSIZE=6000000 bash llmount.sh
+echo 0 > /proc/fs/ldiskfs//prealloc_table
+dd if=/dev/zero bs=500M count=1 of=/mnt/lustre/file3
+sync
+dd if=/dev/zero seek=100k bs=16k count=1 of=/mnt/lustre/file3
+sync
+OSTCOUNT=1 bash llmountcleanup.sh
+
+Without the fix the console shows the error above and the node may crash.
+
+Fix: when the table is empty, do not normalize the request; use the original logical start and length, as stock ext4 does for requests it does not normalize. This was seen on HPE ClusterStor OSS nodes and is fixed in the HPE Lustre branches (HPE ticket LUS-12766).
+
+--- Comment (gerrit, Sat, 14 Nov 2026 13:02:57 +0000) ---
+"Andrew Perepechko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70869
+
+Subject: LU-21216 ldiskfs: do not normalize with empty prealloc_table
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 9900000d95ca7e24e60e2c3b8dd3c0f94c2247f5

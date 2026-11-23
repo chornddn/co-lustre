@@ -1,0 +1,98 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21283] debugfs: logdump -O loops forever on external journal with s_start 0</title>
+                <link>https://jira.whamcloud.com/browse/LU-21283</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;tt&gt;debugfs logdump -O&lt;/tt&gt; cannot dump an external journal device (or an image of one) whose journal superblock has &lt;tt&gt;s_start == 0&lt;/tt&gt;, which is the normal state after e2fsck has recovered the journal. Seen while trying to get the list of blocks written by a journal replay from an image of an external journal. The code is the same in e2fsprogs master-lustre (1.47.3-wc4) and upstream master.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Reproducer&lt;/b&gt;&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mke2fs -F -b 4096 -O journal_dev -U &amp;lt;uuid&amp;gt; jnl.img 1024
+mke2fs -F -b 4096 -O ^has_journal fs.img 8192
+debugfs -w -R "feature has_journal" fs.img      # + ssv journal_dev / journal_uuid
+debugfs -w -f - fs.img &amp;lt;&amp;lt;&amp;lt; $'jo -f jnl.img\njw -b 8000-8003 /dev/zero\njc'
+e2fsck -fy -j jnl.img fs.img                    # replays, sets s_start = 0
+debugfs -R "logdump -aO -f jnl.img" fs.img      # never terminates
+debugfs -R "logdump -S -f jnl.img"              # segfault
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Output repeats forever:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;Found sequence 0 (not 3) at block 1: end of journal.
+Found expected sequence 0, type 4 (V2 superblock) at block 1
+Unexpected block type 4 at block 1.
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;b&gt;Cause&lt;/b&gt; (&lt;tt&gt;debugfs/logdump.c&lt;/tt&gt;, &lt;tt&gt;dump_journal()&lt;/tt&gt;)&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;With &lt;tt&gt;s_start == 0&lt;/tt&gt; and &lt;tt&gt;-O&lt;/tt&gt;, the dump starts at a hard-coded block 1. That is the first log block of an internal journal, but on an external journal device block 0 holds the ext2 superblock, block 1 the journal superblock, and the log starts at &lt;tt&gt;s_first&lt;/tt&gt; (2 with 4 KiB blocks, 3 with 1 KiB blocks).&lt;/li&gt;
+	&lt;li&gt;In the &lt;tt&gt;default:&lt;/tt&gt; case ("Unexpected block type") the &lt;tt&gt;break&lt;/tt&gt; only leaves the &lt;tt&gt;switch&lt;/tt&gt;, so the &lt;tt&gt;while&lt;/tt&gt; loop re-reads the same block forever.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;logdump &lt;del&gt;S -f &amp;lt;journal&amp;gt;&lt;/tt&gt; without an open filesystem passes &lt;tt&gt;current_fs&lt;/del&gt;&amp;gt;blocksize&lt;/tt&gt; to &lt;tt&gt;e2p_list_journal_super()&lt;/tt&gt; with &lt;tt&gt;current_fs == NULL&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;&lt;b&gt;Fix&lt;/b&gt;&lt;br/&gt;
+Start at &lt;tt&gt;s_first&lt;/tt&gt; instead of 1, end the dump on an unexpected block type, and pass 0 as the expected block size when no filesystem is open. New test &lt;tt&gt;j_ext_logdump_old&lt;/tt&gt;: it hangs and segfaults without the fix and passes with it. The existing &lt;tt&gt;j_&lt;b&gt;&lt;/tt&gt; and &lt;tt&gt;f_jnl_&lt;/b&gt;&lt;/tt&gt; logdump tests still pass.&lt;/p&gt;
+
+&lt;p&gt;Not fixed here: with &lt;tt&gt;-O&lt;/tt&gt; the fast-commit dump reads one block past the end of a journal without a fast-commit area and prints "short read".&lt;/p&gt;
+
+&lt;p&gt;Workaround for unpatched debugfs: copy the image and set &lt;tt&gt;s_start&lt;/tt&gt; (journal superblock offset 0x1c) to &lt;tt&gt;s_first&lt;/tt&gt; (offset 0x14), then run &lt;tt&gt;logdump -aO -n &amp;lt;large&amp;gt; -f &amp;lt;copy&amp;gt;&lt;/tt&gt;.&lt;/p&gt;</description>
+                <environment />
+        <key id="100627">LU-21283</key>
+            <summary>debugfs: logdump -O loops forever on external journal with s_start 0</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="zam">Alexander Zarochentsev</assignee>
+                                    <reporter username="zam">Alexander Zarochentsev</reporter>
+                        <labels>
+                            <label>e2fsprogs</label>
+                    </labels>
+                <created>Sat, 21 Nov 2026 17:36:34 +0000</created>
+                <updated>Sat, 21 Nov 2026 17:38:35 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="506416" author="gerrit" created="Sat, 21 Nov 2026 17:38:35 +0000">&lt;p&gt;"Alexander Zarochentsev &amp;lt;alexander.zarochentsev@hpe.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/tools/e2fsprogs/+/71266" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/tools/e2fsprogs/+/71266&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21283" title="debugfs: logdump -O loops forever on external journal with s_start 0" class="issue-link" data-issue-key="LU-21283"&gt;LU-21283&lt;/a&gt; debugfs: fix logdump -O of an external journal&lt;br/&gt;
+Project: tools/e2fsprogs&lt;br/&gt;
+Branch: master-lustre&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: b109ede66e2843b8a22c280639c74ab6a9711527&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073pj:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

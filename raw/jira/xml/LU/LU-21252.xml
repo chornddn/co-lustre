@@ -1,0 +1,360 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21252] quota: deleted quota IDs remain on an OST after reintegration</title>
+                <link>https://jira.whamcloud.com/browse/LU-21252</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Description"&gt;&lt;/a&gt;Description&lt;/h2&gt;
+
+&lt;p&gt;Deleting a quota entry while an OST is offline can leave the deleted&lt;br/&gt;
+entry in the OST's local copy of the global quota index.&lt;/p&gt;
+
+&lt;p&gt;The QMT no longer contains the deleted entry, but the OST retains its&lt;br/&gt;
+previous limit after it comes back online and quota reintegration&lt;br/&gt;
+completes. The OST still reports glb&lt;span class="error"&gt;&amp;#91;1&amp;#93;&lt;/span&gt;,slv&lt;span class="error"&gt;&amp;#91;1&amp;#93;&lt;/span&gt; (uptodate), despite&lt;br/&gt;
+the mismatch.&lt;/p&gt;
+
+&lt;p&gt;Triggering quota_slave.force_reint=1 does not remove the stale entry.&lt;br/&gt;
+In a separate manual test, the stale entry also persisted after&lt;br/&gt;
+unmounting and remounting OST0000.&lt;/p&gt;
+
+&lt;p&gt;A stale limit can affect writes by the user whose quota entry was&lt;br/&gt;
+deleted. In a buffered-write test, quota acquisition requests for the&lt;br/&gt;
+affected ID returned -ESRCH from the QMT, and the OST logged&lt;br/&gt;
+"ID isn't enforced on master". Writes by that user failed with ENOSPC&lt;br/&gt;
+even though lfs df showed free space on the OST.&lt;/p&gt;
+
+&lt;p&gt;The issue was reproduced with user and project block quota entries on&lt;br/&gt;
+ldiskfs and ZFS. A subsequent manual test on ldiskfs confirmed that a&lt;br/&gt;
+deleted user entry remained after reintegration and force_reint, while&lt;br/&gt;
+a different user's changed limit was applied successfully.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Reproduce"&gt;&lt;/a&gt;Reproduce&lt;/h2&gt;
+&lt;h3&gt;&lt;a name="1.Configureuserblockquotas"&gt;&lt;/a&gt;1. Configure user block quotas&lt;/h3&gt;
+
+&lt;p&gt;Enable user block quotas and wait for quota reintegration to complete:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lctl conf_param lustre.quota.ost=u
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Set block quota limits for two user IDs:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lfs setquota -u 60001 -B 8M /mnt/lustre
+lfs setquota -u 60003 -B 8M /mnt/lustre
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Wait for both limits to appear in the OST's global index copy:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Both IDs should have a hard limit of 8192.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="2.DeleteaquotaentrywhiletheOSTisoffline"&gt;&lt;/a&gt;2. Delete a quota entry while the OST is offline&lt;/h3&gt;
+
+&lt;p&gt;Stop OST0000. While it is offline, delete the quota entry for user&lt;br/&gt;
+60001 and change the limit for user 60003:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lfs setquota -u 60001 --delete /mnt/lustre
+lfs setquota -u 60003 -B 16M /mnt/lustre
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Check the QMT global index:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lctl get_param 'qmt.lustre-QMT0000.dt-0x0.glb-usr'
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;User 60001 should be absent, and user 60003 should have a hard limit&lt;br/&gt;
+of 16384.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="3.RestarttheOSTandcheckreintegration"&gt;&lt;/a&gt;3. Restart the OST and check reintegration&lt;/h3&gt;
+
+&lt;p&gt;Start OST0000 and wait for quota reintegration to complete. Check the&lt;br/&gt;
+OST's quota status and global index copy:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Expected result:&lt;/p&gt;
+
+&lt;p&gt;The deleted entry for user 60001 is absent from the OST's global&lt;br/&gt;
+index copy. User 60003 has the updated hard limit of 16384.&lt;/p&gt;
+
+&lt;p&gt;Actual result:&lt;/p&gt;
+
+&lt;p&gt;The OST reports its quota indexes as up to date. User 60003 has the&lt;br/&gt;
+updated limit of 16384, but user 60001 remains in the OST's index copy&lt;br/&gt;
+with the previous hard limit of 8192.&lt;/p&gt;
+
+&lt;p&gt;Triggering force_reint does not remove the stale entry:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;lctl set_param 'osd-*.lustre-OST0000.quota_slave.force_reint=1'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Wait for reintegration to complete before checking the index copy.&lt;/p&gt;
+
+&lt;p&gt;In a separate manual test, the stale entry also persisted after&lt;br/&gt;
+unmounting and remounting OST0000.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="Evidence%3AStaleGlobalIndexEntry"&gt;&lt;/a&gt;Evidence: Stale Global Index Entry&lt;/h2&gt;
+
+&lt;p&gt;The following is an unmodified excerpt from an ldiskfs test after&lt;br/&gt;
+force_reint. In this test, users 60001 and 60002 were deleted while&lt;br/&gt;
+the OST was offline, and the limit for user 60003 was changed.&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;##### 4_after_force_reint  2026-11-18T08:09:07Z
+### lctl get_param qmt.lustre-QMT0000.dt-0x0.glb-usr
+qmt.lustre-QMT0000.dt-0x0.glb-usr=
+global_pool0_dt_usr:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60003
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+### lctl get_param qmt.lustre-QMT0000.dt-0x0.glb-prj
+qmt.lustre-QMT0000.dt-0x0.glb-prj=
+global_pool0_dt_prj:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60013
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+### lctl get_param osd-*.lustre-OST0000.quota_slave.info
+osd-ldiskfs.lustre-OST0000.quota_slave.info=
+target name:    lustre-OST0000
+pool ID:         0
+type:            dt
+quota enabled:   ugp
+conn to master:  setup
+glimpse_refresh: 0
+space acct:     ugp
+user uptodate:  glb[1],slv[1],reint[0]
+group uptodate: glb[1],slv[1],reint[0]
+project uptodate: glb[1],slv[1],reint[0]
+### lctl get_param osd-*.lustre-OST0000.quota_slave.limit_user
+osd-ldiskfs.lustre-OST0000.quota_slave.limit_user=
+global_index_copy:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60001
+  limits:  { hard:         8192, soft:            0, granted:            0, time:               0 }
+- id:      60002
+  limits:  { hard:         8192, soft:            0, granted:            0, time:               0 }
+- id:      60003
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;h2&gt;&lt;a name="UserI%2FOImpact"&gt;&lt;/a&gt;User I/O Impact&lt;/h2&gt;
+
+&lt;p&gt;A separate test set an 8 MiB limit for user 60001, stopped OST0000,&lt;br/&gt;
+deleted the user's quota entry, and started the OST again. User 60004,&lt;br/&gt;
+which had no stale quota entry on the OST, was used for comparison.&lt;/p&gt;
+
+&lt;p&gt;Both users then attempted buffered 64 MiB writes to OST0000. User&lt;br/&gt;
+60004 completed both writes. User 60001 encountered ENOSPC in both&lt;br/&gt;
+attempts, although lfs df showed free space on the OST.&lt;/p&gt;
+
+&lt;p&gt;The following is an unmodified excerpt from the test log:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;  QMT after: 0 entries for u60001
+  OST copy after reint: u60001 hard 8192, u60004 hard absent
+== 2. buffered 64 MiB write to lustre-OST0000, each user twice
+lustre-OST0000_UUID       313104        1408      284536   1% /mnt/lustre[OST:0]
+67108864 bytes (67 MB, 64 MiB) copied, 0.323751 s, 207 MB/s
+  u60004: 0.35s, write RPCs 16, avg 4096 KiB/RPC
+  u60004: client 'setdq to for' 0, 'chkdq found noquota' 0, OST 'isn't enforced on master': 0
+lustre-OST0000_UUID       313104        1408      284536   1% /mnt/lustre[OST:0]
+dd: error writing '/mnt/lustre/imp/f60001': No space left on device
+42991616 bytes (43 MB, 41 MiB) copied, 0.748738 s, 57.4 MB/s
+  u60001: 0.77s, write RPCs 34, avg 1205 KiB/RPC
+  u60001: client 'setdq to for' 34, 'chkdq found noquota' 32, OST 'isn't enforced on master': 34
+lustre-OST0000_UUID       313104        1408      282464   1% /mnt/lustre[OST:0]
+67108864 bytes (67 MB, 64 MiB) copied, 0.761335 s, 88.1 MB/s
+  u60004: 0.78s, write RPCs 17, avg 3855 KiB/RPC
+  u60004: client 'setdq to for' 0, 'chkdq found noquota' 0, OST 'isn't enforced on master': 0
+lustre-OST0000_UUID       313104        1408      281440   1% /mnt/lustre[OST:0]
+dd: error writing '/mnt/lustre/imp/f60001': No space left on device
+19922944 bytes (20 MB, 19 MiB) copied, 0.532672 s, 37.4 MB/s
+  u60001: 0.55s, write RPCs 20, avg 1024 KiB/RPC
+  u60001: client 'setdq to for' 20, 'chkdq found noquota' 20, OST 'isn't enforced on master': 20
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The following messages were captured in the debug log during the&lt;br/&gt;
+write test:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;00040000:04000000:5.0:1795046184.022870:0:959437:0:(qmt_handler.c:1310:qmt_dqacq0()) $$$ dqacq ends count:0 ver:0 rc:-3  qmt:lustre-QMT0000 pool:dt-0x0 id:60001 enforced:0 hard:0 soft:0 granted:0 time:0 qunit:
+1024 edquot:0 may_rel:0 revoke:69646 default:no
+00040000:00020000:6.0:1795046184.043345:0:958632:0:(qsd_handler.c:773:qsd_op_begin0()) $$$ ID isn't enforced on master, it probably due to a legeal race, if this message is showing up constantly, there could
+be some inconsistence between master &amp;amp; slave, and quota reintegration needs be re-triggered.  qsd:lustre-OST0000 qtype:usr lqe: ffff9a7e7e2c1180 id:60001 enforced:1 granted: 0 pending:0 waiting:0 req:0 usage:
+0 qunit:0 qtune:0 edquot:0 default:no revoke:0
+00000001:04000000:5.0:1795046184.021094:0:961170:0:(osc_quota.c:35:osc_quota_chkdq()) chkdq found noquota for usr 60001
+00000001:04000000:0.0:1795046184.089958:0:956377:0:(osc_quota.c:117:osc_quota_setdq()) lustre-OST0000-osc-ffff9a7eaf079000: setdq to for usr 60001
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Because the OST still considers the ID enforced while its granted&lt;br/&gt;
+space remains 0, qsd_op_begin0() can report the ID as over quota to&lt;br/&gt;
+the client. The client marks the ID as out of quota through&lt;br/&gt;
+osc_quota_setdq(), and buffered writes can fall back to synchronous,&lt;br/&gt;
+ungranted writes through vvp_io_commit_sync().&lt;/p&gt;
+
+&lt;p&gt;Ungranted writes are subject to the space available after outstanding&lt;br/&gt;
+grants are reserved, as checked by tgt_grant_check(). In this test,&lt;br/&gt;
+the OST was small, approximately 300 MB, and writes by the affected&lt;br/&gt;
+user failed with ENOSPC. On larger OSTs, the synchronous write path&lt;br/&gt;
+may instead result in degraded I/O performance, consistent with the&lt;br/&gt;
+symptoms reported in &lt;a href="https://jira.whamcloud.com/browse/LU-6382" title="quota : inconsistence between master &amp;amp; slave" class="issue-link" data-issue-key="LU-6382"&gt;&lt;del&gt;LU-6382&lt;/del&gt;&lt;/a&gt;.&lt;/p&gt;
+
+&lt;p&gt;ENOSPC was observed in this test environment; its occurrence may&lt;br/&gt;
+depend on the workload and environment.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="RootCauseAnalysis"&gt;&lt;/a&gt;Root Cause Analysis&lt;/h2&gt;
+
+&lt;p&gt;When a quota entry is deleted, the QMT removes it from the global index&lt;br/&gt;
+and sends a deletion notification to quota slaves holding the global&lt;br/&gt;
+lock. An OST that is offline at that time cannot receive the&lt;br/&gt;
+notification.&lt;/p&gt;
+
+&lt;p&gt;When the OST comes back online, qsd_reint_index() fetches the global&lt;br/&gt;
+index from the QMT. The entries returned by the QMT are processed by&lt;br/&gt;
+qsd_reint_entries() and qsd_reint_qid(), which update the local copy.&lt;/p&gt;
+
+&lt;p&gt;The deleted ID is no longer present in the QMT index, so it is not&lt;br/&gt;
+included in the transferred entries. The existing reintegration path&lt;br/&gt;
+does not compare the received IDs with the local index copy to remove&lt;br/&gt;
+entries that are no longer present on the master.&lt;/p&gt;
+
+&lt;p&gt;As a result, the slave can retain the old limit while recording its&lt;br/&gt;
+global index as up to date.&lt;/p&gt;
+
+&lt;p&gt;Before &lt;a href="https://jira.whamcloud.com/browse/LU-15218" title="remove unused quota ID" class="issue-link" data-issue-key="LU-15218"&gt;&lt;del&gt;LU-15218&lt;/del&gt;&lt;/a&gt;, removing a limit was handled by resetting it to zero,&lt;br/&gt;
+so reintegration could transfer the zero-limit entry. &lt;a href="https://jira.whamcloud.com/browse/LU-15218" title="remove unused quota ID" class="issue-link" data-issue-key="LU-15218"&gt;&lt;del&gt;LU-15218&lt;/del&gt;&lt;/a&gt; added&lt;br/&gt;
+deletion of quota entries and a glimpse-based deletion path on quota&lt;br/&gt;
+slaves, but did not update reintegration to remove entries deleted&lt;br/&gt;
+while a slave was offline.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="TestResults"&gt;&lt;/a&gt;Test Results&lt;/h2&gt;
+
+&lt;p&gt;A manual ldiskfs test compared the behavior before and after the&lt;br/&gt;
+proposed fix.&lt;/p&gt;
+
+&lt;p&gt;Before the fix:&lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;User 60001 was deleted while OST0000 was offline.&lt;/li&gt;
+	&lt;li&gt;After reintegration, 60001 remained on the OST with hard limit 8192.&lt;/li&gt;
+	&lt;li&gt;The entry remained after force_reint.&lt;/li&gt;
+	&lt;li&gt;The changed limit for user 60003 was updated to 16384.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;With the proposed fix:&lt;/p&gt;
+&lt;ul class="alternate" type="square"&gt;
+	&lt;li&gt;The same deletion and limit change were repeated.&lt;/li&gt;
+	&lt;li&gt;After reintegration, 60001 was absent from the OST's index copy.&lt;/li&gt;
+	&lt;li&gt;User 60003 remained present with the updated hard limit of 16384.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;The new sanity-quota test_7g, added with the proposed fix, shows the following:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;Build                 ldiskfs             ZFS
+Without fix           FAIL, 3 of 3 runs   FAIL, 3 of 3 runs
+With proposed fix     PASS, 3 of 3 runs   PASS, 3 of 3 runs
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;With the proposed fix, user 60001 completed both 64 MiB buffered&lt;br/&gt;
+writes on each backend, ldiskfs and ZFS. The test logged no client&lt;br/&gt;
+"setdq to for" or OST "isn't enforced on master" messages during&lt;br/&gt;
+those writes.&lt;/p&gt;
+
+&lt;p&gt;Default quota behavior, MDT inode quota, and the cost of&lt;br/&gt;
+reintegration with large quota indexes require further testing.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="ProposedFix"&gt;&lt;/a&gt;Proposed Fix&lt;/h2&gt;
+
+&lt;p&gt;During global index reintegration, record the IDs returned by the&lt;br/&gt;
+QMT. After a complete transfer at a consistent index version, compare&lt;br/&gt;
+those IDs with the local global index copy and remove stale entries&lt;br/&gt;
+that still carry a limit.&lt;/p&gt;
+
+&lt;p&gt;ID 0 and entries without a hard or soft limit are not removed.&lt;br/&gt;
+Pruning is skipped if the transfer or ID collection cannot be used&lt;br/&gt;
+safely.&lt;/p&gt;
+
+&lt;p&gt;The proposed fix is under further validation, particularly for default&lt;br/&gt;
+quota behavior, concurrent changes, and large indexes.&lt;/p&gt;
+&lt;h2&gt;&lt;a name="RelatedIssues"&gt;&lt;/a&gt;Related Issues&lt;/h2&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-15218" class="external-link" rel="nofollow"&gt;LU-15218&lt;/a&gt; - Introduced deletion of unused quota IDs with &lt;tt&gt;lfs setquota --delete&lt;/tt&gt;. The change added a deletion notification for quota slaves, but reintegration does&lt;br/&gt;
+not remove entries deleted while a slave is offline.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-21241" class="external-link" rel="nofollow"&gt;LU-21241&lt;/a&gt; - Parallel quota updates can stall on quota slaves. Its test results also observed that reintegration did not remove IDs deleted from the QMT.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-6382" class="external-link" rel="nofollow"&gt;LU-6382&lt;/a&gt; - Reports the "ID isn't enforced on master" message and its impact on client I/O. The cause and recovery behavior should be considered separately from the&lt;br/&gt;
+missed-deletion case described here.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-20230" class="external-link" rel="nofollow"&gt;LU-20230&lt;/a&gt; - Reports a related quota slave symptom after deletion. The root cause may differ from the missed-deletion reintegration case described here.&lt;/p&gt;</description>
+                <environment>Rocky Linux 8.10, 4.18.0-553.182.1.el8_10.x86_64
+&lt;br/&gt;
+Lustre master branch(commit 54dc726b56), ldiskfs and ZFS backends
+&lt;br/&gt;
+single-node QEMU VM, one MDT and two OSTs
+&lt;br/&gt;
+user block quota enabled on OSTs</environment>
+        <key id="100591">LU-21252</key>
+            <summary>quota: deleted quota IDs remain on an OST after reintegration</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="shkim3220">Sunghwan Kim</reporter>
+                        <labels>
+                    </labels>
+                <created>Thu, 19 Nov 2026 03:16:42 +0000</created>
+                <updated>Thu, 19 Nov 2026 03:25:16 +0000</updated>
+                                            <version>Upstream</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506136" author="gerrit" created="Thu, 19 Nov 2026 03:25:16 +0000">&lt;p&gt;"Sunghwan Kim &amp;lt;shkim3220@gluesys.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71153" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71153&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21252" title="quota: deleted quota IDs remain on an OST after reintegration" class="issue-link" data-issue-key="LU-21252"&gt;LU-21252&lt;/a&gt; quota: drop deleted IDs from global index on reint&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 4bba77e0dbe2cd90bead935126a1881e76dead0c&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                    <customfield id="customfield_10030" key="com.atlassian.jira.plugin.system.customfieldtypes:labels">
+                        <customfieldname>Epic/Theme</customfieldname>
+                        <customfieldvalues>
+                                        <label>Quota</label>
+    
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073iv:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

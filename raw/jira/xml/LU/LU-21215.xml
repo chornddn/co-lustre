@@ -1,0 +1,92 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21215] llite: dcache/icache reclaim holds shrinker_rwsem for too long</title>
+                <link>https://jira.whamcloud.com/browse/LU-21215</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;On kernels before 6.7, &lt;tt&gt;shrink_slab()&lt;/tt&gt; and &lt;tt&gt;shrink_slab_memcg()&lt;/tt&gt; hold &lt;tt&gt;shrinker_rwsem&lt;/tt&gt; for read across each &lt;tt&gt;do_shrink_slab()&lt;/tt&gt; call, and only check whether it is contended between shrinkers. The scan count for the superblock shrinker comes from &lt;tt&gt;super_cache_count()&lt;/tt&gt;, so on a client with a very large dentry/inode cache (tens of millions of Lustre inodes, e.g. after rsync or a policy-engine scan) a single &lt;tt&gt;super_cache_scan()&lt;/tt&gt; pass evicts a huge number of inodes, especially at low reclaim priority (drop_caches, direct or node reclaim).&lt;/p&gt;
+
+&lt;p&gt;Evicting a Lustre inode can be slow, because &lt;tt&gt;ll_clear_inode()&lt;/tt&gt; may have to close a cached open handle on the MDS:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mdc_close
+lmv_close
+ll_close_inode_openhandle
+ll_md_real_close
+ll_clear_inode
+ll_delete_inode
+evict
+dispose_list
+prune_icache_sb
+super_cache_scan
+do_shrink_slab
+shrink_slab
+shrink_node
+__node_reclaim
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Meanwhile every &lt;tt&gt;down_write(&amp;amp;shrinker_rwsem)&lt;/tt&gt; waits: registering a shrinker on any mount, and creating a memory cgroup (&lt;tt&gt;alloc_shrinker_info()&lt;/tt&gt;). systemd cannot start services or user sessions, journald hits its watchdog timeout, logins hang, and nodes with hung_task_panic panic.&lt;/p&gt;
+
+&lt;p&gt;Reproducer (el9 client): create 10000 files; add a 0.1s delay to &lt;tt&gt;ll_delete_inode()&lt;/tt&gt; with a fail_loc; run &lt;tt&gt;echo 2 &amp;gt; /proc/sys/vm/drop_caches&lt;/tt&gt; in the background; then &lt;tt&gt;mkdir /sys/fs/cgroup/&amp;lt;name&amp;gt;&lt;/tt&gt;. The mkdir blocks until the whole prune has finished (a hung task with hung_task_timeout_secs=22).&lt;/p&gt;
+
+&lt;p&gt;Kernels 6.7 and newer are not affected ("mm: shrinker: make global slab shrink lockless", "mm: shrinker: make memcg slab shrink lockless"). RHEL 8 and RHEL 9 clients are. Affected Lustre versions: master and every maintained release (2.15, 2.16, 2.17); the client has never limited the superblock shrinker.&lt;/p&gt;
+
+&lt;p&gt;Proposed fix: add a per-mount tunable &lt;tt&gt;llite.*.max_shrink&lt;/tt&gt; (default 0, no limit) that caps the object count the superblock shrinker reports. Each &lt;tt&gt;do_shrink_slab()&lt;/tt&gt; call then scans a bounded number of dentries/inodes, and &lt;tt&gt;shrink_slab()&lt;/tt&gt; can release &lt;tt&gt;shrinker_rwsem&lt;/tt&gt; between calls when someone is waiting for it.&lt;/p&gt;
+
+&lt;p&gt;This was seen on HPE customer systems and is fixed in the HPE Lustre branches (HPE ticket LUS-12626).&lt;/p&gt;</description>
+                <environment />
+        <key id="100452">LU-21215</key>
+            <summary>llite: dcache/icache reclaim holds shrinker_rwsem for too long</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="panda">Andrew Perepechko</assignee>
+                                    <reporter username="panda">Andrew Perepechko</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 14 Nov 2026 10:46:41 +0000</created>
+                <updated>Sat, 14 Nov 2026 13:02:41 +0000</updated>
+                                            <version>Upstream</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505793" author="gerrit" created="Sat, 14 Nov 2026 13:02:41 +0000">&lt;p&gt;"Andrew Perepechko &amp;lt;andrew.perepechko@hpe.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70868" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70868&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21215" title="llite: dcache/icache reclaim holds shrinker_rwsem for too long" class="issue-link" data-issue-key="LU-21215"&gt;LU-21215&lt;/a&gt; llite: reclaim dentries/inodes in smaller amounts&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 6c7f6f28841d1e3e7dffcc4c3e46ab324294ad47&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i0738n:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

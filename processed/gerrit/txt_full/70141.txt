@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-29 03:04:01.000000000
-Updated:    2026-11-10 03:29:03.000000000
-Patch Set:  3
-Insertions: +157
-Deletions:  -30
-Comments:   13 (11 unresolved)
+Updated:    2026-11-21 18:48:58.000000000
+Patch Set:  4
+Insertions: +485
+Deletions:  -65
+Comments:   30 (4 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: (no votes)
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
@@ -32,23 +32,54 @@ the FLDB if MDT0000 were lost.
 Keep a full on-disk copy of the FLDB on every MDT:
 
  - fld_server_read() returns the whole FLDB (all MDT and OST ranges)
-   when the request range type is ANY, keeping the batched read.
+   when the request range type is ANY.
  - fld_update_from_controller() fetches the entire FLDB at mount on a
-   non-MDT0 MDT instead of only that MDT's own ranges.
+   non-MDT0 MDT whose local FLDB was just created, instead of only
+   that MDT's own ranges.  An existing MDT fills in its copy on its
+   first lookup miss, below.  If MDT0000
+   returns no entries for the ANY read, it is an older server that
+   cannot read the whole FLDB, so only this MDT's ranges are read.
  - mdt_register_lwp_callback() no longer skips the one-time FLDB
    refresh when the super-sequence is still being allocated from the
    controller (-EINPROGRESS/-EAGAIN) at the connect point.  The
-   FLD_READ RPC is resent by ptlrpc until the controller is ready,
-   so the refresh completes without a local retry loop.
- - a range looked up on demand is persisted with fld_insert_entry()
-   rather than only cached, so ranges allocated after the mount
-   refresh are added to the local FLDB as they are used.
+   FLD_READ RPC is retried until the controller is ready.
+ - a range that a non-MDT0 MDT has to look up on MDT0000 schedules a
+   refresh of the whole FLDB from MDT0000 in a work item, so ranges
+   allocated after the mount refresh, including those of targets this
+   MDT never looks up, are added to the local FLDB.  Refreshes start
+   at most once every 10 seconds, and the work item runs outside of
+   any transaction of the caller.  The lookup itself is still
+   answered by an FLD_QUERY to MDT0000, as before.
+ - fld_replicate_entry() adds each range read from MDT0000, checking
+   the on-disk index rather than the cache, so a range that is only
+   cached so far is still written.  A local range for another target
+   is kept and reported.
+ - fld_client_rpc() returns a full FLD_READ reply (-EAGAIN from the
+   server) to the caller, which continues after its last range,
+   instead of resending the same request forever.  This would hang
+   the reader whenever the FLDB did not fit in one reply page.
+ - fld_server_read() scans the whole index for each FLD_READ and
+   returns the matching ranges with the lowest starts after the
+   request range, in order.  It positioned the iterator with the
+   request range end, which is not a valid load cookie for either
+   OSD (a CPU-order key for an IAM index of big-endian keys, a ZAP
+   cursor on ZFS, where iteration is in hash order), so a second
+   batch would have skipped most of the remaining ranges.
+ - the fld.srv-*.fldb dump keeps the iterator cookie from store() as
+   its seq_file position.  It kept the record key, which load() does
+   not accept, so a dump larger than one read() buffer (about 90
+   ranges) stopped after the first buffer.
 
-The on-disk FLDB from any MDT can then be dumped and written back to
-MDT0000 to restore it (see the "fldb" parameter).  MDTs run in
-lockstep within a filesystem, so no connect flag is used to
-negotiate the full read.
+The FLDB on any MDT can then be dumped from fld.srv-*.fldb and
+written back to MDT0000 to restore it.  MDTs run in lockstep within
+a filesystem, so no connect flag is used to negotiate the full read.
 
+Add conf-sanity test_68a for FLDB replication and test_68b for an
+FLDB larger than one FLD_READ reply.
+
+Fixes: b1acf734f31c ("LU-13468 fld: repeat rpc in fld_client_rpc after EAGAIN")
+Fixes: 519a65ddc046 ("LU-4076 fld: add local fldb to each target")
+Fixes: f394dce2d8c0 ("LU-1187 fld: fix fldb proc after moving range lookup to fld.")
 Test-Parameters: trivial testlist=conf-sanity
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
@@ -171,3 +202,77 @@ Code-wise looks good to me.
 Patch Set 3:
 
 Looks good to me.
+
+--- Message (Andreas Dilger, 2026-11-20 15:28:41.000000000) ---
+Uploaded patch set 4.
+
+--- Message (Andreas Dilger, 2026-11-20 15:29:20.000000000) ---
+Patch Set 1:
+
+(11 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 15:34:17.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-20 15:35:47.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-21 04:46:40.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137269/ : SUCCESS
+
+--- Message (Maloo, 2026-11-21 04:47:03.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 137269 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137269&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137269#redirect
+
+--- Message (Maloo, 2026-11-21 18:38:59.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm42: https://testing.whamcloud.com/test_sessions/33bfacbb-bffb-454b-9a63-fb605a454e45 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 18:48:58.000000000) ---
+Patch Set 4:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good; a few optional minor/style items inline for whenever the patch is next refreshed, no need to re-spin for them.

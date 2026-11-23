@@ -1,0 +1,380 @@
+Key:        LU-21252
+Summary:    quota: deleted quota IDs remain on an OST after reintegration
+Link:       https://jira.whamcloud.com/browse/LU-21252
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Sunghwan Kim
+Created:    Thu, 19 Nov 2026 03:16:42 +0000
+Updated:    Thu, 19 Nov 2026 03:25:16 +0000
+
+--- Environment ---
+Rocky Linux 8.10, 4.18.0-553.182.1.el8_10.x86_64
+
+Lustre master branch(commit 54dc726b56), ldiskfs and ZFS backends
+
+single-node QEMU VM, one MDT and two OSTs
+
+user block quota enabled on OSTs
+
+--- Description ---
+Description
+
+Deleting a quota entry while an OST is offline can leave the deleted
+
+entry in the OST's local copy of the global quota index.
+
+The QMT no longer contains the deleted entry, but the OST retains its
+
+previous limit after it comes back online and quota reintegration
+
+completes. The OST still reports glb[1],slv[1] (uptodate), despite
+
+the mismatch.
+
+Triggering quota_slave.force_reint=1 does not remove the stale entry.
+
+In a separate manual test, the stale entry also persisted after
+
+unmounting and remounting OST0000.
+
+A stale limit can affect writes by the user whose quota entry was
+
+deleted. In a buffered-write test, quota acquisition requests for the
+
+affected ID returned -ESRCH from the QMT, and the OST logged
+
+"ID isn't enforced on master". Writes by that user failed with ENOSPC
+
+even though lfs df showed free space on the OST.
+
+The issue was reproduced with user and project block quota entries on
+
+ldiskfs and ZFS. A subsequent manual test on ldiskfs confirmed that a
+
+deleted user entry remained after reintegration and force_reint, while
+
+a different user's changed limit was applied successfully.
+
+Reproduce
+1. Configure user block quotas
+
+Enable user block quotas and wait for quota reintegration to complete:
+
+lctl conf_param lustre.quota.ost=u
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+
+Set block quota limits for two user IDs:
+
+lfs setquota -u 60001 -B 8M /mnt/lustre
+lfs setquota -u 60003 -B 8M /mnt/lustre
+
+Wait for both limits to appear in the OST's global index copy:
+
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+
+Both IDs should have a hard limit of 8192.
+
+2. Delete a quota entry while the OST is offline
+
+Stop OST0000. While it is offline, delete the quota entry for user
+
+60001 and change the limit for user 60003:
+
+lfs setquota -u 60001 --delete /mnt/lustre
+lfs setquota -u 60003 -B 16M /mnt/lustre
+
+Check the QMT global index:
+
+lctl get_param 'qmt.lustre-QMT0000.dt-0x0.glb-usr'
+
+User 60001 should be absent, and user 60003 should have a hard limit
+
+of 16384.
+
+3. Restart the OST and check reintegration
+
+Start OST0000 and wait for quota reintegration to complete. Check the
+
+OST's quota status and global index copy:
+
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+
+Expected result:
+
+The deleted entry for user 60001 is absent from the OST's global
+
+index copy. User 60003 has the updated hard limit of 16384.
+
+Actual result:
+
+The OST reports its quota indexes as up to date. User 60003 has the
+
+updated limit of 16384, but user 60001 remains in the OST's index copy
+
+with the previous hard limit of 8192.
+
+Triggering force_reint does not remove the stale entry:
+
+lctl set_param 'osd-*.lustre-OST0000.quota_slave.force_reint=1'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.info'
+lctl get_param 'osd-*.lustre-OST0000.quota_slave.limit_user'
+
+Wait for reintegration to complete before checking the index copy.
+
+In a separate manual test, the stale entry also persisted after
+
+unmounting and remounting OST0000.
+
+Evidence: Stale Global Index Entry
+
+The following is an unmodified excerpt from an ldiskfs test after
+
+force_reint. In this test, users 60001 and 60002 were deleted while
+
+the OST was offline, and the limit for user 60003 was changed.
+
+##### 4_after_force_reint  2026-11-18T08:09:07Z
+### lctl get_param qmt.lustre-QMT0000.dt-0x0.glb-usr
+qmt.lustre-QMT0000.dt-0x0.glb-usr=
+global_pool0_dt_usr:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60003
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+### lctl get_param qmt.lustre-QMT0000.dt-0x0.glb-prj
+qmt.lustre-QMT0000.dt-0x0.glb-prj=
+global_pool0_dt_prj:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60013
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+### lctl get_param osd-*.lustre-OST0000.quota_slave.info
+osd-ldiskfs.lustre-OST0000.quota_slave.info=
+target name:    lustre-OST0000
+pool ID:         0
+type:            dt
+quota enabled:   ugp
+conn to master:  setup
+glimpse_refresh: 0
+space acct:     ugp
+user uptodate:  glb[1],slv[1],reint[0]
+group uptodate: glb[1],slv[1],reint[0]
+project uptodate: glb[1],slv[1],reint[0]
+### lctl get_param osd-*.lustre-OST0000.quota_slave.limit_user
+osd-ldiskfs.lustre-OST0000.quota_slave.limit_user=
+global_index_copy:
+- id:      0
+  limits:  { hard:            0, soft:            0, granted:            0, time:          604800 }
+- id:      60001
+  limits:  { hard:         8192, soft:            0, granted:            0, time:               0 }
+- id:      60002
+  limits:  { hard:         8192, soft:            0, granted:            0, time:               0 }
+- id:      60003
+  limits:  { hard:        16384, soft:            0, granted:            0, time:               0 }
+
+User I/O Impact
+
+A separate test set an 8 MiB limit for user 60001, stopped OST0000,
+
+deleted the user's quota entry, and started the OST again. User 60004,
+
+which had no stale quota entry on the OST, was used for comparison.
+
+Both users then attempted buffered 64 MiB writes to OST0000. User
+
+60004 completed both writes. User 60001 encountered ENOSPC in both
+
+attempts, although lfs df showed free space on the OST.
+
+The following is an unmodified excerpt from the test log:
+
+  QMT after: 0 entries for u60001
+  OST copy after reint: u60001 hard 8192, u60004 hard absent
+== 2. buffered 64 MiB write to lustre-OST0000, each user twice
+lustre-OST0000_UUID       313104        1408      284536   1% /mnt/lustre[OST:0]
+67108864 bytes (67 MB, 64 MiB) copied, 0.323751 s, 207 MB/s
+  u60004: 0.35s, write RPCs 16, avg 4096 KiB/RPC
+  u60004: client 'setdq to for' 0, 'chkdq found noquota' 0, OST 'isn't enforced on master': 0
+lustre-OST0000_UUID       313104        1408      284536   1% /mnt/lustre[OST:0]
+dd: error writing '/mnt/lustre/imp/f60001': No space left on device
+42991616 bytes (43 MB, 41 MiB) copied, 0.748738 s, 57.4 MB/s
+  u60001: 0.77s, write RPCs 34, avg 1205 KiB/RPC
+  u60001: client 'setdq to for' 34, 'chkdq found noquota' 32, OST 'isn't enforced on master': 34
+lustre-OST0000_UUID       313104        1408      282464   1% /mnt/lustre[OST:0]
+67108864 bytes (67 MB, 64 MiB) copied, 0.761335 s, 88.1 MB/s
+  u60004: 0.78s, write RPCs 17, avg 3855 KiB/RPC
+  u60004: client 'setdq to for' 0, 'chkdq found noquota' 0, OST 'isn't enforced on master': 0
+lustre-OST0000_UUID       313104        1408      281440   1% /mnt/lustre[OST:0]
+dd: error writing '/mnt/lustre/imp/f60001': No space left on device
+19922944 bytes (20 MB, 19 MiB) copied, 0.532672 s, 37.4 MB/s
+  u60001: 0.55s, write RPCs 20, avg 1024 KiB/RPC
+  u60001: client 'setdq to for' 20, 'chkdq found noquota' 20, OST 'isn't enforced on master': 20
+
+The following messages were captured in the debug log during the
+
+write test:
+
+00040000:04000000:5.0:1795046184.022870:0:959437:0:(qmt_handler.c:1310:qmt_dqacq0()) $$$ dqacq ends count:0 ver:0 rc:-3  qmt:lustre-QMT0000 pool:dt-0x0 id:60001 enforced:0 hard:0 soft:0 granted:0 time:0 qunit:
+1024 edquot:0 may_rel:0 revoke:69646 default:no
+00040000:00020000:6.0:1795046184.043345:0:958632:0:(qsd_handler.c:773:qsd_op_begin0()) $$$ ID isn't enforced on master, it probably due to a legeal race, if this message is showing up constantly, there could
+be some inconsistence between master & slave, and quota reintegration needs be re-triggered.  qsd:lustre-OST0000 qtype:usr lqe: ffff9a7e7e2c1180 id:60001 enforced:1 granted: 0 pending:0 waiting:0 req:0 usage:
+0 qunit:0 qtune:0 edquot:0 default:no revoke:0
+00000001:04000000:5.0:1795046184.021094:0:961170:0:(osc_quota.c:35:osc_quota_chkdq()) chkdq found noquota for usr 60001
+00000001:04000000:0.0:1795046184.089958:0:956377:0:(osc_quota.c:117:osc_quota_setdq()) lustre-OST0000-osc-ffff9a7eaf079000: setdq to for usr 60001
+
+Because the OST still considers the ID enforced while its granted
+
+space remains 0, qsd_op_begin0() can report the ID as over quota to
+
+the client. The client marks the ID as out of quota through
+
+osc_quota_setdq(), and buffered writes can fall back to synchronous,
+
+ungranted writes through vvp_io_commit_sync().
+
+Ungranted writes are subject to the space available after outstanding
+
+grants are reserved, as checked by tgt_grant_check(). In this test,
+
+the OST was small, approximately 300 MB, and writes by the affected
+
+user failed with ENOSPC. On larger OSTs, the synchronous write path
+
+may instead result in degraded I/O performance, consistent with the
+
+symptoms reported in LU-6382.
+
+ENOSPC was observed in this test environment; its occurrence may
+
+depend on the workload and environment.
+
+Root Cause Analysis
+
+When a quota entry is deleted, the QMT removes it from the global index
+
+and sends a deletion notification to quota slaves holding the global
+
+lock. An OST that is offline at that time cannot receive the
+
+notification.
+
+When the OST comes back online, qsd_reint_index() fetches the global
+
+index from the QMT. The entries returned by the QMT are processed by
+
+qsd_reint_entries() and qsd_reint_qid(), which update the local copy.
+
+The deleted ID is no longer present in the QMT index, so it is not
+
+included in the transferred entries. The existing reintegration path
+
+does not compare the received IDs with the local index copy to remove
+
+entries that are no longer present on the master.
+
+As a result, the slave can retain the old limit while recording its
+
+global index as up to date.
+
+Before LU-15218, removing a limit was handled by resetting it to zero,
+
+so reintegration could transfer the zero-limit entry. LU-15218 added
+
+deletion of quota entries and a glimpse-based deletion path on quota
+
+slaves, but did not update reintegration to remove entries deleted
+
+while a slave was offline.
+
+Test Results
+
+A manual ldiskfs test compared the behavior before and after the
+
+proposed fix.
+
+Before the fix:
+
+	User 60001 was deleted while OST0000 was offline.
+
+	After reintegration, 60001 remained on the OST with hard limit 8192.
+
+	The entry remained after force_reint.
+
+	The changed limit for user 60003 was updated to 16384.
+
+With the proposed fix:
+
+	The same deletion and limit change were repeated.
+
+	After reintegration, 60001 was absent from the OST's index copy.
+
+	User 60003 remained present with the updated hard limit of 16384.
+
+The new sanity-quota test_7g, added with the proposed fix, shows the following:
+
+Build                 ldiskfs             ZFS
+Without fix           FAIL, 3 of 3 runs   FAIL, 3 of 3 runs
+With proposed fix     PASS, 3 of 3 runs   PASS, 3 of 3 runs
+
+With the proposed fix, user 60001 completed both 64 MiB buffered
+
+writes on each backend, ldiskfs and ZFS. The test logged no client
+
+"setdq to for" or OST "isn't enforced on master" messages during
+
+those writes.
+
+Default quota behavior, MDT inode quota, and the cost of
+
+reintegration with large quota indexes require further testing.
+
+Proposed Fix
+
+During global index reintegration, record the IDs returned by the
+
+QMT. After a complete transfer at a consistent index version, compare
+
+those IDs with the local global index copy and remove stale entries
+
+that still carry a limit.
+
+ID 0 and entries without a hard or soft limit are not removed.
+
+Pruning is skipped if the transfer or ID collection cannot be used
+
+safely.
+
+The proposed fix is under further validation, particularly for default
+
+quota behavior, concurrent changes, and large indexes.
+
+Related Issues
+
+LU-15218 - Introduced deletion of unused quota IDs with lfs setquota --delete. The change added a deletion notification for quota slaves, but reintegration does
+
+not remove entries deleted while a slave is offline.
+
+LU-21241 - Parallel quota updates can stall on quota slaves. Its test results also observed that reintegration did not remove IDs deleted from the QMT.
+
+LU-6382 - Reports the "ID isn't enforced on master" message and its impact on client I/O. The cause and recovery behavior should be considered separately from the
+
+missed-deletion case described here.
+
+LU-20230 - Reports a related quota slave symptom after deletion. The root cause may differ from the missed-deletion reintegration case described here.
+
+--- Comment (gerrit, Thu, 19 Nov 2026 03:25:16 +0000) ---
+"Sunghwan Kim " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71153
+
+Subject: LU-21252 quota: drop deleted IDs from global index on reint
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4bba77e0dbe2cd90bead935126a1881e76dead0c

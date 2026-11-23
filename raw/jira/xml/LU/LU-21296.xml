@@ -1,0 +1,140 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21296] ldlm: add tracepoints for the lock lifecycle</title>
+                <link>https://jira.whamcloud.com/browse/LU-21296</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Lock contention is behind many Lustre performance problems and hangs: clients writing to the same file, jobs creating files in one shared directory, a client that is slow to answer blocking ASTs. The questions are always the same: which resources are contended, how long enqueues wait for a grant, and which lock, held by which client, is blocking which request. Today the only per-lock source for these answers is the libcfs debug log, which is a poor fit for this:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;dlmtrace has to be enabled before the problem happens, on every client and server involved, and the debug log slows the whole node down. On test VMs, a single-client metadata benchmark ran about 2.5 times slower with a full debug mask left on the servers.&lt;/li&gt;
+	&lt;li&gt;The log is a ring buffer that wraps under load or is dropped under memory pressure (&lt;a href="https://jira.whamcloud.com/browse/LU-15917" title="Memory pressure prevents debug daemon / debug buffer from proper operation" class="issue-link" data-issue-key="LU-15917"&gt;LU-15917&lt;/a&gt;), and matching a client lock with its server lock means dumping the log from every node and pairing handle cookies by hand.&lt;/li&gt;
+	&lt;li&gt;The ldlm namespace and pool statistics give lock counts and rates, not wait times, and say nothing about which resources or clients conflict.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;eBPF tools (bpftrace, bcc, libbpf, perf, trace-cmd) can answer these questions on a production system, aggregating in the kernel at low cost: enqueue-to-grant wait histograms per namespace and mode, the most contended resources, blocking ASTs per client. What they lack in Lustre is stable places to attach:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;kprobes and fentry probes on ldlm functions break whenever a function is renamed, inlined or refactored, which happens every release, so a script written for one version silently stops working on the next.&lt;/li&gt;
+	&lt;li&gt;Reading struct ldlm_lock from a kprobe needs module BTF. &lt;a href="https://jira.whamcloud.com/browse/LU-17768" title="Allow building rpms with BTF" class="issue-link" data-issue-key="LU-17768"&gt;&lt;del&gt;LU-17768&lt;/del&gt;&lt;/a&gt; embeds it only when the build has a vmlinux, or runs on the target kernel with distilled-base support, so most RHEL 8/9 server packages ship without it.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Kernel tracepoints solve both problems. Their names and fields are an interface kept in the Lustre source, described in tracefs, and usable without BTF or debuginfo, and when nothing is attached they cost one static-key branch. &lt;a href="https://jira.whamcloud.com/browse/LU-20837" title="libcfs: add tracepoints for Lustre debug messages" class="issue-link" data-issue-key="LU-20837"&gt;&lt;del&gt;LU-20837&lt;/del&gt;&lt;/a&gt; added the first Lustre tracepoints, for debug messages, and &lt;a href="https://jira.whamcloud.com/browse/LU-21295" title="ptlrpc: add tracepoints for the RPC lifecycle" class="issue-link" data-issue-key="LU-21295"&gt;LU-21295&lt;/a&gt; adds them for the RPC lifecycle. This ticket adds structured events for the lock lifecycle.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="RelationtoLU8980"&gt;&lt;/a&gt;Relation to &lt;a href="https://jira.whamcloud.com/browse/LU-8980" title="Add tracepoint support to Lustre" class="issue-link" data-issue-key="LU-8980"&gt;LU-8980&lt;/a&gt;&lt;/h3&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-8980" title="Add tracepoint support to Lustre" class="issue-link" data-issue-key="LU-8980"&gt;LU-8980&lt;/a&gt; is a subtask of &lt;a href="https://jira.whamcloud.com/browse/LU-9679" title="Prepare lustre for adoption into the linux kernel" class="issue-link" data-issue-key="LU-9679"&gt;&lt;del&gt;LU-9679&lt;/del&gt;&lt;/a&gt; (preparing Lustre for the upstream kernel) and aims to replace the libcfs debug logging with tracepoints. Its series converting libcfs, CDEBUG and llite (changes 24554, 24560 and 52875) is still open. This work is independent of it and small: a few events with fields designed for analysis, with no change to CDEBUG or the debug log, so it can land on its own either way.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Proposal"&gt;&lt;/a&gt;Proposal&lt;/h3&gt;
+
+&lt;p&gt;Add trace system "ldlm" with five events:&lt;/p&gt;
+
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Event&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Fires in&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_enqueue&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ldlm_cli_enqueue() on the client, ldlm_handle_enqueue() on the server, ldlm_cli_enqueue_local() and ldlm_cli_enqueue_placeholder() for a server's own locks&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_grant&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ldlm_grant_lock()&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_blocked&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ldlm_add_bl_work_item(): a granted lock conflicts with a new one and will get a blocking AST; names both locks&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_bl_callback&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ldlm_handle_bl_callback(): a client receives that blocking AST&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_destroy&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ldlm_lock_destroy_internal(): once per lock, after a cancel, or for a lock that was never granted, such as a replaced intent lock&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;Each event carries the namespace, resource name and type, granted and requested modes, flags, pid, and the local and remote handle cookies, so tools can pair enqueue with grant and destroy, and a client lock with its server lock.&lt;/p&gt;
+
+&lt;p&gt;Add contrib/eBPF/ldlm_wait.bt, which prints enqueue-to-grant wait histograms per namespace and mode, and blocking AST counts per resource. Add sanity test 60p, which checks that the MDS's ldlm_lock_blocked and the client's ldlm_lock_bl_callback name the same pair of locks.&lt;/p&gt;
+
+&lt;p&gt;Examples:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;client# bpftrace contrib/eBPF/ldlm_wait.bt
+oss#    bpftrace contrib/eBPF/ldlm_wait.bt
+mds#    trace-cmd record -e ldlm:ldlm_lock_blocked -e ldlm:ldlm_lock_bl_callback
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h3&gt;&lt;a name="Designnotes"&gt;&lt;/a&gt;Design notes&lt;/h3&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;The namespace is a fixed-size, zero-padded array rather than __string(). bpftrace 0.23 on aarch64 reads __data_loc strings as empty, and bpftrace keys maps on the whole array, so trailing bytes would split identical keys. A record takes up to about 200 bytes in the trace buffer, and only while the event is enabled.&lt;/li&gt;
+	&lt;li&gt;Lock modes and resource types are printed symbolically through TRACE_DEFINE_ENUM, so ftrace output reads "PW" and "IBT" while tools still see the numeric values.&lt;/li&gt;
+	&lt;li&gt;The events read l_resource under rcu_read_lock(), because it is RCU-freed and can change when a client enqueue reply arrives.&lt;/li&gt;
+	&lt;li&gt;ldlm_lock_destroy, not a cancel event, ends a lock's life, so a tool that tracks enqueued locks also sees the ones that are never granted and does not leak them.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="100789">LU-21296</key>
+            <summary>ldlm: add tracepoints for the lock lifecycle</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="npapakonstantinou">Nikos Papakonstantinou</assignee>
+                                    <reporter username="npapakonstantinou">Nikos Papakonstantinou</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 23 Nov 2026 10:13:46 +0000</created>
+                <updated>Mon, 23 Nov 2026 10:21:01 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506620" author="gerrit" created="Mon, 23 Nov 2026 10:21:01 +0000">&lt;p&gt;"Nikos Papakonstantinou &amp;lt;npapakonstantinou@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71297" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71297&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21296" title="ldlm: add tracepoints for the lock lifecycle" class="issue-link" data-issue-key="LU-21296"&gt;LU-21296&lt;/a&gt; ldlm: add tracepoints for the lock lifecycle&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 121a6a237924874db39ac27a1f12b0084fb515ba&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073sf:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

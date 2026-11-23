@@ -1,5 +1,5 @@
 Change:     69035
-Subject:    LU-19699 quota: retry grant release on qmt failure
+Subject:    LU-19699 quota: don't fail release in glimpse reply
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69035
 Change-Id:  I129020a8e02b848b696cd2bc85c19672a0f8b594
 Project:    fs/lustre-release
@@ -7,62 +7,36 @@ Branch:     master
 Status:     NEW
 Owner:      Hongchao Zhang
 Created:    2026-09-18 09:23:11.000000000
-Updated:    2026-11-12 21:01:53.000000000
-Patch Set:  12
-Insertions: +170
-Deletions:  -13
-Comments:   55 (1 unresolved)
+Updated:    2026-11-23 11:09:12.000000000
+Patch Set:  16
+Insertions: +5
+Deletions:  -1
+Comments:   63 (0 unresolved)
 Hashtags:   pw_shepherd
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: Vitaliy Kuznetsov: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Andreas Dilger, Sergey Cheremencev
+  REVIEWER: Andreas Dilger, Sergey Cheremencev, Sebastien Buisson, Vitaliy Kuznetsov
 
 --- Commit Message ---
-LU-19699 quota: retry grant release on qmt failure
+LU-19699 quota: don't fail release in glimpse reply
 
-qsd_id_glimpse_ast() drops the surplus space from lqe_granted and
-reports it in lvb_id_rel. If the master fails to apply the release
-in qmt_lvbo_update(), for example with OBD_FAIL_QUOTA_PREACQ, the
-space stays charged to the slave and the next write gets a bogus
--EDQUOT.
+OBD_FAIL_QUOTA_PREACQ is checked in qmt_dqacq0(), which the
+glimpse reply path also uses to apply the space a slave has just
+released. If that release fails, the slave has already dropped the
+space while the master has not, and the test fails later with a
+bogus -EDQUOT.
 
-Record the amount on the target entry, and let the next glimpse
-carry it back with the new LQUOTA_FL_REL_FAILED flag. The rebalance
-thread already sends these glimpses and fills the descriptor, so the
-glimpse reply callback only records the amount and returns. The flag
-is cleared once the glimpse is replied, same as the qunit and edquot
-flags. Then the slave takes the space back and reports it again with
-a normal DQACQ, which is transactional and retried by the slave
-itself.
-
-Replaying the release on the master is not safe, because the slave
-re-reads its slave index when it reintegrates and a release applied
-after that is subtracted twice. The slave only takes the space back
-while it still remembers the release, and forgets it once the slave
-index is read from the master. If a DQACQ is in flight, the space is
-taken back when the DQACQ completes, so the slave index updates stay
-in order.
-
-An old slave ignores the flag. It still gets the current qunit and
-edquot from the glimpse, and keeps the leak. An old master never
-sends the flag, so mixed versions still work. A DOM slave has no
-target entry, so it keeps the leak until the next reintegration.
-
-Also fix two old bugs found next to the new code. qsd_update_lqe()
-writes lqe_granted without the lock, while a DQACQ completion or a
-glimpse can change it at the same time. qmt_clear_lgeg_arr_nu()
-returns without dropping lqe_glbl_data_lock when the target is not
-in the array.
+Check the fault for release requests in qmt_dqacq() instead, and
+fail pre-acquire only in qmt_dqacq0(). A release sent by a slave
+with DQACQ then just gets -EAGAIN and is retried.
 
 Test-Parameters: testlist=sanity-quota env=ONLY=80,ONLY_REPEAT=50
-Fixes: 318fd8d197ff ("LU-1842 quota: qsd lock")
-Fixes: d943c6afe74f ("LU-1842 quota: qsd entry")
-Fixes: 1f9689d0f92e ("LU-17770 quota: don't panic in qmt_map_lge_idx")
+Fixes: 61ec1e0f2ca8 ("LU-15031 quota: reseed glbe in qmt_lvbo_udate")
 Signed-off-by: Hongchao Zhang <hongchao@whamcloud.com>
 Assisted-by: DeepSeek:V4.1-Flash-1017 llm_code_and_review_tools
 Change-Id: I129020a8e02b848b696cd2bc85c19672a0f8b594
@@ -2637,3 +2611,283 @@ Some concerns, see inline comment: the deferred take-back can still be missed by
 Patch Set 12: Verified+1
 
 Passed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm21: https://testing.whamcloud.com/test_sessions/e886450e-3dca-4190-84a2-321d9fb7824c ran 6 tests.
+
+--- Message (Hongchao Zhang, 2026-11-18 08:39:48.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-11-18 08:40:23.000000000) ---
+Patch Set 14: Commit message was updated.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 08:42:36.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 08:46:13.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-18 08:47:56.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-18 09:45:29.000000000) ---
+Patch Set 13: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 14 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136986/ : SUCCESS
+
+--- Message (Maloo, 2026-11-18 09:45:51.000000000) ---
+Patch Set 13:
+
+#### The following sessions will be run for Build 136986 (patch #13):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136986&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136986#redirect
+
+--- Message (Hongchao Zhang, 2026-11-18 11:06:10.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-18 13:20:14.000000000) ---
+Patch Set 13: Verified+1
+
+Copied votes on follow-up patch sets have been updated:
+* Verified+1 has been copied to patch set 14 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE").
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm66: https://testing.whamcloud.com/test_sessions/4518f348-2226-4200-aa41-3e5165366e11 ran 5 tests.
+
+--- Message (patrick bot, 2026-11-19 13:26:48.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Vitaliy Kuznetsov, 2026-11-19 13:42:47.000000000) ---
+Patch Set 14: Code-Review+1
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 02:15:01.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good; one optional question inline about test_80 coverage. No need to re-spin for it.
+
+--- Message (Hongchao Zhang, 2026-11-20 07:17:50.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hongchao Zhang, 2026-11-20 07:18:05.000000000) ---
+Patch Set 14:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 07:21:04.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 07:28:52.000000000) ---
+Patch Set 15:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-20 16:46:02.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137198/ : SUCCESS
+
+--- Message (Maloo, 2026-11-20 16:47:02.000000000) ---
+Patch Set 15:
+
+#### The following sessions will be run for Build 137198 (patch #15):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137198&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137198#redirect
+
+--- Message (Maloo, 2026-11-20 19:26:01.000000000) ---
+Patch Set 15:
+
+Failed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm10: https://testing.whamcloud.com/test_sessions/cd3f2983-b548-4e65-9299-cb887791f0bf ran 3 tests.  1 tests failed: sanity-quota.
+
+--- Message (Autotest, 2026-11-20 19:40:07.000000000) ---
+Patch Set 15:
+
+Onyx Autotest 2 retesting enforced custom session on el9.7-x86_64/ldiskfs servers and clients for build 137198 patch 15. Requested by Patrickbot because of EX-13207.
+The following test parameters were specified: testlist=sanity-quota env=ONLY="80",ONLY_REPEAT="50".
+
+--- Message (Maloo, 2026-11-21 01:32:34.000000000) ---
+Patch Set 15:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm62: https://testing.whamcloud.com/test_sessions/fceefff7-9aa6-4ca8-b07a-b19d73d5ecee ran 13 tests.  2 tests failed: racer, performance-sanity.
+
+--- Message (Maloo, 2026-11-21 02:23:47.000000000) ---
+Patch Set 15:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm1: https://testing.whamcloud.com/test_sessions/3b035adb-ca10-4f4a-9f89-dc6bdb5c3523 ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-21 04:16:02.000000000) ---
+Patch Set 15: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm189: https://testing.whamcloud.com/test_sessions/9b837c2b-a753-4199-9bec-ca92489dfd91 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 04:19:10.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Code change looks right; the commit message doesn't describe what the patch actually does. Fine to land after a message touch-up, and the inline minor can ride along on that refresh.
+
+--- Message (Hongchao Zhang, 2026-11-23 09:09:54.000000000) ---
+Uploaded patch set 16: Commit message was updated.
+
+Copied Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR **changekind:NO_CODE_CHANGE**")
+
+--- Message (Hongchao Zhang, 2026-11-23 09:10:53.000000000) ---
+Patch Set 15:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 09:12:47.000000000) ---
+Patch Set 16:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 09:15:38.000000000) ---
+Patch Set 16:
+
+Looks good to me.
+
+--- Message (Vitaliy Kuznetsov, 2026-11-23 11:09:12.000000000) ---
+Patch Set 16: Code-Review+1

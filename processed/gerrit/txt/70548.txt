@@ -7,18 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Manhong
 Created:    2026-11-06 19:39:01.000000000
-Updated:    2026-11-12 00:22:16.000000000
-Patch Set:  2
-Insertions: +517
-Deletions:  -25
-Comments:   14 (12 unresolved)
+Updated:    2026-11-22 08:01:32.000000000
+Patch Set:  6
+Insertions: +606
+Deletions:  -37
+Comments:   38 (18 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Gerrit AI review for Lustre
+  CC: Andreas Dilger, Nikitas Angelinas, Charlie Olmstead, Gerrit AI review for Lustre, patrick bot
   REVIEWER: Cory Spitz, wangdi, Patrick Farrell
 
 --- Commit Message ---
@@ -35,23 +36,54 @@ duplicated names, and "ls -U dir | sort -u | wc -l" returns fewer
 files than were created.
 
 Read every stripe of a directory whose layout is changing into pages
-kept on the open file, when the first entries are requested, and
-serve the listing from them. Each stripe is read under a PR UPDATE
-lock that is kept until the last stripe has been read, so no name
-can move between the stripes in the meantime. A move takes a
+kept on the open file, and serve the listing from them. The snapshot
+is taken at the first read after the layout is seen to be changing,
+at whatever offset that read has, and is dropped at EOF, on seek, on
+close and when the stripe count changes. Each stripe is read under a
+PR UPDATE lock that is kept until the last stripe has been read, so
+no name can move between the stripes in the meantime. A move takes a
 conflicting lock on both stripes, in stripe index order, so the
 locks are taken in that order too. Only the first page of a stripe
 enqueues the lock; reading the other pages under the lock already
 held avoids a new request queuing behind a conflicting lock that is
-waiting for ours to be cancelled.
+waiting for ours to be cancelled. All the locks are dropped before
+the snapshot is returned. The start page of a stripe is found by
+bisection, as the pages are in hash order.
 
-Add the lock hand-over to md_readdir_info and mdc_read_page(). The
-snapshot is dropped at EOF, on seek and on close. If it cannot be
-taken, readdir reads the stripes directly as before.
+A listing that started before the layout began to change, or that
+continues across the end of the change, is not covered: its position
+is a hash from the old layout, so a name that moved can be returned
+twice or missed. If the snapshot cannot be taken, readdir reads the
+stripes directly as before.
 
-Add sanity test_230D, which lists a directory while it auto-splits.
+The first read of such a directory waits for all stripes, and
+creates, unlinks and moves in it wait for that time. The pages are
+kept until EOF, seek or close, with no limit on their number. The MDT
+does not extend the lock callback timeout, so a read that outlasts it
+can get the client evicted when a conflicting lock is waiting.
 
-Test-Parameters: mdtcount=2 mdscount=2 testlist=sanity env=ONLY=230D,ONLY_REPEAT=10
+Add the lock hand-over to md_readdir_info and mdc_read_page().
+
+Also fix mdt_reint_unlink(), which returned -ENOENT for a file that
+still exists. While a directory splits, the file can be migrated
+between the client's lookup of the name and its unlink. The client
+sends the unlink to the MDT of the child FID it looked up, but the
+name now refers to a new FID on another MDT, so the MDT fails the
+unlink with "name cannot find FID" and rm reports "No such file or
+directory". Return -ESTALE instead, so that the VFS looks the name
+up again and unlinks the file under its new FID.
+
+Add sanity test_230D, which lists a directory while it auto-splits
+and a background job renames and removes names in it. It is skipped
+on an MDS without the -ESTALE change. Without the LMV change it
+fails, mostly with duplicated names and sometimes with missing ones;
+with it, it passes 100 runs in a row. The same workload also ran
+for two days, in a directory holding 1 million files, on a virtual
+cluster of 2 MDS nodes and 7 clients without a duplicated or missing
+name. The clients ran RHEL 9.8, RHEL 10.2, Debian 13.7, SLES 15.7,
+SLES 16.0, Ubuntu 24.04 and Ubuntu 26.04, one distribution each.
+
+Fixes: a336d7c7c1 ("LU-11025 dne: directory restripe and auto split")
 Assisted-by: ClaudeCode:claude-sonnet-5-5
 Signed-off-by: Manhong Dai <manhong.dai@netapp.com>
 Signed-off-by: Cory Spitz <Cory.Spitz@netapp.com>
@@ -136,3 +168,197 @@ Patch Set 2:
 AI code review results below, please doublecheck
 
 Some concerns, see inline comments. The uninitialized return value in mdc_read_page() needs a refresh; the minor items can be picked up in the same cycle.
+
+--- Message (patrick bot, 2026-11-14 22:02:17.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Manhong, 2026-11-15 14:20:27.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-15 14:23:16.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-15 14:29:26.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-15 14:44:50.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136527/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-15 23:40:10.000000000) ---
+Patch Set 3:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The mdt_reint_unlink() -ESTALE change is a server-side fix that can land on its own and has its own interop behavior. Would it be better as a separate patch with its own Change-Id, so the MDS and LMV parts can be reviewed, tested and backported separately?
+
+--- Message (Autotest, 2026-11-16 16:00:00.000000000) ---
+Patch Set 3:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 136527 patch 3. Requested by Patrickbot because of LU-19610.
+
+--- Message (patrick bot, 2026-11-18 00:58:51.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 00:59:13.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (Manhong, 2026-11-18 01:06:21.000000000) ---
+Patch Set 4: Patch Set 3 was rebased
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-18 01:08:20.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 01:09:10.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (patrick bot, 2026-11-18 01:11:52.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 01:17:03.000000000) ---
+Hashtag removed: pw_halt
+
+--- Message (jenkins, 2026-11-18 02:48:04.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136962/ : SUCCESS
+
+--- Message (Autotest, 2026-11-18 06:14:22.000000000) ---
+Patch Set 4:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 136962 patch 4. Requested by Patrickbot because of LU-20873.
+
+--- Message (Andreas Dilger, 2026-11-18 07:50:19.000000000) ---
+Patch Set 4:
+
+(7 comments)
+
+--- Message (Manhong, 2026-11-19 11:50:40.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-19 11:53:16.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 11:53:54.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-19 12:19:13.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137088/ : SUCCESS
+
+--- Message (Autotest, 2026-11-20 06:26:15.000000000) ---
+Patch Set 5:
+
+Trevis Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137088 patch 5. Requested by Patrickbot because of LU-18304.
+
+--- Message (patrick bot, 2026-11-20 09:54:06.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-20 09:54:13.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137088 patch 5. Requested by Patrickbot because of LU-18304.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 11:53:18.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. I found no correctness problems in the snapshot, the stripe lock hand-over or the -ESTALE change: the stripe locks are taken in the same index order mdt_reint_migrate() uses, and the pinned folios outlive truncate_inode_pages() on cancel. Two items are inline. The Fixes: line was already requested on an earlier patch set, so the test gate can be fixed in that same refresh.
+
+--- Message (Manhong, 2026-11-20 12:24:42.000000000) ---
+Uploaded patch set 6: Patch Set 5 was rebased. Commit message was updated.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-20 12:25:29.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 12:27:45.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-20 21:42:07.000000000) ---
+Patch Set 6: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/137219/ : ABORTED
+
+--- Message (Charlie Olmstead, 2026-11-20 21:42:15.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-21 15:47:35.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137389/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-22 02:42:32.000000000) ---
+Patch Set 6:
+
+(1 comment)

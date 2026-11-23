@@ -1,5 +1,5 @@
 Change:     67498
-Subject:    LU-19805 llite: unregister client BDI on pre-5.11 kernels
+Subject:    LU-19805 llite: unregister client BDI on pre-5.16 kernels
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/67498
 Change-Id:  I7cfbc98da727bc8ddb53c9282f62c666f5d5d929
 Project:    fs/lustre-release
@@ -7,22 +7,23 @@ Branch:     master
 Status:     NEW
 Owner:      Oleg Drokin
 Created:    2026-07-23 19:15:40.000000000
-Updated:    2026-10-21 18:45:37.000000000
-Patch Set:  3
-Insertions: +48
-Deletions:  -5
-Comments:   26 (6 unresolved)
+Updated:    2026-11-23 07:23:22.000000000
+Patch Set:  6
+Insertions: +76
+Deletions:  -23
+Comments:   41 (0 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1; Andreas Dilger: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Sebastien Buisson, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  CC: Sebastien Buisson, wangdi, Lustre RISC-V Builder, Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, James Simmons, Shaun Tancheff
 
 --- Commit Message ---
-LU-19805 llite: unregister client BDI on pre-5.11 kernels
+LU-19805 llite: unregister client BDI on pre-5.16 kernels
 
 Repeated client mount/umount eventually fails with:
 
@@ -37,7 +38,7 @@ long as the BDI does not outlive the superblock.
 LU-16954 set SB_I_CGROUPWB on the Lustre superblock.  Every cgroup
 bdi_writeback created for the mount takes a reference on the BDI in
 wb_init(), and those references are only dropped by bdi_unregister()
-via cgwb_bdi_unregister().  Kernels older than v5.11 have no
+via cgwb_bdi_unregister().  Kernels older than v5.16 have no
 SB_I_PERSB_BDI, so generic_shutdown_super() only calls bdi_put():
 release_bdi() cannot run while a cgwb holds a reference, and the cgwbs
 are not killed because that only happens from bdi_unregister().  The
@@ -47,22 +48,31 @@ with -EEXIST.
 
 LU-16954 compensated for this by unregistering the BDI device from
 ll_put_super().  LU-17745 disabled that for kernels which still have
-backing_dev_info.debug_stats (before commit v5.2-rc3-11-g2d146b924e),
-since RHEL 8.2 crashed in wb_workfn(), called dev_name(wb->bdi->dev)
-with no NULL check.  That was fixed by commit v5.5-5400-g68f23b8906
-("memcg: fix a crash in wb_workfn when a device disappears"), which
-added bdi_dev_name(), and which RHEL picked up in 8.6.  The condition
-that matters is therefore not the absence of debug_stats but presence
-of bdi_dev_name(): on RHEL 8.6 and later the explicit unregister is
-safe, and without it every mount/umount cycle strands a BDI.
+backing_dev_info.debug_stats (before v5.3, commit 2d146b924ec3), since
+RHEL 8.2 crashed in wb_workfn(), which called dev_name(wb->bdi->dev)
+with no NULL check.  That is fixed upstream in two steps: v5.6 commit
+68f23b8906 ("memcg: fix a crash in wb_workfn when a device disappears")
+added bdi_dev_name(), which only adds a NULL check, and v5.7 commit
+6bd87eec23cb ("bdi: add a ->dev_name field to struct
+backing_dev_info") caches a copy of the name for the lifetime of the
+bdi so it can be used after bdi_unregister().  The condition that
+matters is the cached name, not the absence of debug_stats: on kernels
+with backing_dev_info.dev_name the explicit unregister is safe, and
+without it every mount/umount cycle strands a BDI.  Vanilla v5.3-v5.5
+kept the unregister enabled but have neither fix.
 
-Key the unregister off a new HAVE_BDI_DEV_NAME test and restore the
-debug_stats removal that pre-v5.3 kernels need.  Only ask for cgroup
+Key the unregister off a new HAVE_BDI_DEV_NAME_FIELD test, clear
+bdi->dev before device_unregister() so nothing can see a freed device,
+and guard the debugfs removal with CONFIG_DEBUG_FS.  The debug_stats
+file lives under debug_dir, so debugfs_remove_recursive() covers it and
+HAVE_BDI_DEBUG_STATS is no longer needed.  Only ask for cgroup
 writeback where the BDI can be unregistered again, so kernels with
-neither SB_I_PERSB_BDI nor bdi_dev_name() do not strand BDIs either.
-That affects RHEL 8.0 through 8.5, and SLES15 SP2/SP3, Ubuntu 20.04.
+neither SB_I_PERSB_BDI nor backing_dev_info.dev_name do not strand BDIs
+either.  Those kernels lose the cgroup writeback support added by
+LU-16954: RHEL 8.0 through 8.5, and the v5.3/v5.4 based SLES15
+SP2/SP3 and Ubuntu 20.04.
 
-This removes the sysfs name collision.  On pre-v5.11 kernels the BDI
+This removes the sysfs name collision.  On pre-v5.16 kernels the BDI
 itself is still only freed once the memory cgroups referencing it go
 away; a module has no exported way to break that cycle.
 
@@ -72,7 +82,7 @@ unmounting in a loop: without the patch the mount fails after ~10
 iterations and one /sys/class/bdi/<fsname>-<address> entry is stranded
 per cycle; with it, 100 iterations pass leaving none.  No regression
 test is added, because triggering the failure requires cgroup v2 with
-both the memory and io controllers on a client kernel older than v5.11,
+both the memory and io controllers on a client kernel older than v5.16,
 which no autotest client configuration provides, and a test that cannot
 fail without the fix is worse than none.
 
@@ -617,3 +627,472 @@ Patch Set 3: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (wangdi, 2026-11-18 21:28:45.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 21:32:10.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-18 21:43:04.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (James Simmons, 2026-11-18 23:22:06.000000000) ---
+Patch Set 4: Code-Review-1
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-19 00:15:24.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137029/ : SUCCESS
+
+--- Message (Maloo, 2026-11-19 00:16:46.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 137029 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137029&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137029#redirect
+
+--- Message (Maloo, 2026-11-19 22:10:30.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm92: https://testing.whamcloud.com/test_sessions/5882d211-8dfe-423f-ad64-184d0600b67c ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-19 22:17:19.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+The code looks correct. One commit-message inaccuracy is inline and can be fixed together with the open review comment.
+
+--- Message (wangdi, 2026-11-20 22:12:00.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (wangdi, 2026-11-20 22:12:54.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-11-20 22:16:04.000000000) ---
+Patch Set 5:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-11-20 22:19:07.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 22:21:21.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-21 16:23:14.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137394/ : SUCCESS
+
+--- Message (Maloo, 2026-11-21 16:24:45.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 137394 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137394&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137394#redirect
+
+--- Message (Maloo, 2026-11-22 03:26:09.000000000) ---
+Patch Set 5: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm56: https://testing.whamcloud.com/test_sessions/c38850bc-7982-42ad-a8f9-35aafa6a1fa6 ran 3 tests.
+
+--- Message (patrick bot, 2026-11-22 03:32:10.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 03:33:39.000000000) ---
+Patch Set 5:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Needs a refresh: the new configure probes look like they fail on RHEL 8 kernels, so the unregister path would never be built there and cgroup writeback would be disabled on every RHEL 8 client. Details inline, plus one minor comment fix.
+
+--- Message (wangdi, 2026-11-22 19:45:43.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wangdi, 2026-11-22 19:46:10.000000000) ---
+Patch Set 5:
+
+(7 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-22 19:49:26.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-22 19:53:17.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-22 20:25:45.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137512/ : SUCCESS
+
+--- Message (Maloo, 2026-11-22 20:26:16.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 137512 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137512&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137512#redirect
+
+--- Message (Maloo, 2026-11-23 02:01:58.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm46: https://testing.whamcloud.com/test_sessions/4ceb1359-cb03-4b4e-843b-705f431c0902 ran 5 tests.  1 tests failed: recovery-small.
+
+--- Message (Autotest, 2026-11-23 02:11:45.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 137512 patch 6. Requested by Patrickbot because of EX-15013.
+
+--- Message (Maloo, 2026-11-23 07:16:31.000000000) ---
+Patch Set 6: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm153: https://testing.whamcloud.com/test_sessions/a3710eb4-c58f-4e63-b327-71f9f060a560 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-23 07:23:22.000000000) ---
+Patch Set 6:
+
+Looks good to me.

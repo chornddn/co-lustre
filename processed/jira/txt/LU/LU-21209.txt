@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   Charlie Olmstead
 Reporter:   Andreas Dilger
 Created:    Fri, 13 Nov 2026 17:49:36 +0000
-Updated:    Fri, 13 Nov 2026 18:14:00 +0000
-Links:      Related: is related to  LU-18041; Related: is related to  LU-19942; Related: is related to  LU-19357; Related: is related to  LU-20780; Related: is related to  LU-17827; Related: is related to  LU-18312; Related: is related to  LU-19725; Related: is related to  LU-17047; Related: is related to  LU-20869
+Updated:    Wed, 18 Nov 2026 06:55:48 +0000
+Links:      Related: is related to  LU-18041; Related: is related to  LU-19942; Related: is related to  LU-19357; Related: is related to  LU-20780; Related: is related to  LU-17827; Related: is related to  LU-18312; Related: is related to  LU-19725; Related: is related to  LU-17047; Related: is related to  LU-15469; Related: is related to  LU-20869
 
 --- Description ---
 The autotest rolling-upgrade/rolling-downgrade sessions run on lustre-master and lustre-master-next builds are the last sessions to finish, about 21h after every other session of the build. They are an autotest construct, not test scripts of that name.
@@ -32,13 +32,15 @@ Variants per build cover b2_15 and b2_16 as the old version, ldiskfs and zfs, an
 
 Options to shorten the critical path (autotest test-group configuration):
 
-	Split each chain into an upgrade chain and a downgrade chain on separate clusters, run in parallel. The downgrade chain starts with old-version init + clean upgrade of all nodes (~0.9h, as clean-upgrade does), then the 4 downgrade steps. Longest chain ~37h -> ~20h, below the other sessions; costs ~1h of extra test time per chain.
+	Split each chain into an upgrade chain and a downgrade chain on separate clusters, run in parallel. The downgrade chain starts with old-version init + clean upgrade of all nodes at once (~0.9h, as clean-upgrade does), then the 3 downgrade steps. Longest chain ~37h -> ~16h, below the other sessions; costs ~1h of extra test time per chain.
 
 	Do not run full sanity in the all-old upgrade-init step: the old version is already tested on its own branch, the step only needs to format and create data. Saves ~3.7h per chain.
 
-	Run full sanity only in the states that matter for deployments (e.g. new servers with old clients, and the final state) and a 30-60 min interop subset in the transient mixed states (oss-only, mds-only, one client upgraded). Running the subset everywhere would bring a chain from ~37h to ~12h, with some loss of coverage.
+	Run full sanity only in the states that matter for deployments (e.g. new servers with old clients, old servers with new clients, and the final state) and a 30-60 min interop subset in the transient mixed states (oss-only, mds-only, one client upgraded). Running the subset everywhere would bring a chain from ~37h to ~12h, with some loss of coverage.
 
-	Reprovision only the node being up/downgraded in each step instead of the whole cluster: saves ~2h per chain.
+	Run with only a single client, which avoids the rolling-upgrade/downgrade-client2 step entirely and cuts ~8h from the chain, since client2 isn't really used by sanity at all
+
+	Do not run sessions with SLOW=yes, since the extra coverage adds only a small number of subtests that take a long time to run
 
 Options 1+2 alone would bring the chains to ~16h and the build completion from ~49h to ~27h.
 
@@ -49,7 +51,7 @@ Related to LU-20869 (reduce run time of long-running tests).
 --- Comment (adilger, Fri, 13 Nov 2026 18:14:00 +0000) ---
 The chain length is set almost entirely by the Autotest wrapper, not by the Lustre tree:
 
-	Each step runs run_test_up_down.sh, which calls auster vk -f autotest_config -g test-groups/rolling with SLOW=yes. The test-groups/rolling-* files are not in master, b2_15 or b2_16 (only regression and regression-mpi are), so the step contents and SLOW mode come from Autotest.
+	Each step runs run_test_up_down.sh, which calls auster -vk -f autotest_config -g test-groups/rolling- with SLOW=yes. The test-groups/rolling-* files are not in master, b2_15 or b2_16 (only regression and regression-mpi are), so the step contents and SLOW mode come from Autotest.
 
 	The tests run from the client's installed lustre-tests package. Only 3 of the 9 steps (upgrade-client1, upgrade-client2, downgrade-client2) run master's sanity.sh; the other 6 run the b2_15/b2_16 sanity.sh. Test-script speedups on master (LU-20869) therefore shorten only a third of each chain.
 
@@ -68,3 +70,38 @@ Failures seen in the rolling steps over 2026-10-23..2026-11-13 (392 failed step 
 	sanity test_119p: LU-19942 (8), test_119f: LU-19725 (4), test_277: LU-20780 (4), test_116a: LU-17827 (4)
 
 Recurring failures with no ticket linked: sanity test_56xk (79), test_66 (55), test_360 (24), test_807 (39), test_160i/160s and test_256 (changelogs, ~50), and 57 "sanity (suite fail)" results. None of these stop the chain, so they do not affect its run time.
+
+--- Comment (adilger, Fri, 13 Nov 2026 21:56:15 +0000) ---
+colmstea it would also be great if the test scripts that run these sessions could (somehow?) be included into the Lustre tree instead of autotest, which would give us more visibility into what is being run, and how.  These sessions have always been a black box for me, and only by Claude following the chain of events was I able to put them together.
+
+--- Comment (colmstea, Tue, 17 Nov 2026 17:58:29 +0000) ---
+The clean/rolling upgrade/downgrade testing is functionality requested by the QA team (https://jira.whamcloud.com/browse/LU-15469). The wiki outlining the clean/rolling upgrade/downgrade testing can be seen here:
+
+https://wiki.whamcloud.com/spaces/ENG/pages/8556092/Upgrade+and+Downgrade+Testing
+
+The upgrade/downgrade sessions are test steps within a test case object; there isn't a separate script driving them. Each step is a normal Autotest session that runs on the same nodes as the previous step. The clean upgrade/downgrade steps run file_creation and file_creation_validation, which are small custom test scripts kept in the Autotest repo and copied to the nodes at setup. They can certainly be moved out of AT and into Lustre. The rolling steps run sanity from the Lustre tree. All of the proposed options are test configuration changes; none of them need Autotest code changes.
+
+Note on option 4: That is what AT currently does for the rolling test cases:
+
+	provision entire cluster with old version
+
+	run sanity
+
+	upgrade OSS, all other nodes are not reprovisioned
+
+	run sanity
+
+	upgrade MDS, all other nodes are not reprovisioned
+
+	etc.
+
+The test configs can be updated to shorten the rolling upgrade/downgrade testing. What was originally implemented was based on the original request and the wiki above, so let me know what the testing should look like and I'll make the changes.
+
+--- Comment (adilger, Wed, 18 Nov 2026 06:55:48 +0000) ---
+Hi Charlie, 
+
+unfortunately I'm unable to see that wiki page in the ENG project, so I can't comment on what James was requesting there.
+
+I've changed #4 to remove the 2nd client from the configuration (I don't think it runs anything at all), and added #5 to remove the SLOW=yes request.
+
+I think most of these changes could be implemented in any order, probably removing SLOW=yes is easiest and would already cut 1h per test step for ldiskfs and almost 2h for ZFS.

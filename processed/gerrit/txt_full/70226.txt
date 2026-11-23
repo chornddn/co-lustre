@@ -7,73 +7,53 @@ Branch:     master
 Status:     NEW
 Owner:      Alexey Lyashkov
 Created:    2026-10-30 08:51:08.000000000
-Updated:    2026-11-13 06:59:38.000000000
-Patch Set:  1
-Insertions: +232
-Deletions:  -75
-Comments:   17 (16 unresolved)
-Hashtags:   pw_shepherd
+Updated:    2026-11-18 21:47:57.000000000
+Patch Set:  5
+Insertions: +217
+Deletions:  -88
+Comments:   36 (21 unresolved)
 
 --- Labels ---
-  Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: Andrew Perepechko: +1; patrick bot: -1
+  Verified: Maloo: -1; jenkins: +1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Nikitas Angelinas, Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Artem Blagodarenko, Arshad Hussain
+  CC: Andreas Dilger, Nikitas Angelinas, Gerrit AI review for Lustre
+  REVIEWER: Vitaly Fertman, Andrew Perepechko, Artem Blagodarenko, Arshad Hussain, patrick bot
 
 --- Commit Message ---
 LU-21073 llite: report the size and times the objects report
 
-A stat() reads the attributes back out of the inode after the glimpse
-that refreshed them.  Both of the fields it reads there are shared with
-other writers, and both can be wrong by the time it reads them.
+stat(), lseek(SEEK_END/SEEK_DATA/SEEK_HOLE), O_APPEND writes and
+fallocate glimpse the file, then read i_size and the timestamps back
+out of the inode.  Between the merge and that read i_size can be
+rewritten by writers that do not take ll_inode_size_lock(), such as
+ll_update_inode() for an MDS reply, truncate or another merge, so the
+size used is not the one the merge produced.  ll_merge_attr() writes
+the timestamps in two steps, MDS values first and then the merge with
+the OST ones, so a racing reader can see the intermediate values.
+LU-17753 closed that for stat() alone by holding the size lock across
+the copy.
 
-i_size is written by the IO path.  vvp_prep_size() publishes the cat_kms
-of the object being read, which is the end of whichever components this
-reader holds an extent lock on - on a composite layout that is a
-component boundary, not a size.  A 4K read at offset 0 of a 200MB file
-whose first component ends at 128K leaves i_size at 131072, and the
-cat_size of the very same cl_attr says 209715200.  Ranks of an MPI job
-that stat such a file right after it was copied get the component
-boundary back; a second stat gets the real size.  Before composite
-layouts a single lock still scaled to within one stripe of the file size
-(lov_stripe_size()), so the value was a usable lower bound and nobody
-noticed that i_size was being used as one.
+Take one snapshot and report from it.  ll_merge_attr() fills a caller
+cl_attr under the size lock with the merged size, blocks and times,
+and cl_glimpse_lock()/ll_glimpse_size0() return 1 when they filled it.
+Paths that do not glimpse (size from the MDS, PCC, AT_STATX_DONT_SYNC,
+restore, directories) fill it from the inode with ll_attr_from_inode()
+under the same lock.  ll_getattr_dentry(), ll_file_seek(), the lseek,
+append and fallocate IO paths, and vvp_prep_size() use the snapshot
+instead of i_size.  lseek seeds it from the inode in case the merge is
+skipped.
 
-The timestamps are written by ll_merge_attr() in two steps - first the
-values the MDS reported, then the merge with the values the OSTs report
-- so a racing stat can catch the intermediate ones.  LUS-12265 closed
-that by making ll_getattr_dentry() take lli_size_mutex while it copies
-the times out of the inode.
+cl_attr carries seconds only, so stat() now reports tv_nsec 0 on every
+path, as the glimpse path already did.  i_size keeps its meaning for
+the IO path.
 
-Neither field has to be read from the inode at all.  Take a snapshot of
-the attributes to report and report that.  When the caller has just
-glimpsed the file the object is the authority: cat_size is the size, and
-the timestamps are merged the way ll_merge_attr() merges them.  On the
-paths that do not glimpse - a size the MDS vouches for, PCC,
-AT_STATX_DONT_SYNC, a file being restored, directories - there is no
-fresher source than the inode and the snapshot is filled from it, so the
-caller has one buffer to report from either way.
-
-The snapshot writes nothing: i_blocks is read from the inode so that the
-dirty page count a glimpse put there for LU-417 is kept.  It is taken
-under the size lock LUS-12265 reached for, which now covers the whole
-snapshot rather than the copy out of the inode, so the half-updated
-timestamps that lock was added for are unobservable whichever source the
-attributes came from.
-
-lseek(SEEK_END) had the same shape - glimpse, then read i_size - and is
-changed the same way.
-
-i_size keeps its current meaning for the IO path, which is what
-LU-16025 and sanityn test_16i rely on: a read is still confined by it
-after the kms it was given is written there.  What changes is that the
-value is no longer reported to userspace as the size of the file.
-
-Change-Id: If1df9f44db3cc38af888e19715766d15740b94d7
+Test-Parameters: trivial testlist=sanityn env=ONLY=16
 Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
 HPE-bug-id: LUS-13567
+Assisted-by: Copilot:claude-opus-5.5
+Change-Id: If1df9f44db3cc38af888e19715766d15740b94d7
 
 --- Review History ---
 
@@ -293,3 +273,590 @@ Hashtag added: pw_shepherd
 Patch Set 1:
 
 (1 comment)
+
+--- Message (Alexey Lyashkov, 2026-11-16 14:58:44.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-16 15:00:56.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 15:01:52.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-16 15:22:26.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136773/ : SUCCESS
+
+--- Message (Maloo, 2026-11-16 15:22:49.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 136773 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-ldiskfs-arm on el9.8-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/sles15sp7-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2404-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-8 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136773&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136773#redirect
+
+--- Message (Autotest, 2026-11-17 07:34:20.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.2-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:34:41.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-arm session on el9.8-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:34:55.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and sles15sp7-x86_64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:35:01.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:35:16.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and el10.2-x86_64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:36:32.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-3 session on el9.8-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:36:52.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:37:12.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-selinux-ssk-part-2 session on el8.10-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:38:32.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:38:36.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-selinux-ssk-part-1 session on el8.10-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:38:53.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-6 session on el10.2-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:39:13.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:39:44.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-8 session on el10.2-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:41:32.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and el9.8-x86_64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:42:03.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.8-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:44:23.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-ubuntu session on el8.10-x86_64/ldiskfs servers and ubuntu2404-x86_64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:44:45.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-ipv6 session on el9.8-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:45:04.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-1 session on el10.2-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:46:24.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.8-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:46:45.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-7 session on el9.8-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:47:05.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:47:46.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.2-x86_64/zfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:48:25.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-arm session on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:57:57.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-7 session on el10.2-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 08:04:18.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-6 session on el9.8-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 08:05:19.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-3 session on el10.2-x86_64/ldiskfs servers and clients for build 136773 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Alexey Lyashkov, 2026-11-17 09:23:34.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-17 09:37:37.000000000) ---
+Patch Set 2: Verified+1
+
+Passed enforced test review-dne-part-8 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm289: https://testing.whamcloud.com/test_sessions/748858a4-672f-40fa-99fb-02d84bbc0d5f ran 4 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-17 09:45:45.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; two earlier review points from patch set 1 are still open and are expanded inline. Neither is a defect in the current tree, so a refresh is optional.
+
+--- Message (Andrew Perepechko, 2026-11-17 10:22:15.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+Thanks for the update. Patch set 2 fixes the three PCC points from the AI review of patch set 1: pcc_inode_enabled() is gone together with its unlocked read of the PCC inode, the PCC-RO fallback is back to if (cached && rc < 0), and the encrypted PCC-RO size now comes from encsize. Moving the seeding from the inode out of __cl_glimpse_size() into the callers also answers Andreas's glimpse.c:186 point: AGL and the callers that pass no buffer take no size lock beyond the one the merge already takes on master. Reporting one snapshot taken under the size lock looks like the right direction to me.
+
+Two points from patch set 1 are still open, and I think both need a change before this lands (inline; both have the one-line fix Andreas proposed). file.c:1840: once the sibling 70225 is applied, the append, fallocate and SEEK_DATA/SEEK_HOLE paths can act on a smaller size than the one the merge keeps in i_size. glimpse.c:109: the LU-417 check still reads the inode outside the lock, so when two stat() calls race on a freshly written file whose data is still only in dirty pages, one of them can report st_blocks 0.
+
+[minor] The patch still sits on patch set 1 of 70224, which is now at patch set 4 with a different vvp_prep_size(). Patch set 2 cherry-picks cleanly onto patch set 4, but it has only been built and tested on the old parent. It will also conflict with 69694 in ll_merge_attr_nolock() and the write-end merges once that lands. When you rebase, could the commit message follow the parent? On top of 70224 patch set 4, vvp_prep_size() only raises i_size to KMS, so the 131072 example does not happen there, and the LU-16025 / test_16i paragraph describes patch set 1 of 70224.
+
+[minor] It would help if the message named the window this patch still closes on top of 70224 and 69694, i.e. which writer can still change i_size between the glimpse and the report. It should also cover the append, fallocate, SEEK_DATA/SEEK_HOLE and vvp_prep_size() hunks, and drop PCC from the paths filled from the inode, since pcc_inode_getattr() fills the snapshot from the PCC copy.
+
+[minor] The other patch set 1 threads are unchanged and still need a fix or a reply: Change-Id before Signed-off-by; LUS-12265 instead of LU-17753 (cd7c1407e3) in the code comments, and the component-boundary wording there; the Doxygen retval list instead of kernel-doc; cl_glimpse_size() left without callers; the ll_glimpse_size0 name; tv_nsec now always 0 on the paths filled from the inode; the directory time assignments that have no effect; and the comments in the append, fallocate and lseek paths that call i_size a kms.
+
+Tests: sanityn test_16l and test_16n in 70224 cover the PFL stat-after-read symptom, but they are the parent's tests and are meant to pass with 70224 alone, so no test shows what this patch adds on top of it. If a window remains, a sanityn test that fails on 70224 alone and passes with this patch would show it. As a client-only change, it needs no version check. If the change is meant as hardening, could the commit message say so?
+
+CI: jenkins built patch set 2, and Maloo gave Verified+1 today after the ATM-4114 retests, both on the 70224 patch set 1 base. I checked patch set 2 by reading it and by trial cherry-picks onto 70224 patch set 4, 70225 patch set 4 (a trivial glimpse.c conflict) and 69694 patch set 6. I found both races by reading the code and did not reproduce them on a test system.
+
+--- Message (Andrew Perepechko, 2026-11-17 10:22:29.000000000) ---
+Patch Set 2: Code-Review-1
+
+--- Message (patrick bot, 2026-11-17 10:33:33.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Maloo, 2026-11-17 10:45:06.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-7 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm175: https://testing.whamcloud.com/test_sessions/e8e3abe2-ff6a-4f5c-80e5-defa60c1dd99 ran 6 tests.
+
+--- Message (Maloo, 2026-11-17 11:26:54.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-6 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm313: https://testing.whamcloud.com/test_sessions/1bbeeb6f-b51d-4c95-8efc-8eff75b0c6c1 ran 4 tests.
+
+--- Message (Maloo, 2026-11-17 11:34:48.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-6 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm25: https://testing.whamcloud.com/test_sessions/2155edd7-e43f-4903-a1fc-5822697462b7 ran 4 tests.
+
+--- Message (Maloo, 2026-11-17 11:45:56.000000000) ---
+Patch Set 2: Verified-1
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm320: https://testing.whamcloud.com/test_sessions/796a03f7-3831-4d76-9ffd-e4a27211c054 ran 5 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-11-17 11:46:56.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm10: https://testing.whamcloud.com/test_sessions/b45a649a-00ee-48a6-8eb2-e9c494a28968 ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 11:47:03.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm294: https://testing.whamcloud.com/test_sessions/ba3f4d9f-2cd7-4f65-abc9-1fcce1b64ee8 ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 12:01:02.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm346: https://testing.whamcloud.com/test_sessions/074004d5-ca90-43bf-bd8f-49d23c5c371e ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 12:01:31.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-7 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm46: https://testing.whamcloud.com/test_sessions/788b1115-6bdb-4168-a921-791de3de020c ran 6 tests.
+
+--- Message (Maloo, 2026-11-17 12:04:38.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs on RHEL 8.10 / x86_64, SLES 15.7 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm346: https://testing.whamcloud.com/test_sessions/4cab6863-f92b-42c1-9325-f25f50fbe8dc ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 12:09:15.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm170: https://testing.whamcloud.com/test_sessions/5951bada-7c09-49df-ad16-ff28911ec861 ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 12:10:20.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-zfs on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm316: https://testing.whamcloud.com/test_sessions/a3a30905-8976-425a-b778-73263d6903a3 ran 8 tests.
+
+--- Message (Maloo, 2026-11-17 12:14:00.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm308: https://testing.whamcloud.com/test_sessions/d8d48f8e-c12a-4b2c-b4e2-fb547ded8793 ran 3 tests.
+
+--- Message (Maloo, 2026-11-17 12:16:56.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm311: https://testing.whamcloud.com/test_sessions/68c5b585-926b-4519-a8a7-b0733832829d ran 5 tests.
+
+--- Message (Maloo, 2026-11-17 12:39:33.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-1 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm13: https://testing.whamcloud.com/test_sessions/1a227b1f-5eee-4b56-a4dd-962edef67fc3 ran 3 tests.
+
+--- Message (Maloo, 2026-11-17 12:43:04.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm348: https://testing.whamcloud.com/test_sessions/92498050-d883-4d5c-8f87-8ede55e53965 ran 3 tests.
+
+--- Message (Maloo, 2026-11-17 12:52:06.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-4 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm316: https://testing.whamcloud.com/test_sessions/1859c9a2-6f32-4e1c-a69f-38c3b5e2e0f7 ran 9 tests.
+
+--- Message (Maloo, 2026-11-17 13:00:52.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-ipv6 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm318: https://testing.whamcloud.com/test_sessions/75ffc93b-769b-48bb-a2e5-a116ddb1a51a ran 4 tests.
+
+--- Message (Maloo, 2026-11-17 13:17:31.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm311: https://testing.whamcloud.com/test_sessions/94ed785f-8563-490d-8776-f70c98fc7df0 ran 11 tests.
+
+--- Message (Maloo, 2026-11-17 13:48:02.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-4 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm306: https://testing.whamcloud.com/test_sessions/b5f1ca6f-ed1c-4679-a9f9-e3edd5778a48 ran 9 tests.
+
+--- Message (Maloo, 2026-11-17 14:00:49.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-2 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm20: https://testing.whamcloud.com/test_sessions/a4a90490-b55f-4cff-8109-ad73641596ce ran 11 tests.
+
+--- Message (Maloo, 2026-11-17 14:24:01.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs-arm on RHEL 9.8 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-154vm16: https://testing.whamcloud.com/test_sessions/08a9e865-d85e-4aca-86d7-ce78f1d688c0 ran 6 tests.
+
+--- Message (Maloo, 2026-11-17 14:52:09.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-3 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm284: https://testing.whamcloud.com/test_sessions/318de90f-413d-4b18-acd9-d195398ec16b ran 3 tests.
+
+--- Message (Maloo, 2026-11-17 14:55:25.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm16: https://testing.whamcloud.com/test_sessions/37e3166a-411c-44bc-a536-68ad1d8b33fe ran 6 tests.
+
+--- Message (Maloo, 2026-11-17 15:19:52.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 24.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-142vm37: https://testing.whamcloud.com/test_sessions/be19b997-b5a3-43cb-a666-60fa720c3b1c ran 6 tests.
+
+--- Message (Maloo, 2026-11-17 20:51:07.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm44: https://testing.whamcloud.com/test_sessions/02515dbe-4233-4031-b380-d695336f5330 ran 3 tests.
+
+--- Message (Alexey Lyashkov, 2026-11-18 13:07:01.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-18 13:09:50.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 13:10:14.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (Alexey Lyashkov, 2026-11-18 13:41:14.000000000) ---
+Uploaded patch set 4.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 13:47:27.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-18 13:56:34.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-18 14:07:46.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+Thanks for the rework. Patch set 4 closes the LU-417 race: the dirty-page fix-up now runs in ll_merge_attr_nolock() under the size lock and goes into each caller's own @attr, so two stat() calls can no longer race on it. The chain now sits on 70225 PS5 and 70224 PS5, and the message cites LU-17753.
+
+One problem remains, and with 70225 now under this patch it is a real one (inline, file.c:1849): the append, fallocate and SEEK_DATA/SEEK_HOLE paths take the size from @attr, and @attr still carries the stale OSC size when the merge keeps the MDT size, which is the case 70225 exists for. The fix is one line, inline.
+
+Smaller points inline. 69694 has not landed yet; the conflict with it in ll_merge_attr_nolock() and the write-end merges remains a rebase note.
+
+--- Message (Andrew Perepechko, 2026-11-18 14:07:54.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (Andrew Perepechko, 2026-11-18 14:08:08.000000000) ---
+Patch Set 4: Code-Review-1
+
+--- Message (Alexey Lyashkov, 2026-11-18 16:04:10.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 16:07:03.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-18 16:17:31.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-18 16:18:34.000000000) ---
+Patch Set 5:
+
+I went over my patch set 4 [major] again against the lock each of those paths takes, and I overstated it. An append locks the whole initialized region (lov_io_rw_iter_init() sets wr_append_lockpos to the end of the last initialized component), and SEEK_DATA/SEEK_HOLE lock [start, EOF], so the merge they do runs on fresh LVBs and cat_size cannot be below the real end of file there. fallocate locks only its range, but it only uses that size to decide whether to extend, and vvp_io_setattr_end() and the OST only ever grow the size. So I see no path where the size the merge refuses does harm, and I withdraw the [major]. Sorry for the noise.
+
+What remains is a consistency question, not a bug: 70225's commit message names exactly these three callers as the ones that need the kept MDT size, and with this patch they no longer read it. If the snapshot should describe the size the merge adopted, the one-line else branch I proposed does that; otherwise 70225's message could drop those callers. Either is fine with me.
+
+Patch set 5 moves the LU-417 check onto @attr, as Andreas suggested, which is right. My patch set 4 [minor] (say in the commit message that the fix-up now also runs on the write-end merges) and the two [nit]s (LUS-12265 in the comments, the seed in vvp_io_lseek_start()) still stand; none of them blocks.
+
+--- Message (Andrew Perepechko, 2026-11-18 16:18:37.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-18 16:18:40.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-18 16:19:02.000000000) ---
+Patch Set 5: Code-Review+1
+
+--- Message (jenkins, 2026-11-18 16:33:12.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136995/ : SUCCESS
+
+--- Message (Maloo, 2026-11-18 16:34:30.000000000) ---
+Patch Set 5:
+
+#### The following sessions will be run for Build 136995 (patch #5):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136995&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136995#redirect
+
+--- Message (Maloo, 2026-11-18 20:26:11.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-ldiskfs-dne on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm70: https://testing.whamcloud.com/test_sessions/834423ee-08d3-4cc1-8998-776053fe66d8 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-18 20:34:45.000000000) ---
+Patch Set 5:
+
+Failed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm71: https://testing.whamcloud.com/test_sessions/8e4a2da8-7d71-4888-971e-7688dd463d28 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (patrick bot, 2026-11-18 20:37:00.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-18 20:54:35.000000000) ---
+Patch Set 5: Code-Review-1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 21:04:49.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Maloo, 2026-11-18 21:41:43.000000000) ---
+Patch Set 5: Verified-1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm4: https://testing.whamcloud.com/test_sessions/f707fd4d-6554-4de4-bda3-9b653240877c ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-18 21:47:57.000000000) ---
+Patch Set 5:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall. The three points inline are open from patch set 4 and still apply to patch set 5. None of them is a defect, so there is no need to re-spin for them; they can go in with the next refresh.

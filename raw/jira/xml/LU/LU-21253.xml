@@ -1,0 +1,109 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21253] ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks</title>
+                <link>https://jira.whamcloud.com/browse/LU-21253</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;&lt;b&gt;Problem&lt;/b&gt;&lt;br/&gt;
+ofd_commitrw_write() forces a journal commit for every write whose pages lack OBD_BRW_ASYNC, so each O_DIRECT write waits for a jbd2 commit, even when it only overwrites blocks that are already allocated, written and committed. For small random O_DIRECT overwrites this commit dominates the write latency.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Proposal&lt;/b&gt; (4 patches, tunable, default off)&lt;/p&gt;
+&lt;ol&gt;
+	&lt;li&gt;osd-ldiskfs: set a new thandle::th_overwrite when every page of the request is an in-place overwrite of committed blocks: no block allocated or converted, write inside i_size, extent-mapped inode, i_datasync_tid committed, and no volatile write cache on the device (or journal without barriers). osd-zfs never sets it. No functional change on its own.&lt;/li&gt;
+	&lt;li&gt;ofd: new tunable obdfilter.*.dio_overwrite_nosync (default 0). When set, such a write skips the forced commit if the object has no uncommitted replayable change, no attribute had to be set, and the request is not a retry/replay and the target is not in recovery. The write becomes a local transaction (no client replay), and the object version is still advanced. fsync() still commits. Counters dio_overwrite_nosync_count / dio_overwrite_sync_count and a man page.&lt;/li&gt;
+	&lt;li&gt;ofd: keep the commit for any write that changes a stored timestamp (OST timestamps are whole seconds from the client, so only the first write per object per second changes them), so mtime/ctime cannot roll back after an OST crash and O_SYNC stays synchronous without a protocol change. Requests changing the object are fenced (in-flight count + dirty transno). Adds dio_overwrite_sync_reasons (forced commits per reason, failed writes as "error"). Adds OBD_FAIL_OST_DIO_NOSYNC_ERR (0x258).&lt;/li&gt;
+	&lt;li&gt;ofd: commit a DIO write after a data_version read of the object, and sync an object with an uncommitted version before returning the version (OST_GETATTR, obd getattr, OBD_IOC_GET_OBJ_VERSION), so tools like the HSM copytool never see an unchanged version for changed data.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;&lt;b&gt;Remaining trade-off&lt;/b&gt; (documented in the man page): with the tunable set, an OST crash can lose the object version advance of a nosync write that was not followed by a data_version read; the data itself is on disk before the reply. Not intended for devices with a volatile write cache (checked automatically).&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Compatibility:&lt;/b&gt; no wire or on-disk format change; default 0 keeps today's behaviour (only in-memory bookkeeping is added); downgrade safe.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Tests added:&lt;/b&gt; sanity 398w, 398x, 398y, 398z (counters, per-reason accounting with an invariant check, timestamp and data_version cases, failed-write accounting via fail_loc 0x258); replay-ost-single 13 and 14 (OST crash after nosync writes; the crash check is retried, then skipped, if a journal commit falls in the crash window).&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Local results&lt;/b&gt; (2-node VMs, loop/dm-flakey OSTs; not hardware numbers)&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;4 KiB O_DIRECT random overwrite, tunable 1 vs 0: about 2.3x IOPS at QD1, 1.7x at QD16; 1 MiB QD16 about 1.1x.&lt;/li&gt;
+	&lt;li&gt;lfs data_version cost with the tunable set: about +3% mean.&lt;/li&gt;
+	&lt;li&gt;Default (tunable 0): one forced commit per DIO write, as today.&lt;/li&gt;
+	&lt;li&gt;Regression: sanity 398a-398v subset, full recovery-small, sanity-flr, sanity-hsm 20-30, lfs migrate tests and sanityn compared at base / tunable 0 / tunable 1 - no new failures (the failures seen also fail on base: 398k/l and some flr/sanityn tests from small test OSTs, NRS TBF tests in this setup).&lt;/li&gt;
+	&lt;li&gt;Each test fails cleanly on the commit before the fix it covers (replay-ost-single 13 before patch 3, 14 before patch 4).&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment>ldiskfs OSTs on devices without a volatile write cache</environment>
+        <key id="100592">LU-21253</key>
+            <summary>ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="4" iconUrl="https://jira.whamcloud.com/images/icons/priorities/minor.svg">Minor</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="spore">Shriram Pore</reporter>
+                        <labels>
+                            <label>performance</label>
+                    </labels>
+                <created>Thu, 19 Nov 2026 12:25:56 +0000</created>
+                <updated>Thu, 19 Nov 2026 20:42:34 +0000</updated>
+                                            <version>Lustre 2.17.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506152" author="gerrit" created="Thu, 19 Nov 2026 12:32:33 +0000">&lt;p&gt;"Shriram Pore &amp;lt;spore@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71184" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71184&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21253" title="ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks" class="issue-link" data-issue-key="LU-21253"&gt;LU-21253&lt;/a&gt; osd-ldiskfs: flag overwrite of committed blocks&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 0d294e47c9d7c33319fd156f1c6c359b9957f81c&lt;/p&gt;</comment>
+                            <comment id="506153" author="gerrit" created="Thu, 19 Nov 2026 12:32:34 +0000">&lt;p&gt;"Shriram Pore &amp;lt;spore@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71185" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71185&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21253" title="ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks" class="issue-link" data-issue-key="LU-21253"&gt;LU-21253&lt;/a&gt; ofd: skip forced commit for DIO overwrite&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 8abe83069de54e86506ea7849361ab4eea997058&lt;/p&gt;</comment>
+                            <comment id="506154" author="gerrit" created="Thu, 19 Nov 2026 12:32:34 +0000">&lt;p&gt;"Shriram Pore &amp;lt;spore@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71186" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71186&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21253" title="ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks" class="issue-link" data-issue-key="LU-21253"&gt;LU-21253&lt;/a&gt; ofd: keep commit for DIO write changing timestamps&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 1a005a64c73a5928a30bba4d5ea9b172844b4216&lt;/p&gt;</comment>
+                            <comment id="506155" author="gerrit" created="Thu, 19 Nov 2026 12:32:35 +0000">&lt;p&gt;"Shriram Pore &amp;lt;spore@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71187" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71187&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21253" title="ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks" class="issue-link" data-issue-key="LU-21253"&gt;LU-21253&lt;/a&gt; ofd: commit DIO write after data_version sample&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: a729a2262d869cdff2ad0aca833e2baf088a5d84&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073j3:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

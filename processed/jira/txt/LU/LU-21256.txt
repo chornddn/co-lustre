@@ -1,0 +1,84 @@
+Key:        LU-21256
+Summary:    MDS LBUG in lod_prep_lmv_md() (ASSERTION(lo->ldo_dir_striped != 0)) when running lfs migrate -m with multi-stripe count on a single-MDT filesystem
+Link:       https://jira.whamcloud.com/browse/LU-21256
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chirag Pandya
+Created:    Thu, 19 Nov 2026 18:32:15 +0000
+Updated:    Fri, 20 Nov 2026 21:45:43 +0000
+Labels:     mds
+
+--- Description ---
+Running lfs migrate -m 0 -c 2  (or any migration requesting stripe_count > max_stripe_count, such as -c 2 without -C or -C 2 when lod_max_stripes_per_mdt=1, on a single-MDT filesystem) causes an immediate LBUG kernel panic on the MDS inside lod_prep_lmv_md():
+
+LustreError: ...:(lod_object.c:...:lod_prep_lmv_md()) ASSERTION( lo->ldo_dir_striped != 0 ) failed:
+
+Call path on the MDS:
+
+lod_prep_lmv_md
+ -> lod_xattr_set_lmv
+ -> lod_dir_striping_create_internal
+ -> lod_xattr_set
+ -> mdo_xattr_set
+ -> mdd_create_object
+ -> mdd_migrate_create
+ -> mdd_migrate_object
+ -> mdd_migrate
+ -> mdt_reint_migrate
+
+Steps to Reproduce
+
+ 
+
+	Mount a Lustre filesystem with a single MDT (MDSCOUNT=1)
+
+	Create a directory with a file inside it.
+
+mkdir /mnt/lustre/testdir touch /mnt/lustre/testdir/file
+
+	 
+
+	Run lfs migrate requesting 2 metadata stripes:
+
+lfs migrate -m 0 -c 2 /mnt/lustre/testdir
+
+--- Comment (JIRAUSER20802, Thu, 19 Nov 2026 18:41:42 +0000) ---
+A small sanity test also reproduces this issue on main.
+
+diff --git a/lustre/tests/sanity.sh b/lustre/tests/sanity.sh
+index d574064c00..04874a358f 100755
+--- a/lustre/tests/sanity.sh
++++ b/lustre/tests/sanity.sh
+@@ -37138,6 +37138,27 @@ test_920()
+ }
+ run_test 920 "Test multy LUFID"
+ 
++test_921() {
++    (( MDSCOUNT == 1 )) || skip "1 MDT only"
++    (( MDS1_VERSION >= $(version_code 2.11.52) )) ||
++        skip "Need MDS version at least 2.11.52"
++
++    mkdir -p $DIR/$tdir || error "mkdir $tdir failed"
++    stack_trap "rm -rf $DIR/$tdir"
++    touch $DIR/$tdir/$tfile || error "touch $tdir/$tfile failed"
++
++    # Requesting >1 stripe on a 1-MDT filesystem must fail cleanly rather
++    # than clamping ldo_dir_stripe_count to 0 and hitting an MDS LBUG in
++    # lod_prep_lmv_md().
++    $LFS migrate -m 0 -c 2 $DIR/$tdir &&
++        error "migrate -m 0 -c 2 on 1-MDT should fail"
++
++    $LFS getdirstripe -H $DIR/$tdir 2>/dev/null | grep -q migrating &&
++        error "$tdir left in migrating state"
++    stat $DIR/$tdir/$tfile > /dev/null || error "stat $tdir/$tfile failed"
++}
++run_test 921 "migrate dir with multi-stripe count on single-MDT"
+
+--- Comment (JIRAUSER20802, Thu, 19 Nov 2026 23:28:21 +0000) ---
+Testing out a fix for the issue.
+
+--- Comment (JIRAUSER21301, Fri, 20 Nov 2026 21:45:43 +0000) ---
+cpio what lustre version were you running?  Do you have a vmcore?  Or at least a full backtrace?

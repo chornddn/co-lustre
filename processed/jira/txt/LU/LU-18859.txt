@@ -8,7 +8,7 @@ Resolution: Fixed
 Assignee:   Sergey Cheremencev
 Reporter:   Sergey Cheremencev
 Created:    Thu, 27 Mar 2025 20:34:48 +0000
-Updated:    Wed, 16 Sep 2026 10:25:31 +0000
+Updated:    Wed, 18 Nov 2026 15:11:22 +0000
 Resolved:   Thu, 10 Apr 2025 12:57:54 +0000
 
 --- Description ---
@@ -70,3 +70,134 @@ Commit: 7e5a5855ca19d3fe773b17a19c78a022b27bdfcb
 
 --- Comment (pjones, Thu, 10 Apr 2025 12:57:54 +0000) ---
 Merged for 2.17
+
+--- Comment (ake_s, Wed, 18 Nov 2026 15:11:22 +0000) ---
+Won't a user be able to trigger this by using lustreapi with something like this (python-ish code taken from an actual case where a user seems to have been triggering this)
+
+ 
+
+```
+
+import ctypes as C, ctypes.util, json
+
+class I(C.Structure):
+
+    fields = [
+
+        ("bgrace", C.c_uint64),
+
+        ("igrace", C.c_uint64),
+
+        ("flags", C.c_uint32),
+
+        ("valid", C.c_uint32),
+
+    ]
+
+class B(C.Structure):
+
+    fields = [
+
+        (n, C.c_uint64)
+
+        for n in [
+
+            "bhard",
+
+            "bsoft",
+
+            "space",
+
+            "ihard",
+
+            "isoft",
+
+            "inodes",
+
+            "btime",
+
+            "itime",
+
+        ]
+
+    ] + [("valid", C.c_uint32), ("padding", C.c_uint32)]
+
+class Q(C.Structure):
+
+    fields = [
+
+        (n, C.c_uint32) for n in ["cmd", "type", "id", "stat", "valid", "idx"]
+
+    ] + [
+
+        ("info", I),
+
+        ("block", B),
+
+        ("obd_type", C.c_char * 16),
+
+        ("uuid", C.c_char * 40),
+
+    ]
+
+lib = C.CDLL(ctypes.util.find_library("lustreapi"))
+
+lib.llapi_quotactl.argtypes = [C.c_char_p, C.POINTER(Q)]
+
+lib.llapi_quotactl.restype = C.c_int
+
+print("sizes", C.sizeof(Q), C.sizeof(I), C.sizeof(B))
+
+for typ, id in [
+
+        (2, 4102372), # project quota for project 4102372
+
+        (0, 4004002), # user quota for user with uid 4004002
+
+        (1, 4102372), # group quota for group with gid 4102372
+
+        (1, 4004002), # group quota for group with gid 4004002
+
+]:
+
+    for cmd in [
+
+            0x800005, # LUSTRE_Q_GETINFO    - get information about quota files
+
+            0x800007, # LUSTRE_Q_GETQUOTA   - get user quota structure
+
+            0x80000D, # LUSTRE_Q_GETDEFAULT - get default quota
+
+    ]:
+
+        q = Q(cmd=cmd, type=typ, id=id)
+
+        rc = lib.llapi_quotactl(b"/mounted/lustre/fs", C.byref(q))
+
+        print(
+
+            json.dumps(
+
+                
+
+{
+                    "type": typ,
+                    "id": id,
+                    "cmd": hex(cmd),
+                    "rc": rc,
+                    "stat": q.stat,
+                    "valid": q.valid,
+                    "info": \{n: getattr(q.info, n) for n, t in I._fields_}
+,
+
+                    "block": {n: getattr(q.block, n) for n, t in B.fields},
+
+                }
+
+            )
+
+        )
+
+```
+
+We think that "id" will be non-zero and with root-squash is not in effect it should trip on the same problem when calling LUSTRE_Q_GETDEFAULT

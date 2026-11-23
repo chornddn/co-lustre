@@ -1,0 +1,342 @@
+Change:     70903
+Subject:    LU-9989 llite: copy data into pipe for splice on old kernels
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70903
+Change-Id:  I2aca5d9466f0124ce8ffc133aeded4a15bab91e6
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andrew Perepechko
+Created:    2026-11-15 11:06:48.000000000
+Updated:    2026-11-22 14:22:00.000000000
+Patch Set:  4
+Insertions: +273
+Deletions:  -4
+Comments:   7 (0 unresolved)
+Hashtags:   pw_shepherd, pw_halt
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: -1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Alexander Zarochentsev, Patrick Farrell
+
+--- Commit Message ---
+LU-9989 llite: copy data into pipe for splice on old kernels
+
+On kernels without copy_splice_read() (before Linux 6.5: RHEL 8,
+RHEL 9.0-9.4, SLES15 SP2-SP5, Ubuntu 20.04/22.04, 6.1),
+pcc_file_splice_read() reads with generic_file_splice_read(), which
+puts the page cache pages themselves into the pipe.  If such a page
+is dropped before the pipe is read, page_cache_pipe_buf_confirm()
+fails the reader with ENODATA (page removed from the page cache) or
+EIO (page still cached, but not uptodate), so read() from the pipe
+fails, and sendfile() and splice() return an error, 0 or a short
+count:
+
+ => page_cache_pipe_buf_confirm
+ => iter_file_splice_write
+ => direct_splice_actor
+ => splice_direct_to_actor
+ => do_splice_direct
+ => do_sendfile
+
+->release_folio() clears PG_uptodate of the pages it deletes from
+Lustre.  An O_DIRECT write, lockless by default, invalidates the
+cached pages of its range on the writing client before any lock is
+cancelled, and invalidate_inode_pages2_range() removes them in spite
+of the pipe reference: ENODATA.  Reclaim, and drop_caches or
+POSIX_FADV_DONTNEED on kernels whose invalidate_inode_page() does not
+check the page refcount (RHEL 8, RHEL 9.0), release such a page as
+well, but cannot remove it while the pipe holds it, so it stays
+cached, not uptodate: EIO.  Before LU-20157
+(https://review.whamcloud.com/69332), a lock cancel also cleared
+PG_uptodate when it discarded the pages: ENODATA; with that change,
+the pipe keeps the data spliced under the lock.
+
+Add ll_copy_splice_read() for these kernels.  Like copy_splice_read()
+of Linux 6.5, which newer kernels already use, it reads the data with
+->read_iter() into new pages under the usual DLM locks and adds them
+to the pipe with add_to_pipe() and nosteal_pipe_buf_ops, so no page
+cache page gets into the pipe.  compat_pipe_free_slots() limits the
+read to the free pipe slots for both pipe layouts (head/tail since
+Linux 5.5, curbuf/nrbufs before).  Also drop the dead
+default_file_splice_read() case, whose check LU-19179 removed.
+
+Add sanity test 443 and the multiop commands Xp (splice into a pipe)
+and XP (read the pipe back and compare it with the file).  The test
+splices from a Lustre file and reads the pipe after an O_DIRECT write
+of the same data over the spliced range, which failed with ENODATA,
+then after a lock cancel, which failed the same way before LU-20157.
+It can only fail on clients without copy_splice_read(): RHEL 9.5+ and
+Linux 6.5+ clients already copy and always pass, hence the el8.10
+client session.
+
+Test-Parameters: clientdistro=el8.10 testlist=sanity env=ONLY=443
+HPE-bug-id: LUS-12235
+Signed-off-by: Andrew Perepechko <andrew.perepechko@hpe.com>
+Assisted-by: DSH:claude-opus-5.5
+Change-Id: I2aca5d9466f0124ce8ffc133aeded4a15bab91e6
+
+--- Review History ---
+
+--- Message (Andrew Perepechko, 2026-11-15 11:06:48.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-15 11:11:11.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-15 11:11:15.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-15 11:31:45.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136524/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-15 20:13:15.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-15 22:07:28.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Autotest, 2026-11-16 08:28:22.000000000) ---
+Patch Set 1:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 136524 patch 1. Requested by Andrew Perepechko because of LU-21167.
+
+--- Message (Andrew Perepechko, 2026-11-16 11:09:00.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andrew Perepechko, 2026-11-16 11:09:50.000000000) ---
+Patch Set 2:
+
+PS2 changes the trigger of sanity 443; the fix code is unchanged (only its kernel-doc comment and the commit message are updated).
+
+https://review.whamcloud.com/69332 (LU-20157, in master-next) stops clearing PG_uptodate when a lock cancel discards pages, and page_cache_pipe_buf_confirm() checks ->mapping only for pages that are not uptodate. With 69332 the PS1 test (cancel_lru_locks between the splice and the pipe read) passes without the fix: 3/3 on master + 69332 PS13 with the pre-6.5 splice path. The bug remains, since ->release_folio() still clears PG_uptodate: an O_DIRECT write from the same client (lockless, so invalidate_inode_pages2_range() releases and removes the spliced pages before any lock is cancelled) fails the read with ENODATA, and reclaim with EIO. The test now reads the pipe after an O_DIRECT write of the same data, and then after a lock cancel as before, which still matters without 69332.
+
+Testbed, RHEL 9.6 client with generic_file_splice_read() forced (lb_cv_export_filemap_splice_read=no, emulating RHEL 8 / 9.0-9.4): without the fix 3/3 FAIL with ENODATA after the O_DIRECT write, both on master and on master + 69332; with the fix 3/3 PASS on both. Default builds (kernel copy_splice_read()) pass. Reclaim through memory.reclaim of a memory cgroup also fails the read without the fix (EIO) on both and passes with it. drop_caches and POSIX_FADV_DONTNEED cannot be the trigger: since RHEL 9.1 mapping_evict_folio() skips a page with an extra reference, so they never call ->release_folio() for a page held by a pipe (RHEL 8 still does).
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 11:19:02.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-16 11:24:54.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-16 12:31:27.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136763/ : SUCCESS
+
+--- Message (Autotest, 2026-11-17 06:59:15.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 06:59:34.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-3 session on el10.2-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 06:59:45.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-1 session on el10.2-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 06:59:55.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-ipv6 session on el9.8-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:05.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-7 session on el9.8-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:16.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.8-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:25.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-3 session on el9.8-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:35.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:46.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-6 session on el9.8-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:00:56.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-4 session on el9.8-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:01:06.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:01:15.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs session on el8.10-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:01:36.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-8 session on el10.2-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:02:46.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:03:06.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.2-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:03:46.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-7 session on el10.2-x86_64/ldiskfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:04:17.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.2-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (Autotest, 2026-11-17 07:05:07.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-6 session on el10.2-x86_64/zfs servers and clients for build 136763 patch 2. Requested by Charlie Olmstead because of ATM-4114.
+
+--- Message (patrick bot, 2026-11-17 15:51:53.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-17 17:11:05.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-17 20:09:52.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 00:14:29.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 00:14:47.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (patrick bot, 2026-11-18 00:24:51.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-19 10:39:22.000000000) ---
+Uploaded patch set 3: Patch Set 2 was rebased.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andrew Perepechko, 2026-11-19 10:41:22.000000000) ---
+Patch Set 3:
+
+Rebased onto master (54dc726b56) to pick up 70827, the LU-21191 sanity-sec test_17/test_21 fix the bot halted on. Code is unchanged from PS2; the diff is the same splice_read change plus sanity 443 and multiop Xp/XP. Please release the halt once CI passes.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 10:43:14.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (patrick bot, 2026-11-19 10:43:38.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-19 10:48:06.000000000) ---
+Hashtag removed: pw_halt
+
+--- Message (wc-checkpatch, 2026-11-19 10:51:28.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-19 11:15:17.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137086/ : SUCCESS
+
+--- Message (Autotest, 2026-11-20 06:19:28.000000000) ---
+Patch Set 3:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 137086 patch 3. Requested by Patrickbot because of LU-20873.
+
+--- Message (patrick bot, 2026-11-20 06:23:38.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-20 06:23:48.000000000) ---
+Hashtag added: pw_halt
+
+--- Message (patrick bot, 2026-11-21 11:33:06.000000000) ---
+Uploaded patch set 4: Patch Set 3 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-21 11:33:18.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-21 11:36:28.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-21 11:45:00.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-21 23:03:20.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137461/ : SUCCESS

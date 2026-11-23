@@ -1,0 +1,48 @@
+Key:        LU-21292
+Summary:    unrm via setattr bypasses owner/CAP checks
+Link:       https://jira.whamcloud.com/browse/LU-21292
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Xiyang Wang
+Reporter:   Xiyang Wang
+Created:    Mon, 23 Nov 2026 06:18:19 +0000
+Updated:    Mon, 23 Nov 2026 06:19:30 +0000
+
+--- Description ---
+Found by code review of ex/lustre-release b_es7_0 @ 2.16.0-ddn63 (TCU, EX-428). Not yet reproduced on hardware; reproducer is sanity-tcu.sh test_10.
+
+Problem
+
+mdd_attr_set() (lustre/mdd/mdd_object.c:1326-1352) sets clear_unrm_fl=true for any setattr that clears LUSTRE_UNRM_FL on a trash object. mdd_fix_attr() then skips these checks when clear_unrm_fl is set:
+
+project-change permission (:708)
+
+flag-change owner / CAP_FOWNER (:757)
+
+chown CAP_CHOWN (:852)
+
+chgrp CAP_CHOWN (:883)
+
+Nothing checks that the caller is root or the original owner (trusted.unrm urm_uid).
+
+When trusted.unrm is absent (mdd.*.trash_can_{uid,gid,projid}=original, or a missing/damaged xattr; :1338-1340), the caller-supplied uid/gid are applied as-is. Any user who can reach a trash object can chown it to an arbitrary uid.
+
+Reproducer
+
+As root: mkdir d; chmod 1777 d
+
+As user A: write d/f, then rm d/f
+
+As user B: chattr -u d/.Trash/f or lfs trash unrm d/.Trash/f
+
+Expected: EPERM; the file stays in the trash with UNRM set.
+
+Actual (by code): succeeds.
+
+Suggested fix
+
+In mdd_attr_set(), allow UNRM clearing only for root (CAP_SYS_ADMIN/CAP_FOWNER, RBAC) or when uc_fsuid == urm_uid. While clearing UNRM, ignore caller LA_UID/LA_GID/LA_PROJID and apply only the ids from the xattr. If the xattr is missing, allow root only.
+
+Related: EX-14708, EX-13731.

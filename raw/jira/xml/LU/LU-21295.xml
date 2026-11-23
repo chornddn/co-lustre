@@ -1,0 +1,138 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21295] ptlrpc: add tracepoints for the RPC lifecycle</title>
+                <link>https://jira.whamcloud.com/browse/LU-21295</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h3&gt;&lt;a name="Why"&gt;&lt;/a&gt;Why&lt;/h3&gt;
+
+&lt;p&gt;When a site reports that the filesystem is slow or that RPCs time out, the first questions are which RPCs are slow, for which job, and where their time goes: on the network, waiting in the server's queue, or in the service thread. Today the only per-request source for these answers is the libcfs debug log, which is a poor fit for this:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;rpctrace has to be enabled before the problem happens, on every node involved, and the debug log slows the whole node down. On test VMs, a single-client metadata benchmark ran about 2.5 times slower with a full debug mask left on the servers.&lt;/li&gt;
+	&lt;li&gt;The log is a ring buffer that wraps under load or is dropped under memory pressure (&lt;a href="https://jira.whamcloud.com/browse/LU-15917" title="Memory pressure prevents debug daemon / debug buffer from proper operation" class="issue-link" data-issue-key="LU-15917"&gt;LU-15917&lt;/a&gt;), can only be filtered by mask and subsystem, and is analysed after the fact by dumping text from each node and matching xids by hand.&lt;/li&gt;
+	&lt;li&gt;The *.stats files and job stats give counts and averages, not distributions, so they hide the slow tail that users notice, and they cannot tie a slow request to its peer or job.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;eBPF tools (bpftrace, bcc, libbpf, perf, trace-cmd) can answer these questions on a production system, aggregating in the kernel at low cost: latency histograms per target, opcode and job, queue time against service time on the server, timeouts as they happen. What they lack in Lustre is stable places to attach:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;kprobes and fentry probes on ptlrpc functions break whenever a function is renamed, inlined or refactored, which happens every release, so a script written for one version silently stops working on the next.&lt;/li&gt;
+	&lt;li&gt;Reading struct ptlrpc_request from a kprobe needs module BTF. &lt;a href="https://jira.whamcloud.com/browse/LU-17768" title="Allow building rpms with BTF" class="issue-link" data-issue-key="LU-17768"&gt;&lt;del&gt;LU-17768&lt;/del&gt;&lt;/a&gt; embeds it only when the build has a vmlinux, or runs on the target kernel with distilled-base support, so most RHEL 8/9 server packages ship without it.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Kernel tracepoints solve both problems. Their names and fields are an interface kept in the Lustre source, described in tracefs, and usable without BTF or debuginfo, and when nothing is attached they cost one static-key branch. &lt;a href="https://jira.whamcloud.com/browse/LU-20837" title="libcfs: add tracepoints for Lustre debug messages" class="issue-link" data-issue-key="LU-20837"&gt;&lt;del&gt;LU-20837&lt;/del&gt;&lt;/a&gt; added the first Lustre tracepoints, for debug messages. This ticket adds structured events for the RPC lifecycle on both the client and the server.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="RelationtoLU8980"&gt;&lt;/a&gt;Relation to &lt;a href="https://jira.whamcloud.com/browse/LU-8980" title="Add tracepoint support to Lustre" class="issue-link" data-issue-key="LU-8980"&gt;LU-8980&lt;/a&gt;&lt;/h3&gt;
+&lt;h3&gt;&lt;a name="Proposal"&gt;&lt;/a&gt;Proposal&lt;/h3&gt;
+
+&lt;p&gt;Add trace system "ptlrpc" with five events:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Event&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Fires in&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Fields beyond xid and opcode&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_cli_send&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ptl_send_rpc(), just before the request goes on the wire, including every resend&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;target, peer NID, jobid, message flags, resent, timeout&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_cli_reply&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;after_reply(), once the reply is unpacked&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;target, status, latency since the last send&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_cli_timeout&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_expire_one_request()&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;target, send time, resent, network error&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_srv_start&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_server_handle_request(), when a service thread takes the request&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;service, peer NID, jobid, time queued&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_srv_done&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;ptlrpc_server_handle_request(), after the handler returns&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;service, peer NID, jobid, status, service time, total time&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;xid, opcode and peer NID let one RPC be followed from the client to the server and back.&lt;/p&gt;
+
+&lt;p&gt;Add contrib/eBPF/ptlrpc_latency.bt, which prints client latency histograms per target and opcode, client timeouts, and server queue and service time histograms per service and opcode. Add sanity test 60n, which checks that one RPC is traced on both the client and the MDS.&lt;/p&gt;
+
+&lt;p&gt;Examples:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;client# bpftrace contrib/eBPF/ptlrpc_latency.bt
+mds#    bpftrace -e 'tracepoint:ptlrpc:ptlrpc_srv_done { @us[args-&amp;gt;jobid] = hist(args-&amp;gt;total_us); }'
+client# trace-cmd record -e ptlrpc:ptlrpc_cli_timeout
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;h3&gt;&lt;a name="Designnotes"&gt;&lt;/a&gt;Design notes&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;String fields are fixed-size, zero-padded arrays rather than __string(). bpftrace 0.23 on aarch64 reads __data_loc strings as empty, and bpftrace keys maps on the whole array, so trailing bytes would split identical keys. A record takes up to about 300 bytes in the trace buffer, and only while the event is enabled.&lt;/li&gt;
+	&lt;li&gt;"resent" comes from MSG_RESENT in the request flags, so it is set for every kind of resend: after a timeout, a reconnect, a truncated reply or -EINPROGRESS.&lt;/li&gt;
+	&lt;li&gt;The events report the latencies that ptlrpc already computes, so they add no new time-keeping.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment />
+        <key id="100788">LU-21295</key>
+            <summary>ptlrpc: add tracepoints for the RPC lifecycle</summary>
+                <type id="4" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11310&amp;avatarType=issuetype">Improvement</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="npapakonstantinou">Nikos Papakonstantinou</assignee>
+                                    <reporter username="npapakonstantinou">Nikos Papakonstantinou</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 23 Nov 2026 10:09:47 +0000</created>
+                <updated>Mon, 23 Nov 2026 10:20:46 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506619" author="gerrit" created="Mon, 23 Nov 2026 10:20:46 +0000">&lt;p&gt;"Nikos Papakonstantinou &amp;lt;npapakonstantinou@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71296" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71296&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21295" title="ptlrpc: add tracepoints for the RPC lifecycle" class="issue-link" data-issue-key="LU-21295"&gt;LU-21295&lt;/a&gt; ptlrpc: add tracepoints for the RPC lifecycle&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: d344b5b09347b67ced0cbe9699b799c2ca190514&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073s7:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

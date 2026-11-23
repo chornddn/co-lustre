@@ -1,0 +1,73 @@
+Key:        LU-21264
+Summary:    mdt: identity upcall has no limit on helper processes and does not cache a failed lookup
+Link:       https://jira.whamcloud.com/browse/LU-21264
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Fri, 20 Nov 2026 00:27:44 +0000
+Updated:    Fri, 20 Nov 2026 00:30:35 +0000
+Links:      Related: is related to  LU-19765; Related: is related to  LU-17605; Related: is related to  LU-17961; Related: is related to  LU-20147
+
+--- Description ---
+Problem
+
+When the name service on an MDS does not answer, the MDT starts l_getidentity helper processes with no limit. The MDS can use all its memory and stop.
+
+At one site, the LDAP client on a new MDS image could not start TLS, so SSSD was offline. Three MDTs mounted on that MDS. The task count went from 870 to 181,214 in 20 minutes. The MDS used 105 GB of its 145 GB of memory, and then it stopped. A second MDS in the same state had 42,491 helper processes in the same time. Its helpers exited, and its task count stayed at approximately 1,350.
+
+Environment
+
+	Seen on an older branch that is not public, on x86_64 with ldiskfs.
+
+	I read the source of master at v2_17_61. The code path is the same.
+
+	identity_upcall is /usr/sbin/l_getidentity. The name service is SSSD with LDAP.
+
+Reproduction
+
+Not reproduced on a test system yet. I expect that a VM cluster can reproduce it. I plan that work for the week of 2026-11-23, if no engineer takes this ticket before then.
+
+The steps that follow from the source are:
+
+	Set up an MDS where getpwuid() fails or does not return for each UID. One way is identity_upcall set to a script that sends an error downcall.
+
+	Mount the MDT, and connect clients that send requests from many UIDs.
+
+	Count the l_getidentity processes and the task count on the MDS.
+
+Analysis
+
+	mdt_identity_do_upcall() starts the helper with call_usermodehelper() and UMH_WAIT_EXEC. The kernel waits for the exec only. The MDT does not count the helpers that are in operation, and it has no limit.
+
+	A failed lookup is not cached. When the helper sends an error, upcall_cache_downcall() sets the entry to invalid and removes it from the hash. The next request for the same UID starts a new helper.
+
+	When a helper does not answer, the request gets -ETIMEDOUT after identity_acquire_expire (30 s). check_unlink_entry() then removes the entry, and the next request starts a new helper. The MDT does not stop the old helper.
+
+	The request rate of the clients thus sets the rate of new processes. At the site, the rate was 2,595 new processes each second after 12 minutes.
+
+The site logs do not show why the helpers did not exit on the first MDS. That part is not known.
+
+Related work
+
+	LU-17605 (2.16.0) limits the time that a request waits for a downcall. It does not limit the helpers.
+
+	LU-19765 reports identity upcall timeouts (rc = -110) with latency and Permission denied. It was closed as "Not a Bug".
+
+	LU-17961 added the INTERNAL upcall, which starts no helper. It uses the groups that the client sends.
+
+	LU-20147 proposes a cache for the l_getsepol helper. That helper has the same pattern of one process for each request.
+
+Proposed fix
+
+One or more of these changes:
+
+	Cache a failed lookup for a short time, so that one UID starts one helper in that time.
+
+	Limit the count of helpers that are in operation for one MDT.
+
+	Stop the helper when its acquire time expires.
+
+I have no patch.

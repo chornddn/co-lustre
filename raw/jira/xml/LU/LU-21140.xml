@@ -38,7 +38,7 @@
                         <labels>
                     </labels>
                 <created>Fri, 6 Nov 2026 14:28:12 +0000</created>
-                <updated>Thu, 12 Nov 2026 12:02:50 +0000</updated>
+                <updated>Thu, 19 Nov 2026 12:23:31 +0000</updated>
                                             <version>Lustre 2.18.0</version>
                                                         <due />
                             <votes>0</votes>
@@ -245,6 +245,37 @@ Directory migration is &lt;em&gt;relatively&lt;/em&gt; rare, so while we shouldn
 &lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=paf0186" class="user-hover" rel="paf0186"&gt;paf0186&lt;/a&gt; I don't think it is possible to read one stripe at a time. The reason is that during migration a single file is moved from one stripe to another stripe, so the &lt;b&gt;same&lt;/b&gt; file may appear twice in the readdir or not at all, which POSIX forbids (and breaks usage.  This is unlike create and unlink, but something similar could potentially happen with rename even on a single-stripe directory.  &lt;/p&gt;
 
 &lt;p&gt;For example if readdir was working in alphabetical order, and a file was renamed from A to Z, then the file named A could be removed after appearing and replaced by Z at the end. However A should still never appear twice as it does in the migrate case. &lt;/p&gt;</comment>
+                            <comment id="505901" author="JIRAUSER24002" created="Sun, 15 Nov 2026 14:55:35 +0000">&lt;p&gt;I just pushed patchset 3. It modifies one line on the server side: mdt_reint_unlink() now returns -ESTALE instead of -ENOENT when the child was migrated between the client’s lookup and the unlink, so the VFS looks the name up again. Before this change, rm failed in about 0.3% of the cases I tested with patchset 2. I have not seen it since, in a test that ran for two days with seven clients on a small virtual Lustre cluster. Everything else in patchset 3 is client code.&lt;/p&gt;
+
+&lt;p&gt;Andreas, on the listing that starts before the migration: I agree this is the remaining gap, and your idea covers it. I replied on Gerrit with the details. In short, patchset 3 only handles the case where the layout is already changing, because reading everything up front for every striped directory would change the behaviour of all listings on striped directories and needs a larger patch.&lt;/p&gt;
+
+&lt;p&gt;Di Wang, on eviction with large directories: you’re right. The MDT does not extend the lock callback timeout while the client reads. If the read outlasts the callback timeout (at least 100 s, about 150 s by default) and a conflicting lock is waiting, the MDT can evict the client.&lt;/p&gt;
+
+&lt;p&gt;The reads are not one page at a time, as I understand it. One READPAGE RPC fetches up to cl_max_pages_per_rpc_read pages (set by the MDC max_pages_per_rpc tunable). Reading the stripes in parallel (client side) and extending the timeout on the MDT while READPAGE is in progress (server side) would both help, but neither is in this patch.&lt;/p&gt;
+
+&lt;p&gt;I have only tested directories of about 57,000 entries on a small virtual cluster, not millions. I will test a large directory on bare-metal hardware soon, and measure the performance penalty at the same time.&lt;/p&gt;</comment>
+                            <comment id="505948" author="adilger" created="Sun, 15 Nov 2026 22:11:57 +0000">&lt;p&gt;&lt;a href="https://jira.whamcloud.com/secure/ViewProfile.jspa?name=manhongdai" class="user-hover" rel="manhongdai"&gt;manhongdai&lt;/a&gt;, definitely there is no requirement to fix all of the issues in the first patch, as long as it is not introducing new issues.  Reading the stripes in parallel would be great, as with lock extension to reduce the chance of the client timing out.&lt;/p&gt;
+
+&lt;p&gt;I suspect in 99% of cases that a single 1MiB RPC (as we use today) will already read the whole directory, so I don't think reading the whole directory in advance will affect many uses, but I can see how pre-fetching a 2GiB directory to every client would be problematic in some cases.  I think it makes sense to keep some statistics on the client (either or per-process or mountpoint) of how many directories are being read fully vs. partially, which would help make a decision whether the prefetch is worthwhile. &lt;/p&gt;
+
+&lt;p&gt;I'm wondering if we could have some middle ground between always reading the full content of a directory vs. incremental reads, by tracking on the MDS whether there is an active directory migration on the filesystem, and notifying clients with a flag in the open and/or first readdir reply whether they should fetch the whole directory or not.  &lt;/p&gt;</comment>
+                            <comment id="506151" author="JIRAUSER24002" created="Thu, 19 Nov 2026 12:23:31 +0000">&lt;p&gt;I pushed patch set #5 of 70548.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Faster start-page lookup:&lt;/b&gt; reading from the snapshot used to find the starting page by scanning each stripe's pages from the first one, once per output page, so a full listing took time quadratic in the number of directory pages. The pages are in hash order, so it now bisects and returns the same page as before.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Commit message:&lt;/b&gt; it now says when the snapshot is taken (at the first read after the layout is seen to be changing, at any offset) and when it is dropped. It also lists the cases that are not covered (a listing that started before the layout began to change, or that continues across the end of the change) and the costs: the first read waits for all stripes, creates, unlinks and moves wait for that time, memory is unbounded, and the MDT does not extend the lock callback timeout.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;sd_dp check:&lt;/b&gt; &lt;tt&gt;stripe_dirent_load()&lt;/tt&gt; now tests only &lt;tt&gt;sd_folio&lt;/tt&gt;, since &lt;tt&gt;sd_dp&lt;/tt&gt; is always mapped when it is set. This removes the inconsistency flagged by the checker robot and Andreas.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Testing:&lt;/b&gt; I re-tested this version on a directory with a million files on the virtual cluster (2 MDS nodes, 7 clients on RHEL 9.8, RHEL 10.2, Debian 13.7, SLES 15.7, SLES 16.0, Ubuntu 24.04 and Ubuntu 26.04), with no duplicated or missing names. Bare-metal testing is next.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Plan:&lt;/b&gt; I'd like to land this patch first and do the rest as follow-ups, but I'm happy to fold any of them in if reviewers prefer.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;&lt;b&gt;Parallel stripe reads:&lt;/b&gt; take the stripe locks in index order, read the stripes in parallel, and measure the performance difference against the current sequential reads.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Snapshot for every readdir of a striped directory, whether or not it is being migrated:&lt;/b&gt; this covers a listing that starts before a migration begins, which is the gap Andreas described on 11 Nov. It has the cost Di Wang and Andreas discussed, so I would measure it before proposing it. This is a more radical change, so it should go in a separate patch.&lt;/li&gt;
+&lt;/ol&gt;
+</comment>
                     </comments>
                 <issuelinks>
                             <issuelinktype id="10011">

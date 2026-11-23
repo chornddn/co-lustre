@@ -1,0 +1,201 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21241] quota: concurrent setquota stalls limit updates on quota slaves</title>
+                <link>https://jira.whamcloud.com/browse/LU-21241</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;Running four or more &lt;tt&gt;lfs setquota&lt;/tt&gt; or &lt;tt&gt;lfs setquota --delete&lt;/tt&gt; commands in parallel can cause quota limit updates to stall on the quota slaves.&lt;/p&gt;
+
+&lt;p&gt;The QMT global index contains all the updated limits, but only the first few updates reach the slave copies (&lt;tt&gt;osd-&lt;b&gt;.&lt;/b&gt;.quota_slave.limit_*&lt;/tt&gt;). Despite the missing updates, the slave still reports &lt;tt&gt;glb&lt;span class="error"&gt;&amp;#91;1&amp;#93;&lt;/span&gt;,slv&lt;span class="error"&gt;&amp;#91;1&amp;#93;&lt;/span&gt; (uptodate)&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;On Lustre 2.15, the updates remain stuck until &lt;tt&gt;quota_slave.force_reint=1&lt;/tt&gt; is set or the filesystem is remounted. On master, automatic reintegration introduced by &lt;a href="https://jira.whamcloud.com/browse/LU-18078" title="trigger global quota entry reintegration automatically" class="issue-link" data-issue-key="LU-18078"&gt;&lt;del&gt;LU-18078&lt;/del&gt;&lt;/a&gt; eventually recovers the missing limits, usually after a minute or more. However, the same issue can occur again with another batch of parallel &lt;tt&gt;setquota&lt;/tt&gt; commands.&lt;/p&gt;
+
+&lt;p&gt;Until the missing updates are applied, the new quota limits are not enforced on the affected OSTs.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Reproducer"&gt;&lt;/a&gt;Reproducer&lt;/h3&gt;
+
+&lt;p&gt;With project quotas enabled on two OSTs, set limits for 2,000 project IDs using eight parallel processes:&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;# seq 0 1999 | xargs -P8 -I{} sh -c 'lfs setquota -p "$((3000000000 + $1))" -B 2097152 -I 0 /mnt/lustre' _ {&lt;/tt&gt;}&lt;br/&gt;
+&lt;tt&gt;# lctl get_param &lt;del&gt;n osd&lt;/del&gt;&lt;b&gt;.&lt;/b&gt;-OST0000.quota_slave.limit_project | grep -c 'hard: *2097152' 0 # expected: 2000&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;Only two IDs reach the quota slave, both with &lt;tt&gt;hard: 0&lt;/tt&gt;, although all 2,000 limits are present in the QMT global index.&lt;/p&gt;
+
+&lt;p&gt;Running the same commands sequentially works as expected: all 2,000 limits are applied on the slave.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="QuotaEnforcement"&gt;&lt;/a&gt;Quota Enforcement&lt;/h3&gt;
+
+&lt;p&gt;A separate test confirmed that the missing updates also affect quota enforcement.&lt;/p&gt;
+
+&lt;p&gt;After running 300 parallel quota updates, none of the new limits had been applied on OST0001, although they were present in the QMT global index.&lt;/p&gt;
+
+&lt;p&gt;With an 8MB quota configured for the &lt;tt&gt;nobody&lt;/tt&gt; user, a 64MB write completed successfully, bringing the reported usage to 65,527KB.&lt;/p&gt;
+
+&lt;p&gt;After forcing reintegration with &lt;tt&gt;quota_slave.force_reint=1&lt;/tt&gt;, the 8MB limit was applied on the slave, and further writes were blocked.&lt;/p&gt;
+
+&lt;p&gt;This confirms that the issue is not limited to stale quota information on the slaves. It can also allow writes beyond the configured quota limits.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Analysis"&gt;&lt;/a&gt;Analysis&lt;/h3&gt;
+
+&lt;p&gt;When &lt;tt&gt;qsd_upd_schedule()&lt;/tt&gt; receives a glimpse update whose version is not &lt;tt&gt;qqi_glb_ver + 1&lt;/tt&gt;, it defers the update through &lt;tt&gt;qsd_add_deferred()&lt;/tt&gt;. The deferred list is supposed to be kept in ascending version order.&lt;/p&gt;
+
+&lt;p&gt;After each update is committed, &lt;tt&gt;qsd_bump_version()&lt;/tt&gt; calls &lt;tt&gt;qsd_kickoff_deferred()&lt;/tt&gt;. This function checks only the first entry in the deferred list and processes it if its version matches &lt;tt&gt;ver + 1&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;The problem is in &lt;tt&gt;qsd_add_deferred()&lt;/tt&gt;.&lt;/p&gt;
+
+&lt;p&gt;The function walks the list backward from the tail. When the incoming update has a higher version than &lt;tt&gt;tmp&lt;/tt&gt;, it calls:&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;list_add_tail(&amp;amp;upd-&amp;gt;qur_link, &amp;amp;tmp-&amp;gt;qur_link);&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;This inserts &lt;tt&gt;upd&lt;/tt&gt; before &lt;tt&gt;tmp&lt;/tt&gt;, rather than after it. As a result, updates arriving in ascending version order can be inserted in reverse order.&lt;/p&gt;
+
+&lt;p&gt;For example:&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;deferred &lt;span class="error"&gt;&amp;#91;6010&amp;#93;&lt;/span&gt;, 6011 arrives -&amp;gt; &lt;span class="error"&gt;&amp;#91;6011, 6010&amp;#93;&lt;/span&gt;&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;When version 6009 is committed, &lt;tt&gt;qsd_kickoff_deferred()&lt;/tt&gt; finds 6011 at the head instead of 6010. Since 6011 is not the expected next version, no deferred update is processed.&lt;/p&gt;
+
+&lt;p&gt;The global version remains at 6009, and subsequent updates are deferred as well. The slave still considers itself up to date, so Lustre 2.15 does not trigger reintegration.&lt;/p&gt;
+
+&lt;p&gt;The issue requires at least two updates to be deferred at the same time. This can happen when multiple glimpse updates arrive while an earlier update is still being written, explaining why the problem occurs with parallel &lt;tt&gt;setquota&lt;/tt&gt; commands but not with sequential execution.&lt;/p&gt;
+
+&lt;p&gt;The following message was captured on Lustre 2.15 with &lt;tt&gt;+quota&lt;/tt&gt; debugging enabled:&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;qsd_kickoff_deferred()) cvol-OST0000: found deferred update record. version:6011/6009&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;On master, &lt;a href="https://jira.whamcloud.com/browse/LU-18078" title="trigger global quota entry reintegration automatically" class="issue-link" data-issue-key="LU-18078"&gt;&lt;del&gt;LU-18078&lt;/del&gt;&lt;/a&gt; eventually triggers reintegration. As the deferred entries are removed from the head of the list, the logs show that they are not in ascending version order:&lt;/p&gt;
+
+&lt;p&gt;&lt;tt&gt;found deferred update record. version:20021/20017&lt;/tt&gt;&lt;br/&gt;
+&lt;tt&gt;Starting reintegration thread for &lt;span class="error"&gt;&amp;#91;0x200000006:0x2020000:0x0&amp;#93;&lt;/span&gt;&lt;/tt&gt;&lt;br/&gt;
+{{ skipping deferred update ver:20021/23628}}&lt;br/&gt;
+&lt;tt&gt;skipping deferred update ver:20020/23628&lt;/tt&gt;&lt;br/&gt;
+&lt;tt&gt;skipping deferred update ver:20019/23628&lt;/tt&gt;&lt;br/&gt;
+&lt;tt&gt;skipping deferred update ver:20018/23628&lt;/tt&gt;&lt;br/&gt;
+&lt;tt&gt;skipping deferred update ver:20024/23628&lt;/tt&gt;&lt;br/&gt;
+&lt;tt&gt;skipping deferred update ver:20023/23628&lt;/tt&gt;&lt;/p&gt;
+
+&lt;p&gt;This code dates back to &lt;a href="https://jira.whamcloud.com/browse/LU-1842" title="Quota enforcement landing" class="issue-link" data-issue-key="LU-1842"&gt;&lt;del&gt;LU-1842&lt;/del&gt;&lt;/a&gt; and remains unchanged in &lt;tt&gt;b2_15&lt;/tt&gt;, &lt;tt&gt;b2_16&lt;/tt&gt;, &lt;tt&gt;b2_17&lt;/tt&gt;, and &lt;tt&gt;master&lt;/tt&gt;.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="TestResults"&gt;&lt;/a&gt;Test Results&lt;/h3&gt;
+
+&lt;p&gt;The tests used eight parallel processes to set and delete quota limits for 2,000 project IDs on two OSTs.&lt;/p&gt;
+
+&lt;p&gt; &lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Build&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;After setquota&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;After delete&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Reintegration&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;2.15.8&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0 / 0(2 IDs arrived, hard: 0),&lt;br/&gt;
+stalled&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Not applied&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Requires &lt;tt&gt;force_reint&lt;/tt&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;2.15.8 + fix&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;2000 / 2000 within 15s&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0 / 0 within 15s&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;None&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;master &lt;/td&gt;
+&lt;td class='confluenceTd'&gt;1806 / 1832 initially;&lt;br/&gt;
+all applied after ~2 min&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;1999 / 1999 left after&lt;br/&gt;
+reintegration &lt;img class="emoticon" src="https://jira.whamcloud.com/images/icons/emoticons/star_yellow.png" height="16" width="16" align="absmiddle" alt="" border="0"/&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;Automatic,&lt;br/&gt;
+multiple times&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;master + fix&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;2000 / 2000 within 15s&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0 / 0 within 15s&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;None&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+&lt;p&gt;&lt;img class="emoticon" src="https://jira.whamcloud.com/images/icons/emoticons/star_yellow.png" height="16" width="16" align="absmiddle" alt="" border="0"/&gt; Reintegration does not remove IDs that have been deleted from the QMT. This issue will be reported separately.&lt;/p&gt;
+
+&lt;p&gt;With the fix, all 2,000 quota updates and deletions were applied within 15 seconds on both branches, without requiring reintegration.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Fix"&gt;&lt;/a&gt;Fix&lt;/h3&gt;
+
+&lt;p&gt;Replace &lt;tt&gt;list_add_tail()&lt;/tt&gt; with &lt;tt&gt;list_add()&lt;/tt&gt; to insert the new update immediately after &lt;tt&gt;tmp&lt;/tt&gt;, rather than before it.&lt;/p&gt;
+
+&lt;p&gt;This keeps the deferred list in ascending version order, allowing &lt;tt&gt;qsd_kickoff_deferred()&lt;/tt&gt; to find and process the expected &lt;tt&gt;ver + 1&lt;/tt&gt; update at the head.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="RelatedIssues"&gt;&lt;/a&gt;Related Issues&lt;/h3&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-18078" title="trigger global quota entry reintegration automatically" class="issue-link" data-issue-key="LU-18078"&gt;&lt;del&gt;LU-18078&lt;/del&gt;&lt;/a&gt;:&lt;/b&gt; Adds automatic &lt;tt&gt;force_reint&lt;/tt&gt; after &lt;tt&gt;QSD_WB_INTERVAL&lt;/tt&gt;. This eventually recovers the missing updates but does not fix the underlying ordering bug.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-19136" title="check and sync global quota setting periodically" class="issue-link" data-issue-key="LU-19136"&gt;&lt;del&gt;LU-19136&lt;/del&gt;&lt;/a&gt;:&lt;/b&gt; Adds a periodic version consistency check after version_mismatch_timeout (3 * obd_timeout, 300 seconds by default), which can trigger reintegration when the slave's quota index is out of sync with&lt;br/&gt;
+  the master.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-21025" title="quota: slave doesn't reintegrate after LWP reconnects to restarted master" class="issue-link" data-issue-key="LU-21025"&gt;LU-21025&lt;/a&gt;:&lt;/b&gt; Quota slaves fail to reintegrate after the LWP reconnects to a restarted master. The symptom is similar, but the root cause is different.&lt;/li&gt;
+&lt;/ul&gt;
+</description>
+                <environment>zfs-2.2.9, lustre-2.15.8, rokcy 8.10 (4.18.0-553)</environment>
+        <key id="100503">LU-21241</key>
+            <summary>quota: concurrent setquota stalls limit updates on quota slaves</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="shkim3220">Sunghwan Kim</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 18 Nov 2026 02:30:53 +0000</created>
+                <updated>Wed, 18 Nov 2026 05:38:21 +0000</updated>
+                                            <version>Upstream</version>
+                    <version>Lustre 2.15.8</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506072" author="gerrit" created="Wed, 18 Nov 2026 05:38:21 +0000">&lt;p&gt;"Sunghwan Kim &amp;lt;shkim3220@gluesys.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71077" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71077&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21241" title="quota: concurrent setquota stalls limit updates on quota slaves" class="issue-link" data-issue-key="LU-21241"&gt;LU-21241&lt;/a&gt; quota: keep qsd deferred update list sorted&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: bfdcb710e9c4da5ae6a887c197c247d6c011d3de&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073g7:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

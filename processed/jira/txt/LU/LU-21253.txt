@@ -1,0 +1,100 @@
+Key:        LU-21253
+Summary:    ofd: skip forced journal commit for O_DIRECT overwrite of committed blocks
+Link:       https://jira.whamcloud.com/browse/LU-21253
+Type:       Improvement
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Shriram Pore
+Created:    Thu, 19 Nov 2026 12:25:56 +0000
+Updated:    Thu, 19 Nov 2026 20:42:34 +0000
+Labels:     performance
+
+--- Environment ---
+ldiskfs OSTs on devices without a volatile write cache
+
+--- Description ---
+Problem
+
+ofd_commitrw_write() forces a journal commit for every write whose pages lack OBD_BRW_ASYNC, so each O_DIRECT write waits for a jbd2 commit, even when it only overwrites blocks that are already allocated, written and committed. For small random O_DIRECT overwrites this commit dominates the write latency.
+
+Proposal (4 patches, tunable, default off)
+
+	osd-ldiskfs: set a new thandle::th_overwrite when every page of the request is an in-place overwrite of committed blocks: no block allocated or converted, write inside i_size, extent-mapped inode, i_datasync_tid committed, and no volatile write cache on the device (or journal without barriers). osd-zfs never sets it. No functional change on its own.
+
+	ofd: new tunable obdfilter.*.dio_overwrite_nosync (default 0). When set, such a write skips the forced commit if the object has no uncommitted replayable change, no attribute had to be set, and the request is not a retry/replay and the target is not in recovery. The write becomes a local transaction (no client replay), and the object version is still advanced. fsync() still commits. Counters dio_overwrite_nosync_count / dio_overwrite_sync_count and a man page.
+
+	ofd: keep the commit for any write that changes a stored timestamp (OST timestamps are whole seconds from the client, so only the first write per object per second changes them), so mtime/ctime cannot roll back after an OST crash and O_SYNC stays synchronous without a protocol change. Requests changing the object are fenced (in-flight count + dirty transno). Adds dio_overwrite_sync_reasons (forced commits per reason, failed writes as "error"). Adds OBD_FAIL_OST_DIO_NOSYNC_ERR (0x258).
+
+	ofd: commit a DIO write after a data_version read of the object, and sync an object with an uncommitted version before returning the version (OST_GETATTR, obd getattr, OBD_IOC_GET_OBJ_VERSION), so tools like the HSM copytool never see an unchanged version for changed data.
+
+Remaining trade-off (documented in the man page): with the tunable set, an OST crash can lose the object version advance of a nosync write that was not followed by a data_version read; the data itself is on disk before the reply. Not intended for devices with a volatile write cache (checked automatically).
+
+Compatibility: no wire or on-disk format change; default 0 keeps today's behaviour (only in-memory bookkeeping is added); downgrade safe.
+
+Tests added: sanity 398w, 398x, 398y, 398z (counters, per-reason accounting with an invariant check, timestamp and data_version cases, failed-write accounting via fail_loc 0x258); replay-ost-single 13 and 14 (OST crash after nosync writes; the crash check is retried, then skipped, if a journal commit falls in the crash window).
+
+Local results (2-node VMs, loop/dm-flakey OSTs; not hardware numbers)
+
+	4 KiB O_DIRECT random overwrite, tunable 1 vs 0: about 2.3x IOPS at QD1, 1.7x at QD16; 1 MiB QD16 about 1.1x.
+
+	lfs data_version cost with the tunable set: about +3% mean.
+
+	Default (tunable 0): one forced commit per DIO write, as today.
+
+	Regression: sanity 398a-398v subset, full recovery-small, sanity-flr, sanity-hsm 20-30, lfs migrate tests and sanityn compared at base / tunable 0 / tunable 1 - no new failures (the failures seen also fail on base: 398k/l and some flr/sanityn tests from small test OSTs, NRS TBF tests in this setup).
+
+	Each test fails cleanly on the commit before the fix it covers (replay-ost-single 13 before patch 3, 14 before patch 4).
+
+--- Comment (gerrit, Thu, 19 Nov 2026 12:32:33 +0000) ---
+"Shriram Pore " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71184
+
+Subject: LU-21253 osd-ldiskfs: flag overwrite of committed blocks
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0d294e47c9d7c33319fd156f1c6c359b9957f81c
+
+--- Comment (gerrit, Thu, 19 Nov 2026 12:32:34 +0000) ---
+"Shriram Pore " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71185
+
+Subject: LU-21253 ofd: skip forced commit for DIO overwrite
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 8abe83069de54e86506ea7849361ab4eea997058
+
+--- Comment (gerrit, Thu, 19 Nov 2026 12:32:34 +0000) ---
+"Shriram Pore " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71186
+
+Subject: LU-21253 ofd: keep commit for DIO write changing timestamps
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 1a005a64c73a5928a30bba4d5ea9b172844b4216
+
+--- Comment (gerrit, Thu, 19 Nov 2026 12:32:35 +0000) ---
+"Shriram Pore " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71187
+
+Subject: LU-21253 ofd: commit DIO write after data_version sample
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: a729a2262d869cdff2ad0aca833e2baf088a5d84

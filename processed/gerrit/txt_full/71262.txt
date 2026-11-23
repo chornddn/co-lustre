@@ -1,0 +1,213 @@
+Change:     71262
+Subject:    LU-21281 ldlm: avoid quadratic scan in ldlm_extent_shift_kms()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71262
+Change-Id:  I3bc3f5520ecb93d163480f99ee36e744bd2fd19e
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Manhong
+Created:    2026-11-21 03:24:29.000000000
+Updated:    2026-11-22 07:58:42.000000000
+Patch Set:  1
+Insertions: +234
+Deletions:  -63
+Comments:   4 (4 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Alex Zhuravlev
+
+--- Commit Message ---
+LU-21281 ldlm: avoid quadratic scan in ldlm_extent_shift_kms()
+
+A client that holds tens of thousands of PR extent locks on one object
+can spend minutes cancelling them.  This happens when many clients
+share one file and access it with unaligned records.
+ldlm_extent_shift_kms() runs for each cancel under the resource lock.
+It walks every lock in the extent tree whenever no remaining lock
+protects the old KMS, so the work is quadratic.  The other threads
+that need the resource lock spin behind it.  The ldlm_bl threads miss
+the 100s callback timeout, the OST evicts the client, and ll_imp_inval
+then reports soft lockups while ldlm_namespace_cleanup() cancels the
+same locks.
+
+Prune the walk with l_subtree_last, the highest extent end of a
+subtree, and skip subtrees that cannot raise the KMS.  Only locks
+being cancelled, which are marked kms_ignore, are visited.  The result
+is unchanged.  Drop the PW special case, as the pruning covers it.
+
+On seven clients sharing one file, cancelling 20000 adjacent PR locks
+takes 4.9 to 6.5s without this patch and 0.13 to 0.23s with it.  The
+kunit case costs 9us per call from 10 to 100000 locks with the patch,
+and grows to 350us at 27000 locks without it.
+
+Add sanity 255e, which takes many adjacent PR locks with lockahead and
+compares the time to cancel them from the lowest and from the highest
+offset.  Add test 24 to lockahead_test for it, and a kunit case for
+the many-locks, high-KMS case.
+
+Test-Parameters: testlist=sanity env=ONLY=255e
+Signed-off-by: Cory Spitz <Cory.Spitz@netapp.com>
+Signed-off-by: Manhong Dai <manhong.dai@netapp.com>
+Assisted-by: Claude Code:claude-sonnet-5-5
+Change-Id: I3bc3f5520ecb93d163480f99ee36e744bd2fd19e
+
+--- Review History ---
+
+--- Message (Manhong, 2026-11-21 03:24:29.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-21 03:27:57.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-21 03:32:03.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-21 20:39:31.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137428/ : SUCCESS
+
+--- Message (Maloo, 2026-11-21 20:40:00.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 137428 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137428&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137428#redirect
+
+--- Message (Andreas Dilger, 2026-11-22 07:26:12.000000000) ---
+Patch Set 1: Code-Review+1
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-22 07:27:21.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm226: https://testing.whamcloud.com/test_sessions/4b47429e-5be2-4bf6-9430-a4b1b4366733 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 07:36:06.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The pruned walk is correct and keeps the old result apart from one corner case, noted inline. The inline comments are optional nits for whenever the patch is next refreshed; there is no need to re-spin for them.
+
+--- Message (patrick bot, 2026-11-22 07:58:42.000000000) ---
+Hashtag added: pw_shepherd

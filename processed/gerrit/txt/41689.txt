@@ -1,5 +1,5 @@
 Change:     41689
-Subject:    LU-14407 osd-zfs: add basic direct IO support
+Subject:    LU-14407 osd-zfs: add direct and uncached IO support
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/41689
 Change-Id:  I5a651a196f716feac671b71010733ea129543d38
 Project:    fs/lustre-release
@@ -7,57 +7,69 @@ Branch:     master
 Status:     NEW
 Owner:      Brian Behlendorf
 Created:    2021-02-18 22:23:32.000000000
-Updated:    2026-11-12 14:15:54.000000000
-Patch Set:  12
-Insertions: +500
+Updated:    2026-11-20 12:21:08.000000000
+Patch Set:  15
+Insertions: +791
 Deletions:  -47
-Comments:   113 (31 unresolved)
+Comments:   162 (40 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: -1
+  Verified: jenkins: +1; Maloo: +1
 
 --- Reviewers ---
   CC: Mark Roper, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Alex Zhuravlev, James Simmons, Olaf Faaland, Patrick Farrell (personal), Akash B, Timothy Day, Brian Atkinson, Migeljan Imeri
+  REVIEWER: Alex Zhuravlev, James Simmons, Olaf Faaland, Patrick Farrell (personal), Akash B, Timothy Day, Brian Atkinson, Migeljan Imeri, patrick bot
 
 --- Commit Message ---
-LU-14407 osd-zfs: add basic direct IO support
+LU-14407 osd-zfs: add direct and uncached IO support
 
-As of OpenZFS 2.3 direct IO is supported.  This functionality allows
-the zfs-osd to optionally bypass the ARC cache and perform the I/O
-directly to the storage.  This may improve performance when using a
-fast flash based pool or large disk based pool.
+OpenZFS 2.4 adds two DMU IO modes:
+  - Direct IO (DMU_DIRECTIO) bypasses the ARC entirely.
+  - Uncached IO (DMU_UNCACHEDIO) goes through the ARC but evicts
+    the buffers once the IO completes.
 
-The new "direct" dataset property can be used to enable direct IO
-for the OSD.  When set to "always" the DMU_DIRECTIO flag will always
-be passed to the new DMU interface to request direct IO.  When set
-"disabled" direct IO will never be requested.
+This patch lets osd-zfs use both modes for bulk data IO. Caching
+bulk data in the ARC often adds overhead with little benefit, so
+these modes can improve performance on fast flash pools and on
+large disk pools.
 
-This initial mechanism provides no granularity so the long term
-intent is to extend Lustre to only request direct IO when it makes
-sense.  This way the property can be left at its default value of
-"standard" which indicates direct IO should only be done when
-requested.  However, supporting the "always" and "disabled" values
-is important to make sure Lustre datasets honor these setting in
-the same way as the ZFS Posix Layer.  Hopefully, we'll be able to
-take advantage of some of the existing Lustre/ldiskfs tunings to
-control when direct IO should be performed.
+Direct IO is disabled by default. Enable it with the new tunable:
 
-The behavior of the existing DMU interfaces used by Lustre has not
-been changed for OpenZFS 2.1.  This means versions of Lustre without
-this change can still be built against OpenZFS 2.1.  They will simply
-not be able to take advantge of the direct IO support.
+    lctl set_param osd-zfs.*.direct_enabled=1
 
-Furthermore, new versions of Lustre with this change are compatible
-with all OpenZFS releases.  Again the default behavior will remain
-unchanged unless the "direct=always" dataset property is manually set.
+Once enabled, the OSD honors the ZFS "direct" dataset property. The
+OSD tracks changes to this property through a dsl_prop callback, so
+updates take effect without remounting:
 
-For reference, the new ZFS interfaces which can be used to request
-direct IO by passing the DMU_DIRECTIO flag are the following:
+  - disabled: direct IO is never used.
+  - always:   direct IO is used if IO meets alignment checks.
+  - standard: the default. The OSD decides for each IO:
+      * On a non-rotational pool, it behaves like "always".
+      * Otherwise, a write uses direct IO if its length is at least
+        writethrough_max_io_mb. A read uses direct IO if its length
+        is at least readcache_max_io_mb, or if the file size is at
+        least readcache_max_filesize. These thresholds apply to
+        each niobuf, not to the whole RPC.
 
-    - dmu_read_abd()
-    - dmu_write_abd()
+Direct IO follows the same alignment rules as O_DIRECT in the ZFS
+POSIX layer. If the policy selects direct IO but the IO is misaligned,
+the OSD falls back to uncached IO.
+  - Reads must be page aligned.
+  - Writes must be both page and recordsize aligned.
+
+Direct and uncached IO support is compiled in only when configure
+detects the OpenZFS 2.4 interfaces (HAVE_DMU_DIRECT):
+  - dmu_read_abd()
+  - dmu_write_abd()
+  - abd_alloc_from_pages()
+  - DMU_DIRECTIO / DMU_UNCACHEDIO
+
+Lustre still builds against older OpenZFS releases. In that case
+the data path is unchanged and direct_enabled has no effect. With
+direct_enabled=0 (the default), the data path is also unchanged on
+OpenZFS 2.4. Only non-rotational auto-detection takes effect.
 
 Test-Parameters: fstype=zfs
 Signed-off-by: Brian Behlendorf <behlendorf1@llnl.gov>
@@ -661,3 +673,115 @@ https://build.whamcloud.com/job/lustre-reviews/132233/ : FAILURE
 Patch Set 12:
 
 (1 comment)
+
+--- Message (Migeljan Imeri, 2026-11-18 19:22:20.000000000) ---
+Uploaded patch set 13.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-18 19:23:38.000000000) ---
+Patch Set 13:
+
+(12 comments)
+
+12 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-18 19:26:06.000000000) ---
+Patch Set 13:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-18 20:02:20.000000000) ---
+Patch Set 13: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137014/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-19 12:07:44.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-19 12:19:43.000000000) ---
+Patch Set 13: Code-Review-1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-19 12:30:06.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Migeljan Imeri, 2026-11-19 15:01:52.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 15:07:29.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-19 15:15:46.000000000) ---
+Patch Set 14:
+
+(13 comments)
+
+13 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-19 15:32:03.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137097/ : SUCCESS
+
+--- Message (Migeljan Imeri, 2026-11-19 15:38:13.000000000) ---
+Uploaded patch set 15.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 15:41:23.000000000) ---
+Patch Set 15:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-19 15:46:43.000000000) ---
+Patch Set 15:
+
+(13 comments)
+
+13 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-19 16:05:19.000000000) ---
+Patch Set 15: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137098/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-20 06:41:41.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-20 06:55:32.000000000) ---
+Patch Set 15:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-20 06:59:14.000000000) ---
+Patch Set 15:
+
+Trevis Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137098 patch 15. Requested by Patrickbot because of LU-18304.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 12:21:08.000000000) ---
+Patch Set 15:
+
+(9 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Two of them are server memory-safety or LBUG issues reachable once direct_enabled=1, so this needs a refresh. While at it, the inline minors can be picked up too.

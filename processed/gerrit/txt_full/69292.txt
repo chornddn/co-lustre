@@ -1,5 +1,5 @@
 Change:     69292
-Subject:    LU-20841 lnet: fix acceptor listener teardown race
+Subject:    LU-19651 lnet: fix acceptor shutdown and teardown
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69292
 Change-Id:  I62000764b3b8ca8b3628519f50a6ef467a62287b
 Project:    fs/lustre-release
@@ -7,65 +7,59 @@ Branch:     master
 Status:     NEW
 Owner:      Cyril Bordage
 Created:    2026-09-28 16:37:22.000000000
-Updated:    2026-10-21 18:45:44.000000000
-Patch Set:  1
-Insertions: +104
-Deletions:  -79
-Comments:   6 (4 unresolved)
+Updated:    2026-11-20 15:51:57.000000000
+Patch Set:  2
+Insertions: +170
+Deletions:  -73
+Comments:   11 (8 unresolved)
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1
-  Verified: jenkins: +1; Maloo: +1
+  Code-Review: patrick bot: -1
+  Verified: Maloo: -1; jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Gerrit AI review for Lustre
-  REVIEWER: James Simmons, Chris Horn, Serguei Smirnov, Manish Regmi, Xinxia Qu
+  REVIEWER: James Simmons, Chris Horn, Serguei Smirnov, Manish Regmi, Xinxia Qu, patrick bot
 
 --- Commit Message ---
-LU-20841 lnet: fix acceptor listener teardown race
+LU-19651 lnet: fix acceptor shutdown and teardown
 
-A client crash is seen in __wake_up_common(), called from the
-NET_RX_SOFTIRQ (napi_gro_receive -> tcp_v4_rcv ->
-tcp_child_process), right after LNet has been unloaded and
-reloaded. The waitqueue being woken is lnet_acceptor_waitq,
-reached from a listening socket whose sk_data_ready still points
-at lnet_acceptor_ready() in the module that is going away.
+LNetNIFini() calls lnet_acceptor_stop() before
+lnet_shutdown_lndnets(). The acceptor thread releases the
+listening sockets when it exits, so lnet_acceptor_remove_sockets()
+called from ksocknal_shutdown() no longer finds them, and
+"listening socket not found" is reported on every LNet shutdown.
+The LNetNIInit() error path has the same inversion. Stop the
+acceptor after lnet_shutdown_lndnets(), as lnet_dyn_del_ni() and
+lnet_dyn_del_net() already do.
 
-Several problems allow this:
+Also make the listener callback teardown safe against softirqs:
 
-- sk_data_ready is installed and restored without holding
-  sk->sk_callback_lock, so a softirq can be using the old value
-  while it is being replaced, and nothing waits for it to
-  complete before sock_release() and the module unload. Install
-  and restore the callback under
-  write_lock_bh(&sk->sk_callback_lock), let lnet_acceptor_ready()
-  take the lock for read and NOOP if it lost the race, and call
+- sk_data_ready is installed and restored without
+  sk->sk_callback_lock, and nothing waits for a running
+  lnet_acceptor_ready() before sock_release() and module unload.
+  Swap the callback under write_lock_bh(&sk->sk_callback_lock),
+  take it for read in lnet_acceptor_ready(), and call
   synchronize_net() before releasing the socket.
 
-- The previous callback is saved in a single global,
-  lnet_acceptor_state.pta_odata, overwritten by every add and
-  never reset, hence stale across an unload/reload and NULL
-  before the first listener is added. Store it per listening
-  socket instead.
+- Keep the saved callback in the listening socket, found through
+  sk_user_data, instead of in the global pta_odata.
 
-- LNetNIFini() calls lnet_acceptor_stop() before
-  lnet_shutdown_lndnets(). The acceptor thread exit path drains
-  socket_list and releases the listeners itself, so when
-  ksocknal_shutdown() later calls lnet_acceptor_remove_sockets()
-  the listener is already gone and "Interface %s not found" is
-  reported. The same inversion exists in the LNetNIInit() error
-  path. Call lnet_acceptor_stop() after lnet_shutdown_lndnets(),
-  as lnet_dyn_del_ni() and lnet_dyn_del_net() already do.
+- A socket returned by kernel_accept() inherits the listener's
+  sk_data_ready and sk_user_data, so ksocklnd saves
+  lnet_acceptor_ready() as its original callback, which can then
+  run with sk_user_data pointing at a ksock_conn or at a freed
+  listener. Restore the child's callback right after accept.
 
-The four open coded refcount drops are folded into
-lnet_acceptor_put_socket(), socket_lock is taken with the _bh
-variants now that it is shared with a softirq callback, and the
-listening socket leaked when lnet_sock_listen() fails is freed.
+Fold the open coded refcount drops into lnet_acceptor_put_socket().
+
+Add sanity-lnet test_295 to reload LNet while connections arrive
+at the acceptor.
 
 Assisted-by: ClaudeCode:claude-opus-5
-Test-Parameters: trivial testlist=sanity-selinux,sanity-lnet
-Fixes: 2e49bc7dd1 ("LU-18812 lnet: restrict IP addresses that socklnd listens on")
-Fixes: 40e4d957e3 ("LU-10391 lnet: use data_ready callback to trigger accept()")
+Test-Parameters: testlist=sanity-lnet
+Fixes: 2e49bc7dd170 ("LU-18812 lnet: restrict IP addresses that socklnd listens on")
+Fixes: 40e4d957e332 ("LU-10391 lnet: use data_ready callback to trigger accept()")
 Signed-off-by: Cyril Bordage <cbordage@whamcloud.com>
 Change-Id: I62000764b3b8ca8b3628519f50a6ef467a62287b
 
@@ -181,3 +175,226 @@ Patch Set 1: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Cyril Bordage, 2026-11-19 17:15:53.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 17:18:28.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-19 17:19:39.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-19 17:47:43.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137101/ : SUCCESS
+
+--- Message (Maloo, 2026-11-19 17:48:04.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 137101 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137101&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137101#redirect
+
+--- Message (Maloo, 2026-11-20 04:29:11.000000000) ---
+Patch Set 2:
+
+Failed enforced test custom-1001 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm133: https://testing.whamcloud.com/test_sessions/787d057e-85d5-43c1-9066-6e5fce76e6d1 ran 3 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 06:38:35.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm10: https://testing.whamcloud.com/test_sessions/1041b540-8a86-426e-87d1-1daca6fcc2e3 ran 9 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2026-11-20 06:52:43.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm333: https://testing.whamcloud.com/test_sessions/c2557baf-2c5d-4eed-84a7-808ee78761b2 ran 5 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 06:56:03.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm5: https://testing.whamcloud.com/test_sessions/8af07155-70e8-480f-b5bc-b88f575c2169 ran 5 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 07:15:33.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm162: https://testing.whamcloud.com/test_sessions/e388427f-6985-42d3-9c6a-f89d58eabb4c ran 5 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 07:21:50.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-zfs-part-4 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm14: https://testing.whamcloud.com/test_sessions/e3b3455f-1e04-4683-b7b6-c9837d080ffa ran 5 tests.  1 tests failed: sanity-pcc.
+
+--- Message (Maloo, 2026-11-20 07:54:48.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-ipv6 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm341: https://testing.whamcloud.com/test_sessions/52dcffee-d568-4df6-988f-f4f1c81728db ran 4 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 08:14:10.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm9: https://testing.whamcloud.com/test_sessions/b2d1db7f-a396-4b83-a036-1a3a7d91f451 ran 11 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 08:24:13.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm11: https://testing.whamcloud.com/test_sessions/8ad8e18c-0e5b-4eae-935f-80a06abf2972 ran 11 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 08:32:35.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm9: https://testing.whamcloud.com/test_sessions/57d7cc9a-5533-422e-b72c-778df6ac59c3 ran 6 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-20 12:12:08.000000000) ---
+Patch Set 2: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm188: https://testing.whamcloud.com/test_sessions/8d045b9c-e9e3-42d9-ade0-e74209dccb8d ran 3 tests.
+
+--- Message (patrick bot, 2026-11-20 12:19:43.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 12:21:26.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good: the shutdown reordering and the per-socket sk_callback_lock handling look right. One question inline about lnet_acceptor_unhook_child() keying on sk_user_data, plus a couple of minor notes.
+
+--- Message (Autotest, 2026-11-20 12:33:46.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-4 session on el10.2-x86_64/zfs servers and clients for build 137101 patch 2. Requested by Patrickbot because of LU-21238.
+
+--- Message (patrick bot, 2026-11-20 12:34:04.000000000) ---
+Patch Set 2: Code-Review-1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-20 12:41:49.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Maloo, 2026-11-20 15:51:57.000000000) ---
+Patch Set 2:
+
+Passed enforced test review-dne-zfs-part-4 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-75vm1: https://testing.whamcloud.com/test_sessions/c41a2ee1-8a5a-4e6c-a7ed-99282376eb6a ran 5 tests.

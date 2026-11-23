@@ -1,5 +1,5 @@
 Change:     68163
-Subject:    LU-20613 llapi: add a ZFS backend to llapi_scan_device()
+Subject:    LU-20613 llapi: add a ZFS backend to the device scan
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68163
 Change-Id:  I97a6d8815924b2671c818152f42d66cc580a609d
 Project:    fs/lustre-release
@@ -7,38 +7,39 @@ Branch:     master
 Status:     NEW
 Owner:      Hiroshi Nishida
 Created:    2026-08-20 01:08:10.000000000
-Updated:    2026-11-13 05:43:24.000000000
-Patch Set:  49
-Insertions: +1917
-Deletions:  -150
-Comments:   203 (1 unresolved)
-Hashtags:   pw_shepherd, lfu
+Updated:    2026-11-22 04:25:45.000000000
+Patch Set:  54
+Insertions: +1885
+Deletions:  -139
+Comments:   224 (5 unresolved)
+Hashtags:   lfu
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder
+  CC: Lustre RISC-V Builder, patrick bot
   REVIEWER: Andreas Dilger, Alex Zhuravlev, Jian Yu, Artem Blagodarenko, Timothy Day, Gerrit AI review for Lustre
 
 --- Commit Message ---
-LU-20613 llapi: add a ZFS backend to llapi_scan_device()
+LU-20613 llapi: add a ZFS backend to the device scan
 
-Add scan_osd_zfs.so, the ZFS half of llapi_scan_device(), which reads
+Add scan_osd_zfs.so, the ZFS half of a device stream, which reads
 objects out of a pool through libzpool the way zdb does, behind the
 same llapi_scan_sink the ldiskfs backend is behind.
 
 A pool that is still imported answers EBUSY rather than being read
 underneath its server: reading an imported pool from outside is not
 supported, so the pool has to be exported first, and its snapshots
-then become readable too. lfsp_search names the directories to look in
-for a pool's vdevs, since a pool on file vdevs is invisible to a scan
-of /dev. The scan loads no /etc/zfs/zpool.cache: a pool listed there
-would be opened directly, before those checks, and a pool the kernel
-holds would answer EREMOTEIO instead of EBUSY. ZFS 2.4 also falls back
-to /boot/zfs/zpool.cache, so the scan drops every pool that
-kernel_init() loaded before it opens its own.
+then become readable too. lsop_search, new in llapi_scan_open_param,
+names the directories to look in for a pool's vdevs, since a pool on
+file vdevs is invisible to a scan of /dev. The scan loads no
+/etc/zfs/zpool.cache: a pool listed there would be opened directly,
+before those checks, and a pool the kernel holds would answer
+EREMOTEIO instead of EBUSY. ZFS 2.4 also falls back to
+/boot/zfs/zpool.cache, so the scan drops every pool that kernel_init()
+loaded before it opens its own.
 
 Like zdb, the scan caps the ARC at 256 MB, because it reads each
 block once. It also sets zfs_arc_min to 32 MB: in libzpool the
@@ -94,18 +95,20 @@ conf-sanity 302 and 304, which read a stopped OST and a stopped MDT,
 run on ZFS too: each exports the pool, checks that it is exported,
 passes --search, and skips on ENOTSUP where there is no backend.
 
-lfs find gains --search DIRS, which sets lfsp_search, and --device
+lfs find gains --search DIRS, which sets lsop_search, and --device
 takes a pool/dataset name for a ZFS target; lfs-find.1 says when such
 a pool answers EBUSY.  scan_device_target(), which llapi_find_device()
 reads a target's label with, takes the search path too and selects its
-backend the way llapi_scan_device() does.  The ldiskfs half of
+backend the way llapi_scan_open() does.  The ldiskfs half of
 conf-sanity 300 still errors where the backend will not load, an
 ldiskfs build being unable to configure without libext2fs; only a ZFS
 target skips on ENOTSUP, and only when the build has no ZFS backend:
 every dlopen() tried found no scan_osd_zfs.so. The loader now names
 each attempt's error, so a plugin that is there but does not load
-fails the test instead. While mds1 is still up, the test also checks
-that --target on a ZFS MDT is refused as in use.
+fails the test instead. Each plugin exports its own scan_<name>_abi,
+which the loader checks, and LLAPI_SCAN_BACKEND_ABI goes to 3 for the
+search argument of sb_open. While mds1 is still up, the test also
+checks that --target on a ZFS MDT is refused as in use.
 
 The backend goes into the programs that scan, not into liblustreapi,
 which is what mkfs.lustre already does with -lzfs -lnvpair -lzpool.
@@ -122,7 +125,7 @@ So liblustreapi keeps -DHAVE_ZFS_SCAN and declares the five entry
 points weak, and libscan_zfs_in.la is linked into
 llapi_scan_device_test, the scanner conf-sanity 300 drives, and not
 into lfs, which clients install.  A program without it links and
-leaves the slot NULL, which is the -ENOTSUP llapi_scan_device.3
+leaves the slot NULL, which is the -ENOTSUP llapi_scan_open.3
 already describes -- the same answer as a build whose configure found
 no libzpool headers at all, so no caller and no test learns a new
 outcome.  lfs find --device therefore reads a ZFS target in a packaged
@@ -154,7 +157,7 @@ ldiskfs before its own stat(), so a mount point or another directory
 is never sent to the ZFS backend. A relative name is ldiskfs only if
 it is a block device or a regular file; any other relative name,
 including one that does not exist, is taken as a dataset. -ENOTSUP
-keeps the meaning that llapi_scan_device.3 gives it, and that
+keeps the meaning that llapi_scan_open.3 gives it, and that
 conf-sanity 300 uses for its skip: this build has no backend for the
 target.
 
@@ -173,7 +176,7 @@ pool called fm.  Only a directory there is a pool.
 holds, and a dataset already owned within this process, which is a
 second scan of the same target.  dmu_objset_own() answers the same
 errno through dsl_dataset_tryown() for the second, where the pool is
-exported and there is nothing to export.  llapi_scan_device.3 says
+exported and there is nothing to export.  llapi_scan_open.3 says
 the same.
 
 Test-Parameters: trivial
@@ -2084,3 +2087,185 @@ Patch Set 49:
 AI code review results below, please doublecheck
 
 Looks good. One optional test-script point inline for the next refresh; no need to re-spin for it.
+
+--- Message (Hiroshi Nishida, 2026-11-16 22:02:47.000000000) ---
+Uploaded patch set 50.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-11-16 22:03:16.000000000) ---
+Patch Set 49:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 23:47:43.000000000) ---
+Patch Set 50:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-17 00:25:31.000000000) ---
+Patch Set 50:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-11-17 20:42:57.000000000) ---
+Patch Set 50:
+
+BUILD
+
+--- Message (jenkins, 2026-11-17 21:37:31.000000000) ---
+Patch Set 50: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136942/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-18 02:22:54.000000000) ---
+Patch Set 50:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. Two small points inline, neither worth a re-spin on its own; pick them up if the patch is refreshed.
+
+--- Message (Hiroshi Nishida, 2026-11-19 06:19:10.000000000) ---
+Uploaded patch set 51.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-19 06:20:10.000000000) ---
+Patch Set 51:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-19 06:25:55.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (wc-checkpatch, 2026-11-19 06:28:07.000000000) ---
+Patch Set 51:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 06:45:29.000000000) ---
+Patch Set 51:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-19 06:58:32.000000000) ---
+Patch Set 51: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137063/ : SUCCESS
+
+--- Message (Hiroshi Nishida, 2026-11-20 04:13:39.000000000) ---
+Uploaded patch set 52.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-20 04:19:28.000000000) ---
+Patch Set 52:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 04:29:45.000000000) ---
+Patch Set 52:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-20 05:12:44.000000000) ---
+Patch Set 52: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137156/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 12:29:42.000000000) ---
+Patch Set 52:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, two minor comments inline. Neither needs a re-spin; pick them up if the patch is refreshed for other reasons.
+
+--- Message (Hiroshi Nishida, 2026-11-20 21:02:53.000000000) ---
+Uploaded patch set 53.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Hiroshi Nishida, 2026-11-20 21:03:24.000000000) ---
+Patch Set 52:
+
+(2 comments)
+
+--- Message (wc-checkpatch, 2026-11-20 21:15:19.000000000) ---
+Patch Set 53:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 21:47:20.000000000) ---
+Patch Set 53:
+
+Code-wise looks good to me.
+
+--- Message (Hiroshi Nishida, 2026-11-20 22:27:10.000000000) ---
+Uploaded patch set 54.
+
+--- Message (wc-checkpatch, 2026-11-20 22:38:34.000000000) ---
+Patch Set 54:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 22:46:53.000000000) ---
+Patch Set 54:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-21 12:32:04.000000000) ---
+Patch Set 53: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137357/ : SUCCESS
+
+--- Message (jenkins, 2026-11-21 16:34:55.000000000) ---
+Patch Set 54: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137396/ : SUCCESS
+
+--- Message (Autotest, 2026-11-21 22:52:41.000000000) ---
+Patch Set 54:
+
+Onyx Autotest 2 retesting enforced review-ldiskfs-dne session on el9.8-x86_64/ldiskfs servers and clients for build 137396 patch 54. Requested by Hiroshi Nishida because of LU-17601.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-22 04:25:45.000000000) ---
+Patch Set 54:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. Two optional suggestions inline for whenever the patch is next refreshed; there is no need to re-spin for them.

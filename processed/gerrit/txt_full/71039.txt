@@ -1,0 +1,836 @@
+Change:     71039
+Subject:    LU-20908 llite: swap one object at lease close
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71039
+Change-Id:  I7645163fbd9478ef00da0f48bb5a7101da23d927
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Artem Blagodarenko
+Created:    2026-11-17 01:38:00.000000000
+Updated:    2026-11-23 14:38:47.000000000
+Patch Set:  4
+Insertions: +390
+Deletions:  -69
+Comments:   32 (3 unresolved)
+Hashtags:   218_review_blocker, pw_shepherd
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Andreas Dilger, Hiroshi Nishida, patrick bot
+
+--- Commit Message ---
+LU-20908 llite: swap one object at lease close
+
+A single-object layout swap (SWAP_LAYOUTS_SINGLE_STRIPE) can only go
+through MDS_SWAP_LAYOUTS, which does not look at a lease.  A writer
+that opens the file after the caller last checked its lease and data
+version can still write to the old object before the swap, and that
+data is lost when the old object is destroyed.  A group lock would
+close the gap but, on a composite file, takes a write intent over the
+whole file, which instantiates every component and makes the other
+mirrors stale.
+
+Carry the two OST object FIDs in close_data, as struct close_data_swap
+in the union that already holds cd_data_version2, so that the swap is
+done in mdt_close_handle_layouts().  There the MDT holds mot_open_sem
+and checks that the lease is not broken before it swaps, as for the
+full layout swap of lfs migrate --non-block.
+
+OBD_CONNECT2_ONE_OBJ_SWAP, added in 2.18 for the single-object
+MDS_SWAP_LAYOUTS, now also means the MDT swaps one object at close, so
+no release has one without the other.  It keeps a client from sending
+this to an older MDT, which would swap the whole layouts, and the MDT
+from reading the new fields from a client that never set them.  The
+DNE close goes to the MDT of the file, not the MDT0000 llite checks,
+so mdc_close() checks that MDT too, and without the flag releases the
+lease without the swap and returns -EOPNOTSUPP.
+
+Also check the two files before the lease is taken from the file
+descriptor, not after: a failed check there freed the open handle
+without a close, and the lease and the MDT open stayed until umount.
+llapi_fswap_layout_fids() now accepts SWAP_LAYOUTS_CLOSE, and returns
+-EBUSY for a broken lease, which close reports as -EBUSY or -ESTALE
+depending on whether the lease open has committed.
+
+Add a lease option to swap_single_stripe and sanity-pfl test_29d,
+which swaps one object at lease close and checks that a broken
+lease leaves both layouts unchanged.
+
+Test-Parameters: testlist=sanity-pfl serverversion=2.17
+Test-Parameters: testlist=sanity-pfl serverversion=2.16
+Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
+Assisted-by: Claude:claude-opus-5-5
+Change-Id: I7645163fbd9478ef00da0f48bb5a7101da23d927
+
+--- Review History ---
+
+--- Message (Artem Blagodarenko, 2026-11-17 01:38:00.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-17 01:47:17.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (wc-checkpatch, 2026-11-17 01:53:09.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Hiroshi Nishida, 2026-11-17 20:27:07.000000000) ---
+Patch Set 1:
+
+BUILD
+
+--- Message (jenkins, 2026-11-17 20:51:38.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136935/ : SUCCESS
+
+--- Message (Maloo, 2026-11-17 20:52:55.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 136935 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=136935&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=136935#redirect
+
+--- Message (Maloo, 2026-11-18 00:41:55.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm5: https://testing.whamcloud.com/test_sessions/beff1f49-3067-4d82-965a-7ba18f7bf8e0 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-18 01:28:33.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm42: https://testing.whamcloud.com/test_sessions/2cee3a68-3c1b-4c23-b382-eedc3432ebcd ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-18 01:45:05.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm129: https://testing.whamcloud.com/test_sessions/735eff1b-e02e-450d-b17c-a59ea87bf253 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-18 01:54:23.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-zfs-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm40: https://testing.whamcloud.com/test_sessions/351bc2c6-c4c1-4b73-baf3-902c408434f3 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-18 01:58:11.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm144: https://testing.whamcloud.com/test_sessions/cbc21834-fc20-4e94-b025-eacfa1dbd946 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-18 02:11:06.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm192: https://testing.whamcloud.com/test_sessions/a34d9eee-9641-4739-b443-fb70f048d1d3 ran 11 tests.  1 tests failed: sanity-lfsck.
+
+--- Message (Maloo, 2026-11-18 03:57:07.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm118: https://testing.whamcloud.com/test_sessions/d0b91de2-ee62-4950-a18f-1f4c4cbfc6e3 ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-18 04:00:11.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm165: https://testing.whamcloud.com/test_sessions/9502e053-2f28-4211-9889-ec083d44c041 ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-18 08:13:04.000000000) ---
+Patch Set 1: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm37: https://testing.whamcloud.com/test_sessions/63da3345-c040-41bf-8809-d5af9ce74cad ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-18 08:30:36.000000000) ---
+Patch Set 1:
+
+(6 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the MDT-side FID binding and connect-flag gating look correct. The error and lease contracts in the documentation don't fully match the code, and the next patch in the series relies on them, so this is worth fixing on the next refresh. The new close-time single-object swap also has no test: consider extending swap_single_stripe.c with a lease/SWAP_LAYOUTS_CLOSE mode and adding a sanity-pfl case that swaps at lease close, plus one where an open for write breaks the lease first and nothing is swapped.
+
+--- Message (patrick bot, 2026-11-18 17:11:05.000000000) ---
+Patch Set 1: Code-Review-1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-18 17:15:03.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-18 17:20:44.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Hiroshi Nishida, 2026-11-18 20:37:49.000000000) ---
+Patch Set 1: Code-Review-1
+
+I checked the AI comments. I agree with all of them: the -ESTALE one on the man page line 152 is the important one. A broken lease gives -ESTALE when the lease open is not committed yet, and -EBUSY only when it is. 70470 maps only -EBUSY to -EAGAIN, so a quick copy fails instead of retrying. Please map the two to one errno here, or handle -ESTALE in 70470 too.
+
+I don't see a test for the swap at close in this patch or in 70470. sanity-pfl test_29a-29c only use the ioctl path. Could you add one, for example a lease option for swap_single_stripe and a sanity-pfl subtest that checks: the swap works, an open for write after the lease stops the swap, and the errno is the documented one? Then the interop runs the AI asked for would test something.
+
+The Patch Watcher -1 on sanity-lfsck test_16 looks like the parents (70746/70747) to me too; this patch does not touch that code.
+
+--- Message (Artem Blagodarenko, 2026-11-19 01:53:49.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-19 02:04:02.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 02:12:32.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me, 1 warnings less than parent.
+
+--- Message (jenkins, 2026-11-19 03:09:40.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137039/ : SUCCESS
+
+--- Message (Maloo, 2026-11-19 03:11:00.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 137039 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.4-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137039&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137039#redirect
+
+--- Message (Maloo, 2026-11-19 23:59:07.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-6 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm12: https://testing.whamcloud.com/test_sessions/a39877cd-5de7-4604-8cef-a664a6cae189 ran 5 tests.  1 tests failed: replay-single.
+
+--- Message (Maloo, 2026-11-20 00:51:45.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm113: https://testing.whamcloud.com/test_sessions/7d016b7a-4377-4c1e-9926-e4862b27c768 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-20 01:05:45.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm144: https://testing.whamcloud.com/test_sessions/a069512d-c64c-4046-9fec-4e811610ca19 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Hiroshi Nishida, 2026-11-20 01:58:32.000000000) ---
+Patch Set 2: Code-Review-1
+
+(1 comment)
+
+Thank you for Patch Set 2. The -ESTALE to -EBUSY mapping fixes my main point for 70470, and the man page is much clearer now.
+
+Two points are still open:
+1. I still don't see a test of the swap at close, in this patch or in 70470. The new sanity-pfl interop runs only reach the ioctl path (test_29a-29c), so they don't check the new connect flag or a broken lease. A lease option for swap_single_stripe and one sanity-pfl subtest would cover it: the swap works, an open for write after the lease stops it with -EBUSY, and an MDS without close_obj_swap gives -EOPNOTSUPP.
+2. The man page now says that -EINVAL and -EPERM leave the lease on fd_src. That is not true for every case, see the inline comment in file.c.
+
+The Maloo failures do not look like this patch: replay-dual is LU-21242 (this base does not have 70384), and replay-single 70b/70c is the MDT0000 osp eviction from LU-21032 / LU-20895.
+
+--- Message (Maloo, 2026-11-20 08:31:39.000000000) ---
+Patch Set 2: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm132: https://testing.whamcloud.com/test_sessions/a0adbcc4-6592-4f1d-b3a2-7451ecd3aa5a ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 08:42:25.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the MDT-side binding of cso_fid1/cso_fid2 to the sorted parents checks out. One interop question on the connect-flag check in a mixed-version DNE setup, and the lease-on-error contract in the man page still has a gap beyond the client-side one already discussed. Comments inline.
+
+--- Message (Artem Blagodarenko, 2026-11-20 13:18:55.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Artem Blagodarenko, 2026-11-20 13:19:38.000000000) ---
+Patch Set 3:
+
+(10 comments)
+
+--- Message (wc-checkpatch, 2026-11-20 13:28:57.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 13:41:18.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-21 01:32:22.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137238/ : SUCCESS
+
+--- Message (Maloo, 2026-11-21 01:33:19.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 137238 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.4-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137238&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137238#redirect
+
+--- Message (Maloo, 2026-11-21 07:26:58.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-selinux-ssk-part-2 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-75vm1: https://testing.whamcloud.com/test_sessions/495f402b-7c32-4218-ae7e-119665c1a99d ran 7 tests.  1 tests failed: sanity-sec.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-21 07:42:58.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm17: https://testing.whamcloud.com/test_sessions/4b5f24da-eb8b-41e7-984c-ba237c154058 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-21 08:13:15.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm229: https://testing.whamcloud.com/test_sessions/fdc49f38-3393-4931-a8a7-eeaa9a69e383 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-21 09:00:54.000000000) ---
+Patch Set 3:
+
+Failed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-142vm12: https://testing.whamcloud.com/test_sessions/58684f47-e568-4177-a75b-1e51d5a3740e ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-21 15:39:54.000000000) ---
+Patch Set 3: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-145vm13: https://testing.whamcloud.com/test_sessions/8885a589-4226-4808-b9b5-4528882bb943 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 15:48:07.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; a few optional minors inline, none of which need a re-spin by themselves.
+
+Nothing in this patch exercises the new close path, though: sanity-pfl reaches llapi_fswap_layout_fids() only through swap_single_stripe, which never passes SWAP_LAYOUTS_CLOSE, so the serverversion=2.16/2.17 runs never reach the -EOPNOTSUPP check or mdt_close_handle_layouts() with cso_flags set. Could a sanity-pfl case be added (here or later in the series) that takes a write lease, swaps one object with SWAP_LAYOUTS_CLOSE and checks that only that object moved, then repeats with a racing open for write and expects -EBUSY with both layouts unchanged?
+
+--- Message (Hiroshi Nishida, 2026-11-21 21:29:36.000000000) ---
+Patch Set 3: Code-Review-1
+
+(1 comment)
+
+Thanks, PS3 fixes my PS2 point: the man page now says what happens to the lease after an error. Moving the file checks before the lease is taken also fixes a real leak of the open handle. I checked the new DNE fallback in mdc_close() and the object order in mdt_close_handle_layouts(); both look right to me.
+
+My only remaining point is the test. Nothing calls SWAP_LAYOUTS_CLOSE with SWAP_LAYOUTS_SINGLE_STRIPE yet: swap_lock_test only uses the full-layout close swap, and sanity-pfl test_29a-29c use the ioctl path. One sanity-pfl subtest with a lease option for swap_single_stripe would cover it: the swap works and the data is intact, an open for write after the lease stops the swap with -EBUSY, and an MDS without close_obj_swap gives -EOPNOTSUPP.
+
+The Maloo failures are known and not from this patch: LU-21242 (replay-dual), LU-14601 (sanity 64e) and LU-21044 (sanity-sec 27ac crash).
+
+--- Message (Andreas Dilger, 2026-11-22 23:57:19.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-23 04:16:46.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-23 04:16:56.000000000) ---
+Hashtag added: 218_review_blocker
+
+--- Message (Andreas Dilger, 2026-11-23 04:17:31.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-23 04:18:24.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 04:20:06.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-23 04:42:14.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137523/ : SUCCESS
+
+--- Message (Maloo, 2026-11-23 04:43:31.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 137523 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.4-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137523&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137523#redirect
+
+--- Message (Andreas Dilger, 2026-11-23 04:44:07.000000000) ---
+Patch Set 4: Code-Review+1
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-23 07:42:31.000000000) ---
+Patch Set 4:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm16: https://testing.whamcloud.com/test_sessions/8f40b455-8e8e-49b9-a39f-8385280f2f21 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (patrick bot, 2026-11-23 07:53:52.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-23 08:14:29.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-23 08:14:49.000000000) ---
+Patch Set 4:
+
+Trevis Autotest 2 retesting enforced review-dne-zfs-part-1 session on el9.8-x86_64/zfs servers and clients for build 137523 patch 4. Requested by Patrickbot because of LU-18133.
+
+--- Message (Maloo, 2026-11-23 11:33:45.000000000) ---
+Patch Set 4:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm68: https://testing.whamcloud.com/test_sessions/04cc967d-eb02-40a6-83a5-4c5ceee300c3 ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-23 12:02:01.000000000) ---
+Patch Set 4:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm28: https://testing.whamcloud.com/test_sessions/3871cb19-231d-4f22-9973-8868abf21a5e ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-23 14:28:56.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm5: https://testing.whamcloud.com/test_sessions/a8467a76-bcae-4372-a671-7bf1f37669ef ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-23 14:38:47.000000000) ---
+Patch Set 4:
+
+Looks good to me.

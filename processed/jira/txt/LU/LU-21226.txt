@@ -1,0 +1,80 @@
+Key:        LU-21226
+Summary:    ptlrpc_invalidate_import()) ASSERTION( test_bit(IMPF_INVALID, imp->imp_flags) )
+Link:       https://jira.whamcloud.com/browse/LU-21226
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Alex Zhuravlev
+Created:    Sun, 15 Nov 2026 06:07:42 +0000
+Updated:    Tue, 17 Nov 2026 15:22:48 +0000
+
+--- Description ---
+in replay-single/135:
+
+[  269.487859] LustreError: 25306:0:(import.c:302:ptlrpc_invalidate_import()) ASSERTION( test_bit(IMPF_INVALID, imp->imp_flags) ) failed: 
+[  269.487950] LustreError: 25306:0:(import.c:302:ptlrpc_invalidate_import()) LBUG
+[  269.487996] CPU: 0 PID: 25306 Comm: ll_imp_inval Tainted: G           O       ------  ---  5.14.0 #4
+[  269.488584] LustreError: lustre-OST0000-osc-MDT0000: This client was evicted by lustre-OST0000; in progress operations using this service will fail.
+[  269.495364] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.17.0-9.fc43 06/10/2025
+[  269.495368] Call Trace:
+[  269.495428]  
+[  269.495430]  dump_stack_lvl+0x8a/0xa0
+[  269.495439]  lbug_with_loc+0x35/0x80 [libcfs]
+[  269.495448]  ptlrpc_invalidate_import+0x784/0x9e0 [ptlrpc]
+[  269.505274]  ? lock_release+0x1d5/0x2b0
+[  269.505379]  ? __ptlrpc_import_recovery_state_machine+0xda0/0xda0 [ptlrpc]
+[  269.505598]  ptlrpc_invalidate_import_thread+0x86/0x380 [ptlrpc]
+[  269.505734]  kthread+0xeb/0x1f0
+[  269.505773]  ? kthreads_online_cpu+0x100/0x100
+[  269.505819]  ret_from_fork+0x1f/0x30
+[  269.505857]
+
+--- Comment (bzzz, Sun, 15 Nov 2026 07:30:29 +0000) ---
+the problem is that we enter recovery machine twice:
+
+00000100:00080000:0.0:1794724597.786550:0:3575:0:(import.c:64:import_set_state_nolock()) ffff964d3ffad000 lustre-OST0000_UUID: changing import state from REPLAY_LOCKS to CONNECTING
+00000100:00080000:0.0:1794724597.786561:0:3575:0:(import.c:742:import_select_connection()) lustre-OST0000-osc-ffff964d41512000: import ffff964d3ffad000 using connection 192.168.121.186@tcp/0@lo
+00000100:00080000:0.0:1794724597.786956:0:3575:0:(import.c:1559:ptlrpc_connect_interpret()) set ffff964d3ffad000 from ptlrpc_connect_interpret
+00000100:00080000:0.0:1794724597.786957:0:3575:0:(import.c:64:import_set_state_nolock()) ffff964d3ffad000 lustre-OST0000_UUID: changing import state from CONNECTING to EVICTED
+00000100:00080000:0.0:1794724597.787149:0:3575:0:(import.c:1893:__ptlrpc_import_recovery_state_machine()) evicted from lustre-OST0000_UUID@0@lo; invalidating ffff964d3ffad000
+00010000:00020000:1.0:1794724597.787289:0:20768:0:(ldlm_request.c:3055:ldlm_lock_replay_thread()) IMPORT ffff964d3ffad000 HAS CHANGED STATE to EVICTED (84 != 86)
+00000100:00080000:1.0:1794724597.787381:0:20768:0:(import.c:1893:__ptlrpc_import_recovery_state_machine()) evicted from lustre-OST0000_UUID@0@lo; invalidating ffff964d3ffad000
+
+AFAIU, ldlm_lock_replay_thread()
+
+lock replay failed and that initiated reconnect:
+
+00000100:00000400:0.0:1794724597.786519:0:3575:0:(client.c:2534:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply: [sent 1794724581/real 1794724581]  req@ffff964d3b971dc0 x1881904915454848/t0(0) o400->lustre-OST0000-osc-MDT0000@0@lo:28/4 lens 224/224 e 0 to 1 dl 1794724597 ref 1 fl Rpc:XQr/2c0/ffffffff rc 0/-1 job:'ldlm_lock_repla.0' uid:0 gid:0 projid:4294967295
+00000100:00100000:0.0:1794724597.786522:0:3575:0:(client.c:2569:ptlrpc_expire_one_request()) @@@ err -110, sent_state=REPLAY_WAIT (now=REPLAY_WAIT)  req@ffff964d3b971dc0 x1881904915454848/t0(0) o400->lustre-OST0000-osc-MDT0000@0@lo:28/4 lens 224/224 e 0 to 1 dl 1794724597 ref 1 fl Rpc:XQU/2c0/ffffffff rc 0/-1 job:'ldlm_lock_repla.0' uid:0 gid:0 projid:4294967295
+00000100:00000400:0.0:1794724597.786526:0:3575:0:(client.c:2534:ptlrpc_expire_one_request()) @@@ Request sent has timed out for slow reply: [sent 1794724581/real 1794724581]  req@ffff964d3b972ec0 x1881904915454720/t0(0) o400->lustre-OST0000-osc-MDT0001@0@lo:28/4 lens 224/224 e 0 to 1 dl 1794724597 ref 1 fl Rpc:XQr/2c0/ffffffff rc 0/-1 job:'ldlm_lock_repla.0' uid:0 gid:0 projid:4294967295
+00000100:00100000:0.0:1794724597.786529:0:3575:0:(client.c:2569:ptlrpc_expire_one_request()) @@@ err -110, sent_state=REPLAY_WAIT (now=REPLAY_WAIT)  req@ffff964d3b972ec0 x1881904915454720/t0(0) o400->lustre-OST0000-osc-MDT0001@0@lo:28/4 lens 224/224 e 0 to 1 dl 1794724597 ref 1 fl Rpc:XQU/2c0/ffffffff rc 0/-1 job:'ldlm_lock_repla.0' uid:0 gid:0 projid:4294967295
+00000100:00080000:0.0:1794724597.786550:0:3575:0:(import.c:64:import_set_state_nolock()) ffff964d3ffad000 lustre-OST0000_UUID: changing import state from REPLAY_LOCKS to CONNECTING
+
+but then ldlm_lock_replay_thread() enters the recovery state machine again unconditionally:
+
+       __ldlm_replay_locks(imp, true);
+        atomic_dec(&imp->imp_replay_inflight);
+       ptlrpc_import_recovery_state_machine(imp);
+       class_import_put(imp);
+
+and if state happens to be EVICTED at the moment, then ptlrpc_import_recovery_state_machine() fires yet another thread to invalidate import - two import races.
+
+I guess ldlm_lock_replay_thread() should be entering RSM if import's state has changed
+
+--- Comment (gerrit, Sun, 15 Nov 2026 08:32:32 +0000) ---
+"Alex Zhuravlev " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70900
+
+Subject: imp_flags) )" class="issue-link" data-issue-key="LU-21226">LU-21226 ldlm: skip recovery state machine
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: dfc2188610e28332376efdf1fba852ebf0651013
+
+--- Comment (bzzz, Tue, 17 Nov 2026 15:22:48 +0000) ---
+I think the problem was introduced in LU-13600 where we introduced a separate thread to replay locks and now this thread can race with ptlrpcd runing "normal" recovery state machinery.

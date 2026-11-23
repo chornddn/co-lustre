@@ -3,13 +3,12 @@ Summary:    Directory migration failed Directory not empty (39)
 Link:       https://jira.whamcloud.com/browse/LU-20177
 Type:       Requirement
 Priority:   Medium
-Status:     Resolved
-Resolution: Fixed
+Status:     Reopened
+Resolution: Unresolved
 Assignee:   Rajeev Mishra
 Reporter:   Rajeev Mishra
 Created:    Tue, 21 Apr 2026 15:33:18 +0000
-Updated:    Tue, 29 Sep 2026 00:43:48 +0000
-Resolved:   Tue, 29 Sep 2026 00:43:48 +0000
+Updated:    Wed, 18 Nov 2026 03:40:13 +0000
 Links:      Related: is related to  LU-15602
 
 --- Description ---
@@ -274,3 +273,31 @@ Commit: 23de90c02fc37ab67ed817a977221f148608d523
 
 --- Comment (pjo, Tue, 29 Sep 2026 00:43:48 +0000) ---
 Merged for 2.18
+
+--- Comment (JIRAUSER18604, Wed, 18 Nov 2026 01:13:00 +0000) ---
+I got following review on this bug hence I will do one more commit on this ticket 
+
+The fix handles the reported failure: when mdd_migrate_cmd_check() returns -EALREADY for a subdirectory that is already on the target MDT, but the source and target parent stripes differ, the name entry is now moved to the target stripe so that the shrink no longer hits -ENOTEMPTY. The retry stops after one attempt because it is guarded by sp_migrate_nsonly, the locks taken earlier are still valid for the nsonly path, and the commit message format, Fixes tag and Signed-off-by are fine. There are two problems. First, the namespace-only path for a directory leaves its ".." entry pointing at the old source stripe, and the shrink then destroys that stripe (see the inline comment). Second, the regression test test_230C in HEAD^ never runs on this branch. It is gated on MDS1_VERSION >= version_code 2.17.56, but this tree is based on the 2.17.0.1_cray tag (git describe gives 2.17.0.1_cray-515, and the 2.17.50 to 2.17.60 tags are not ancestors of HEAD). lustre_build_version_node therefore reports 2.17.0.1 and the test always skips, so it neither reproduces the bug nor verifies the fix here. Lower the version gate to a value this branch reports, or drop the gate. No failed-tests results were present for this run, and this is not an ldiskfs patch, so section 3 does not apply. Verdict: the approach is reasonable, but the stale ".." and the test that always skips should be resolved before landing.
+
+lustre/mdt/mdt_reint.c
+
+Line 2518:
+
+[major] The retry sends this directory through mdd_migrate_update(). That function moves the name from spobj to tpobj and rewrites the linkEA, but it does not update the directory's own ".." entry. mdd_object_initialize() created that entry with the FID of the stripe the directory was made in, which is spobj here. In exactly the case this patch targets, a layout shrink, lod_dir_layout_shrink() then destroys spobj. After a successful migrate the subdirectory's linkEA points at tpobj while its ".." points at a destroyed stripe FID. mdd_parent_fid() reads the linkEA first, so in-kernel path walks still work. However, anything that looks up ".." directly (for example the NFS get_parent path) gets a stale FID, and LFSCK namespace will see a mismatch between linkEA and dotdot. Before this change such a directory was simply left behind; the normal mdd_migrate_create() path creates the target with the correct "..". Please update ".." to tpobj when a directory is moved between different parent stripes, as mdd_rename() does with __mdd_index_delete_only and __mdd_index_insert_only on dotdot. That could go in mdd_migrate_update() and its declare function. It would also be worth checking in test_230C that d_mdt0/.. resolves after the shrink, for example with lfs path2fid on $DIR/$tdir/d_mdt0/.. or with an LFSCK namespace run.
+
+Line 2526:
+
+[minor] This fallback depends on mdd internals: mdt has to know that EALREADY from mdo_migrate() comes only from mdd_migrate_cmd_check() and that nothing was changed before it returned. It would be more robust to handle this in mdd_migrate_object(): when mdd_migrate_cmd_check() returns -EALREADY and spobj != tpobj, set spec>sp_migrate_nsonly there and continue, as that function already does for -EBUSY and for the linkea_prepare result. That avoids repeating the attribute and sanity-check round trip, and keeps the condition next to the code that produces -EALREADY. Not blocking.
+
+--- Comment (gerrit, Wed, 18 Nov 2026 03:40:13 +0000) ---
+"Rajeev Mishra " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71075
+
+Subject: LU-20177 mdd: fix dotdot during directory stripe shrink
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3f875f31c49b40eff334dc2ca6e0be967c8e8391

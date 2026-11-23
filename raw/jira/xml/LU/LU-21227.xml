@@ -1,0 +1,119 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21227] lod_mdt_alloc_specific() overflows stripes[]/idx_array[] when    overstripe clamping shrinks the stripe count</title>
+                <link>https://jira.whamcloud.com/browse/LU-21227</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;In lod_prep_md_striped_create(), when a create request has&lt;br/&gt;
+  LMV_HASH_FLAG_OVERSTRIPED set and stripe_count exceeds mdt_count * &lt;br/&gt;
+  lod_max_stripes_per_mdt, the code clamps the request down to that&lt;br/&gt;
+  limit — but only in the local variable stripe_count:&lt;/p&gt;
+
+&lt;p&gt;  stripe_count = lo-&amp;gt;ldo_dir_stripe_count;&lt;br/&gt;
+  if (lo-&amp;gt;ldo_dir_hash_type &amp;amp; LMV_HASH_FLAG_OVERSTRIPED) {&lt;br/&gt;
+          if (stripe_count &amp;gt; mdt_count * lod-&amp;gt;lod_max_stripes_per_mdt)&lt;/p&gt;
+   {
+                  if (le32_to_cpu(lum-&amp;gt;lum_magic) == LMV_USER_MAGIC)
+                          stripe_count = mdt_count *
+  lod-&amp;gt;lod_max_stripes_per_mdt;
+                  else
+                          RETURN(-E2BIG);
+          }
+&lt;p&gt;          ...&lt;br/&gt;
+  }&lt;/p&gt;
+
+&lt;p&gt;  lo-&amp;gt;ldo_dir_stripe_count itself is not updated at this point — it only&lt;br/&gt;
+   gets set to the final value after allocation succeeds. stripes[] and&lt;br/&gt;
+  idx_array[] are then allocated/sized using the clamped stripe_count:&lt;/p&gt;
+
+&lt;p&gt;  OBD_ALLOC_PTR_ARRAY(stripes, stripe_count);&lt;br/&gt;
+  ...&lt;br/&gt;
+  OBD_ALLOC_PTR_ARRAY(idx_array, stripe_count);&lt;/p&gt;
+
+&lt;p&gt;  When lo-&amp;gt;ldo_dir_stripe_offset != LMV_OFFSET_DEFAULT (an&lt;br/&gt;
+  explicit/specific MDT offset was requested), allocation goes through&lt;br/&gt;
+  lod_mdt_alloc_specific(). Unlike lod_mdt_alloc_qos() and&lt;br/&gt;
+  lod_mdt_alloc_rr(), which take the stripe count as an explicit&lt;br/&gt;
+  parameter, lod_mdt_alloc_specific() reads the loop bound from&lt;br/&gt;
+  lo-&amp;gt;ldo_dir_stripe_count directly — the stale, pre-clamp value.&lt;/p&gt;
+
+&lt;p&gt;  Result: whenever overstripe clamping actually shrinks the stripe count&lt;br/&gt;
+   (e.g. requested 8, clamped to 5) and the offset is non-default,&lt;br/&gt;
+  lod_mdt_alloc_specific() iterates up to the stale larger count (8)&lt;br/&gt;
+  while stripes[]/idx_array[] were only allocated for the clamped count&lt;br/&gt;
+  (5) — a heap buffer overflow writing past the end of both arrays.&lt;/p&gt;
+
+&lt;p&gt;  This was caught directly by KASAN while writing a new KUnit test&lt;br/&gt;
+  (lod_prep_md_striped_create_test.c) that exercised this exact&lt;br/&gt;
+  combination (overstripe clamp + specific offset):&lt;/p&gt;
+
+&lt;p&gt;  BUG: KASAN: slab-out-of-bounds in lod_mdt_alloc_specific&lt;br/&gt;
+  ...&lt;br/&gt;
+  kasan: bad access detected&lt;/p&gt;
+
+&lt;p&gt;  Fix direction: have lod_mdt_alloc_specific() take the&lt;br/&gt;
+  (already-clamped) stripe count as a parameter, the same way&lt;br/&gt;
+  lod_mdt_alloc_qos()/lod_mdt_alloc_rr() do, instead of re-reading&lt;br/&gt;
+  lo-&amp;gt;ldo_dir_stripe_count. Alternatively, update&lt;br/&gt;
+  lo-&amp;gt;ldo_dir_stripe_count to the clamped value immediately after&lt;br/&gt;
+  clamping, before any allocator is called — but passing it explicitly&lt;br/&gt;
+  is more consistent with the other two allocators and avoids relying on&lt;br/&gt;
+   object state being correct mid-function.&lt;/p&gt;
+
+</description>
+                <environment />
+        <key id="100481">LU-21227</key>
+            <summary>lod_mdt_alloc_specific() overflows stripes[]/idx_array[] when    overstripe clamping shrinks the stripe count</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="rsahlberg@whamcloud.com">Ronnie Sahlberg</assignee>
+                                    <reporter username="rsahlberg@whamcloud.com">Ronnie Sahlberg</reporter>
+                        <labels>
+                    </labels>
+                <created>Sun, 15 Nov 2026 07:52:43 +0000</created>
+                <updated>Sun, 15 Nov 2026 08:00:53 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505892" author="gerrit" created="Sun, 15 Nov 2026 08:00:53 +0000">&lt;p&gt;"Ronnie Sahlberg &amp;lt;rsahlberg@whamcloud.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70897" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70897&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21227" title="lod_mdt_alloc_specific() overflows stripes[]/idx_array[] when    overstripe clamping shrinks the stripe count" class="issue-link" data-issue-key="LU-21227"&gt;LU-21227&lt;/a&gt; lod: fix stripe count overflow in lod_mdt_alloc_specific&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: fa518af2df2ba65116a63b7d71fa787d15844d51&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073bb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

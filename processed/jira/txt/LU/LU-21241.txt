@@ -1,0 +1,167 @@
+Key:        LU-21241
+Summary:    quota: concurrent setquota stalls limit updates on quota slaves
+Link:       https://jira.whamcloud.com/browse/LU-21241
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Sunghwan Kim
+Created:    Wed, 18 Nov 2026 02:30:53 +0000
+Updated:    Wed, 18 Nov 2026 05:38:21 +0000
+
+--- Environment ---
+zfs-2.2.9, lustre-2.15.8, rokcy 8.10 (4.18.0-553)
+
+--- Description ---
+Running four or more lfs setquota or lfs setquota --delete commands in parallel can cause quota limit updates to stall on the quota slaves.
+
+The QMT global index contains all the updated limits, but only the first few updates reach the slave copies (osd-..quota_slave.limit_*). Despite the missing updates, the slave still reports glb[1],slv[1] (uptodate).
+
+On Lustre 2.15, the updates remain stuck until quota_slave.force_reint=1 is set or the filesystem is remounted. On master, automatic reintegration introduced by LU-18078 eventually recovers the missing limits, usually after a minute or more. However, the same issue can occur again with another batch of parallel setquota commands.
+
+Until the missing updates are applied, the new quota limits are not enforced on the affected OSTs.
+
+Reproducer
+
+With project quotas enabled on two OSTs, set limits for 2,000 project IDs using eight parallel processes:
+
+# seq 0 1999 | xargs -P8 -I{} sh -c 'lfs setquota -p "$((3000000000 + $1))" -B 2097152 -I 0 /mnt/lustre' _ {}
+
+# lctl get_param n osd.-OST0000.quota_slave.limit_project | grep -c 'hard: *2097152' 0 # expected: 2000
+
+Only two IDs reach the quota slave, both with hard: 0, although all 2,000 limits are present in the QMT global index.
+
+Running the same commands sequentially works as expected: all 2,000 limits are applied on the slave.
+
+Quota Enforcement
+
+A separate test confirmed that the missing updates also affect quota enforcement.
+
+After running 300 parallel quota updates, none of the new limits had been applied on OST0001, although they were present in the QMT global index.
+
+With an 8MB quota configured for the nobody user, a 64MB write completed successfully, bringing the reported usage to 65,527KB.
+
+After forcing reintegration with quota_slave.force_reint=1, the 8MB limit was applied on the slave, and further writes were blocked.
+
+This confirms that the issue is not limited to stale quota information on the slaves. It can also allow writes beyond the configured quota limits.
+
+Analysis
+
+When qsd_upd_schedule() receives a glimpse update whose version is not qqi_glb_ver + 1, it defers the update through qsd_add_deferred(). The deferred list is supposed to be kept in ascending version order.
+
+After each update is committed, qsd_bump_version() calls qsd_kickoff_deferred(). This function checks only the first entry in the deferred list and processes it if its version matches ver + 1.
+
+The problem is in qsd_add_deferred().
+
+The function walks the list backward from the tail. When the incoming update has a higher version than tmp, it calls:
+
+list_add_tail(&upd->qur_link, &tmp->qur_link);
+
+This inserts upd before tmp, rather than after it. As a result, updates arriving in ascending version order can be inserted in reverse order.
+
+For example:
+
+deferred [6010], 6011 arrives -> [6011, 6010]
+
+When version 6009 is committed, qsd_kickoff_deferred() finds 6011 at the head instead of 6010. Since 6011 is not the expected next version, no deferred update is processed.
+
+The global version remains at 6009, and subsequent updates are deferred as well. The slave still considers itself up to date, so Lustre 2.15 does not trigger reintegration.
+
+The issue requires at least two updates to be deferred at the same time. This can happen when multiple glimpse updates arrive while an earlier update is still being written, explaining why the problem occurs with parallel setquota commands but not with sequential execution.
+
+The following message was captured on Lustre 2.15 with +quota debugging enabled:
+
+qsd_kickoff_deferred()) cvol-OST0000: found deferred update record. version:6011/6009
+
+On master, LU-18078 eventually triggers reintegration. As the deferred entries are removed from the head of the list, the logs show that they are not in ascending version order:
+
+found deferred update record. version:20021/20017
+
+Starting reintegration thread for [0x200000006:0x2020000:0x0]
+
+{{ skipping deferred update ver:20021/23628}}
+
+skipping deferred update ver:20020/23628
+
+skipping deferred update ver:20019/23628
+
+skipping deferred update ver:20018/23628
+
+skipping deferred update ver:20024/23628
+
+skipping deferred update ver:20023/23628
+
+This code dates back to LU-1842 and remains unchanged in b2_15, b2_16, b2_17, and master.
+
+Test Results
+
+The tests used eight parallel processes to set and delete quota limits for 2,000 project IDs on two OSTs.
+
+ 
+
+Build
+After setquota
+After delete
+Reintegration
+
+2.15.8
+0 / 0(2 IDs arrived, hard: 0),
+
+stalled
+Not applied
+Requires force_reint
+
+2.15.8 + fix
+2000 / 2000 within 15s
+0 / 0 within 15s
+None
+
+master 
+1806 / 1832 initially;
+
+all applied after ~2 min
+1999 / 1999 left after
+
+reintegration 
+Automatic,
+
+multiple times
+
+master + fix
+2000 / 2000 within 15s
+0 / 0 within 15s
+None
+
+ Reintegration does not remove IDs that have been deleted from the QMT. This issue will be reported separately.
+
+With the fix, all 2,000 quota updates and deletions were applied within 15 seconds on both branches, without requiring reintegration.
+
+Fix
+
+Replace list_add_tail() with list_add() to insert the new update immediately after tmp, rather than before it.
+
+This keeps the deferred list in ascending version order, allowing qsd_kickoff_deferred() to find and process the expected ver + 1 update at the head.
+
+Related Issues
+
+	LU-18078: Adds automatic force_reint after QSD_WB_INTERVAL. This eventually recovers the missing updates but does not fix the underlying ordering bug.
+
+	LU-19136: Adds a periodic version consistency check after version_mismatch_timeout (3 * obd_timeout, 300 seconds by default), which can trigger reintegration when the slave's quota index is out of sync with
+
+  the master.
+
+	LU-21025: Quota slaves fail to reintegrate after the LWP reconnects to a restarted master. The symptom is similar, but the root cause is different.
+
+--- Comment (gerrit, Wed, 18 Nov 2026 05:38:21 +0000) ---
+"Sunghwan Kim " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71077
+
+Subject: LU-21241 quota: keep qsd deferred update list sorted
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: bfdcb710e9c4da5ae6a887c197c247d6c011d3de

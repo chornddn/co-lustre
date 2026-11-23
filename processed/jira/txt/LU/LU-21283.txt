@@ -1,0 +1,57 @@
+Key:        LU-21283
+Summary:    debugfs: logdump -O loops forever on external journal with s_start 0
+Link:       https://jira.whamcloud.com/browse/LU-21283
+Type:       Bug
+Priority:   Minor
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexander Zarochentsev
+Reporter:   Alexander Zarochentsev
+Created:    Sat, 21 Nov 2026 17:36:34 +0000
+Updated:    Sat, 21 Nov 2026 17:38:35 +0000
+Labels:     e2fsprogs
+
+--- Description ---
+debugfs logdump -O cannot dump an external journal device (or an image of one) whose journal superblock has s_start == 0, which is the normal state after e2fsck has recovered the journal. Seen while trying to get the list of blocks written by a journal replay from an image of an external journal. The code is the same in e2fsprogs master-lustre (1.47.3-wc4) and upstream master.
+
+Reproducer
+
+mke2fs -F -b 4096 -O journal_dev -U  jnl.img 1024
+mke2fs -F -b 4096 -O ^has_journal fs.img 8192
+debugfs -w -R "feature has_journal" fs.img      # + ssv journal_dev / journal_uuid
+debugfs -w -f - fs.img 
+
+Output repeats forever:
+
+Found sequence 0 (not 3) at block 1: end of journal.
+Found expected sequence 0, type 4 (V2 superblock) at block 1
+Unexpected block type 4 at block 1.
+
+Cause (debugfs/logdump.c, dump_journal())
+
+	With s_start == 0 and -O, the dump starts at a hard-coded block 1. That is the first log block of an internal journal, but on an external journal device block 0 holds the ext2 superblock, block 1 the journal superblock, and the log starts at s_first (2 with 4 KiB blocks, 3 with 1 KiB blocks).
+
+	In the default: case ("Unexpected block type") the break only leaves the switch, so the while loop re-reads the same block forever.
+
+	logdump S -f  without an open filesystem passes current_fs>blocksize to e2p_list_journal_super() with current_fs == NULL.
+
+Fix
+
+Start at s_first instead of 1, end the dump on an unexpected block type, and pass 0 as the expected block size when no filesystem is open. New test j_ext_logdump_old: it hangs and segfaults without the fix and passes with it. The existing j_ and f_jnl_ logdump tests still pass.
+
+Not fixed here: with -O the fast-commit dump reads one block past the end of a journal without a fast-commit area and prints "short read".
+
+Workaround for unpatched debugfs: copy the image and set s_start (journal superblock offset 0x1c) to s_first (offset 0x14), then run logdump -aO -n  -f .
+
+--- Comment (gerrit, Sat, 21 Nov 2026 17:38:35 +0000) ---
+"Alexander Zarochentsev " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/71266
+
+Subject: LU-21283 debugfs: fix logdump -O of an external journal
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: b109ede66e2843b8a22c280639c74ab6a9711527

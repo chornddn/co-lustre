@@ -1,0 +1,21 @@
+Key:        LU-21222
+Summary:    socklnd: use kernel zero-copy completions instead of ZC-ACK
+Link:       https://jira.whamcloud.com/browse/LU-21222
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Sat, 14 Nov 2026 23:11:58 +0000
+Updated:    Sat, 14 Nov 2026 23:12:03 +0000
+Links:      Related: is related to  LU-21217
+
+--- Description ---
+socklnd learns that TCP has finished with the pages of a zero-copy send through its own protocol: the sender asks for a ZC-ACK, and the receiver sends a 24-byte NOOP back after it has received the whole payload. That is an extra message per zero-copy send, with an allocation, a scheduler wakeup, a sendmsg and a recvmsg on each side, and the sender's completion waits for the peer to read the payload and answer rather than for TCP to release the pages.
+
+The kernel can tell a kernel socket user this directly. A caller can pass its own ubuf_info in msghdr.msg_ubuf with MSG_ZEROCOPY (upstream 6.0), with its own completion callback through ubuf_info_ops (6.10), and needs neither SO_ZEROCOPY nor the error queue. RHEL 9 and RHEL 10 both have these (backported to RHEL 9). Only io_uring uses it today. socklnd could embed a ubuf_info in ksock_tx, complete the tx from the callback (deferred to a scheduler thread, since it can run in softirq), and stop asking for ZC-ACKs. Nothing changes on the wire: a receiver sends a ZC-ACK only when the message asks for one, so old and new peers interoperate.
+
+Expected effect: after LU-21217 a 1 MB transfer is about 18 packets, so the extra message is about 5% more packets and a few percent of CPU. Transfers just above zc_min_payload (16 KB) are 1 to 4 packets, where the extra message nearly doubles the message count, so perhaps 10 to 20% there. Send completions also arrive about one round trip sooner. Estimates, not measured. On RHEL 9 this path also gives real zero copy without relying on ->sendpage.
+
+Size: a few hundred lines with configure checks (the reference rules for a caller's ubuf_info differ between upstream and RHEL 9).

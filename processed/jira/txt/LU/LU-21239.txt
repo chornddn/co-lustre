@@ -1,0 +1,49 @@
+Key:        LU-21239
+Summary:    ldlm: resource hash sums name words, causing long hash chains on the MDT
+Link:       https://jira.whamcloud.com/browse/LU-21239
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Di Wang
+Reporter:   Di Wang
+Created:    Tue, 17 Nov 2026 19:06:03 +0000
+Updated:    Tue, 17 Nov 2026 20:38:41 +0000
+
+--- Description ---
+The LDLM namespace resource hash (ldlm_res_hop_hash()) computes the bucket index by adding the four 64-bit words of struct ldlm_res_id and masking the result. For MDT ibits locks the name is {f_seq, f_oid, f_ver, 0}, so the hash is effectively seq + oid.
+
+FID sequences are consecutive and each one starts again from a small oid. Resources from different sequences therefore have equal sums, because (seq N, oid X) and (seq N+1, oid X-1) land in the same bucket. The number of distinct buckets in use is bounded by roughly the sequence width plus the number of sequences, however many resources exist. The MDT namespace has 2^21 buckets (nsd_all_bits = 21) and never rehashes, so most of the table stays empty while a small part of it holds very long chains.
+
+ 
+
+Observed on an MDS under a batch getattr load
+
+mdt_batch_getattr (statahead batching) from many clients, MDT0001, perf profile on ll_ost_out threads:
+
+ldlm_res_hop_keycmp takes about 7% to 10% of CPU per thread (under ldlm_resource_get from ldlm_lock_create).
+
+The ftrace function profiler counted hits of ldlm_res_hop_keycmp and ldlm_resource_get over 10 seconds on all CPUs. Compares per lookup is the average chain walked:
+
+resource_count    compares per lookup    ldlm_resource_get time
+
+1.38M                      about 16                        about 10 µs
+
+2.48M                     about 49                        about 31 µs
+
+2.13M                      about 82                        about 55 µs
+
+A uniform hash with about 1 to 2.5M resources in 2.1M buckets should walk 1 to 2 entries. Chain length varies with how many resources share the same seq + oid, not with the resource count alone.
+
+--- Comment (gerrit, Tue, 17 Nov 2026 20:38:41 +0000) ---
+"wangdi " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71061
+
+Subject: LU-21239 ldlm: mix all name words in the resource hash
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0fcb5e9ccbb75f1529ddb33d82fb0c9d0e7081ea

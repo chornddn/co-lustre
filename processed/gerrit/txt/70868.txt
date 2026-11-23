@@ -1,0 +1,180 @@
+Change:     70868
+Subject:    LU-21215 llite: reclaim dentries/inodes in smaller amounts
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70868
+Change-Id:  I4e2e4425745aef060b0e6a08cf788970e2bc0d73
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andrew Perepechko
+Created:    2026-11-14 13:02:38.000000000
+Updated:    2026-11-23 09:44:48.000000000
+Patch Set:  3
+Insertions: +339
+Deletions:  -0
+Comments:   9 (0 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Alexander Boyko, Alexander Zarochentsev
+
+--- Commit Message ---
+LU-21215 llite: reclaim dentries/inodes in smaller amounts
+
+Before Linux 6.7, shrink_slab() and shrink_slab_memcg() hold
+shrinker_rwsem for read across each do_shrink_slab() call and check
+only between shrinkers whether a writer waits.  The superblock
+shrinker reports all unused dentries and inodes of the mount from
+super_cache_count(), and do_shrink_slab() scans up to twice that
+number in one call under heavy memory pressure or for drop_caches.
+Evicting a Lustre inode can be slow, as ll_delete_inode() may close
+an open handle on the MDS, so on a client with millions of cached
+inodes one call holds shrinker_rwsem for minutes.  Every down_write()
+of it waits meanwhile, e.g. shrinker registration on any mount and
+memory cgroup creation: systemd cannot start services or sessions,
+logins hang, and nodes with hung_task_panic set panic.
+
+Add the llite.*.max_shrink tunable, the number of objects one call
+of the superblock shrinker scans at most.  ll_fill_super() wraps the
+shrinker methods.  ll_sb_count_objects() keeps the count, so the
+kernel computes the same reclaim target, and refills a scan budget
+of max_shrink objects.  ll_sb_scan_objects() takes nr_to_scan from
+the budget and returns SHRINK_STOP once it is used: do_shrink_slab()
+then carries the rest of its target over to its next calls in
+nr_deferred, and shrink_slab() can release shrinker_rwsem in between.
+Capping the count instead would cut the reclaim target, e.g. to none
+at DEF_PRIORITY for max_shrink below 4096.  The default 0 sets no
+limit.
+
+As drop_slab() stops once a pass frees fewer than 2^pass objects
+(Linux 5.15, RHEL 8.10 and 9), one write to drop_caches frees only
+about max_shrink * log2(max_shrink) objects of a mount with a limit.
+
+Check whether super_block.s_shrink is a pointer: RHEL 9.6 has
+shrinker_alloc() but keeps it embedded.  The wrappers are installed
+only while s_shrink is embedded: with the lockless shrinkers of Linux
+6.7 they would bring no benefit, so max_shrink has no effect there.
+
+Add sanity test_444 with OBD_FAIL_LLITE_SLOW_EVICT to slow down
+ll_delete_inode().
+
+Test-Parameters: trivial clientdistro=el8.10 testlist=sanity env=ONLY=444
+HPE-bug-id: LUS-12626
+Signed-off-by: Andrew Perepechko <andrew.perepechko@hpe.com>
+Reviewed-by: Alexander Zarochentsev <alexander.zarochentsev@hpe.com>
+Reviewed-by: Alexander Boyko <alexander.boyko@hpe.com>
+Assisted-by: DSH:claude-opus-5.5
+Change-Id: I4e2e4425745aef060b0e6a08cf788970e2bc0d73
+
+--- Review History ---
+
+--- Message (Andrew Perepechko, 2026-11-14 13:02:38.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-14 13:07:24.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-14 13:16:09.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-14 13:37:50.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136334/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-14 17:27:57.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; one concern inline about how capping the count interacts with drop_caches on some kernels, plus a related man page note.
+
+--- Message (patrick bot, 2026-11-14 22:02:19.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Andrew Perepechko, 2026-11-15 12:57:42.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andrew Perepechko, 2026-11-15 12:59:07.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-15 13:01:09.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-15 13:12:53.000000000) ---
+Patch Set 2:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-15 13:22:27.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136525/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-15 17:06:23.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good overall; one design question about reclaim pressure and an optional nit inline. Nothing here needs a re-spin on its own.
+
+--- Message (Andrew Perepechko, 2026-11-16 09:42:12.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andrew Perepechko, 2026-11-16 09:42:48.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-16 09:45:42.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-16 09:50:41.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-16 10:30:41.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136745/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-16 20:36:01.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-23 09:44:48.000000000) ---
+Patch Set 3:
+
+(1 comment)

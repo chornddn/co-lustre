@@ -1,0 +1,29 @@
+Key:        LU-21243
+Summary:    ptlrpc: reconnect echo keeps a stale service estimate alive, so recovery goes straight to the hard timeout
+Link:       https://jira.whamcloud.com/browse/LU-21243
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Bot
+Created:    Wed, 18 Nov 2026 11:08:09 +0000
+Updated:    Wed, 18 Nov 2026 11:08:12 +0000
+Links:      Related: is related to  LU-21242
+
+--- Description ---
+check_and_start_recovery_timer() feeds the service estimate that a reconnecting client reports in its connect request back into the server's own estimate (obd_at_measure() on scp_at_estimate, "Teach server about old server's estimates"). The client's value is the server's estimate, echoed back: the server returns its estimate in every reply, and the client reports at_timeout2est(rq_timeout) when it reconnects (ptlrpc/import.c, ptlrpc_connect_import_locked()). After a single slow request, every recovery re-measures the old value into the current bin. The estimate never ages out of at_history while reconnects come more often than that, and the clients keep the inflated value as well.
+
+Consequence: with obd_timeout=20, check_and_start_recovery_timer() sets the recovery window to at_est2timeout(est) + 60 s, so any estimate above about 92 s puts every later recovery straight at the hard limit (180 s). A target with a client that does not come back then never reaches the soft timeout and its VBR pass: recovery is aborted by hard timeout and the replays of healthy clients are dropped (LU-20135 covers that extension itself). The echo turns one slow RPC into a permanent condition for the rest of a test suite, or for as long as clients keep reconnecting.
+
+Reproduced on master 54dc726b56 (rocky9 el9.8, one node, MDSCOUNT=2, OSTCOUNT=2, timeout=20, at_history=600):
+
+1. replay-dual 15a passes: stale client evicted at the soft timeout, "Recovery over after 1:10".
+
+2. On the MDS: lctl set_param fail_val=100000 fail_loc=0x8000050a; touch a file on MDT0000; fail_loc=0. mds.MDS.mdt.timeouts then shows "cur 112 worst 112".
+
+3. replay-dual 15a, run three times in a row, fails each time with "extended recovery timer reached hard limit: 180, extend: 0", "recovery is aborted by hard timeout", and unlink(f15a.replay-dual-0) ENOENT.
+
+4. After the third run, 642 s after the only slow request, mds.MDS.mdt.timeouts still shows cur 112 with the history bins "1 112 1 112", refreshed by the reconnects of the failovers in between.
+
+In CI this showed up as LU-21242. From 2026-11-17, replay-dual runs in review-dne-part-5 right after insanity. On bases older than master 54dc726b56, insanity left the MDS service estimate at about 224 s (a live client blocked about 100 s on the locks of a client failed with umount -f, fixed in the test by LU-20076 7c3c9f8814). That estimate was still in place three hours later, at replay-dual 15a.

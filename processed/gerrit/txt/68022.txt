@@ -1,5 +1,5 @@
 Change:     68022
-Subject:    LU-20587 lnet: fix NULL pointer deref in lnet_peer_ni_show_dump
+Subject:    LU-20587 lnet: fix NULL deref in lnet_peer_ni_show_dump
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68022
 Change-Id:  I24688de6f0a001943f2de6241b60bce567e29176
 Project:    fs/lustre-release
@@ -7,58 +7,60 @@ Branch:     master
 Status:     NEW
 Owner:      Andrew Perepechko
 Created:    2026-08-14 20:14:51.000000000
-Updated:    2026-10-21 18:45:38.000000000
-Patch Set:  13
-Insertions: +423
-Deletions:  -117
-Comments:   378 (14 unresolved)
+Updated:    2026-11-20 10:41:27.000000000
+Patch Set:  14
+Insertions: +400
+Deletions:  -124
+Comments:   395 (2 unresolved)
+Hashtags:   pw_shepherd, master-next
 
 --- Labels ---
-  Code-Review: James Simmons: -1; wc-checkpatch: -1
-  Verified: jenkins: +1; Maloo: -1
+  Code-Review: Chris Horn: +1; James Simmons: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Andreas Dilger, Minh, Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: James Simmons, Alexey Lyashkov, Alexander Zarochentsev
+  CC: Andreas Dilger, Minh, Patrick Farrell, Lustre RISC-V Builder, Gerrit AI review for Lustre
+  REVIEWER: James Simmons, Alexey Lyashkov, Chris Horn, Alexander Zarochentsev
 
 --- Commit Message ---
-LU-20587 lnet: fix NULL pointer deref in lnet_peer_ni_show_dump
+LU-20587 lnet: fix NULL deref in lnet_peer_ni_show_dump
 
-lnet_peer_ni_show_dump() left several nla_nest_start()/nla_put_*()
-return values unchecked, so a full reply skb caused a NULL pointer
-dereference instead of being handled. Check every call and roll back/
-retry on a fresh skb instead of crashing. Apply the same treatment to
-lnet_udsp_info_send()/lnet_nl_put_latency(), and let the dump skip a
-peer that got deleted mid-dump instead of aborting the whole listing.
+"lnetctl peer show" of many peers, or of peers with many NIs, at a
+higher verbosity crashes the node:
 
-On the userspace side, fix the YAML output buffer in
-liblnetconfig_netlink.c, which the same verbose 'peer show' dumps can
-overflow. yaml_netlink_msg_parse() only reserves a small amount of
-headroom between messages, but a single message can expand into
-several KiB of YAML. Add yaml_netlink_input_grow() to realloc the
-buffer on demand (rebasing the buffer/read pointers and resyncing
-*size to the real free space) and call it in yaml_parse_value_list()
-before writing each key, sizing the request for the indent, the key
-name, the scalar value and separators, so a message can never write
-past data->end and corrupt the heap. Also fix the free-space
-accounting after emitting a line to decrement *size by the bytes
-written instead of incrementing it.
+  BUG: kernel NULL pointer dereference, address: 0000000000000000
+  RIP: lnet_peer_ni_show_dump+0xbb2/0x1010 [lnet]
 
-Add sanity-lnet test_630 to exercise a multi-skb peer dump.
+lnet_peer_ni_show_dump() has to fit the whole dump into one skb and
+ignores the results of nla_nest_start() and nla_put_*().  Once the
+skb is full, nla_nest_start() returns NULL and nla_nest_end()
+dereferences it.
 
-Only mark the once-per-dump 'peer' header as sent once the message
-carrying it is finalized: a msg_full rollback cancels the attribute
-along with the partial entry, so the flag must not suppress it on the
-retry. On the tools side, report a failed realloc in
-yaml_parse_value_list() like yaml_netlink_msg_parse() does instead of
-printing a truncated YAML document and exiting 0, and fix the
-free-space accounting when the buffer pointer moves back. Tighten
-test_630 to expect exactly one header, check the primary-nid count,
-and clean up peers and output on failure.
+Check every attribute of a peer entry.  When the skb is full, cancel
+the partial entry and return the skb length, so that the dump goes
+on with that peer in a new skb.  Fail with -EMSGSIZE only if a peer
+does not fit into an empty skb.  Keep in the dump state whether the
+key table and the "peer" header were sent instead of deriving it from
+the peer index.  Skip a peer deleted since lnet_peer_ni_show_start()
+built the list, unless the caller asked for that peer.  Set
+cb->min_dump_alloc in lnet_peer_ni_show_start() so that an skb holds
+the key table and the peer with the most NIs.
 
+lnet_udsp_info_send() and lnet_nl_put_latency() now report a full
+skb with -EMSGSIZE.  lnet_net_show_dump() cannot resume a partial
+dump: check its nla_nest_start() calls as well, cancel the open
+message and return -ENOBUFS, because newer kernels take -EMSGSIZE as
+"call the dump again", which would repeat the same nets forever.
+
+Add sanity-lnet test_630.  It dumps 300 peers with 4 NIDs each (1500
+with SLOW=yes) with "lnetctl peer show -v 4" and checks that every
+peer is listed once, under a single "peer" key.
+
+Test-Parameters: trivial testlist=sanity-lnet
 Fixes: f0be00678cc8 ("LU-9680 lnet: collect data about peer_ni by using Netlink")
 HPE-bug-id: LUS-13452
 Signed-off-by: Andrew Perepechko <andrew.perepechko@hpe.com>
+Assisted-by: DSH:claude-opus-5.5
 Change-Id: I24688de6f0a001943f2de6241b60bce567e29176
 
 --- Review History ---
@@ -546,3 +548,88 @@ Patch Set 13: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Andrew Perepechko, 2026-11-14 11:45:26.000000000) ---
+Uploaded patch set 14.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-14 11:48:47.000000000) ---
+Patch Set 14:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-14 11:59:40.000000000) ---
+Patch Set 14:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-14 12:07:32.000000000) ---
+Patch Set 14: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136331/ : SUCCESS
+
+--- Message (Andrew Perepechko, 2026-11-14 12:08:58.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 12:09:03.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-14 12:09:07.000000000) ---
+Patch Set 10:
+
+(3 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 12:09:12.000000000) ---
+Patch Set 12:
+
+(2 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 12:09:17.000000000) ---
+Patch Set 13:
+
+(5 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 12:09:22.000000000) ---
+Patch Set 14:
+
+PS14 is rebased on current master and addresses the review of PS13 (details in the inline replies). James' patch-set comments: the liblnetconfig_netlink.c part is dropped, since #68358 fixed the buffer handling; the dump is hybrid now: lnet_peer_ni_show_start() sets cb->min_dump_alloc to the key table plus the peer with the most NIs (capped at the field type), and the dump continues in the next skb when one fills up; a refactor of this code can follow on top. sanity-lnet failed on PS13 because test_630 was the first sanity-lnet test with stack_trap, which chained the suite's cleanup_testsuite trap (LU-21059); the test now clears the inherited EXIT trap first. #68164 addresses the same LU-20587 with a refactor. Chris, Serguei, please pick the approach you prefer; I will help with the other one as needed.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-14 16:30:57.000000000) ---
+Patch Set 14:
+
+(2 comments)
+
+AI code review results below, please doublecheck
+
+Looks good. The partial-skb handling in lnet_peer_ni_show_dump() and the -ENOBUFS end of lnet_net_show_dump() hold up when traced through netlink_dump(). Two optional style nits are inline for whenever the patch is next refreshed; no need to re-spin for them.
+
+--- Message (patrick bot, 2026-11-14 21:56:35.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (James Simmons, 2026-11-19 15:54:00.000000000) ---
+Patch Set 14: Code-Review+1
+
+(1 comment)
+
+--- Message (Chris Horn, 2026-11-20 00:39:58.000000000) ---
+Patch Set 14: Code-Review+1
+
+--- Message (Marc Vef, 2026-11-20 10:41:25.000000000) ---
+Hashtag added: master-next
+
+--- Message (Marc Vef, 2026-11-20 10:41:26.000000000) ---
+Patch Set 14:
+
+[Marc Bot] Note: This change has been cherry-picked to master-next and is considered for landing. Please avoid updates unless required while the master-next hashtag is set; doing so may cause the patch to be removed from master-next and not landed. Note: AI review comments should be addressed/responded to.
+
+--- Message (Marc Vef, 2026-11-20 10:41:27.000000000) ---
+Removed cc <GERRIT_ACCOUNT_1055>.

@@ -1,0 +1,54 @@
+Key:        LU-21215
+Summary:    llite: dcache/icache reclaim holds shrinker_rwsem for too long
+Link:       https://jira.whamcloud.com/browse/LU-21215
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andrew Perepechko
+Reporter:   Andrew Perepechko
+Created:    Sat, 14 Nov 2026 10:46:41 +0000
+Updated:    Sat, 14 Nov 2026 13:02:41 +0000
+
+--- Description ---
+On kernels before 6.7, shrink_slab() and shrink_slab_memcg() hold shrinker_rwsem for read across each do_shrink_slab() call, and only check whether it is contended between shrinkers. The scan count for the superblock shrinker comes from super_cache_count(), so on a client with a very large dentry/inode cache (tens of millions of Lustre inodes, e.g. after rsync or a policy-engine scan) a single super_cache_scan() pass evicts a huge number of inodes, especially at low reclaim priority (drop_caches, direct or node reclaim).
+
+Evicting a Lustre inode can be slow, because ll_clear_inode() may have to close a cached open handle on the MDS:
+
+mdc_close
+lmv_close
+ll_close_inode_openhandle
+ll_md_real_close
+ll_clear_inode
+ll_delete_inode
+evict
+dispose_list
+prune_icache_sb
+super_cache_scan
+do_shrink_slab
+shrink_slab
+shrink_node
+__node_reclaim
+
+Meanwhile every down_write(&shrinker_rwsem) waits: registering a shrinker on any mount, and creating a memory cgroup (alloc_shrinker_info()). systemd cannot start services or user sessions, journald hits its watchdog timeout, logins hang, and nodes with hung_task_panic panic.
+
+Reproducer (el9 client): create 10000 files; add a 0.1s delay to ll_delete_inode() with a fail_loc; run echo 2 > /proc/sys/vm/drop_caches in the background; then mkdir /sys/fs/cgroup/. The mkdir blocks until the whole prune has finished (a hung task with hung_task_timeout_secs=22).
+
+Kernels 6.7 and newer are not affected ("mm: shrinker: make global slab shrink lockless", "mm: shrinker: make memcg slab shrink lockless"). RHEL 8 and RHEL 9 clients are. Affected Lustre versions: master and every maintained release (2.15, 2.16, 2.17); the client has never limited the superblock shrinker.
+
+Proposed fix: add a per-mount tunable llite.*.max_shrink (default 0, no limit) that caps the object count the superblock shrinker reports. Each do_shrink_slab() call then scans a bounded number of dentries/inodes, and shrink_slab() can release shrinker_rwsem between calls when someone is waiting for it.
+
+This was seen on HPE customer systems and is fixed in the HPE Lustre branches (HPE ticket LUS-12626).
+
+--- Comment (gerrit, Sat, 14 Nov 2026 13:02:41 +0000) ---
+"Andrew Perepechko " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/70868
+
+Subject: LU-21215 llite: reclaim dentries/inodes in smaller amounts
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6c7f6f28841d1e3e7dffcc4c3e46ab324294ad47

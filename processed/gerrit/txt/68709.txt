@@ -1,5 +1,5 @@
 Change:     68709
-Subject:    LU-20713 mdt: fix missing close when migrate fails
+Subject:    LU-20713 mdt: cancel the lease when migrate fails
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/68709
 Change-Id:  Iddf298928c6a29bc0dea6b338e1fa6ea3c51ccdf
 Project:    fs/lustre-release
@@ -7,50 +7,59 @@ Branch:     master
 Status:     NEW
 Owner:      Andrew Perepechko
 Created:    2026-09-08 21:28:14.000000000
-Updated:    2026-11-01 23:50:58.000000000
-Patch Set:  4
-Insertions: +29
-Deletions:  -5
-Comments:   10 (10 unresolved)
+Updated:    2026-11-20 07:31:49.000000000
+Patch Set:  7
+Insertions: +145
+Deletions:  -21
+Comments:   25 (0 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1; Maloo: +1
+  Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
-  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre
-  REVIEWER: Vitaly Fertman, Alexander Zarochentsev
+  CC: Lustre RISC-V Builder, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Alex Zhuravlev, Vitaly Fertman, Alexander Zarochentsev, Patrick Farrell
 
 --- Commit Message ---
-LU-20713 mdt: fix missing close when migrate fails
+LU-20713 mdt: cancel the lease when migrate fails
 
-mdd_migrate_close() is only called from mdt_reint_migrate_internal()
-on the success path (after the source open_sem has been taken).  If
-the migration fails earlier or later - e.g. the directory is already
-being migrated and the source lookup returns -EALREADY, migrate is
-disabled, or mdo_migrate() errors out - the server-side close of the
-file that carries the lease is skipped.
+lfs migrate of a regular file takes a lease and sends the migrate
+with MDS_CLOSE_MIGRATE; mdc_close_intent_pack() cancels the client
+copy of the lease lock locally.  On the MDT the lease is revoked when
+mdt_reint_migrate() locks the source with the OPEN bit, and cancelled
+in mdd_migrate_close() at the latest.  A request that fails before
+the source is locked, e.g. with -EPERM when migration is disabled,
+with -EALREADY from the lookup when an interrupted directory
+migration is repeated, or in mdt_reint_internal() before the handler
+is called, leaves the lease lock granted on the MDT.  The client
+closes the file with a plain close, which does not cancel the lock,
+so it stays until a conflicting lock request revokes it with a
+blocking AST that the client answers with -EINVAL.  Repeating the
+migration of a large directory thus leaves a lease lock for each
+file migrated before, and an MDS thread was seen spinning in
+ldlm_reclaim_ns().
 
-The client has already canceled its lease lock when it packs the
-close intent, so the server-side lease lock is never revoked and
-leaks until the export is evicted.  If the client then retries on
--EAGAIN (e.g. from mdt_migrate_links_lock()) it overwrites its open
-handle, and the open file (mfd) leaks on the MDT too, keeping the
-file busy (e.g. for HSM release or future migration).
+Split the lease cancel out of mdd_migrate_close() into
+mdt_migrate_lease_end() and call it from mdt_reint() through
+mdt_reint_migrate_cleanup() when mdt_reint_migrate() did not get to
+mdd_migrate_close(), so that every failed migrate ends its lease.
+Leave the file open then: the reply carries no
+OBD_MD_CLOSE_INTENT_EXECED and the client closes it as before, a
+close that would fail with -ESTALE ("mdc close failed: rc = -116")
+had the MDT closed the file.  As the lease may now be ended for a
+refused request, cancel only a lock of the requesting export.  Also
+fix the mot_open_sem comment, which did not hold when
+down_write_trylock() fails.
 
-Move the handler into mdt_reint_migrate_internal() and have
-mdt_reint_migrate() call mdd_migrate_close() after it returns if
-sp_migrate_close is still set, so every return path of the handler
-closes the file.  sp_migrate_close is cleared once the in-path close
-has been attempted.  mdd_migrate_close() may now be called with a
-NULL obj, so only log the "lease broken" message when obj is non-NULL.
-Failures before the handler runs (mdt_reint_internal()) are not
-covered.  Also fix the mot_open_sem comment in mdd_migrate_close().
+Add sanity test_211: a migrate refused with -EPERM must not leave a
+lease lock on the MDT.
 
 Fixes: 220e6cbfa65c ("LU-6475 mdt: race between open and migrate")
-Signed-off-by: Andrew Perepechko <andrew.perepechko@hpe.com>
-Assisted-by: Copilot:claude-sonnet-5.5
 HPE-bug-id: LUS-13096
+Signed-off-by: Andrew Perepechko <andrew.perepechko@hpe.com>
+Assisted-by: DSH:claude-opus-5.5
 Change-Id: Iddf298928c6a29bc0dea6b338e1fa6ea3c51ccdf
 
 --- Review History ---
@@ -149,3 +158,154 @@ Patch Set 4:
 AI code review results below, please doublecheck
 
 The code change looks correct. The commit message describes failure cases that the code does not have. Fine to land as is; worth fixing the wording if the patch is refreshed for other reasons.
+
+--- Message (Andrew Perepechko, 2026-11-14 17:30:59.000000000) ---
+Uploaded patch set 5.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andrew Perepechko, 2026-11-14 17:31:58.000000000) ---
+Patch Set 3:
+
+(8 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 17:32:04.000000000) ---
+Patch Set 4:
+
+(2 comments)
+
+--- Message (Andrew Perepechko, 2026-11-14 17:32:09.000000000) ---
+Patch Set 5:
+
+PS5 changes the approach: on a failed migrate the MDT now only cancels the server lease of the requesting export and leaves the file to the client's own close, so clients no longer get -ESTALE ("mdc close failed: rc = -116") for every file when a directory migration is repeated. mdt_reint() calls mdt_reint_migrate_cleanup() after mdt_reint_internal(), which covers the early returns of mdt_reint_migrate() and the failures in mdt_reint_internal() alike. The new sanity test_211 leaves 10 leases on MDT0000 without the fix and none with it (10/10 passes with 1 and 2 MDTs); sanity 208, 210, 230b-230r, 417, sanityn 80b and sanity-hsm 406 pass. This overlaps with #69962 (LU-21023, which also adds mdt_migrate_lease_end()) and #68436 (LU-9827); whichever lands later will need a rebase. I am happy to rebase this one, or to fold it into those series if preferred.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-14 17:35:19.000000000) ---
+Patch Set 5:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-14 17:36:43.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-14 18:04:33.000000000) ---
+Patch Set 5: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136350/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-15 03:07:01.000000000) ---
+Patch Set 5:
+
+Looks good to me.
+
+--- Message (Autotest, 2026-11-15 08:39:38.000000000) ---
+Patch Set 5:
+
+Onyx Autotest 2 retesting enforced review-dne-part-2 session on el9.7-x86_64/ldiskfs servers and clients for build 136350 patch 5. Requested by Andrew Perepechko because of LU-21191.
+
+--- Message (Andrew Perepechko, 2026-11-15 08:43:58.000000000) ---
+Patch Set 6: Patch Set 5 was rebased on behalf of <GERRIT_ACCOUNT_443>
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-15 08:50:31.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-15 08:53:08.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-15 09:19:57.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136519/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-15 21:56:08.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-16 17:55:16.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-17 08:16:03.000000000) ---
+Uploaded patch set 7: Patch Set 6 was rebased.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-17 08:18:55.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-17 08:23:03.000000000) ---
+Patch Set 7:
+
+PS7: rebased on top of 70190 (LU-20869 tests: shorten sanity test_51f, in master-next), as Patrick-Bot asked; no code change. sanity test_211 passes 3/3 on top of it on a RHEL 9.6 client with two MDTs.
+
+--- Message (wc-checkpatch, 2026-11-17 08:29:57.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-17 08:34:28.000000000) ---
+Patch Set 7: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/136881/ : FAILURE
+
+--- Message (patrick bot, 2026-11-17 08:37:36.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-17 12:06:25.000000000) ---
+Patch Set 7:
+
+BUILD
+
+--- Message (jenkins, 2026-11-17 12:54:39.000000000) ---
+Patch Set 7:
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/136897/ : FAILURE
+
+--- Message (Andrew Perepechko, 2026-11-17 17:33:15.000000000) ---
+Patch Set 7:
+
+BUILD
+
+--- Message (jenkins, 2026-11-17 18:51:03.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/136927/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-19 04:24:12.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-19 13:40:31.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-20 07:31:49.000000000) ---
+Patch Set 7:
+
+(1 comment)

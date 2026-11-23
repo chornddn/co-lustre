@@ -1,5 +1,5 @@
 Change:     70470
-Subject:    LU-20908 utils: add llapi_ost_object_migrate()
+Subject:    LU-20908 llapi: add llapi_ost_object_migrate()
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70470
 Change-Id:  Ib1e1601e37d4051de8344345e99d9b421109faa9
 Project:    fs/lustre-release
@@ -7,22 +7,22 @@ Branch:     master
 Status:     NEW
 Owner:      Artem Blagodarenko
 Created:    2026-11-04 23:35:40.000000000
-Updated:    2026-11-13 09:13:52.000000000
-Patch Set:  6
-Insertions: +1196
+Updated:    2026-11-21 17:35:17.000000000
+Patch Set:  9
+Insertions: +1358
 Deletions:  -0
-Comments:   9 (8 unresolved)
+Comments:   45 (5 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: jenkins: +1
+  Verified: Maloo: -1; jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
   REVIEWER: Andreas Dilger, Timothy Day, Hiroshi Nishida, Sergey N
 
 --- Commit Message ---
-LU-20908 utils: add llapi_ost_object_migrate()
+LU-20908 llapi: add llapi_ost_object_migrate()
 
 Emptying an OST with lfs migrate rewrites every file that has an
 object there, along with all its other objects, and lfs migrate can
@@ -30,21 +30,32 @@ neither take a file by FID nor avoid the side effects of a group lock
 on mirrored and PFL files.
 
 Add llapi_lov_object_iterate() to walk the OST objects of a raw
-lustre.lov buffer, as fgetxattr() or llapi_scan_device() return it,
-and llapi_ost_object_migrate() to move one object to another OST with
-the single-object layout swap.  The object is read at its own offsets
-through OBJECT I/O scope (LU-20802), so no stripe arithmetic is done
+lustre.lov buffer, as fgetxattr() or llapi_scan_chunk_inode() return
+it, and llapi_ost_object_migrate() to move one object to another OST
+with the single-object layout swap.  The object is read at its own
+offsets through OBJECT I/O scope, so no stripe arithmetic is done
 here, and copied into a one-stripe volatile file, skipping holes,
-under a read lease that fails the move if another writer opens the
-file; the swap checks both data versions.  LLAPI_OBJ_MIGRATE_LOCK_COPY
-takes a group lock instead, for files that stay open for writing.
+under a read lease.  The objects are swapped when the MDS closes the
+lease, and only if no open for write broke it, so that no writer can
+come in between; no lock is taken, so no component is instantiated and
+no mirror made stale.  LLAPI_OBJ_MIGRATE_LOCK_COPY takes a group lock
+instead, for files that stay open for writing.
+
+OBJECT I/O scope is LU-20802 (69511), which this needs to read an
+object of a striped file; without it only single-stripe files can be
+moved.  It needs a component, so the objects of plain striped layouts
+cannot be read.  An encrypted file is refused: the copy ends at the
+end of its last encryption unit, and the volatile file has no
+encryption context to truncate it back to the file's size with.
 
 The MDS allocates the new object, as for any new object, unless the
-caller names an OST.  The object is never put on an OST the caller
-excludes, nor beside another copy of its data: another stripe of a
-component that is not overstriped, or a mirror or parity covering the
-same extent.  A progress callback lets the caller limit the bandwidth
-or stop the copy.
+caller names an OST with LLAPI_OBJ_MIGRATE_DST_OST, and then the call
+fails with -ENOSPC if the MDS put the object on another one.  The
+object is never put on an OST the caller excludes, nor beside another
+copy of its data: another stripe of a component that is not
+overstriped, or a mirror or parity covering the same extent.  A
+progress callback lets the caller limit the bandwidth or stop the
+copy.
 
 The copy reads and writes 64 MiB at a time, as lfs migrate does, or
 lom_io_size, with lom_io_threads threads (2 by default) that take the
@@ -54,7 +65,7 @@ places at once.  On a test VM, one 1 GiB object moved at 313 MB/s
 with one synchronous 4 MiB piece at a time, and at 830 MB/s with
 64 MiB pieces.
 
-Test-Parameters: trivial testlist=sanity-pfl
+Test-Parameters: testlist=sanity-pfl
 Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
 Assisted-by: Claude:claude-opus-5-5
 Change-Id: Ib1e1601e37d4051de8344345e99d9b421109faa9
@@ -159,3 +170,121 @@ Patch Set 6: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/136139/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-13 23:26:22.000000000) ---
+Patch Set 6:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. Needs a refresh for the short-read handling in objmig_copy_thread(); while at it, the inline minors can go in too.
+
+--- Message (Hiroshi Nishida, 2026-11-14 10:53:19.000000000) ---
+Patch Set 6: Code-Review-1
+
+(2 comments)
+
+Two ways to lose data: the lease mode can drop a concurrent write, and moving two objects of one file can put two stripes or mirrors on one OST. Please also put this on 69511 or add it as a dependency, so CI runs the striped cases (sanity-pfl 30a, 30b and 30i skip now). 69511 refuses component ID 0, so plain striped files cannot move even then; please say so in the man page. Not blocking: 67651 (migrate_stripe) also moves one object, in lfs.c; could it use this API?
+
+--- Message (Hiroshi Nishida, 2026-11-14 10:53:20.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Artem Blagodarenko, 2026-11-17 01:38:00.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Artem Blagodarenko, 2026-11-17 01:39:22.000000000) ---
+Patch Set 7:
+
+(14 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-17 01:47:22.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-17 01:52:58.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Artem Blagodarenko, 2026-11-19 01:53:49.000000000) ---
+Uploaded patch set 8.
+
+--- Message (wc-checkpatch, 2026-11-19 02:04:27.000000000) ---
+Patch Set 8:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-19 02:12:38.000000000) ---
+Patch Set 8:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-19 03:20:54.000000000) ---
+Patch Set 8: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137041/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-20 08:27:38.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The encrypted-file size issue in objmig_copy() looks like it needs a refresh; while at it, the other inline items.
+
+--- Message (Artem Blagodarenko, 2026-11-20 13:18:55.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Artem Blagodarenko, 2026-11-20 13:19:41.000000000) ---
+Patch Set 8:
+
+(3 comments)
+
+--- Message (wc-checkpatch, 2026-11-20 13:28:46.000000000) ---
+Patch Set 9:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 13:41:23.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-21 01:54:14.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137241/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 17:35:17.000000000) ---
+Patch Set 9:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good, minor comments inline. None of them needs a re-spin on its own. They are worth picking up if the patch is refreshed.

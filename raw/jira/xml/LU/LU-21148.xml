@@ -2,48 +2,69 @@
             <title>[LU-21148] socklnd: optionally verify the HELLO source NID matching the remote endpoint</title>
                 <link>https://jira.whamcloud.com/browse/LU-21148</link>
                 <project id="10000" key="LU">Lustre</project>
-                    <description>&lt;p&gt;Socklnd identifies the remote peer by the NID in its HELLO (kshm_src_nid) and never relates that NID to the connection it arrived on. &lt;/p&gt;
+                    <description>&lt;p&gt;SockLND identifies a remote peer using the NID supplied in its HELLO (&lt;tt&gt;kshm_src_nid&lt;/tt&gt;). Currently, this NID is not validated against the remote address of the underlying TCP connection.&lt;/p&gt;
 &lt;ul&gt;
-	&lt;li&gt;Passive: for connections from a reserved source port (the accept=secure default), ksocknal_recv_hello() uses kshm_src_nid verbatim. Only the accept=all branch derives the identity from the socket address.&lt;/li&gt;
-	&lt;li&gt;Active: ksocknal_recv_hello() checks that the HELLO NID equals the NID that was dialed, not that the connection's peer address belongs to that NID.&lt;/li&gt;
-	&lt;li&gt;The claimed NID's network is not checked against the receiving NI's network.&lt;/li&gt;
-	&lt;li&gt;lnet_connect() binds to an address chosen by choose_ipv4_src() on the interface, not necessarily the NI's own address, so a NID cannot be reliably derived from a connection's source address.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Passive:&lt;/b&gt; For connections from a reserved source port (&lt;tt&gt;accept=secure&lt;/tt&gt;, the default), &lt;tt&gt;ksocknal_recv_hello()&lt;/tt&gt; uses &lt;tt&gt;kshm_src_nid&lt;/tt&gt; directly. The &lt;tt&gt;accept=all&lt;/tt&gt; branch instead derives the peer identity from the socket address.&lt;/li&gt;
 &lt;/ul&gt;
 
 
-&lt;p&gt;The claimed NID becomes the key of the peer table, and traffic subsequently selected for that NID may be sent over the connections that claimed it.&lt;/p&gt;
-
-&lt;p&gt;Threat scenario:&lt;/p&gt;
-
-&lt;p&gt;Attacker: a node that can reach a socklnd listener and run arbitrary code with enough privilege to bind a reserved source port (e.g. root on its own host or VM). It can send a HELLO claiming any NID.&lt;/p&gt;
-
-&lt;p&gt;Assumption: the network (fabric, hypervisor or SDN) prevents a node from sending packets from, or receiving packets addressed to, an IP address it does not own. Strict mode relies on this; where it does not hold, the check provides no protection.&lt;/p&gt;
-
-&lt;p&gt; &lt;br/&gt;
-Out of scope: on-path and L2 attackers, NAT/proxies, forged LNet headers and peer-membership manipulation.&lt;/p&gt;
-
-&lt;p&gt;Proposal:&lt;/p&gt;
-
-&lt;p&gt;Add an opt-in policy, off by default, with three modes:&lt;/p&gt;
 &lt;ul&gt;
-	&lt;li&gt;off: current behavior.&lt;/li&gt;
-	&lt;li&gt;warn: log and count connections that fail verification but accept them; outgoing source selection is unchanged.&lt;/li&gt;
-	&lt;li&gt;enforce: bind outgoing connections to the NI's address and reject connections that fail verification, on both active and passive paths.&lt;/li&gt;
+	&lt;li&gt;&lt;b&gt;Active:&lt;/b&gt; &lt;tt&gt;ksocknal_recv_hello()&lt;/tt&gt; checks that the HELLO NID matches the requested peer NID, but does not verify its consistency with the connection's remote address.&lt;/li&gt;
 &lt;/ul&gt;
 
 
-&lt;p&gt;A connection passes verification when both hold:&lt;/p&gt;
 &lt;ul&gt;
-	&lt;li&gt;the claimed NID's network equals the receiving NI's network&lt;/li&gt;
-	&lt;li&gt;the claimed NID's address equals the connection's peer address&lt;/li&gt;
+	&lt;li&gt;The advertised NID's network is not checked against the receiving NI's network.&lt;/li&gt;
 &lt;/ul&gt;
 
 
-&lt;p&gt;The policy is a read-only (0444) module parameter, so every connection in a module's lifetime is created under the same policy.&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;lnet_connect()&lt;/tt&gt; currently selects a source address using &lt;tt&gt;choose_ipv4_src()&lt;/tt&gt; on the interface, which may differ from the NI's configured address.&lt;/li&gt;
+&lt;/ul&gt;
 
-&lt;p&gt;In enforce mode, peers that source from a non-NID address (e.g. secondary addresses in the same subnet) or sit behind NAT are rejected; warn mode shows which connections would be affected.&lt;/p&gt;
 
-&lt;p&gt; &lt;/p&gt;</description>
+&lt;p&gt;The advertised NID is subsequently used as the key for SockLND peer lookup and connection management. Inconsistent NID and transport-address information can therefore lead to unexpected peer associations, connection replacement, or traffic delivery over unintended connections.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Proposal"&gt;&lt;/a&gt;Proposal&lt;/h3&gt;
+
+&lt;p&gt;Introduce an optional SockLND connection-address validation policy, disabled by default, with three modes:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;off:&lt;/b&gt; Preserve current behavior.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;warn:&lt;/b&gt; Log and count connections with inconsistent NID and transport-address information, without rejecting them or changing outgoing source-address selection.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;b&gt;enforce:&lt;/b&gt; Bind outgoing connections to the NI's configured address and reject connections whose advertised NID does not match the observed TCP peer address.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;A connection passes validation when both conditions hold:&lt;/p&gt;
+&lt;ul&gt;
+	&lt;li&gt;The advertised NID's network matches the receiving NI's network.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;ul&gt;
+	&lt;li&gt;The advertised NID's address matches the connection's remote IP address.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Validation applies to both active and passive connections and takes place before the connection is associated with a SockLND peer.&lt;/p&gt;
+
+&lt;p&gt;The policy is exposed as a read-only (&lt;tt&gt;0444&lt;/tt&gt;) module parameter, ensuring consistent behavior throughout the module's lifetime.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="Compatibility"&gt;&lt;/a&gt;Compatibility&lt;/h3&gt;
+
+&lt;p&gt;The default &lt;tt&gt;off&lt;/tt&gt; mode preserves existing behavior.&lt;/p&gt;
+
+&lt;p&gt;In &lt;tt&gt;enforce&lt;/tt&gt; mode, configurations that use a TCP source address different from the NI's configured NID address, including some secondary-address and NAT configurations, may no longer establish connections.&lt;/p&gt;
+
+&lt;p&gt;The &lt;tt&gt;warn&lt;/tt&gt; mode allows administrators to identify address inconsistencies before enabling enforcement.&lt;/p&gt;
+
+&lt;p&gt;The change is limited to SockLND connection identity validation. It does not alter LNet message-header source handling, peer discovery, or Multi-Rail membership management.&lt;/p&gt;</description>
                 <environment />
         <key id="100349">LU-21148</key>
             <summary>socklnd: optionally verify the HELLO source NID matching the remote endpoint</summary>
@@ -57,11 +78,19 @@ Out of scope: on-path and L2 attackers, NAT/proxies, forged LNet headers and pee
                         <labels>
                     </labels>
                 <created>Sat, 7 Nov 2026 01:11:00 +0000</created>
-                <updated>Sat, 7 Nov 2026 01:11:00 +0000</updated>
+                <updated>Fri, 20 Nov 2026 19:58:08 +0000</updated>
                                                                                 <due />
-                            <votes>0</votes>
-                                    <watches>1</watches>
-                                                                                    <attachments>
+                            <votes>1</votes>
+                                    <watches>3</watches>
+                                                                            <comments>
+                            <comment id="506395" author="gerrit" created="Fri, 20 Nov 2026 19:58:08 +0000">&lt;p&gt;"Serguei Smirnov &amp;lt;ssmirnov@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71258" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71258&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21148" title="socklnd: optionally verify the HELLO source NID matching the remote endpoint" class="issue-link" data-issue-key="LU-21148"&gt;LU-21148&lt;/a&gt; socklnd: Validate HELLO NID against TCP addresses&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 1629d6fe90c79f276dac3688f1ff9ef679c51c57&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
                     </attachments>
                 <subtasks>
                     </subtasks>

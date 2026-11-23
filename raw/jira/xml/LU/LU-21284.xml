@@ -1,0 +1,131 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21284] osd-ldiskfs: preserve unrelated inodes during rm_entry agent cleanup</title>
+                <link>https://jira.whamcloud.com/browse/LU-21284</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description />
+                <environment />
+        <key id="100628">LU-21284</key>
+            <summary>osd-ldiskfs: preserve unrelated inodes during rm_entry agent cleanup</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="2" iconUrl="https://jira.whamcloud.com/images/icons/priorities/critical.svg">Critical</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="abooback">Vadakkumuri Valappil Abooback</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 21 Nov 2026 19:12:52 +0000</created>
+                <updated>Sat, 21 Nov 2026 21:54:21 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506417" author="JIRAUSER19323" created="Sat, 21 Nov 2026 19:14:13 +0000">&lt;h3&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h3&gt;
+
+&lt;p&gt;lfs rm_entry intentionally removes a namespace entry without normal child-object deletion. However, the shared ldiskfs directory-entry deletion path also schedules deferred local-agent inode cleanup. That cleanup can clear the link count of an unrelated inode when a stale directory entry points to a reused backend inode number.&lt;/p&gt;
+
+&lt;p&gt;The cleanup does not retain the directory entry's expected FID, compare it with the inode's current LMA self-FID, or require LMAI_AGENT before clear_nlink(). A remote FID is used as the final eligibility check. Remote ownership alone does not establish that this inode is the agent belonging to the removed entry.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Sourceinspected"&gt;&lt;/a&gt;Source inspected&lt;/h3&gt;
+
+&lt;p&gt;The missing identity and agent-role checks are present in upstream fs/lustre-release commit f3cf75d4d6bffe72c418d98bc6aa6343388b0da2 and an older downstream source tree. Latest upstream master and the exact deployed binary have not been verified; the full affected release range is not established.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Relevantpath"&gt;&lt;/a&gt;Relevant path&lt;/h3&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;mdt_reint_unlink(): the sp_rm_entry branch calls mdo_unlink() with a NULL child, intentionally bypassing normal child lookup and deletion.&lt;/li&gt;
+	&lt;li&gt;mdd_unlink(): NULL child means delete only the name entry.&lt;/li&gt;
+	&lt;li&gt;osd_index_ea_delete(): invokes osd_take_care_of_agent() for a non-'..' entry, including this special removal path.&lt;/li&gt;
+	&lt;li&gt;osd_take_care_of_agent(): can schedule cleanup when the entry FID is remote, its lookup fails, or the entry has no embedded FID.&lt;/li&gt;
+	&lt;li&gt;osd_schedule_agent_inode_removal(): records only the backend inode number and environment, not the expected FID or inode generation.&lt;/li&gt;
+	&lt;li&gt;osd_process_scheduled_agent_removals(): obtains the current inode and FID, checks osd_remote_fid(), and calls clear_nlink(), mark_inode_dirty(), and iput(). It does not compare against the removed entry's FID or validate LMAI_AGENT.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;h3&gt;&lt;a name="Failurescenario"&gt;&lt;/a&gt;Failure scenario&lt;/h3&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;A stale directory entry contains FID A and backend inode number N.&lt;/li&gt;
+	&lt;li&gt;N has been reused for a valid local agent whose LMA records remote FID B, where B != A. Another valid directory entry still needs this agent.&lt;/li&gt;
+	&lt;li&gt;An administrator runs lfs rm_entry on the stale name for A.&lt;/li&gt;
+	&lt;li&gt;Deferred cleanup loads N, sees that B is remote, and clears N's link count.&lt;/li&gt;
+	&lt;li&gt;Removing the stale name for A has therefore also destroyed an unrelated agent for B.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;This is a source-derived reproducer design, not a completed controlled runtime reproduction on upstream master.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Relatedobservedimpact"&gt;&lt;/a&gt;Related observed impact&lt;/h3&gt;
+
+&lt;p&gt;In an investigation on an older downstream build, 11 EA-value inodes were allocated with link count 1 before stale-entry cleanup. In a copy taken after rm_entry and before e2fsck, those EA inodes were unallocated with link count 0 and size 0, while their allocated owner inodes still referenced them through trusted.lov. Later access produced EA-inode ESTALE errors, journal aborts, and an MDT backend becoming read-only.&lt;/p&gt;
+
+&lt;p&gt;The snapshot ordering and subsequent errors were observed. The precise runtime call path responsible for freeing those inodes was not traced, and the exact deployed binary has not been matched to the inspected source.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-15542" title="lfsck have panic with ea inode linked into lost+found." class="issue-link" data-issue-key="LU-15542"&gt;&lt;del&gt;LU-15542&lt;/del&gt;&lt;/a&gt; / commit 716de353b7b65fa506ce7f31f59c187a19f44b64 adds an EA-inode exclusion in osd_iget2(). That is relevant protection for EA-value inodes, but does not address a reused, valid remote agent with a different FID. The identity-check gap above remains in the inspected upstream snapshot.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Expectedbehavior%2Fproposedfix"&gt;&lt;/a&gt;Expected behavior / proposed fix&lt;/h3&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;Preserve the directory entry's expected FID in the deferred cleanup record.&lt;/li&gt;
+	&lt;li&gt;Before changing the inode's link count, read and validate its LMA, require the appropriate local-agent flag, and compare lma_self_fid with the expected FID when the directory entry provides one.&lt;/li&gt;
+	&lt;li&gt;On FID mismatch, missing/unreadable LMA, or a non-agent inode, leave the inode untouched; removal of the stale name should still be possible.&lt;/li&gt;
+	&lt;li&gt;Retain the EA-inode exclusion.&lt;/li&gt;
+	&lt;li&gt;Handle legacy entries without embedded FIDs explicitly. Do not infer agent identity from remote ownership alone; decide and document the safe policy for this case while preserving compatibility where possible.&lt;/li&gt;
+	&lt;li&gt;Preserve correct cleanup for a matching, genuine agent during normal deletion and rm_entry.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;h3&gt;&lt;a name="Regressioncoveragerequested"&gt;&lt;/a&gt;Regression coverage requested&lt;/h3&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;Stale entry A points to valid agent B: rm_entry removes only A's name; B's inode, link count, LMA, and valid namespace reference survive.&lt;/li&gt;
+	&lt;li&gt;Matching entry and genuine agent: normal agent cleanup still works.&lt;/li&gt;
+	&lt;li&gt;Non-agent and missing/unreadable-LMA cases: no inode link-count clearing.&lt;/li&gt;
+	&lt;li&gt;Legacy entry without an embedded FID: exercise the chosen safe policy.&lt;/li&gt;
+	&lt;li&gt;EA-value inode: retain existing exclusion and verify no owner-EA damage.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Related issue: &lt;a href="https://jira.whamcloud.com/browse/LU-15542" class="external-link" rel="nofollow"&gt;https://jira.whamcloud.com/browse/LU-15542&lt;/a&gt;&lt;br/&gt;
+Related change: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/46486" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/46486&lt;/a&gt;&lt;/p&gt;</comment>
+                            <comment id="506418" author="gerrit" created="Sat, 21 Nov 2026 21:54:21 +0000">&lt;p&gt;"Aboo Valappil &amp;lt;vadakkumuri.valappil.abooback@oracle.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71267" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71267&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21284" title="osd-ldiskfs: preserve unrelated inodes during rm_entry agent cleanup" class="issue-link" data-issue-key="LU-21284"&gt;LU-21284&lt;/a&gt; osd-ldiskfs: validate agents before cleanup&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: f70ca344a4bed2a297049953f9f5fdb219991657&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073pr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

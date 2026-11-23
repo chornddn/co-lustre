@@ -1,0 +1,132 @@
+Change:     71243
+Subject:    LU-21272 o2iblnd: map bulk DMA in IOVA-cacheable chunks
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71243
+Change-Id:  Ic8b71b3fde058394da777256c1603dfdc07545e9
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Cyril Bordage
+Created:    2026-11-20 15:56:44.000000000
+Updated:    2026-11-22 07:50:55.000000000
+Patch Set:  1
+Insertions: +344
+Deletions:  -6
+Comments:   9 (5 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Ravindra Singh, Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Chris Horn, Michael Margolin
+
+--- Commit Message ---
+LU-21272 o2iblnd: map bulk DMA in IOVA-cacheable chunks
+
+Behind a translating IOMMU, every dma_map_sg() allocates one IOVA
+range for the whole scatterlist. The IOMMU layer only caches ranges
+up to dma_opt_mapping_size() (128 KiB on current kernels) per CPU.
+o2iblnd maps a whole LNet bulk (up to 1 MiB, 256 pages) in one call,
+so every bulk map and unmap goes to the rbtree allocator under the
+IOMMU domain's iova_rbtree_lock, first trying the 32-bit window. On
+RoCE clients with the IOMMU in translated mode, Lustre bulk throughput
+drops to 1/2 or 1/3 of line rate on about a third of boots. With
+iommu=pt, 0 of 21 boots degraded, versus 8 of 21 without it.
+
+Map tx_frags with one dma_map_sg() per chunk of at most
+dma_opt_mapping_size(), so each IOVA comes from the per-CPU cache.
+The DMA segments of all chunks are packed into a new tx_dma_frags
+array, which feeds rd_frags and ib_map_mr_sg(). FastReg still
+registers the whole bulk as one MR, so the wire protocol and the
+number of RDMAs are unchanged. Unmap splits the list the same way,
+using only the page offsets and lengths that dma_map_sg() leaves
+intact.
+
+Chunking follows dma_opt_mapping_size() of the device, not the IOMMU
+mode. With iommu=pt or no IOMMU, that size is usually larger than
+a bulk, so the mapping does not change. A device that bounces through
+swiotlb reports about 256 KiB, and its bulks are chunked too. Kernels
+without dma_opt_mapping_size() do not chunk by default. Chunking is
+off when the IOMMU granule is smaller than PAGE_SIZE. The chunk IOVAs
+then do not meet at page boundaries, and FastReg cannot register them
+as one MR. Bulks that already fit in one chunk, and P2P buffers, are
+still mapped in a single call. The tx_dma_frags array
+(IBLND_MAX_RDMA_FRAGS entries per tx) is only allocated for pools
+that chunk.
+
+At device setup, print whether bulk DMA is mapped in chunks and the
+chunk size, and warn when the IOMMU translates the HCA's DMA
+addresses, so the setting shows up in the console log.
+
+Add compat helpers for dma_get_merge_boundary(),
+iommu_is_dma_domain() and dma_opt_mapping_size().
+
+Add a ko2iblnd module parameter:
+  dma_map_chunk_kb=-1  use dma_opt_mapping_size() (default)
+  dma_map_chunk_kb=0   map each bulk in one call (old behaviour)
+  dma_map_chunk_kb=N   chunks of N KiB, e.g. on kernels without
+                       dma_opt_mapping_size()
+
+Test-Parameters: trivial
+Test-Parameters: nettype=o2ib testlist=sanity-lnet,sanity
+Signed-off-by: Ravindra Singh <rsingh@ddn.com>
+Signed-off-by: Cyril Bordage <cbordage@whamcloud.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Assisted-by: Augment:claude-opus-5-5
+Change-Id: Ic8b71b3fde058394da777256c1603dfdc07545e9
+
+--- Review History ---
+
+--- Message (Cyril Bordage, 2026-11-20 15:56:44.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-20 16:00:39.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-20 16:07:16.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Cyril Bordage, 2026-11-20 21:36:37.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (jenkins, 2026-11-21 05:13:07.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137273/ : SUCCESS
+
+--- Message (jenkins, 2026-11-21 15:10:23.000000000) ---
+Patch Set 1:
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137383/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-21 15:31:01.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-21 15:31:47.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good. I found no correctness problem in the chunked map/unmap logic, and there are a few comments inline. The chunked path also looks untested: test nodes without a translating IOMMU never chunk by default, so neither the map nor the unwind path runs in regular test sessions. Consider adding a sanity-lnet case that reloads ko2iblnd with a small dma_map_chunk_kb (e.g. 4 or 64) and runs bulk I/O, so kiblnd_dma_map_tx_frags() and kiblnd_dma_unmap_chunks() are exercised.
+
+--- Message (patrick bot, 2026-11-22 07:50:55.000000000) ---
+Patch Set 1:
+
+(1 comment)

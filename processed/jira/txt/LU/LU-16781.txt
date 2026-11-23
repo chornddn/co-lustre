@@ -5,11 +5,11 @@ Type:       Improvement
 Priority:   Minor
 Status:     Open
 Resolution: Unresolved
-Assignee:   WC Triage
+Assignee:   Andreas Dilger
 Reporter:   Andreas Dilger
 Created:    Thu, 27 Apr 2023 20:23:09 +0000
-Updated:    Thu, 27 Apr 2023 20:26:49 +0000
-Links:      Related: is related to  LU-16765; Related: is related to  LU-16766
+Updated:    Sat, 21 Nov 2026 05:28:37 +0000
+Links:      Related: is related to  LU-21060; Related: is related to  LU-16765; Related: is related to  LU-16766; Related: is related to LU-21060
 
 --- Description ---
 For user-initiated threads like ll_sa_* these should be associated with the UID/GID/PID of the original task for %u, %g, and %p, so that they can be accounted correctly on the servers.
@@ -17,3 +17,61 @@ For user-initiated threads like ll_sa_* these should be associated with the UID/
 For jobid_name_is_valid() we may consider to reduce the exclusions for kernel processes.  Firstly, this exclusion doesn't always working properly, since kworker and ll_sa tasks still show up in the server stats.  Secondly, this hides the real presence of RPCs sent to the server, so job_stats are not showing the full picture of what is generating the load.
 
 The client needs to save the originating comm/UID/GID/PID for the work that is done (e.g. cache in inode when it is read/written).  This should already be happening, but doesn't seem to be used consistently.
+
+--- Comment (adilger, Fri, 20 Nov 2026 22:16:55 +0000) ---
+AI generated content:
+
+Audit of JobID creation, caching and RPC packing on master (54dc726b5625). Only BRW RPCs use the per-inode cached jobinfo (lli_jobinfo via vvp_req_attr_set() -> osc_build_rpc()); every other RPC gets pb_jobid from current in lustre_msg_set_jobinfo(msg, NULL), called from ptlrpc_set_add_req() / ptlrpcd_add_req(). RPCs sent by kernel threads on behalf of an application are therefore attributed to the thread name, or to no job, and the two kernel-thread filters are inconsistent. LU-21060 (client-side job_stats) inherits the same attribution.
+
+	mmap I/O never updates lli_jobinfo. vvp_io_init() only updates it for CIT_READ/CIT_WRITE/CIT_EC_RD, not CIT_FAULT. Pages dirtied via mmap are flushed with the stale jobid of the last read()/write() caller (possibly a different job), or with an empty one that is then filled from the flushing ptlrpcd/kworker thread. Even a synchronous fault read in the application's own context uses the stale cached value, since a non-NULL ji is never overridden. Fix: update lli_jobinfo for CIT_FAULT (at least write faults).
+
+	uid/gid -1 on BRW for never-read/written inodes. lli_jobinfo is initialised with uid/gid (__u32)-1 in ll_lli_init(); lustre_msg_set_jobinfo() sets MSG_PACK_UID_GID whenever ji is passed, so the later NULL call fills only the empty jobid and leaves uid/gid 4294967295. Breaks TBF uid/gid rules; occurs with item 1.
+
+	Async readahead clobbers lli_jobinfo. ll_readahead_handle_work() calls cl_io_rw_init(), whose vvp_io_init() stores the kworker's jobid in the inode before rw.c restores lrw_jobinfo; ci_async_readahead is set only afterwards. A concurrent writeback BRW in that window gets the kworker jobid, and a newer jobid from a concurrent reader is reverted. Same for any kthread doing CIT_READ/WRITE (e.g. PCC-RO attach ll_pcc_). Fix: skip the inode update when current->flags & PF_KTHREAD; pass lrw_jobinfo explicitly.
+
+	Inconsistent kernel-thread filtering. jobid_name_is_valid() (env-var mode only) rejects ll_ping/ptlrpc/ldlm/ll_sa/kworker/kswapd/writeback/irq/ksoftirq/ll_ucp; jobid_print_current_comm() trims only kworker/kswapd/ll_sa/ll_agl/ldlm_bl/ll_ucp. Results:
+	
+		env-var mode: unlisted kthreads (ll_agl_, ll_pcc_, ll_imp_inval, chlg_load_thread, kuc_reregister, server mdt*/osp*) fail the environ lookup (no mm) and fall back to jobid_name, e.g. ll_agl.0, or ll_pcc_12345.0 (a new job_stats entry per PID), while ll_sa RPCs get no jobid at all.
+
+		procname_uid / nodelocal: no filter, so ptlrpcd_00_03.0, ptlrpcd_rcv.0, ll_ping.0, ldlm_cb.0 etc. each become separate jobids.
+
+		the irq prefix also matches userspace irqbalance.
+
+Fix: a single PF_KTHREAD-based rule (empty jobid for kthreads unless an on-behalf-of jobid is supplied, item 5), applied in all modes.
+
+	
+	
+
+	On-behalf-of RPCs from kernel threads lose the application jobid.
+	
+		statahead (ll_sa_): getattr/intent RPCs for ls -l are empty (env mode) or ll_sa.0 with uid 0;
+
+		AGL glimpses (ll_agl_): same, but labelled differently because of item 4;
+
+		MDS_CLOSE of cached opens from lock cancel (ll_md_blocking_ast path in namei.c, ldlm_bl) and inode eviction (ll_clear_inode(), kswapd/shrinker);
+
+		batch resend (cli_batch_resend_work via schedule_work()).
+
+Fix: capture a struct job_info when work is handed off (in sai, the open handle or the inode, using lli_jobinfo for closes), and add a per-task override that lustre_msg_set_jobinfo(NULL) checks before current (e.g. via lu_env_find()).
+
+	
+	
+
+	Server-originated RPCs. OSP/OUT requests (MDT->OST destroy/setattr, DNE cross-MDT updates) never set a jobid; with jobid_var set via set_param -P (which also applies to servers) the remote targets record e.g. mdt00_003.0 per service thread, although uc_jobid of the originating request is available for synchronous OUT calls.
+
+	Minor: %u expands current_fsuid() while the packed uid is current_uid() (differ under NFS re-export/setfsuid); the environ cache is keyed by thread PID rather than TGID, so each thread of a multithreaded app rescans the (per-process) environment.
+
+Leaving ping, connect, lock cancel and LDLM callbacks without a jobid is fine; item 4 would make them consistently empty in all modes.
+
+--- Comment (gerrit, Sat, 21 Nov 2026 05:28:37 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71264
+
+Subject: LU-16781 obdclass: account kernel thread RPCs to the job
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2bf2ac3f256c1985793c1f586eca14f9b8db4f2c

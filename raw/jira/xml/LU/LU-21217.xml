@@ -1,0 +1,132 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21217] socklnd: zero-copy send copies on RHEL 9 and sends one page per call</title>
+                <link>https://jira.whamcloud.com/browse/LU-21217</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;socklnd's zero-copy send does more work than it should, in two ways, both in ksocknal_lib_sendpage(). On RHEL 9 it is not zero copy at all. On kernels where it is, it hands TCP one 4 KB page per call. Both cost sender CPU on every bulk transfer, so they matter where the sender is the limit: an OSS serving reads to many clients, or a client writing fast.&lt;/p&gt;
+
+&lt;p&gt;1. RHEL 9: the "zero-copy" send is a copy.&lt;br/&gt;
+socklnd picks its send method with "#ifdef MSG_SPLICE_PAGES". Upstream added that flag in 6.5 together with TCP support for it, and removed -&amp;gt;sendpage. RHEL 9 defines MSG_SPLICE_PAGES (include/linux/socket.h, brought in for an rxrpc backport), but its TCP never looks at the flag: nothing in net/ipv4 or net/core handles it, and tcp_sendmsg_locked() copies from the bvec iterator as for any other send. RHEL 9 still has tcp_sendpage(), which socklnd's other branch would have used. So on EL9 every bulk payload is copied, one page per call, and the sender still waits for a ZC-ACK from the peer, a protocol that only exists so the sender knows when it may reuse pages it did not copy. Checked in the Rocky 9 source, kernel 5.14.0-687.46.1.el9_8. RHEL 8, RHEL 10 and upstream 6.5 and later behave as the code assumes.&lt;br/&gt;
+Fix: choose the method with a configure test for 'struct proto' having 'sendpage', not with the flag.&lt;br/&gt;
+Expected gain: on EL9 senders whose CPU is the limit, probably 20 to 30% more bulk throughput. &lt;a href="https://jira.whamcloud.com/browse/LU-19763" title="Enable TCP zerocopy sending by default" class="issue-link" data-issue-key="LU-19763"&gt;&lt;del&gt;LU-19763&lt;/del&gt;&lt;/a&gt; measured more than 30% lower throughput in VMs when socklnd's zero-copy send was turned off, the closest measurement of the same difference, and the EL9 path is somewhat worse than socklnd's own copy path, which at least sends a message in one call and asks for no ZC-ACK.&lt;/p&gt;
+
+&lt;p&gt;2. One page per call where splicing works.&lt;br/&gt;
+When TCP does take MSG_SPLICE_PAGES (upstream 6.5 and later, RHEL 10), socklnd still builds the iterator over a single page per sock_sendmsg() call, a shape kept from -&amp;gt;sendpage when the code was ported (&lt;a href="https://jira.whamcloud.com/browse/LU-17081" title="Kernel 6.5 client support" class="issue-link" data-issue-key="LU-17081"&gt;&lt;del&gt;LU-17081&lt;/del&gt;&lt;/a&gt;). A 1 MB message takes 256 calls, each taking the socket lock and redoing TCP's per-call work, where socklnd's own copy path takes one call. MSG_SPLICE_PAGES takes the whole bio_vec array, as the NFS server and nvme-tcp use it, and a MSG_DONTWAIT call returns the bytes queued so far when the send buffer fills, which socklnd already handles.&lt;br/&gt;
+Fix: pass the whole bio_vec array in one call when splicing. Kernels with -&amp;gt;sendpage still send a page per call.&lt;br/&gt;
+Expected gain: smaller than (1). At a few tenths of a microsecond per call, 255 extra calls are on the order of 0.1 ms of sender CPU per MB, against roughly 0.6 ms per MB for a core moving 1.5 GB/s, so perhaps 10 to 15% of sender CPU per byte. This is an estimate; measurements will be added here.&lt;/p&gt;
+
+&lt;p&gt;Found by reading the socklnd data path (lnet/klnds/socklnd/socklnd_lib.c).&lt;/p&gt;</description>
+                <environment />
+        <key id="100454">LU-21217</key>
+            <summary>socklnd: zero-copy send copies on RHEL 9 and sends one page per call</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="patrickbot">Patrick Bot</reporter>
+                        <labels>
+                    </labels>
+                <created>Sat, 14 Nov 2026 21:05:01 +0000</created>
+                <updated>Sun, 15 Nov 2026 00:58:03 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="505797" author="gerrit" created="Sat, 14 Nov 2026 21:14:11 +0000">&lt;p&gt;"patrick bot &amp;lt;patrick-bot@mulberrytree.us&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70880" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70880&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21217" title="socklnd: zero-copy send copies on RHEL 9 and sends one page per call" class="issue-link" data-issue-key="LU-21217"&gt;LU-21217&lt;/a&gt; socklnd: use sendpage where TCP still has it&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 13820e5039cfed22da4ed8277a3f2536b2d5f22c&lt;/p&gt;</comment>
+                            <comment id="505798" author="gerrit" created="Sat, 14 Nov 2026 21:14:11 +0000">&lt;p&gt;"patrick bot &amp;lt;patrick-bot@mulberrytree.us&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70881" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70881&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21217" title="socklnd: zero-copy send copies on RHEL 9 and sends one page per call" class="issue-link" data-issue-key="LU-21217"&gt;LU-21217&lt;/a&gt; socklnd: send a zero-copy message in one call&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: ca6a9d1ea4bf8633f8bc7c3e64e18ac3175700b3&lt;/p&gt;</comment>
+                            <comment id="505799" author="JIRAUSER24100" created="Sat, 14 Nov 2026 21:14:21 +0000">&lt;p&gt;Patches: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70880" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70880&lt;/a&gt; (RHEL 9: use sendpage where TCP still has it) and &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/70881" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/70881&lt;/a&gt; (send a zero-copy message in one call). Both build for Rocky 9.8 and Rocky 10.2 clients; configure picks sendpage on 9.8 and the multi-page splice on 10.2. Before/after numbers will follow.&lt;/p&gt;</comment>
+                            <comment id="505800" author="JIRAUSER24100" created="Sat, 14 Nov 2026 21:31:08 +0000">&lt;p&gt;Measured 70881 (with 70880 under it) between two Rocky 10 VMs (6.12 kernel, so the splice path) over a fast virtio-net switch, LNet selftest 1 MB transfers, 8 in flight. Sending a message's pages in one call roughly halves the sender's CPU and cuts the packets the receiver handles about eight times, because the sender now builds full-size TSO frames instead of 5 to 9 KB ones. Throughput in these VMs did not change beyond run-to-run noise, since the limit there is elsewhere (the receiving guest is still about 40% idle); where the sender's CPU is the limit, as on a busy OSS, the CPU saving is what turns into bandwidth.&lt;/p&gt;
+
+&lt;p&gt;Per 1 MB, before -&amp;gt; after:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+                          1 connection        4 connections&lt;br/&gt;
+sender tcp_sendmsg calls  258 -&amp;gt; 4&lt;br/&gt;
+sender TSO frame size     5-9 KB -&amp;gt; 57 KB     17-42 KB -&amp;gt; 56 KB&lt;br/&gt;
+receiver skbs             115-183 -&amp;gt; 17-18    24-56 -&amp;gt; 18&lt;br/&gt;
+receiver data_ready       65-125 -&amp;gt; 7&lt;br/&gt;
+receiver recvmsg calls    26-64 -&amp;gt; 7-8&lt;br/&gt;
+sender guest CPU (vCPUs)  1.7-1.8 -&amp;gt; 0.8-1.1  1.9-2.5 -&amp;gt; 1.4&lt;br/&gt;
+host CPU, sender QEMU     2.5 -&amp;gt; 2.0          2.3 -&amp;gt; 1.55&lt;br/&gt;
+GB/s write (2 runs)       2.35/2.63 -&amp;gt; 2.60/2.71   3.17/2.69 -&amp;gt; 2.61/2.89&lt;br/&gt;
+GB/s read (2 runs)        1.78/2.22 -&amp;gt; 2.20/2.19   3.18/2.66 -&amp;gt; 3.33/2.53&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;RHEL 9 before/after numbers for 70880 will follow.&lt;/p&gt;</comment>
+                            <comment id="505801" author="JIRAUSER24100" created="Sat, 14 Nov 2026 21:31:33 +0000">&lt;p&gt;Measured 70880 on RHEL 9 (Rocky 9 guests, kernel 5.14.0-611, plain virtio-net bridge), LNet selftest 1 MB transfers, 8 in flight, 5 runs each, medians. The fix cuts the sender's CPU per GB sent by 55 to 61% in every case, from about 1.0 to 0.4 CPU-seconds per GB. Before it, 43% of the sender's samples were the copy (_copy_from_iter under tcp_sendmsg_locked); after it the payload goes through tcp_sendpage and the copy is gone. So 5.14.0-611 is affected as well as 5.14.0-687.&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+                    before   after&lt;br/&gt;
+cpp1 write GB/s     1.16     1.40   (+20%)&lt;br/&gt;
+cpp1 read GB/s      1.34     1.53   (+14%)&lt;br/&gt;
+cpp4 write GB/s     1.32     1.33&lt;br/&gt;
+cpp4 read GB/s      1.35     1.39&lt;br/&gt;
+sender CPU-s/GB     ~1.0     ~0.4   (all four cases)&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;With four connections the bridge between the VMs is the limit, so the saving shows as CPU rather than bandwidth there.&lt;/p&gt;</comment>
+                            <comment id="505802" author="JIRAUSER24100" created="Sat, 14 Nov 2026 21:32:22 +0000">&lt;p&gt;Affected kernels: RHEL 9.4 and later (5.14.0-427 onward, checked up to 9.8, 5.14.0-687), where MSG_SPLICE_PAGES arrived with the rxrpc backport while TCP kept -&amp;gt;sendpage. RHEL 9.0 to 9.3, RHEL 8 and RHEL 10 are not affected. SLES 15 was not checked.&lt;/p&gt;</comment>
+                            <comment id="505808" author="JIRAUSER24100" created="Sun, 15 Nov 2026 00:58:03 +0000">&lt;p&gt;Measured on real Google Cloud hardware too: two c4-standard-8 VMs (gVNIC, Rocky 10, kernel 6.12, so the multi-page splice path of 70881), LNet selftest 1 MB transfers, 8 in flight, conns_per_peer 3 (auto from the 23 Gbit link), link capped at about 2.7 GB/s. Sender CPU per MiB, whole VM, medians of repeated runs:&lt;/p&gt;
+
+&lt;p&gt;```&lt;br/&gt;
+direction              stock    &lt;a href="https://jira.whamcloud.com/browse/LU-21217" title="socklnd: zero-copy send copies on RHEL 9 and sends one page per call" class="issue-link" data-issue-key="LU-21217"&gt;LU-21217&lt;/a&gt;   change&lt;br/&gt;
+read (server sends)    235 us   181 us     about 20% less&lt;br/&gt;
+write (client sends)   247 us   218 us     about 10% less&lt;br/&gt;
+```&lt;/p&gt;
+
+&lt;p&gt;Throughput is the same (link-capped), so the saving is CPU. One run in ten showed no saving; the rest agreed. Receiver CPU unchanged, as expected on a link where TSO frames were already large.&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                                                <inwardlinks description="is related to">
+                                        <issuelink>
+            <issuekey id="100459">LU-21222</issuekey>
+        </issuelink>
+                            </inwardlinks>
+                                    </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i07393:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

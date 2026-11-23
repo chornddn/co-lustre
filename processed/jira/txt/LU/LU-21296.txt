@@ -1,0 +1,87 @@
+Key:        LU-21296
+Summary:    ldlm: add tracepoints for the lock lifecycle
+Link:       https://jira.whamcloud.com/browse/LU-21296
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Nikos Papakonstantinou
+Reporter:   Nikos Papakonstantinou
+Created:    Mon, 23 Nov 2026 10:13:46 +0000
+Updated:    Mon, 23 Nov 2026 10:21:01 +0000
+
+--- Description ---
+Lock contention is behind many Lustre performance problems and hangs: clients writing to the same file, jobs creating files in one shared directory, a client that is slow to answer blocking ASTs. The questions are always the same: which resources are contended, how long enqueues wait for a grant, and which lock, held by which client, is blocking which request. Today the only per-lock source for these answers is the libcfs debug log, which is a poor fit for this:
+
+	dlmtrace has to be enabled before the problem happens, on every client and server involved, and the debug log slows the whole node down. On test VMs, a single-client metadata benchmark ran about 2.5 times slower with a full debug mask left on the servers.
+
+	The log is a ring buffer that wraps under load or is dropped under memory pressure (LU-15917), and matching a client lock with its server lock means dumping the log from every node and pairing handle cookies by hand.
+
+	The ldlm namespace and pool statistics give lock counts and rates, not wait times, and say nothing about which resources or clients conflict.
+
+eBPF tools (bpftrace, bcc, libbpf, perf, trace-cmd) can answer these questions on a production system, aggregating in the kernel at low cost: enqueue-to-grant wait histograms per namespace and mode, the most contended resources, blocking ASTs per client. What they lack in Lustre is stable places to attach:
+
+	kprobes and fentry probes on ldlm functions break whenever a function is renamed, inlined or refactored, which happens every release, so a script written for one version silently stops working on the next.
+
+	Reading struct ldlm_lock from a kprobe needs module BTF. LU-17768 embeds it only when the build has a vmlinux, or runs on the target kernel with distilled-base support, so most RHEL 8/9 server packages ship without it.
+
+Kernel tracepoints solve both problems. Their names and fields are an interface kept in the Lustre source, described in tracefs, and usable without BTF or debuginfo, and when nothing is attached they cost one static-key branch. LU-20837 added the first Lustre tracepoints, for debug messages, and LU-21295 adds them for the RPC lifecycle. This ticket adds structured events for the lock lifecycle.
+
+Relation to LU-8980
+
+LU-8980 is a subtask of LU-9679 (preparing Lustre for the upstream kernel) and aims to replace the libcfs debug logging with tracepoints. Its series converting libcfs, CDEBUG and llite (changes 24554, 24560 and 52875) is still open. This work is independent of it and small: a few events with fields designed for analysis, with no change to CDEBUG or the debug log, so it can land on its own either way.
+
+Proposal
+
+Add trace system "ldlm" with five events:
+
+Event
+Fires in
+
+ldlm_lock_enqueue
+ldlm_cli_enqueue() on the client, ldlm_handle_enqueue() on the server, ldlm_cli_enqueue_local() and ldlm_cli_enqueue_placeholder() for a server's own locks
+
+ldlm_lock_grant
+ldlm_grant_lock()
+
+ldlm_lock_blocked
+ldlm_add_bl_work_item(): a granted lock conflicts with a new one and will get a blocking AST; names both locks
+
+ldlm_lock_bl_callback
+ldlm_handle_bl_callback(): a client receives that blocking AST
+
+ldlm_lock_destroy
+ldlm_lock_destroy_internal(): once per lock, after a cancel, or for a lock that was never granted, such as a replaced intent lock
+
+Each event carries the namespace, resource name and type, granted and requested modes, flags, pid, and the local and remote handle cookies, so tools can pair enqueue with grant and destroy, and a client lock with its server lock.
+
+Add contrib/eBPF/ldlm_wait.bt, which prints enqueue-to-grant wait histograms per namespace and mode, and blocking AST counts per resource. Add sanity test 60p, which checks that the MDS's ldlm_lock_blocked and the client's ldlm_lock_bl_callback name the same pair of locks.
+
+Examples:
+
+client# bpftrace contrib/eBPF/ldlm_wait.bt
+oss#    bpftrace contrib/eBPF/ldlm_wait.bt
+mds#    trace-cmd record -e ldlm:ldlm_lock_blocked -e ldlm:ldlm_lock_bl_callback
+
+Design notes
+
+	The namespace is a fixed-size, zero-padded array rather than __string(). bpftrace 0.23 on aarch64 reads __data_loc strings as empty, and bpftrace keys maps on the whole array, so trailing bytes would split identical keys. A record takes up to about 200 bytes in the trace buffer, and only while the event is enabled.
+
+	Lock modes and resource types are printed symbolically through TRACE_DEFINE_ENUM, so ftrace output reads "PW" and "IBT" while tools still see the numeric values.
+
+	The events read l_resource under rcu_read_lock(), because it is RCU-freed and can change when a client enqueue reply arrives.
+
+	ldlm_lock_destroy, not a cancel event, ends a lock's life, so a tool that tracks enqueued locks also sees the ones that are never granted and does not leak them.
+
+--- Comment (gerrit, Mon, 23 Nov 2026 10:21:01 +0000) ---
+"Nikos Papakonstantinou " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71297
+
+Subject: LU-21296 ldlm: add tracepoints for the lock lifecycle
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 121a6a237924874db39ac27a1f12b0084fb515ba
