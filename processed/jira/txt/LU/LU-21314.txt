@@ -1,0 +1,62 @@
+Key:        LU-21314
+Summary:    failover: LBUGs in mdt_export_cleanup() and osp_statfs_update() during lctl cleanup failover
+Link:       https://jira.whamcloud.com/browse/LU-21314
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Alexander Boyko
+Created:    Tue, 24 Nov 2026 13:36:25 +0000
+Updated:    Tue, 24 Nov 2026 13:36:25 +0000
+
+--- Description ---
+Two pre-existing LBUGs on the "lctl --device  cleanup failover" path, reproduced on a single-node setup (MDT0000 + OST0000/OST0001 with localrecov, one client mounted), Lustre master, kernel 5.14.0-687 (aarch64). Found while validating the commit-gap counters of LU-21269.
+
+== 1. mdt_export_cleanup() ASSERTION(env) ==
+
+Steps: with a client connected, "lctl --device asrt-MDT0000 cleanup failover"
+
+Expected: the MDT target fails over (OBDF_FAIL set, exports disconnected, precleanup runs).
+
+Actual: kernel panic in the lctl task:
+
+LustreError: 307801:0:(mdt_handler.c:7859:mdt_export_cleanup()) ASSERTION( env ) failed:
+LustreError: 307801:0:(mdt_handler.c:7859:mdt_export_cleanup()) LBUG
+Call trace:
+ lbug_with_loc+0x78/0xb0 [libcfs]
+ mdt_export_cleanup+0x384/0x3c8 [mdt]
+ mdt_obd_disconnect+0x9c/0x308 [mdt]
+ obd_disconnect+0x60/0x1f8 [obdclass]
+ class_disconnect_export_list+0x158/0x378 [obdclass]
+ class_disconnect_exports+0x11c/0x2f8 [obdclass]
+ class_cleanup+0x1a0/0x790 [obdclass]
+ class_process_config+0xe90/0x18d8 [obdclass]
+ class_handle_ioctl+0x4bc/0x1220 [obdclass]
+ obd_class_ioctl+0x74/0x1b8 [obdclass]
+ __arm64_sys_ioctl+0xa8/0xf0
+Kernel panic - not syncing: LBUG
+
+Cause: mdt_export_cleanup() obtains the lu_env via lu_env_find(), which returns NULL outside the MDT-thread context; in the lctl/ioctl context the LASSERT(env) fires.
+
+== 2. osp_statfs_update() ASSERTION(imp) ==
+
+Steps: "lctl --device asrt-OST0000 cleanup failover" (with the MDT-side osc import to the OST connected)
+
+Expected: the OST target fails over.
+
+Actual: a few seconds later the osp-precreate kthread panics:
+
+Lustre: asrt-OST0000-osc-ffff4defa21c8000: Connection to asrt-OST0000 (at 0@lo) was lost; in progress operations using this service will wait for recovery to complete
+LustreError: 7733:0:(osp_precreate.c:220:osp_statfs_update()) ASSERTION( imp ) failed:
+LustreError: 7733:0:(osp_precreate.c:220:osp_statfs_update()) LBUG
+Call trace:
+ lbug_with_loc+0x78/0xb0 [libcfs]
+ osp_statfs_update+0x29c/0x5f0 [osp]
+ osp_precreate_thread+0x230/0xaa0 [osp]
+ kthread+0x104/0x120
+Kernel panic - not syncing: LBUG
+
+Cause: the failover disconnects the MDT-side osc import to the failed-over OST; the precreate thread then calls osp_statfs_update() with opd_obd->u.cli.cl_import == NULL and the LASSERT(imp) fires. A failure-prone import state should return an error instead of asserting.
+
+Full vmcore-dmesg.txt files available on request.

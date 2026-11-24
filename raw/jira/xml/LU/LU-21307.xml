@@ -1,0 +1,131 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21307] o2iblnd: kiblnd_shutdown hangs after a RoCE GID is deleted under a live connection</title>
+                <link>https://jira.whamcloud.com/browse/LU-21307</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;h2&gt;&lt;a name="Problem"&gt;&lt;/a&gt;Problem&lt;/h2&gt;
+
+&lt;p&gt;On RoCEv2, &lt;tt&gt;lnetctl lnet unconfigure&lt;/tt&gt; and &lt;tt&gt;lustre_rmmod&lt;/tt&gt; can hang forever in &lt;tt&gt;kiblnd_shutdown()&lt;/tt&gt;. The trigger is a local IP address that goes away while an o2ib connection uses it. The hang occurs when ko2iblnd closes that connection later.&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;kiblnd_close_conn_locked()) Closing conn ... to 10.99.0.2@o2ib: error -5(waiting)
+kiblnd_shutdown()) 10.99.0.1@o2ib: waiting for 1 peers to disconnect
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The message repeats until a restart of the node.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Cause"&gt;&lt;/a&gt;Cause&lt;/h2&gt;
+
+&lt;p&gt;On RoCE, the GID table follows the IP addresses of the netdev. When the IP address goes away, the RDMA core deletes the RoCEv2 GID that the established connection uses. The connection still holds a reference to the deleted GID entry.&lt;/p&gt;
+
+&lt;p&gt;When ko2iblnd closes the connection, &lt;tt&gt;kiblnd_disconnect_conn()&lt;/tt&gt; calls &lt;tt&gt;rdma_disconnect()&lt;/tt&gt;. ib_cm cannot send the DREQ:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;&lt;tt&gt;cm_send_dreq_locked()&lt;/tt&gt; calls &lt;tt&gt;cm_alloc_msg()&lt;/tt&gt;, which calls &lt;tt&gt;rdma_create_ah()&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;For a RoCEv2 GID with a non-zero flow label, &lt;tt&gt;rdma_lag_get_ah_roce_slave()&lt;/tt&gt; reads the GID netdev. The GID entry is no longer valid, so it returns -EINVAL.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;cm_send_dreq_locked()&lt;/tt&gt; moves the ib_cm id to timewait and returns the error. It gives no event.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;rdma_disconnect()&lt;/tt&gt; ignores the error.&lt;/li&gt;
+	&lt;li&gt;&lt;tt&gt;cma_ib_handler()&lt;/tt&gt; later drops &lt;tt&gt;IB_CM_TIMEWAIT_EXIT&lt;/tt&gt;, because the rdma_cm state is still &lt;tt&gt;RDMA_CM_CONNECT&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;ko2iblnd drops the last connection reference only in the &lt;tt&gt;RDMA_CM_EVENT_DISCONNECTED&lt;/tt&gt; handler. That event never comes, so ko2iblnd never frees the connection and its peer, and &lt;tt&gt;kiblnd_shutdown()&lt;/tt&gt; waits for &lt;tt&gt;ibn_npeers&lt;/tt&gt; to reach 0 forever.&lt;/p&gt;
+
+&lt;p&gt;The RDMA core code is the same upstream and in MLNX_OFED 24.10. ko2iblnd on master has the same gap. On InfiniBand the GIDs do not follow IP addresses, so this trigger is RoCE-specific. Any other cause of a lost DISCONNECTED event gives the same hang.&lt;/p&gt;
+
+&lt;h2&gt;&lt;a name="Reproduction"&gt;&lt;/a&gt;Reproduction&lt;/h2&gt;
+
+&lt;p&gt;Two rocky9 VMs (kernel 5.14.0-611.55.1.el9_7, inbox RDMA), Lustre master 2.17.62, Soft-RoCE &lt;tt&gt;rxe0&lt;/tt&gt; on &lt;tt&gt;eth0&lt;/tt&gt;. The o2ib NI uses a secondary IP address.&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;On each node: &lt;tt&gt;ip addr add 10.99.0.N/24 dev eth0 label eth0:1&lt;/tt&gt;, &lt;tt&gt;rdma link add rxe0 type rxe netdev eth0&lt;/tt&gt;, &lt;tt&gt;lnetctl lnet configure&lt;/tt&gt;, &lt;tt&gt;lnetctl net add --net o2ib --if eth0:1&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;On node 1: &lt;tt&gt;lnetctl ping 10.99.0.2@o2ib&lt;/tt&gt;. The connection is established.&lt;/li&gt;
+	&lt;li&gt;On node 1: &lt;tt&gt;ip addr del 10.99.0.1/24 dev eth0&lt;/tt&gt;, then &lt;tt&gt;ip addr add 10.99.0.1/24 dev eth0 label eth0:1&lt;/tt&gt;.&lt;/li&gt;
+	&lt;li&gt;On node 1: &lt;tt&gt;lnetctl ping 10.99.0.2@o2ib&lt;/tt&gt;. The ping fails, and ko2iblnd closes the connection with -EIO.&lt;/li&gt;
+	&lt;li&gt;On node 1: &lt;tt&gt;lnetctl lnet unconfigure&lt;/tt&gt;.&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;Without step 3, unconfigure completes in about 1 s. With step 3, it hung in 2 of 2 runs. Kretprobes in the second run show where the DREQ fails:&lt;/p&gt;
+
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;cm_disconnect: cm.id=1 src=10.99.0.1:1023 dst=10.99.0.2:987
+lagret: (rdma_create_ah &amp;lt;- rdma_lag_get_ah_roce_slave) ret=0xffffffffffffffea
+ahret: (cm_alloc_msg &amp;lt;- rdma_create_ah) ret=0xffffffffffffffea
+icm_send_drep_err: ... state=TIMEWAIT
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;h2&gt;&lt;a name="Proposedfix"&gt;&lt;/a&gt;Proposed fix&lt;/h2&gt;
+
+&lt;p&gt;ko2iblnd must not wait forever for &lt;tt&gt;RDMA_CM_EVENT_DISCONNECTED&lt;/tt&gt;. After &lt;tt&gt;rdma_disconnect()&lt;/tt&gt;, put the connection on a list that connd checks on each tick. If the event has not come after the LND timeout, connd drops the CM reference itself. The event handler and connd each take an explicit claim under &lt;tt&gt;kib_global_lock&lt;/tt&gt;. Only the one that gets the claim drops the reference. &lt;tt&gt;rdma_destroy_id()&lt;/tt&gt; in &lt;tt&gt;kiblnd_destroy_conn()&lt;/tt&gt; handles an ib_cm id in any state.&lt;/p&gt;
+
+&lt;p&gt;&lt;a href="https://jira.whamcloud.com/browse/LU-16283" title="o2iblnd.c:3049:kiblnd_shutdown() &amp;lt;NID&amp;gt;: waiting for &amp;lt;N&amp;gt; peers to disconnect" class="issue-link" data-issue-key="LU-16283"&gt;LU-16283&lt;/a&gt; reports the same &lt;tt&gt;kiblnd_shutdown()&lt;/tt&gt; wait on a router, with no root cause. A timeout on the DISCONNECTED wait may also bound that hang.&lt;/p&gt;</description>
+                <environment />
+        <key id="100802">LU-21307</key>
+            <summary>o2iblnd: kiblnd_shutdown hangs after a RoCE GID is deleted under a live connection</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="hornc">Chris Horn</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 24 Nov 2026 04:07:04 +0000</created>
+                <updated>Tue, 24 Nov 2026 04:58:55 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506717" author="gerrit" created="Tue, 24 Nov 2026 04:58:55 +0000">&lt;p&gt;"Chris Horn &amp;lt;chorn@ddn.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71363" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71363&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21307" title="o2iblnd: kiblnd_shutdown hangs after a RoCE GID is deleted under a live connection" class="issue-link" data-issue-key="LU-21307"&gt;LU-21307&lt;/a&gt; o2iblnd: bound the wait for DISCONNECTED&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 06610e89616d56626465f2548a09d5fb6057262a&lt;/p&gt;</comment>
+                    </comments>
+                <issuelinks>
+                            <issuelinktype id="10011">
+                    <name>Related</name>
+                                            <outwardlinks description="is related to ">
+                                        <issuelink>
+            <issuekey id="73036">LU-16283</issuekey>
+        </issuelink>
+                            </outwardlinks>
+                                                        </issuelinktype>
+                    </issuelinks>
+                <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073vb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

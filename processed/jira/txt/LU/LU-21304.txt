@@ -1,0 +1,42 @@
+Key:        LU-21304
+Summary:    llite: no-key open of long-named dir on remote MDT fails ENODATA
+Link:       https://jira.whamcloud.com/browse/LU-21304
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Andreas Dilger
+Created:    Mon, 23 Nov 2026 20:20:43 +0000
+Updated:    Mon, 23 Nov 2026 20:20:54 +0000
+
+--- Description ---
+Without the encryption key, open() of a directory with a long (digested) no-key name fails with ENODATA when the directory is on a different MDT than its parent, and the open is the first access to the name. A stat() of the same name first, or a short (non-digested) name, works.
+
+Reproducer on master (v2_17_62), single node with 2 MDTs:
+
+mount -t lustre -o user_xattr,flock,test_dummy_encryption $MGSNID:/testfs /mnt/testfs
+mkdir -p /mnt/testfs/d/enc/sub /mnt/testfs/d/enc/$(printf "l%.0s" {1..80})
+# "enc" lands on MDT0001 and the long-named dir on MDT0000 here
+key=$(keyctl show | awk '$7 ~ "^fscrypt:" { print $1 }')
+keyctl revoke $key; keyctl reap
+lctl set_param -n ldlm.namespaces.*.lru_size=clear; echo 3 > /proc/sys/vm/drop_caches
+d=$(echo /mnt/testfs/d/*)
+for n in $(ls $d); do
+    python3 -c "import os,sys; os.open(sys.argv[1], os.O_RDONLY); print('ok')" $d/$n
+done
+# +BQQAAAIA...: OSError: [Errno 61] No data available   
+
+From the debug log, ll_atomic_open() sends the open intent for the digested name with fid2 = child FID, so lmv_intent_open() routes it to the child's MDT (MDT0000) rather than the parent's:
+
+lmv_intent_open()) OPEN_INTENT with fid1=[0x240000405:0x1:0x0], fid2=[0x200000405:0x3:0x0], name='...' -> mds #0
+mdc_finish_intent_lock()) D_IT dentry=... intent=open status=0 disp=0x80002b: rc = 0
+xattr_cache.c:630:ll_xattr_cache_get()) Process leaving via out (rc=-61)
+namei.c:792:ll_lookup_it_finish()) Process leaving via out (rc=-61)
+namei.c:1587:ll_atomic_open()) Process leaving (rc=-61)
+
+The open succeeds on the MDT, but the reply carries no encryption context ("server returned encryption ctx" is not logged for it, while it is for the lookups). ll_lookup_it_finish() then calls llcrypt_prepare_readdir() on the new directory inode. ll_get_context() reads the context from the xattr cache, and ll_xattr_cache_get() does not refill the cache for the encryption context name, so it returns -ENODATA, which fails the open.
+
+Possible fixes: have the MDT pack the encryption context in the reply of an open by FID (MDS_FID_OP), or have the client fetch the context with a getxattr when the reply has none, rather than failing.
+
+The sanityn test_102b change for LU-20514 (not yet pushed) skips long names in its no-key check because of this.

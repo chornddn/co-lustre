@@ -1,0 +1,112 @@
+Change:     71361
+Subject:    LU-20090 nrs: add a two-stage class lookup for TBF
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71361
+Change-Id:  I2c64d9117ba09829b7c187b89489e22781bbe308
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Chris Horn
+Created:    2026-11-24 03:48:23.000000000
+Updated:    2026-11-24 12:36:44.000000000
+Patch Set:  1
+Insertions: +966
+Deletions:  -393
+Comments:   9 (4 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+
+--- Commit Message ---
+LU-20090 nrs: add a two-stage class lookup for TBF
+
+A TBF class bucket caches its rule. After a rule add, the bucket
+matches again and takes the new rule. Its queued requests and its
+heap slot carry over. A bucket thus has no fixed rule, and a rule
+cannot set the key of its buckets.
+
+Split the lookup in two stages. A rule cache entry holds the request
+key and points at the class bucket of the matched rule. The key of
+the bucket adds the rule ID, so the bucket keeps its rule for life.
+A hit costs one lookup and no walk of the rule list. The rule dump
+adds the rule ID, and the CPT line adds the lookup counters:
+
+    CPT 0: key=nid, miss 2, walk 2, checked 4, lru_free 0, rcache 2,
+      class 2
+    default * 10000, id 1, ref 0
+
+The counter lru_free counts the rule cache entries that the LRU shrink
+frees. A miss count that grows with lru_free shows a cache thrash. A
+miss count that grows alone shows new keys.
+
+A rule stop or a rule add no longer moves a bucket to a new rule.
+The queued requests of the old bucket drain at the rate of its rule.
+The next request of the key goes to a bucket of the new rule.
+
+The key now clears each ID field that the policy type does not use.
+The command structures lose the TBF prefix for a second policy.
+
+The rule stop path removed a rule from the list under nrs_lock only.
+A walk of the list holds th_rule_lock, so it could reach the removed
+rule. The stop path now holds th_rule_lock over the removal.
+
+A rule start takes the type of the head that runs it. Before, a rule
+start failed with -EINVAL when the two heads had different types.
+The policy start parses its argument with the command parser, so a
+later patch can add start keys. A bad key value now returns the
+error of its parse, not -EINVAL. An empty policy start argument now
+starts the generic type, as no argument does. Before, it failed with
+-EINVAL.
+
+Fix three test defects. The 77k cleanup left TBF rules for the next
+test, so 77k now registers it with stack_trap. 77kb restored the
+jobid_var from the wrong variable. 77kj did not wait for the servers
+to get the nodemap.
+
+Fixes: 33e35c0bf214 ("LU-3558 ptlrpc: Add the NRS TBF policy")
+Fixes: 3408489c96ba ("LU-20090 nrs: use fixed size key for NRS TBF class bucket")
+Test-Parameters: trivial testlist=sanityn env=ONLY=77
+Signed-off-by: Chris Horn <chorn@ddn.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Change-Id: I2c64d9117ba09829b7c187b89489e22781bbe308
+
+--- Review History ---
+
+--- Message (Chris Horn, 2026-11-24 03:48:23.000000000) ---
+Uploaded patch set 1.
+
+--- Message (wc-checkpatch, 2026-11-24 03:54:11.000000000) ---
+Patch Set 1:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-24 03:55:23.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-24 04:22:58.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137634/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-24 12:33:58.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-24 12:36:44.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Mostly good; the two-stage lookup and its refcount/RCU handling look correct to me. One behavior question and a few minor items inline. Separately: this change carries two independent bug fixes, the th_rule_lock fix in nrs_tbf_rule_stop() (a rule_match() walker can hit the NTRS_STOPPING LASSERT) and the unused-ID zeroing in nrs_tbf_id_cli_set(). They are small and are the parts most worth backporting. Would it be worth splitting them out ahead of the 1100-line rework so that they can be picked to maintenance branches on their own? Also, nothing in sanityn exercises the new dump fields (id, miss/rcache/class counters) or a rule start with different reg/hp TBF types; a small check in one of the 77* tests would cover them.

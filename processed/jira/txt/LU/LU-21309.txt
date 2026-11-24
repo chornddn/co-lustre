@@ -1,0 +1,69 @@
+Key:        LU-21309
+Summary:    Client sends MDS_HSM_STATE_SET(HS_DIRTY) on every setattr-after-write before close: one extra synchronous RPC per setattr on non-HSM files
+Link:       https://jira.whamcloud.com/browse/LU-21309
+Type:       Improvement
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   HeonJe Lee
+Created:    Tue, 24 Nov 2026 06:30:42 +0000
+Updated:    Tue, 24 Nov 2026 09:14:39 +0000
+
+--- Description ---
+Since 2.8 (Gerrit 15541, LU-6817) the "HSM set dirty failed: rc2 = -22" message was lowered to D_INFO, because the RPC was considered a rare race (concurrent append + truncate on a never-archived file).
+
+Measurements show the RPC itself is not rare at all. It is sent deterministically for the common sequence "write, then any non-size setattr before close", exactly once per setattr, for every regular file, including files on filesystems that do not use HSM at all.
+
+Environment
+
+	2-node Lustre, ZFS OSD, RHEL 8.10 kernel 4.18.0-553
+
+	client and server 2.15.91 (built from the release tag)
+
+	client behavior re-verified on master 2.17.62 (client-only, against the 2.15.91 server); the relevant source is identical in the v2_15_8 line, 2.15.91 and master (ll_setattr_raw() LLIF_DATA_MODIFIED block, vvp_io write fini / setattr fini, llite_mmap fault)
+
+Reproduction (counters: client /sys/kernel/debug/lustre/mdc/*/stats, server mds.MDS.mdt.stats; 33 cases x 2 rounds x 3 mount environments, zero mismatches)
+
+Sent (exactly 1 MDS_HSM_STATE_SET each):
+
+	chmod / fchmod after a write, before close
+
+	utimes family: futimens (explicit times / UTIME_NOW), utimensat by path, atime-only, mtime-only
+
+	chown family: fchown(uid), fchown(uid,gid), fchown(gid)
+
+	unchanged by an intervening fsync or rename
+
+	triggering write kinds: buffered, 1 byte, pwrite, O_DIRECT, mmap(MAP_SHARED), fallocate
+
+	same for non-root (uid 65534); independent of mount options (noencrypt, noflock, nolazystatfs tested); same on both client nodes
+
+Not sent:
+
+	after close + reopen (close consumes the flag)
+
+	any ATTR_SIZE setattr (truncate smaller / same size / extend)
+
+	setxattr, chmod on a directory
+
+	a second consecutive setattr (flag consumed once)
+
+Server-side cross-check: N write->chmod->close sequences produce exactly N mds_hsm_state_set receipts (100/100 in a dedicated window; chmod without a prior write: 0/100). The server rejects HS_DIRTY on a file without HS_EXISTS with -EINVAL (same condition as LU-20118). On a file with HS_EXISTS the same RPC succeeds and sets HS_DIRTY (states 0x3 / 0xb observed), so the RPC is only meaningful for HSM-managed files.
+
+Impact: one extra synchronous RPC (queued and waited inside the setattr path, ptlrpc_queue_wait) per setattr on files with uncommitted writes, which is the common case on non-HSM filesystems. On a low-latency LAN rig this adds 0.07-0.20 ms median per setattr; it scales with RTT on long-haul mounts.
+
+Possible direction (for discussion): skip the RPC when the client knows the file is not HSM-managed (no HS_EXISTS / HS_RELEASED), or restrict it to the restored-file case this was originally meant to cover. LU-21127 (Gerrit 70677) is currently reworking LLIF_DATA_MODIFIED handling on close, so a change here should be coordinated with it.
+
+--- Comment (gerrit, Tue, 24 Nov 2026 09:14:39 +0000) ---
+"파랑새 " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71365
+
+Subject: LU-21309 llite: avoid extra HSM RPC on setattr after write
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 0a84d8ad577386ecc5fbbf6276a3cb239b8811f4

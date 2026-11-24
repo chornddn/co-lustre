@@ -1,0 +1,147 @@
+Change:     71347
+Subject:    LU-21305 osc: end page writeback at commit, not at reply
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71347
+Change-Id:  Ib4b00b241e3a333076d1e4411141f6a6913559f4
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Patrick Farrell
+Created:    2026-11-23 21:04:13.000000000
+Updated:    2026-11-24 15:55:53.000000000
+Patch Set:  3
+Insertions: +448
+Deletions:  -15
+Comments:   14 (7 unresolved)
+Hashtags:   pw_own
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: -1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre, patrick bot
+  REVIEWER: Andreas Dilger, Qian Yingjin, wangdi
+
+--- Commit Message ---
+LU-21305 osc: end page writeback at commit, not at reply
+
+A bulk write leaves its pages pinned until the target commits it,
+but their writeback ended at the reply, so reclaim and dirty
+throttling saw clean page cache they could not free. With the
+multi-gen LRU, memcg reclaim never wakes the flushers for such
+pages, nothing forces a commit, and writers in a small cgroup are
+OOM-killed inside the target's commit interval.
+
+Keep page writeback set until the commit, as NFS does for unstable
+pages: the write reply records the page cache folios of an
+uncommitted bulk write, and the commit callback ends their
+writeback. Lustre's own node-level unstable accounting is skipped
+for them, since writeback accounting (node, memcg and wb) now
+covers them.
+
+Waiters for writeback that need the data committed (truncate and
+fallocate dropping page cache, fsync, sync(2), syncfs, and a writer
+over its dirty limit once a pipeline of RPCs is uncommitted) ask
+for the commit first, through a reclaim sync that keeps one in
+flight per target. A kick refused while a sync is in flight is sent
+when that sync completes. fsync now waits for writeback after its
+sync, and Lustre gains a sync_fs.
+
+Owners of a page (a lock cancel discarding it, a rewrite,
+page_mkwrite) never needed the commit, since the request keeps the
+page for replay. They end the held writeback before waiting. If
+the write has no reply yet, they mark the page so that the reply
+does not hold it.
+
+osc_wb_until_commit (module parameter, default on) switches it.
+
+With the multi-gen LRU on, 4 cgroups of 4 writers on one OST and
+memory.max 256M or 512M, OOM kills go from 11-16 per run to none.
+
+Assisted-by: ClaudeCode:claude-opus-5-5
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Change-Id: Ib4b00b241e3a333076d1e4411141f6a6913559f4
+
+--- Review History ---
+
+--- Message (Patrick Farrell, 2026-11-23 21:04:13.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Patrick Farrell, 2026-11-23 21:04:41.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 21:08:13.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 21:10:10.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Patrick Farrell, 2026-11-23 21:43:55.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-23 21:45:48.000000000) ---
+Hashtag added: pw_own
+
+--- Message (jenkins, 2026-11-23 21:48:10.000000000) ---
+Patch Set 1: Verified-1
+
+Build Failed 
+
+https://build.whamcloud.com/job/lustre-reviews/137604/ : FAILURE
+
+--- Message (patrick bot, 2026-11-23 21:56:34.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (patrick bot, 2026-11-23 21:56:36.000000000) ---
+Patch Set 3: Commit message was updated.
+
+--- Message (patrick bot, 2026-11-23 21:56:50.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-23 21:57:34.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 22:01:11.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (patrick bot, 2026-11-24 13:37:25.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-24 14:49:43.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-24 15:55:53.000000000) ---
+Patch Set 3:
+
+(7 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns, see inline comments. The main one is that several kernel-side waiters for page writeback never ask for the commit, so they now wait until the client next learns of a commit. The patch also adds no test: could a sanity/sanityn case check that writeback stays set until commit and is released by an owner, a truncate and an unlink?

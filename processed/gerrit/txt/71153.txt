@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Sunghwan Kim
 Created:    2026-11-19 03:25:15.000000000
-Updated:    2026-11-23 14:12:00.000000000
-Patch Set:  3
-Insertions: +454
-Deletions:  -21
-Comments:   11 (4 unresolved)
+Updated:    2026-11-24 15:50:30.000000000
+Patch Set:  4
+Insertions: +577
+Deletions:  -40
+Comments:   17 (0 unresolved)
 Hashtags:   pw_shepherd
 
 --- Labels ---
@@ -37,14 +37,15 @@ space for the deleted ID. The master rejects the request with
 writes. This can degrade I/O or result in ENOSPC.
 
 Record the IDs returned during global index reintegration in
-qsd_reint_index(). In qsd_reint_prune(), remove the local entries
-that were not returned and have a limit or use the default quota;
-other entries enforce nothing and are kept. Mark the lqe of each
-removed ID deleted, as on the master: not enforced, edquot
-cleared, and not following the default quota. Set these flags
-directly instead of calling lqe_set_deleted(): on a slave lqe, its
-writes to the master limits overwrite lqe_qtune, lqe_lockh and
-lqe_pending_write, which share the same union.
+qsd_reint_index(). qsd_reint_stale() finds the local entries that
+were not returned and have a limit or use the default quota, and
+qsd_reint_prune() removes them; other entries enforce nothing and
+are kept. Mark the lqe of each removed ID deleted, as on the
+master: not enforced, edquot cleared, and not following the
+default quota. Set these flags directly instead of calling
+lqe_set_deleted(): on a slave lqe, its writes to the master limits
+overwrite lqe_qtune, lqe_lockh and lqe_pending_write, which share
+the same union.
 
 The default quota update in qsd_entry_def_iter_cb() can run
 concurrently with the pruning, so check lqe_is_default under the
@@ -53,10 +54,30 @@ quota when its record uses it, instead of leaving the lqe
 unchanged. Otherwise a removed ID restored to the default quota
 stays unenforced when the slave gets the record from a
 reintegration. Set the lqe flags there under the lqe lock as well,
-and read the default limits inside it.
+and read the default limits inside it. Clear lqe_is_deleted there
+too, as qmt_set() does on the master when a deleted ID gets a limit
+again.
 
-If the index version changes during the transfer, transfer the
-index once more, which repeats the whole transfer. Skip pruning if
+Since LU-15283, qsd_updating delays the start of a reintegration
+while the writeback thread applies the updates it has dequeued, but
+only on ldiskfs. On ZFS, an update dequeued before a reintegration
+starts can complete after the index transfer. It then marks the
+global index up to date and kicks off the deferred updates that
+follow it. So an ID set on the master after the transfer can be
+written to the global index copy before the pruning, which then
+removes it as stale and stops enforcing its limit. Set qsd_updating
+on ZFS too: a reintegration now waits for the dequeued updates to
+be applied, as on ldiskfs. A reintegration delayed this way is
+started again by the writeback thread, which can take up to
+QSD_WB_INTERVAL (60 seconds) when it has nothing else to do. The
+writeback thread on ZFS still doesn't wait for a running
+reintegration.
+
+If the index version changes during the transfer, look for stale
+entries with qsd_reint_stale(), and transfer the index once more
+only if it finds some or fails, which repeats the whole transfer.
+Without stale entries there is nothing to prune, so a change of
+the index alone does not cost a second transfer. Skip pruning if
 the version changes again, if the transfer is incomplete, or if
 collecting the IDs failed; in the last case, don't transfer again.
 Preserve ID 0. Entries left by a skipped or failed pruning stay
@@ -188,3 +209,46 @@ Patch Set 3: Verified+1
 Build Successful 
 
 https://build.whamcloud.com/job/lustre-reviews/137538/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-23 19:03:38.000000000) ---
+Patch Set 3:
+
+Looks good to me.
+
+--- Message (Sunghwan Kim, 2026-11-24 06:02:27.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-24 06:05:50.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (Sunghwan Kim, 2026-11-24 06:12:21.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-24 06:13:02.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (Sunghwan Kim, 2026-11-24 06:13:33.000000000) ---
+Patch Set 4:
+
+(4 comments)
+
+--- Message (jenkins, 2026-11-24 06:26:10.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137646/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-24 15:50:30.000000000) ---
+Patch Set 4:
+
+(1 comment)

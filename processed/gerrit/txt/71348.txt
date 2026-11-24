@@ -1,0 +1,99 @@
+Change:     71348
+Subject:    LU-6654 osd-ldiskfs: do not keep iobuf wait queue in the iobuf
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71348
+Change-Id:  I4d70b86360b79eb65eb99bc6c99e8052c0961262
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Hiroshi Nishida
+Created:    2026-11-23 21:14:32.000000000
+Updated:    2026-11-24 14:46:52.000000000
+Patch Set:  1
+Insertions: +32
+Deletions:  -10
+Comments:   1 (0 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Andreas Dilger, Gerrit AI review for Lustre
+  REVIEWER: Alex Zhuravlev, Artem Blagodarenko
+
+--- Commit Message ---
+LU-6654 osd-ldiskfs: do not keep iobuf wait queue in the iobuf
+
+osd_bio_fini() drops dr_numreqs to 0 and then calls
+wake_up(&iobuf->dr_wait).  The service thread waiting in
+osd_trans_stop() or osd_do_bio() checks dr_numreqs without the wait
+queue lock, and finish_wait() does not take the lock either once
+autoremove_wake_function() has removed the entry.  So the service
+thread can see 0 and move on while the completion side still holds
+dr_wait.lock: its next request re-initializes the iobuf, and
+init_waitqueue_head() writes 0 into the held spinlock, or the service
+thread exits and osd_key_fini() frees the osd_thread_info that holds
+the iobuf.
+
+With paravirt spinlocks on KVM guests the first case shows up as
+  pvqspinlock: lock 0x... has corrupted value 0x0!
+  WARNING: ... __pv_queued_spin_unlock_slowpath
+  __wake_up+0x44/0x60
+  osd_bio_fini+0x47/0x70 [osd_ldiskfs]
+under sustained OST write load.  The second case is the freed-memory
+GPF in __wake_up_common() of the original LU-6654 report.
+
+Remove dr_wait and wait with ___wait_var_event() on &dr_numreqs, woken
+by wake_up_var().  The hashed variable wait queues are static, and the
+completion side only uses the address of dr_numreqs as a key, so it
+no longer touches the iobuf after the decrement.  The waiter keeps the
+lockless fast path for transactions without data I/O, reads the
+counter with acquire semantics so the later dr_error/dr_elapsed loads
+are ordered after it, and still sleeps in io_schedule() so the time is
+accounted as iowait.
+
+Fixes: 67076c3c7e2b ("LU-911 osd: zerocopy methods in ldiskfs osd")
+Signed-off-by: Hiroshi Nishida <hnishida@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5
+Change-Id: I4d70b86360b79eb65eb99bc6c99e8052c0961262
+
+--- Review History ---
+
+--- Message (Hiroshi Nishida, 2026-11-23 21:14:32.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 21:17:53.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 21:26:23.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-23 21:45:06.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137605/ : SUCCESS
+
+--- Message (Autotest, 2026-11-24 07:43:30.000000000) ---
+Patch Set 1:
+
+Onyx Autotest 2 retesting enforced review-zfs session on el8.10-x86_64/zfs servers and clients for build 137605 patch 1. Requested by Hiroshi Nishida because of LU-21223.
+
+--- Message (Alex Zhuravlev, 2026-11-24 10:14:37.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Gerrit AI review for Lustre, 2026-11-24 14:41:41.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (patrick bot, 2026-11-24 14:46:52.000000000) ---
+Hashtag added: pw_shepherd

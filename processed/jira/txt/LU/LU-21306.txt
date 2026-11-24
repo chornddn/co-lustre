@@ -1,0 +1,73 @@
+Key:        LU-21306
+Summary:    lmv: encrypted op_name leaks on getattr-by-FID retries
+Link:       https://jira.whamcloud.com/browse/LU-21306
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Andreas Dilger
+Reporter:   Andreas Dilger
+Created:    Mon, 23 Nov 2026 21:31:41 +0000
+Updated:    Mon, 23 Nov 2026 21:56:36 +0000
+
+--- Description ---
+In an encrypted directory, ll_prep_md_op_data() stores a kmalloc'd encoded name from ll_setup_filename() in op_data->op_name and sets MF_OPNAME_KMALLOCED, so that ll_finish_md_op_data() frees it.  Two places in LMV set op_data->op_name = NULL (and op_namelen = 0) before sending a by-FID request, and never put it back.  ll_finish_md_op_data() then does kfree(NULL) and the encoded name leaks:
+
+	lmv_intent_lookup(), for MF_GETATTR_BY_FID: ll_inode_revalidate() sets this flag (with OBD_CONNECT2_GETATTR_PFID) for every revalidate of an inode whose dentry has a parent.  So every stat() or getattr RPC of a file in an encrypted directory, when no cached lock covers it, leaks 32 bytes.
+
+	lmv_getattr_name(), when the MDT replies with OBD_MD_MDS (the entry is on another MDT) and LMV retries the getattr by FID.  This is reached through ll_lov_getstripe_ea_info() (IOC_MDC_GETFILESTRIPE / IOC_MDC_GETFILEINFO, used by lfs find/getstripe) and ll_get_fid_by_name() for a remote entry in an encrypted directory.
+
+Reproduced on master v2_17_62 (rocky10 aarch64, 2 MDTs, 2 OSTs, booted with kmemleak=on), client mounted with -o test_dummy_encryption:
+
+mkdir /mnt/lustre/enc                    # on MDT0
+lfs mkdir -i 1 /mnt/lustre/enc/remote
+touch /mnt/lustre/enc/file
+
+# 100 x stat with locks dropped:        100 leaked objects
+for i in $(seq 100); do
+        lctl set_param -n ldlm.namespaces.*mdc*.lru_size=clear
+        stat /mnt/lustre/enc/file > /dev/null
+done
+
+# 100 x ioctl(enc_fd, IOC_MDC_GETFILESTRIPE, "remote"): 100 leaked objects
+# 100 x ioctl(enc_fd, IOC_MDC_GETFILESTRIPE, "file"):     0 leaked objects
+
+unreferenced object 0xffff163be21aab40 (size 32):
+  comm "getstripe_name", pid 10479, jiffies 4294990642
+  backtrace (crc 12fc2ee9):
+    kmemleak_alloc+0xb8/0xe0
+    __kmalloc_noprof+0x34c/0x440
+    ll_digest_long_name+0xf4/0x270 [lustre]
+    ll_setup_filename+0x90/0x1b0 [lustre]
+    ll_prep_md_op_data+0x1c8/0x740 [lustre]
+    ll_lov_getstripe_ea_info+0xd4/0x8b0 [lustre]
+    ll_dir_ioctl+0x1674/0x49f8 [lustre]
+
+unreferenced object 0xffff163be21aa160 (size 32):
+  comm "stat", pid 10530, jiffies 4294992564
+  backtrace (crc cc81bd4b):
+    kmemleak_alloc+0xb8/0xe0
+    __kmalloc_noprof+0x34c/0x440
+    ll_digest_long_name+0xf4/0x270 [lustre]
+    ll_setup_filename+0x90/0x1b0 [lustre]
+    ll_prep_md_op_data+0x1c8/0x740 [lustre]
+    ll_inode_revalidate.constprop.0+0x288/0x518 [lustre]
+    ll_getattr_dentry+0xdc/0xb88 [lustre]
+    ll_getattr+0x30/0x50 [lustre]
+
+The name buffer is allocated with kmalloc() and not OBD_ALLOC(), so the Lustre memory leak check at module unload does not catch it.  Only kmemleak shows it.
+
+Fix: LMV should restore op_name/op_namelen before returning from these functions, so the caller can free the buffer.
+
+--- Comment (gerrit, Mon, 23 Nov 2026 21:56:36 +0000) ---
+"Andreas Dilger " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71352
+
+Subject: LU-21306 lmv: keep encrypted op_name for the caller to free
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4d2ee91f2ff4fe135543a9d2659717463a159747

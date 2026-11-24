@@ -1,0 +1,80 @@
+Key:        LU-21307
+Summary:    o2iblnd: kiblnd_shutdown hangs after a RoCE GID is deleted under a live connection
+Link:       https://jira.whamcloud.com/browse/LU-21307
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Tue, 24 Nov 2026 04:07:04 +0000
+Updated:    Tue, 24 Nov 2026 04:58:55 +0000
+Links:      Related: is related to  LU-16283
+
+--- Description ---
+Problem
+
+On RoCEv2, lnetctl lnet unconfigure and lustre_rmmod can hang forever in kiblnd_shutdown(). The trigger is a local IP address that goes away while an o2ib connection uses it. The hang occurs when ko2iblnd closes that connection later.
+
+kiblnd_close_conn_locked()) Closing conn ... to 10.99.0.2@o2ib: error -5(waiting)
+kiblnd_shutdown()) 10.99.0.1@o2ib: waiting for 1 peers to disconnect
+
+The message repeats until a restart of the node.
+
+Cause
+
+On RoCE, the GID table follows the IP addresses of the netdev. When the IP address goes away, the RDMA core deletes the RoCEv2 GID that the established connection uses. The connection still holds a reference to the deleted GID entry.
+
+When ko2iblnd closes the connection, kiblnd_disconnect_conn() calls rdma_disconnect(). ib_cm cannot send the DREQ:
+
+	cm_send_dreq_locked() calls cm_alloc_msg(), which calls rdma_create_ah().
+
+	For a RoCEv2 GID with a non-zero flow label, rdma_lag_get_ah_roce_slave() reads the GID netdev. The GID entry is no longer valid, so it returns -EINVAL.
+
+	cm_send_dreq_locked() moves the ib_cm id to timewait and returns the error. It gives no event.
+
+	rdma_disconnect() ignores the error.
+
+	cma_ib_handler() later drops IB_CM_TIMEWAIT_EXIT, because the rdma_cm state is still RDMA_CM_CONNECT.
+
+ko2iblnd drops the last connection reference only in the RDMA_CM_EVENT_DISCONNECTED handler. That event never comes, so ko2iblnd never frees the connection and its peer, and kiblnd_shutdown() waits for ibn_npeers to reach 0 forever.
+
+The RDMA core code is the same upstream and in MLNX_OFED 24.10. ko2iblnd on master has the same gap. On InfiniBand the GIDs do not follow IP addresses, so this trigger is RoCE-specific. Any other cause of a lost DISCONNECTED event gives the same hang.
+
+Reproduction
+
+Two rocky9 VMs (kernel 5.14.0-611.55.1.el9_7, inbox RDMA), Lustre master 2.17.62, Soft-RoCE rxe0 on eth0. The o2ib NI uses a secondary IP address.
+
+	On each node: ip addr add 10.99.0.N/24 dev eth0 label eth0:1, rdma link add rxe0 type rxe netdev eth0, lnetctl lnet configure, lnetctl net add --net o2ib --if eth0:1.
+
+	On node 1: lnetctl ping 10.99.0.2@o2ib. The connection is established.
+
+	On node 1: ip addr del 10.99.0.1/24 dev eth0, then ip addr add 10.99.0.1/24 dev eth0 label eth0:1.
+
+	On node 1: lnetctl ping 10.99.0.2@o2ib. The ping fails, and ko2iblnd closes the connection with -EIO.
+
+	On node 1: lnetctl lnet unconfigure.
+
+Without step 3, unconfigure completes in about 1 s. With step 3, it hung in 2 of 2 runs. Kretprobes in the second run show where the DREQ fails:
+
+cm_disconnect: cm.id=1 src=10.99.0.1:1023 dst=10.99.0.2:987
+lagret: (rdma_create_ah 
+
+Proposed fix
+
+ko2iblnd must not wait forever for RDMA_CM_EVENT_DISCONNECTED. After rdma_disconnect(), put the connection on a list that connd checks on each tick. If the event has not come after the LND timeout, connd drops the CM reference itself. The event handler and connd each take an explicit claim under kib_global_lock. Only the one that gets the claim drops the reference. rdma_destroy_id() in kiblnd_destroy_conn() handles an ib_cm id in any state.
+
+: waiting for  peers to disconnect" class="issue-link" data-issue-key="LU-16283">LU-16283 reports the same kiblnd_shutdown() wait on a router, with no root cause. A timeout on the DISCONNECTED wait may also bound that hang.
+
+--- Comment (gerrit, Tue, 24 Nov 2026 04:58:55 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71363
+
+Subject: LU-21307 o2iblnd: bound the wait for DISCONNECTED
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 06610e89616d56626465f2548a09d5fb6057262a

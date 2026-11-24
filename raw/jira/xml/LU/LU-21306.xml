@@ -1,0 +1,113 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21306] lmv: encrypted op_name leaks on getattr-by-FID retries</title>
+                <link>https://jira.whamcloud.com/browse/LU-21306</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;In an encrypted directory, ll_prep_md_op_data() stores a kmalloc'd encoded name from ll_setup_filename() in op_data-&amp;gt;op_name and sets MF_OPNAME_KMALLOCED, so that ll_finish_md_op_data() frees it.  Two places in LMV set op_data-&amp;gt;op_name = NULL (and op_namelen = 0) before sending a by-FID request, and never put it back.  ll_finish_md_op_data() then does kfree(NULL) and the encoded name leaks:&lt;/p&gt;
+
+&lt;ul&gt;
+	&lt;li&gt;lmv_intent_lookup(), for MF_GETATTR_BY_FID: ll_inode_revalidate() sets this flag (with OBD_CONNECT2_GETATTR_PFID) for every revalidate of an inode whose dentry has a parent.  So every stat() or getattr RPC of a file in an encrypted directory, when no cached lock covers it, leaks 32 bytes.&lt;/li&gt;
+	&lt;li&gt;lmv_getattr_name(), when the MDT replies with OBD_MD_MDS (the entry is on another MDT) and LMV retries the getattr by FID.  This is reached through ll_lov_getstripe_ea_info() (IOC_MDC_GETFILESTRIPE / IOC_MDC_GETFILEINFO, used by lfs find/getstripe) and ll_get_fid_by_name() for a remote entry in an encrypted directory.&lt;/li&gt;
+&lt;/ul&gt;
+
+
+&lt;p&gt;Reproduced on master v2_17_62 (rocky10 aarch64, 2 MDTs, 2 OSTs, booted with kmemleak=on), client mounted with -o test_dummy_encryption:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;mkdir /mnt/lustre/enc                    # on MDT0
+lfs mkdir -i 1 /mnt/lustre/enc/remote
+touch /mnt/lustre/enc/file
+
+# 100 x stat with locks dropped:        100 leaked objects
+for i in $(seq 100); do
+        lctl set_param -n ldlm.namespaces.*mdc*.lru_size=clear
+        stat /mnt/lustre/enc/file &amp;gt; /dev/null
+done
+
+# 100 x ioctl(enc_fd, IOC_MDC_GETFILESTRIPE, "remote"): 100 leaked objects
+# 100 x ioctl(enc_fd, IOC_MDC_GETFILESTRIPE, "file"):     0 leaked objects
+
+unreferenced object 0xffff163be21aab40 (size 32):
+  comm "getstripe_name", pid 10479, jiffies 4294990642
+  backtrace (crc 12fc2ee9):
+    kmemleak_alloc+0xb8/0xe0
+    __kmalloc_noprof+0x34c/0x440
+    ll_digest_long_name+0xf4/0x270 [lustre]
+    ll_setup_filename+0x90/0x1b0 [lustre]
+    ll_prep_md_op_data+0x1c8/0x740 [lustre]
+    ll_lov_getstripe_ea_info+0xd4/0x8b0 [lustre]
+    ll_dir_ioctl+0x1674/0x49f8 [lustre]
+
+unreferenced object 0xffff163be21aa160 (size 32):
+  comm "stat", pid 10530, jiffies 4294992564
+  backtrace (crc cc81bd4b):
+    kmemleak_alloc+0xb8/0xe0
+    __kmalloc_noprof+0x34c/0x440
+    ll_digest_long_name+0xf4/0x270 [lustre]
+    ll_setup_filename+0x90/0x1b0 [lustre]
+    ll_prep_md_op_data+0x1c8/0x740 [lustre]
+    ll_inode_revalidate.constprop.0+0x288/0x518 [lustre]
+    ll_getattr_dentry+0xdc/0xb88 [lustre]
+    ll_getattr+0x30/0x50 [lustre]
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;The name buffer is allocated with kmalloc() and not OBD_ALLOC(), so the Lustre memory leak check at module unload does not catch it.  Only kmemleak shows it.&lt;/p&gt;
+
+&lt;p&gt;Fix: LMV should restore op_name/op_namelen before returning from these functions, so the caller can free the buffer.&lt;/p&gt;</description>
+                <environment />
+        <key id="100800">LU-21306</key>
+            <summary>lmv: encrypted op_name leaks on getattr-by-FID retries</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="adilger">Andreas Dilger</assignee>
+                                    <reporter username="adilger">Andreas Dilger</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 23 Nov 2026 21:31:41 +0000</created>
+                <updated>Mon, 23 Nov 2026 21:56:36 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506684" author="gerrit" created="Mon, 23 Nov 2026 21:56:36 +0000">&lt;p&gt;"Andreas Dilger &amp;lt;adilger@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71352" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71352&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21306" title="lmv: encrypted op_name leaks on getattr-by-FID retries" class="issue-link" data-issue-key="LU-21306"&gt;LU-21306&lt;/a&gt; lmv: keep encrypted op_name for the caller to free&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 4d2ee91f2ff4fe135543a9d2659717463a159747&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073uv:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

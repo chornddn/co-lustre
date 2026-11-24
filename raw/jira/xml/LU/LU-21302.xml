@@ -1,0 +1,123 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21302] nodemap: after ban and unban, client keeps OST extent lock the server dropped and gets ESTALE on that object</title>
+                <link>https://jira.whamcloud.com/browse/LU-21302</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;When a client NID is banned with &lt;tt&gt;lctl nodemap_ban&lt;/tt&gt;, the OST drops the client's extent lock on an object, but the client keeps its copy of the lock. After &lt;tt&gt;lctl nodemap_unban&lt;/tt&gt;, the client sends OST_WRITE and OST_PUNCH for that object with the old lock. The OST cannot find the lock and returns -ESTALE (&lt;tt&gt;ofd_rw_hpreq_check()&lt;/tt&gt; in &lt;tt&gt;ofd_dev.c&lt;/tt&gt;). Nothing on the client releases the lock, so every write to the file fails with "Stale file handle" until the lock LRU is cleared or the client remounts.&lt;/p&gt;
+
+&lt;p&gt;The unban itself works: the MDT and other objects accept the client again. Only objects whose locks the server dropped stay broken.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="HowIproducedit%3A"&gt;&lt;/a&gt;How I produced it:&lt;/h3&gt;
+
+&lt;p&gt;Version: 2.14.0_ddn266. Tenant nodemap with one client NID, 2 HA pairs, 16 OSTs. After the ban / unban operations:&lt;/p&gt;
+
+&lt;ol&gt;
+	&lt;li&gt;On the client, write a file every 2 s: &lt;tt&gt;while true; do date &amp;gt; /mnt/lustre/heartbeat; sleep 2; done&lt;/tt&gt;&lt;/li&gt;
+	&lt;li&gt;On the MGS: &lt;tt&gt;lctl nodemap_ban&lt;/tt&gt; the client NID. Writes fail with "Operation not permitted".&lt;/li&gt;
+	&lt;li&gt;On the MGS: &lt;tt&gt;lctl nodemap_unban&lt;/tt&gt; the client NID.&lt;/li&gt;
+	&lt;li&gt;After about 8 s, writes fail with "Stale file handle" and do not recover (I saw this for more than 20 minutes).&lt;/li&gt;
+&lt;/ol&gt;
+
+
+&lt;p&gt;It is intermittent. It occurs when the ban arrives while the client holds a cached extent lock on the object. In another run, writes recovered about 6 s after the unban.&lt;/p&gt;
+&lt;h3&gt;&lt;a name="EvidencefrommyBDDrun"&gt;&lt;/a&gt;Evidence from my BDD run&lt;/h3&gt;
+
+&lt;p&gt;Client console:&lt;/p&gt;
+&lt;div class="preformatted panel" style="border-width: 1px;"&gt;&lt;div class="preformattedContent panelContent"&gt;
+&lt;pre&gt;Lustre: This client was banned by administrative request for file system fs. All requests will get Operation not permitted.
+LustreError: 11-0: fs-OST000d-osc-ff25dca2b200e800: operation ost_write to node 10.73.20.17@tcp1 failed: rc = -116
+LustreError: 11-0: fs-OST000d-osc-ff25dca2b200e800: operation ost_punch to node 10.73.20.17@tcp1 failed: rc = -116
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+
+&lt;p&gt;Every server logs "nodemap acme banning client" and later "nodemap acme un-banned client" for this client.&lt;/p&gt;
+
+&lt;p&gt;20 minutes after the unban:&lt;/p&gt;
+&lt;div class='table-wrap'&gt;
+&lt;table class='confluenceTable'&gt;&lt;tbody&gt;
+&lt;tr&gt;
+&lt;th class='confluenceTh'&gt;Where&lt;/th&gt;
+&lt;th class='confluenceTh'&gt;Result&lt;/th&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;OSS: {
+&lt;div class="error"&gt;&lt;span class="error"&gt;Unknown macro: {ldlm.namespaces.filter-fs-OST000d_UUID.lock_count}&lt;/span&gt; &lt;/div&gt;
+&lt;p&gt;}&lt;/p&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;0&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Client: {
+&lt;div class="error"&gt;&lt;span class="error"&gt;Unknown macro: {ldlm.namespaces.fs-OST000d-osc-*.lock_count}&lt;/span&gt; &lt;/div&gt;
+&lt;p&gt;}&lt;/p&gt;&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;1&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td class='confluenceTd'&gt;Client: &lt;tt&gt;lctl set_param ldlm.namespaces.&lt;b&gt;osc&lt;/b&gt;.lru_size=clear&lt;/tt&gt;, then write&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;lock_count 0, write succeeds&lt;/td&gt;
+&lt;td class='confluenceTd'&gt;  &lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;&lt;/table&gt;
+&lt;/div&gt;
+
+
+
+&lt;h3&gt;&lt;a name="Expected"&gt;&lt;/a&gt;Expected&lt;/h3&gt;
+
+&lt;p&gt;After the unban, the client can use all objects again with no manual action. Either the server cancels the lock in a way the client sees, or the client drops a lock that the OST rejects with -ESTALE.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Workaround"&gt;&lt;/a&gt;Workaround&lt;/h3&gt;
+
+&lt;p&gt;On the client: &lt;tt&gt;lctl set_param ldlm.namespaces.&lt;b&gt;osc&lt;/b&gt;.lru_size=clear&lt;/tt&gt;, or remount.&lt;/p&gt;
+
+&lt;h3&gt;&lt;a name="Possiblyrelated"&gt;&lt;/a&gt;Possibly related&lt;/h3&gt;
+
+&lt;p&gt;When a ban does not change the export's nodemap, &lt;tt&gt;nm_member_revoke_locks()&lt;/tt&gt; revokes only MDT exports, and &lt;tt&gt;tgt_handler.c&lt;/tt&gt; rejects LDLM_CANCEL from banned exports. So the client cannot cancel the OST lock while banned, and the server drops it on its side only.&lt;/p&gt;</description>
+                <environment />
+        <key id="100795">LU-21302</key>
+            <summary>nodemap: after ban and unban, client keeps OST extent lock the server dropped and gets ESTALE on that object</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="wc-triage">WC Triage</assignee>
+                                    <reporter username="wcjohnso">Will Johnson</reporter>
+                        <labels>
+                    </labels>
+                <created>Mon, 23 Nov 2026 19:01:00 +0000</created>
+                <updated>Mon, 23 Nov 2026 19:01:00 +0000</updated>
+                                            <version>Lustre 2.14.0</version>
+                                                        <due />
+                            <votes>0</votes>
+                                    <watches>1</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073tr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

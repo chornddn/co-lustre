@@ -7,15 +7,19 @@ Branch:     master
 Status:     NEW
 Owner:      Timothy Day
 Created:    2026-11-23 15:25:32.000000000
-Updated:    2026-11-23 15:28:42.000000000
-Patch Set:  1
-Insertions: +104
-Deletions:  -207
-Comments:   1 (0 unresolved)
+Updated:    2026-11-24 15:04:57.000000000
+Patch Set:  2
+Insertions: +132
+Deletions:  -211
+Comments:   7 (0 unresolved)
 
 --- Labels ---
   Code-Review: (no votes)
-  Verified: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Andreas Dilger
+  REVIEWER: Alex Zhuravlev, Patrick Farrell
 
 --- Commit Message ---
 LU-21139 ptlrpc: run the ping evictor from a workqueue
@@ -27,9 +31,13 @@ can start several evictor threads, or leave a thread that never
 exits.  ping_evictor_stop() does not wait for the thread, so a new
 start can also reinitialize pet_waitq while the old thread uses it.
 
-Replace the thread with a work item in each obd_device, queued on
-system_long_wq by obd_export_timed_evict().  The work holds a
+Replace the thread with a work item in each obd_device, queued by
+obd_export_timed_evict() on a new obd_evict workqueue, which is
+WQ_MEM_RECLAIM since eviction frees memory.  The work holds a
 reference on the obd, so nothing has to be started or stopped.
+class_cleanup() cancels pending work, and the work does nothing once
+the obd is stopping.  Like the thread, the work unshares its fs_struct
+so osd_create() does not change the umask of init_fs.
 Remove ping_evictor_start(), ping_evictor_stop(), their callers and
 the global list of obds.  The evictor moves to obdclass, next to the
 export deadline tree that it walks.  Devices are no longer evicted
@@ -40,8 +48,16 @@ ptlrpc_update_export_timer() now queues the work only if an export
 has timed out.  It used to wake the evictor on every deadline
 update while obd_eviction_timer was zero.
 
-Test-Parameters: ignore
+Since no lu_env is kept between evictions, mdd, osp and mdt are no
+longer pinned by an evictor thread that was never stopped, which
+made rmmod fail with "Module mdd is in use" in sanity-sec test_31
+(LU-21149).
+
+Test-Parameters: mdscount=2 mdtcount=4 testlist=recovery-small env=ONLY=161,ONLY_REPEAT=10
+Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity-sec env=ONLY=31,ONLY_REPEAT=10
 Signed-off-by: Timothy Day <timday@thelustrecollective.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: I89a6eb1b793bc8706c237260ecd7dbc16a6a6964
 
 --- Review History ---
@@ -61,3 +77,74 @@ For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelin
 Patch Set 1:
 
 Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-23 16:35:11.000000000) ---
+Patch Set 1: Verified-1
+
+No Builds Executed 
+
+https://build.whamcloud.com/job/lustre-reviews/137577/ : NOT_BUILT
+
+--- Message (Andreas Dilger, 2026-11-24 03:07:17.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-24 08:07:01.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-24 08:07:36.000000000) ---
+Patch Set 2:
+
+PS2 vs PS1, from a local review:
+- Queue the work on a new "obd_evict" workqueue (WQ_MEM_RECLAIM | WQ_UNBOUND) created with zombie_wq at obdclass init, instead of system_long_wq.
+- Call unshare_fs_struct() at the start of the work, as the old thread did, so osd_create() saving/zeroing current->fs->umask can't touch the init_fs shared by all kworkers. Unbound kworkers are shared between workqueues, so there is no per-worker init hook; after the first run on a kworker it is just a check.
+- class_cleanup() now does cancel_work_sync() after setting OBDF_STOPPING and drops the "evictor" ref if work was pending; the work skips eviction once the obd is stopping.
+- Dropped the stale ping_evictor_main entry from crash-find-unique-traces.awk.
+- The env-setup CERROR is already rate limited (CERROR is CDEBUG_LIMIT), so that is unchanged.
+- Commit message names LU-21149 and has real Test-Parameters in place of "ignore".
+
+Tested locally (rocky9 aarch64, 4 MDT/4 OST): recovery-small 10a 11 18b 24b 58 59 66 108 146 153 161 all pass, and modules unload cleanly with no LBUG. On a 2-node cluster sanity-sec test_31 passes, and mdd/mdt/osp then unload on the server without "Module mdd is in use".
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-24 08:12:37.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-24 08:18:38.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-24 08:46:08.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137655/ : SUCCESS
+
+--- Message (Alex Zhuravlev, 2026-11-24 13:38:47.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Timothy Day, 2026-11-24 14:50:02.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-24 14:58:25.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Timothy Day, 2026-11-24 15:04:57.000000000) ---
+Patch Set 2:
+
+(1 comment)

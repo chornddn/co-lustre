@@ -1,0 +1,70 @@
+Key:        LU-21317
+Summary:    e2image -Q/-r fails for filesystems > 512 TiB: qcow2 L1 table > 2 GiB not written/read
+Link:       https://jira.whamcloud.com/browse/LU-21317
+Type:       Bug
+Priority:   Major
+Status:     Open
+Resolution: Unresolved
+Assignee:   Alexander Zarochentsev
+Reporter:   Alexander Zarochentsev
+Created:    Tue, 24 Nov 2026 16:02:40 +0000
+Updated:    Tue, 24 Nov 2026 16:09:16 +0000
+
+--- Description ---
+Problem
+For a filesystem larger than 512 TiB - 1 GiB (4 KiB blocks) the qcow2 L1 table exceeds 0x7ffff000 bytes (MAX_RW_COUNT, the most a single read()/write() transfers). Both the qcow2 writer and reader in e2image do a single read()/write() of the whole L1 table.
+
+	Writer (e2image -Q): output_qcow2_meta_data_blocks() passes the L1 size to generic_write(int fd, void *buf, int blocksize, ...). The size is truncated to int:
+	
+		0x7ffff000 2^31  write() fails with EFAULT, nothing written, exit 1;
+
+		size >= 2^32 (fs >= 1 PiB): truncated size may be positive -> L1 table silently written partially, exit 0, corrupted image.
+
+In all cases the L2 tables and data clusters are already written, so a large qcow2 file with a zeroed/partial L1 table is left behind.
+
+	
+	
+
+	Reader (e2image -r): qcow2_read_l1_table() gets a short read and returns stale errno, e.g.
+
+e2image: No such file or directory while trying to convert qcow2 image (fs.raw) into raw image (fs.qcow2)
+
+(the file names in the message are also swapped).
+
+Even with a fixed reader, an image with a zeroed L1 converts to an empty sparse file.
+
+Limits (max blocks = 268434944 * blocksize/8):
+
+blocksize
+max blocks
+max fs size
+
+1 KiB
+34,359,672,832
+32 TiB - 32 MiB
+
+2 KiB
+68,719,345,664
+128 TiB - 256 MiB
+
+4 KiB
+137,438,691,328
+512 TiB - 1 GiB
+
+Seen with a 513 TiB ldiskfs filesystem (137,759,705,088 4 KiB blocks, L1 table 2,152,495,392 bytes): the 334 GB qcow2 image has an all-zero L1 table and cannot be converted.
+
+Fix
+"e2image: handle qcow2 L1 table larger than 2GiB": write and read the L1 table in pieces, return EXT2_ET_SHORT_READ on short L1/L2 reads, fix the swapped file names in the qcow2-to-raw error message.
+
+--- Comment (gerrit, Tue, 24 Nov 2026 16:09:16 +0000) ---
+"Alexander Zarochentsev " uploaded a new patch: https://review.whamcloud.com/c/tools/e2fsprogs/+/71393
+
+Subject:  512 TiB: qcow2 L1 table > 2 GiB not written/read" class="issue-link" data-issue-key="LU-21317">LU-21317 e2image: handle qcow2 L1 table larger than 2GiB
+
+Project: tools/e2fsprogs
+
+Branch: master-lustre
+
+Current Patch Set: 1
+
+Commit: d11e0deff4a8d039eaaf3ce43cfe7552bbf9e80b

@@ -8,8 +8,8 @@ Resolution: Unresolved
 Assignee:   Vladimir Saveliev
 Reporter:   Vladimir Saveliev
 Created:    Wed, 23 Feb 2022 16:43:28 +0000
-Updated:    Tue, 22 Mar 2022 14:23:00 +0000
-Links:      Related: is related to  LU-14708
+Updated:    Tue, 24 Nov 2026 08:54:25 +0000
+Links:      Related: is related to  LU-5242; Related: is related to  LU-14708; Related: is related to  LU-3534; Related: is related to LU-18302
 
 --- Description ---
 exp_need_sync flag of obd_export is supposed to provide blocking of
@@ -45,3 +45,26 @@ Branch: master
 Current Patch Set: 1
 
 Commit: 80bc51e7884d270dacc2c0aeba150079ad4dec36
+
+--- Comment (adilger, Tue, 24 Nov 2026 08:53:26 +0000) ---
+This is the cause of recovery-small test_134 failures in LU-18302 (22-33% of master failover-part-1 runs in Nov 2026, also failover-zfs-part-1).
+
+In the 2026-11-22 failover-part-1 run (test set d9b8fe86), a client's first unlink on MDT0001 after remount was replied with transno 910533066780 and last_committed 0. The HARD failover came about 1s later, so the new client records in last_rcvd were never committed. MDT0000 and MDT0001 then denied all three clients as new during recovery and evicted them, so an acknowledged unlink was lost.
+
+Two places lose the th_sync that tgt_last_rcvd_update() sets from exp_need_sync:
+
+	MDT (ldiskfs and ZFS): dt_txn_hook_stop() passes th->th_top to tgt_txn_stop_cb(), so th_sync is set on the top thandle after top_trans_stop() has copied it to the sub thandle, and osd_trans_stop() only checks the sub thandle. Since c233f39a0159 (LU-3534, v2_7_54_0-42-gc233f39a0159, in 2.7.55).
+
+	osd-zfs: osd_trans_stop() reads th_sync before calling dt_txn_hook_stop(), so every sync set by the hook is ignored. Since 9b704e4088d8 (LU-5242, v2_7_53_0-27-g9b704e4088d8, in 2.7.54).
+
+OFD and OUT are not affected, since they set th_sync from exp_need_sync when the transaction is created.
+
+Verified on an ldiskfs VM with a fail_loc to switch the propagation off:
+
+	off: top th_sync=1, sub th_sync=0, and the first create after mount gets last_committed 0 (3/3)
+
+	on: sub th_sync=1, and last_committed equals the create's transno (3/3)
+
+	replay_barrier_nosync + fail mds1 after the first create: the client is denied as new, evicted, and the file is lost without the fix (2/2); it is kept with the fix (2/2)
+
+https://review.whamcloud.com/46596 is rebased on master as PS8, with the test moved to replay-single test_0e. https://review.whamcloud.com/71308 (which synced the MDTs in test_134 instead) is abandoned.

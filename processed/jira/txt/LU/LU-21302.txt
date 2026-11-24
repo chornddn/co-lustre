@@ -1,0 +1,75 @@
+Key:        LU-21302
+Summary:    nodemap: after ban and unban, client keeps OST extent lock the server dropped and gets ESTALE on that object
+Link:       https://jira.whamcloud.com/browse/LU-21302
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Will Johnson
+Created:    Mon, 23 Nov 2026 19:01:00 +0000
+Updated:    Mon, 23 Nov 2026 19:01:00 +0000
+
+--- Description ---
+When a client NID is banned with lctl nodemap_ban, the OST drops the client's extent lock on an object, but the client keeps its copy of the lock. After lctl nodemap_unban, the client sends OST_WRITE and OST_PUNCH for that object with the old lock. The OST cannot find the lock and returns -ESTALE (ofd_rw_hpreq_check() in ofd_dev.c). Nothing on the client releases the lock, so every write to the file fails with "Stale file handle" until the lock LRU is cleared or the client remounts.
+
+The unban itself works: the MDT and other objects accept the client again. Only objects whose locks the server dropped stay broken.
+
+How I produced it:
+
+Version: 2.14.0_ddn266. Tenant nodemap with one client NID, 2 HA pairs, 16 OSTs. After the ban / unban operations:
+
+	On the client, write a file every 2 s: while true; do date > /mnt/lustre/heartbeat; sleep 2; done
+
+	On the MGS: lctl nodemap_ban the client NID. Writes fail with "Operation not permitted".
+
+	On the MGS: lctl nodemap_unban the client NID.
+
+	After about 8 s, writes fail with "Stale file handle" and do not recover (I saw this for more than 20 minutes).
+
+It is intermittent. It occurs when the ban arrives while the client holds a cached extent lock on the object. In another run, writes recovered about 6 s after the unban.
+
+Evidence from my BDD run
+
+Client console:
+
+Lustre: This client was banned by administrative request for file system fs. All requests will get Operation not permitted.
+LustreError: 11-0: fs-OST000d-osc-ff25dca2b200e800: operation ost_write to node 10.73.20.17@tcp1 failed: rc = -116
+LustreError: 11-0: fs-OST000d-osc-ff25dca2b200e800: operation ost_punch to node 10.73.20.17@tcp1 failed: rc = -116
+
+Every server logs "nodemap acme banning client" and later "nodemap acme un-banned client" for this client.
+
+20 minutes after the unban:
+
+Where
+Result
+
+OSS: {
+Unknown macro: {ldlm.namespaces.filter-fs-OST000d_UUID.lock_count} 
+
+}
+
+0
+
+Client: {
+Unknown macro: {ldlm.namespaces.fs-OST000d-osc-*.lock_count} 
+
+}
+
+1
+
+Client: lctl set_param ldlm.namespaces.osc.lru_size=clear, then write
+lock_count 0, write succeeds
+  
+
+Expected
+
+After the unban, the client can use all objects again with no manual action. Either the server cancels the lock in a way the client sees, or the client drops a lock that the OST rejects with -ESTALE.
+
+Workaround
+
+On the client: lctl set_param ldlm.namespaces.osc.lru_size=clear, or remount.
+
+Possibly related
+
+When a ban does not change the export's nodemap, nm_member_revoke_locks() revokes only MDT exports, and tgt_handler.c rejects LDLM_CANCEL from banned exports. So the client cannot cancel the OST lock while banned, and the server drops it on its side only.

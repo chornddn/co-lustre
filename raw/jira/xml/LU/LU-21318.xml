@@ -1,0 +1,112 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21318] TCU: Set transaction with sync when create the trash striped dir</title>
+                <link>https://jira.whamcloud.com/browse/LU-21318</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+Lustre nodes running on Controller 0 [VM-1 and VM-2]  are continuously crashing as soon as they came up .  [  299.981544] LustreError: 22008:0:(dt_object.c:229:dt_mode_to_dft()) ASSERTION( 0 ) failed: invalid mode 0
+[  299.984827] LustreError: 22008:0:(dt_object.c:229:dt_mode_to_dft()) LBUG
+[  299.987412] CPU: 7 UID: 0 PID: 22008 Comm: tgt_recover_0 Kdump: loaded Tainted: G           OE      ------  ---  6.12.0-124.56.1.el10_1_lustre.ddn1.x86_64 #1 PREEMPT(voluntary)
+[  299.987418] Tainted: [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+[  299.987419] Hardware name: DDN SFA400NVX2E, BIOS 1.17.0-20261023_200230-co-sf-pe-157 04/01/2014
+[  299.987421] Call Trace:
+[  299.987423]  &amp;lt;TASK&amp;gt;
+[  299.987426]  dump_stack_lvl+0x4e/0x70
+[  299.987436]  lbug_with_loc.cold+0x5/0x50 [libcfs]
+[  299.987458]  dt_mode_to_dft+0x89/0xa0 [obdclass]
+[  299.987602]  update_recovery_create+0x1b7/0x3b0 [ptlrpc]
+[  299.987856]  update_recovery_exec+0x831/0xbd0 [ptlrpc]
+[  299.988055]  distribute_txn_replay_handle+0x226/0xd20 [ptlrpc]
+[  299.988249]  ? __mod_timer+0x120/0x340
+[  299.988256]  replay_request_or_update+0x44b/0x9b0 [ptlrpc]
+[  299.988484]  ? __pfx_target_recovery_thread+0x10/0x10 [ptlrpc]
+[  299.988720]  target_recovery_thread+0x5b8/0xf30 [ptlrpc]
+[  299.988939]  ? __pfx_target_recovery_thread+0x10/0x10 [ptlrpc]
+[  299.989151]  kthread+0xfa/0x240
+[  299.989155]  ? __pfx_kthread+0x10/0x10
+[  299.989157]  ret_from_fork+0x31/0x50
+[  299.989160]  ? __pfx_kthread+0x10/0x10
+[  299.989161]  ret_from_fork_asm+0x1a/0x30
+[  299.989166]  &amp;lt;/TASK&amp;gt;
+[  300.028492] Kernel panic - not syncing: LBUG
+[  300.029577] CPU: 7 UID: 0 PID: 22008 Comm: tgt_recover_0 Kdump: loaded Tainted: G           OE      ------  ---  6.12.0-124.56.1.el10_1_lustre.ddn1.x86_64 #1 PREEMPT(voluntary)
+[  300.032647] Tainted: [O]=OOT_MODULE, [E]=UNSIGNED_MODULE
+[  300.033809] Hardware name: DDN SFA400NVX2E, BIOS 1.17.0-20261023_200230-co-sf-pe-157 04/01/2014
+[  300.035386] Call Trace:
+[  300.036095]  &amp;lt;TASK&amp;gt;
+[  300.036809]  dump_stack_lvl+0x4e/0x70
+[  300.037722]  panic+0x113/0x2dd
+[  300.038587]  lbug_with_loc.cold+0x1a/0x50 [libcfs]
+[  300.039717]  dt_mode_to_dft+0x89/0xa0 [obdclass]
+[  300.040774]  update_recovery_create+0x1b7/0x3b0 [ptlrpc]
+[  300.042067]  update_recovery_exec+0x831/0xbd0 [ptlrpc]
+[  300.043341]  distribute_txn_replay_handle+0x226/0xd20 [ptlrpc]
+[  300.044593]  ? __mod_timer+0x120/0x340
+[  300.045485]  replay_request_or_update+0x44b/0x9b0 [ptlrpc]
+[  300.046738]  ? __pfx_target_recovery_thread+0x10/0x10 [ptlrpc]
+[  300.048060]  target_recovery_thread+0x5b8/0xf30 [ptlrpc]
+[  300.049240]  ? __pfx_target_recovery_thread+0x10/0x10 [ptlrpc]
+[  300.050621]  kthread+0xfa/0x240
+[  300.051393]  ? __pfx_kthread+0x10/0x10
+[  300.052253]  ret_from_fork+0x31/0x50
+[  300.053083]  ? __pfx_kthread+0x10/0x10
+[  300.053908]  ret_from_fork_asm+0x1a/0x30
+[  300.054798]  &amp;lt;/TASK&amp;gt;
+ &lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;After replay, the removed striped directory is no longer in the namespace and *&lt;b&gt;not in `.Trash` either&lt;/b&gt;*, and LFSCK afterwards repairs 4 namespace entries.&lt;/p&gt;
+
+&lt;p&gt;The logs and code explain it. The striped trash directory is created by `mdd_trash_create()` in *&lt;b&gt;its own transaction&lt;/b&gt;*, separate from the user's `rmdir`. After a failover the two are replayed separately: the client replays its `rmdir`, while the separate cross-MDT create is replayed from the update log. They don't line up. MDT0000 has lost objects created after the barrier ("cannot lookup FID"), the replayed updates that refer to them fail, and they can't be rolled back ("can not rollback index_delete yet").&lt;/p&gt;
+
+&lt;p&gt;So the crash fix makes recovery survive, but *&lt;b&gt;removing a striped directory into the trash isn't crash-consistent&lt;/b&gt;*. If an MDT fails over while one is being removed, the deleted data can be missing from the trash, and the namespace needs LFSCK. Fixing that means doing the trash create inside the unlink transaction: a design change in Yingjin's TCU code, much bigger than this patch. It's row 12c in the TCU issue list. I expect QA's setup to show the same thing once it's back up, since their failover happened during exactly this kind of delete.&lt;/p&gt;</description>
+                <environment />
+        <key id="100813">LU-21318</key>
+            <summary>TCU: Set transaction with sync when create the trash striped dir</summary>
+                <type id="7" iconUrl="https://jira.whamcloud.com/images/icons/issuetypes/task_agile.png">Technical task</type>
+                            <parent id="85868">LU-18456</parent>
+                                    <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="qian_wc">Qian Yingjin</assignee>
+                                    <reporter username="qian_wc">Qian Yingjin</reporter>
+                        <labels>
+                    </labels>
+                <created>Tue, 24 Nov 2026 16:18:02 +0000</created>
+                <updated>Tue, 24 Nov 2026 16:39:27 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073xr:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

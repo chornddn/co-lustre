@@ -1,0 +1,40 @@
+Key:        LU-21305
+Summary:    osc: memcg OOM with uncommitted pages under the multi-gen LRU
+Link:       https://jira.whamcloud.com/browse/LU-21305
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Patrick Farrell
+Created:    Mon, 23 Nov 2026 20:45:21 +0000
+Updated:    Mon, 23 Nov 2026 21:04:16 +0000
+Links:      Related: is related to  LU-20856
+
+--- Description ---
+A bulk write's pages stay pinned on the client until the OST commits the transaction, so the client can resend them in recovery. Their page writeback ends at the reply, though, so reclaim and dirty throttling see them as clean page cache that cannot be freed. Under the classic LRU, memcg reclaim scanning such pages wakes the flushers, and the writeback pass that follows forces a commit (CL_FSYNC_RECLAIM, LU-16713). The 6.12 multi-gen LRU wakes the flushers only for dirty folios not yet queued for writeback (1bc542c6a0d1 "mm: multi-gen LRU: wake up flushers conditionally"), so with the uncommitted pages clean nothing forces a commit, and writers in a small cgroup are OOM-killed well inside the OST's commit interval. RHEL 9.4 and later, RHEL 10 and Debian 13 enable the multi-gen LRU by default.
+
+Reproduced on a 6.12 Debian kernel with the multi-gen LRU on: 4 memory-limited cgroups of 4 buffered writers each, 768 MB per writer, all files on one OST, osc.*.max_dirty_mb=512. OOM kills per run (16 is every writer):
+
+	memory.max=512M: 3-6 on 2.17.60, 11-13 with LU-20856's changes
+
+	memory.max=256M: 13-16 on every build
+
+	same runs with /sys/kernel/mm/lru_gen/enabled=0: none
+
+At the OOM, a cgroup held 265 MB of file pages with 13 MB dirty and none under writeback; the rest was written and waiting for the commit, and the cgroup's reclaim had scanned 36.7M pages to free 152k. LU-20856's patches make this more likely at moderate limits, because the background writeback commits they remove were also committing these pages.
+
+Proposed fix: keep page writeback set until the commit, as NFS does for unstable pages, so reclaim, dirty throttling and the memcg see the pages as under writeback, and have every path that waits for writeback ask the OST for the commit first.
+
+--- Comment (gerrit, Mon, 23 Nov 2026 21:04:16 +0000) ---
+"Patrick Farrell " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71347
+
+Subject: LU-21305 osc: end page writeback at commit, not at reply
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 188efa1222a00d5e9b8cb4072a261e60958ba526

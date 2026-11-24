@@ -1,5 +1,5 @@
 Change:     71260
-Subject:    LU-21139 ptlrpc: turn pet_refcount atomic
+Subject:    LU-21139 ptlrpc: serialize evictor thread start/stop
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71260
 Change-Id:  Ifa96907741479c6beffb2d016d60bf8024e79c52
 Project:    fs/lustre-release
@@ -7,27 +7,53 @@ Branch:     master
 Status:     NEW
 Owner:      Alex Zhuravlev
 Created:    2026-11-20 20:48:45.000000000
-Updated:    2026-11-23 15:47:37.000000000
-Patch Set:  1
-Insertions: +5
-Deletions:  -4
-Comments:   9 (4 unresolved)
+Updated:    2026-11-24 14:32:02.000000000
+Patch Set:  4
+Insertions: +80
+Deletions:  -23
+Comments:   22 (3 unresolved)
+Hashtags:   pw_shepherd
 
 --- Labels ---
-  Code-Review: Alex Zhuravlev: -1
+  Code-Review: Andreas Dilger: +1
   Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
   CC: Patrick Farrell, Timothy Day, Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Alex Zhuravlev
+  REVIEWER: Andreas Dilger, Alex Zhuravlev
 
 --- Commit Message ---
-LU-21139 ptlrpc: turn pet_refcount atomic
+LU-21139 ptlrpc: serialize evictor thread start/stop
 
-otherwise we can start few evictor thread which will be corrupting
-obd refcounting.
+pet_refcount was changed without locking by ping_evictor_start()
+and ping_evictor_stop(), which run from target setup and cleanup in
+mdt_init0(), mgs_init0() and oss_device_init(), and targets on one
+server are mounted in parallel.  Each start also re-initialized
+pet_waitq, possibly under a thread still sleeping on it, and
+ping_evictor_stop() did not wait for the thread to exit, so a start
+soon after the last stop could run a second thread on pet_list.
+Two evictor threads could both class_decref() the same obd, hitting
+the OBDF_ATTACHED assertion in class_decref_free() (conf-sanity
+test_153c).  An orphaned thread kept its lu_env, which pins mdd, osp
+and mdt, so rmmod failed with "Module mdd is in use" (sanity-sec
+test_31, LU-21149).
 
+Serialize start/stop with pet_mutex, declare pet_waitq statically,
+and have the last ping_evictor_stop() end the thread with
+kthread_stop() after it has drained pet_list.  Change pet_state
+only under pet_lock.  If the thread can't be created, keep the
+reference, since callers always call ping_evictor_stop(), and
+retry on the next start.  If lu_env_init() fails, the thread stops
+queueing obds, releases those queued and waits to be stopped.
+
+Test-Parameters: trivial
+Test-Parameters: mdscount=2 mdtcount=4 testlist=sanity-sec env=ONLY=31,ONLY_REPEAT=10
+Test-Parameters: mdscount=2 mdtcount=4 testlist=conf-sanity env=ONLY=153c,ONLY_REPEAT=10
+Fixes: 113303973ec9 ("land b1_5 onto HEAD")
 Signed-off-by: Alex Zhuravlev <azhuravlev@thelustrecollective.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Assisted-by: ClaudeCode:glm-5.4
+Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: Ifa96907741479c6beffb2d016d60bf8024e79c52
 
 --- Review History ---
@@ -214,3 +240,399 @@ Patch Set 1: Code-Review-1
 
 --- Message (patrick bot, 2026-11-23 15:47:37.000000000) ---
 Hashtag removed: pw_shepherd
+
+--- Message (Alex Zhuravlev, 2026-11-23 18:08:07.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-23 18:11:41.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-23 18:19:36.000000000) ---
+Patch Set 2:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-23 18:55:54.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137588/ : SUCCESS
+
+--- Message (Maloo, 2026-11-23 18:56:24.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 137588 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137588&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137588#redirect
+
+--- Message (Andreas Dilger, 2026-11-24 03:07:18.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-24 04:31:49.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm209: https://testing.whamcloud.com/test_sessions/83724450-6d1e-4eb1-9300-24d509d26c68 ran 6 tests.  1 tests failed: recovery-small.
+
+--- Message (patrick bot, 2026-11-24 04:40:23.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (Autotest, 2026-11-24 04:49:13.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 137588 patch 2. Requested by Patrickbot because of LU-21195.
+
+--- Message (Maloo, 2026-11-24 05:00:30.000000000) ---
+Patch Set 2:
+
+Failed enforced test review-dne-part-2 on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm209: https://testing.whamcloud.com/test_sessions/a24ee6bb-f954-408d-a302-62d00f631a6c ran 11 tests.  1 tests failed: sanityn.
+
+--- Message (Alex Zhuravlev, 2026-11-24 05:53:11.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-24 05:56:08.000000000) ---
+Patch Set 3:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-24 05:57:42.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-24 06:18:27.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137645/ : SUCCESS
+
+--- Message (Autotest, 2026-11-24 06:18:40.000000000) ---
+Patch Set 2:
+
+Trevis Autotest 2 is abandoning the following sessions because: later build 137645 found
+- Enforced review-dne-part-3 on el10.2-x86_64/ldiskfs servers and clients
+
+--- Message (Maloo, 2026-11-24 06:19:16.000000000) ---
+Patch Set 3:
+
+#### The following sessions will be run for Build 137645 (patch #3):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137645&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137645#redirect
+
+--- Message (Autotest, 2026-11-24 06:19:35.000000000) ---
+Patch Set 2:
+
+Onyx Autotest 2 is abandoning the following sessions because: later build 137645 found
+- Enforced review-ldiskfs-arm on el8.10-x86_64/ldiskfs servers and rocky9.8-aarch64/ldiskfs clients
+
+--- Message (Andreas Dilger, 2026-11-24 07:24:25.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-24 07:25:54.000000000) ---
+Patch Set 4:
+
+Alex, PS3 could deadlock: ping_evictor_start() holds pet_mutex while it waits in wait_event_idle() for pet_state == PET_INIT, and the exiting thread now needs pet_mutex to set PET_INIT.
+
+PS4 reworks this with a kthread_stop()-based approach. The last ping_evictor_stop() sets PET_TERMINATE under pet_lock, then calls kthread_stop(), and the thread exits once pet_list is drained. Start never waits for an old thread, and the lu_env pinning mdd/mdt/osp is gone by the time the last target unmounts (LU-21149). pet_state now only changes under pet_lock. A failed kthread_create() keeps the reference and the next start retries. If lu_env_init() fails, the queued obds are released.
+
+Tested on a 2-node VM cluster: sanity-sec test_31 x5, conf-sanity test_153c x5, and 23 rounds of parallel target umount/mount (including dropping to zero targets). There was never more than one ll_evictor thread, there was no LBUG, and lustre_rmmod was clean.
+
+--- Message (Andreas Dilger, 2026-11-24 07:26:08.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+--- Message (Andreas Dilger, 2026-11-24 07:27:26.000000000) ---
+Patch Set 4: Code-Review+1
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-24 07:27:30.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-24 07:30:55.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-24 07:49:58.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137652/ : SUCCESS
+
+--- Message (Maloo, 2026-11-24 07:50:33.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 137652 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137652&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137652#redirect
+
+--- Message (Alex Zhuravlev, 2026-11-24 08:10:48.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-24 08:32:15.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-24 09:22:14.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-24 09:45:06.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Alex Zhuravlev, 2026-11-24 12:41:59.000000000) ---
+Patch Set 4:
+
+(1 comment)
+
+--- Message (Maloo, 2026-11-24 14:26:15.000000000) ---
+Patch Set 4: Verified+1
+
+Passed enforced test review-ldiskfs-dne-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-154vm28: https://testing.whamcloud.com/test_sessions/dc5591db-00ce-42a5-8127-5d940be3eb38 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-24 14:32:02.000000000) ---
+Patch Set 4:
+
+Looks good to me.
