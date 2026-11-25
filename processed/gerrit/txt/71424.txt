@@ -1,0 +1,99 @@
+Change:     71424
+Subject:    LU-13833 llite: hook client object cache to sb shrinker
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71424
+Change-Id:  I8d4850e0197ae3d4d3403647602beb49a602440a
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Zhenyu Xu
+Created:    2026-11-25 07:34:17.000000000
+Updated:    2026-11-25 16:31:13.000000000
+Patch Set:  1
+Insertions: +251
+Deletions:  -0
+Comments:   6 (1 unresolved)
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  REVIEWER: Andreas Dilger, James Simmons
+
+--- Commit Message ---
+LU-13833 llite: hook client object cache to sb shrinker
+
+The VFS per-superblock shrinker accounts for the dentry and inode
+caches through sb->s_dentry_lru and sb->s_inode_lru, but it knows
+nothing about the lu_object cache hanging off every cached inode: one
+mdc/lov object per inode plus one lovsub and OSC object per stripe.
+Those come from lu_kmem_init() without SLAB_RECLAIM_ACCOUNT, so they
+are reported as unreclaimable slab, and since an object referenced by
+a cached inode never reaches the lu_site LRU, the global lu_site
+shrinker cannot see it either until that inode is evicted.
+
+On a client caching tens of millions of inodes and their stripes this
+leaves a large, apparently unreclaimable population that only
+drop_caches, or enough pressure to drive inode eviction, ever frees -
+what LU-14408 and LU-13833 describe.
+
+Hook llite into super_operations::nr_cached_objects() and
+->free_cached_objects().  The kernel has had these since v3.0 and adds
+the filesystem count to the dentry and inode LRU counts in
+super_cache_count() (checked against v4.18 and v6.17), so
+super_cache_scan() proportions its budget over the three populations
+and hands ->free_cached_objects() the share that belongs to the
+lu_object cache.
+
+Report only objects on the site LRU, i.e. those that can be freed
+without evicting an inode, so that the number stays honest; objects
+still held by an inode show up here once prune_icache_sb() has evicted
+it in the same scan.  free_cached_objects() caps itself at 1024
+objects per call and takes the site lock and the purge mutex with
+trylock, so it can never queue behind a long purge (drop_caches) nor
+use lu_shrink_env concurrently with the global lu_site shrinker.
+
+The LDLM lock cache is left alone: cancelling locks needs the ldlm
+pool state machine and its own thread, and lru_size/lru_max_age
+already bound it on the client.  Per-node and per-memcg accuracy of
+the count is left to LU-18175.
+
+Add sanity test_921, which populates the client object cache with a
+small metadata workload and then checks that reclaim drains it: the
+lu_site must grow while the inodes are cached, its lru_purged counter
+must advance by at least one object per inode after drop_caches, the
+hash must shrink, and osc_object_kmem must return to its baseline.
+
+Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Assisted-by: AugmentAgent:DeepSeek-V4.1-Flash
+Change-Id: I8d4850e0197ae3d4d3403647602beb49a602440a
+
+--- Review History ---
+
+--- Message (Zhenyu Xu, 2026-11-25 07:34:17.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 07:38:01.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 07:39:45.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-25 08:17:36.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137726/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-25 13:04:04.000000000) ---
+Patch Set 1: Code-Review+1
+
+(2 comments)

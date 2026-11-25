@@ -1,0 +1,67 @@
+Key:        LU-21325
+Summary:    osd-zfs: first project ID of an old object drops its xattr dnode
+Link:       https://jira.whamcloud.com/browse/LU-21325
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Max Wang
+Reporter:   Max Wang
+Created:    Wed, 25 Nov 2026 04:48:46 +0000
+Updated:    Wed, 25 Nov 2026 04:53:34 +0000
+
+--- Description ---
+Problem
+
+osd_add_projid() adds the project ID attribute to an object made before the pool had project_quota, such as any object of a pool made by ZFS 0.7. It rebuilds the SA with sa_replace_all_by_template(), which drops every attribute that is not in the template, and the template lacks SA_ZPL_XATTR. The first time such an object gets a project ID, with "lfs project -p" or by a rename into a project directory, the pointer to its xattr dnode is dropped.
+
+The xattr dnode holds the xattrs, and a layout, that do not fit in the SA. The MDT keeps using its cached copy of the object, so nothing shows until it loads the object from disk again, at a restart or when the cache is trimmed. After that those xattrs are gone, and a file whose layout spilled reads as empty (size 0, no stripe info).
+
+Objects that already lost the pointer are not repaired. Their xattr dnodes stay allocated, with nothing pointing at them.
+
+__osd_sa_attr_init() builds its template the same way and has the same omission. It matters only if a value over DXATTR_MAX_SA_SIZE is set in the creating transaction.
+
+Who is affected
+
+ZFS file systems whose objects predate project quota: a pool made by ZFS 0.7, moved to ZFS 0.8 or later and a Lustre with project quota, then given zpool set feature@project_quota=enabled. Every old object takes this path on its first project ID. Only objects whose xattrs do not fit in the 64 KiB of SA are damaged, for example three xattrs of 30000 bytes, or two of them and a composite layout of 120 components.
+
+Reproducer
+
+conf-sanity 141 in the patch does this.
+
+	Make the MDT pool with -o feature@project_quota=disabled, format and mount.
+
+	Make files with xattrs that spill, three of 30000 bytes each (trusted.t1..t3).
+
+	zpool set feature@project_quota=enabled  and remount the MDT until lctl get_param osd-zfs.*.quota_slave.info shows "space acct: ugp".
+
+	lfs project -p 1000 f
+
+	Restart the MDT. One of the three xattrs is gone. zdb -dddd shows an "xattr " line on the object before step 4 and none after.
+
+Second problem, found while testing
+
+osd_attr_set() calls osd_add_projid() with oo_attr_lock held for write, and osd_add_projid() sleeps: sa_lookup() and sa_replace_all_by_template() take SA mutexes, and zio_buf_alloc() and nvlist_pack() allocate with KM_SLEEP. On a kernel that counts preemption, such as RHEL 9, an allocation that has to grow its slab cache schedules inside the lock, and the MDS panics:
+
+BUG: scheduling while atomic: mdt00_000/1212285/0x00000002
+
+schedule_timeout / spl_cache_grow / spl_kmem_cache_alloc [spl]
+
+osd_add_projid / osd_attr_set [osd_zfs]
+
+LNetError: (lib-move.c:566:lnet_ni_send()) LBUG
+
+The rest of osd_attr_set() updates the cached attributes under the lock and calls osd_object_sa_bulk_update() after it.
+
+--- Comment (gerrit, Wed, 25 Nov 2026 04:53:34 +0000) ---
+"Max Wang " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71420
+
+Subject: LU-21325 osd-zfs: keep the xattr dnode in osd_add_projid()
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: b1434fc75b306d1221d817d89ad59448b2775c53

@@ -1,0 +1,108 @@
+Key:        LU-21326
+Summary:    gss: SSK mount hangs when a context init reply is sent across LNet networks
+Link:       https://jira.whamcloud.com/browse/LU-21326
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Matt Rásó-Barnett
+Reporter:   Matt Rásó-Barnett
+Created:    Wed, 25 Nov 2026 12:37:06 +0000
+Updated:    Wed, 25 Nov 2026 12:44:58 +0000
+
+--- Description ---
+With SSK, a mount can hang when the client and server share more than one
+
+LNet network. The client's context init request (`SEC_CTX_INIT`, o801)
+
+arrives on one network, but the server sends the reply to the client's
+
+primary NID on another. LNet has no route between them and drops the
+
+reply:
+
+LNetError: lnet_handle_find_routed_path()) Unable to send message from @tcp1 to @tcp - Route table may be misconfigured
+
+The client logs `o801 ... Request sent has timed out for slow reply`, the
+
+import stays `CONNECTING`, and the mount waits. Without any rule, LNet
+
+spreads requests over the shared networks, so the hang is intermittent: a
+
+different set of imports fails at each mount. The same happens between
+
+servers that share networks (MDT-MDT, MDT-OST).
+
+Affects 2.15.52 and later; seen on 2.17.62.
+
+To reproduce, with one client and one server (MGS/MDS/OSS) on two
+
+LNet networks that are not routed to each other:
+
+1. On both nodes, put LNet on two networks, `tcp` first so that it holds
+
+the primary NID. Discovery is on by default.
+
+lnetctl lnet configure
+lnetctl net add --net tcp --if eth0
+lnetctl net add --net tcp1 --if eth1
+
+2. Set up SSK. On the server, make one key and copy it to the client:
+
+lgss_sk -t mgs,server,client -f testfs -n default \
+-g @tcp -d /dev/urandom -w /etc/lustre/testfs.key
+
+Start `lsvcgssd` with SK enabled (`-s`) on the server, mount the
+
+targets with `-o skpath=/etc/lustre/testfs.key`, and set the flavor on
+
+the MGS:
+
+lctl conf_param testfs.srpc.flavor.default=skn
+
+3. On the client, send everything to the server over `tcp1`, which is not
+
+the network of the client's primary NID:
+
+lnetctl udsp add --dst tcp1 --priority 0
+
+4. Mount the client:
+
+mount -t lustre -o skpath=/etc/lustre/testfs.key @tcp:/testfs /mnt/testfs
+
+The mount hangs, and the server logs the error above for each reply.
+
+Removing the rule (`lnetctl udsp del --all`) lets it finish. With the rule
+
+on `tcp` instead (`--dst tcp`), the mount works.
+
+Cause. `gss_svc_upcall_handle_init()` looks up the sender's primary
+
+NID to key the context, which SK needs. Since 1c250cbfa127 ("LU-10391
+
+ptlrpc: change rq_source to struct lnet_nid") it does that lookup on
+
+`req->rq_source` itself, and `LNetPrimaryNID()` rewrites its argument in
+
+place. `ptlrpc_send_reply()` then sends the reply from the NI the request
+
+arrived on to that rewritten NID. Before that commit the lookup used a
+
+copy.
+
+Fix. Do the lookup on a copy again, so the reply goes back to the NID
+
+the request came from. With it, the steps above mount, as do repeated mounts with no rule.
+
+--- Comment (gerrit, Wed, 25 Nov 2026 12:44:58 +0000) ---
+"Matt Raso-Barnett " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71432
+
+Subject: LU-21326 gss: send context init reply to the request's source
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 3d7a5b3dcf312249fec06e955b87ee0ff808949a

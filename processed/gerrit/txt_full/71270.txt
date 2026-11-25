@@ -7,16 +7,16 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-11-22 05:34:29.000000000
-Updated:    2026-11-24 05:07:47.000000000
-Patch Set:  3
-Insertions: +672
+Updated:    2026-11-25 13:07:58.000000000
+Patch Set:  4
+Insertions: +703
 Deletions:  -25
-Comments:   13 (3 unresolved)
-Hashtags:   218_review_priority, pt_ecro
+Comments:   16 (0 unresolved)
+Hashtags:   pt_ecro, 218_review_priority
 
 --- Labels ---
-  Code-Review: patrick bot: -1; Ronnie Sahlberg: +1
-  Verified: Maloo: -1; jenkins: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre
@@ -37,25 +37,26 @@ file contents, and that works for the objects of parity components as
 for those of data components, so accept EC layouts everywhere, and
 drop the argument of lfsck_layout_verify_header() that selected them.
 
-A repair that gives a component a new empty OST object, for a
-dangling reference with "lfsck --create-ostobj" or for an object
-shared with another file, would leave an EC component without its
-parity or data.  A data component whose in-sync parity can rebuild
-one more stripe of its raid set gets a dummy slot instead, as the
-orphan handling leaves for a lost object, so that EC reads rebuild
-that stripe from parity, as clients with
-https://review.whamcloud.com/71263 ("LU-20911 lov: rebuild EC
-stripes with no object from parity") do, and the object of the
-other file is no longer referenced.  Otherwise it gets the empty
-object as before.  A parity component still gets the new object,
-but is marked stale first, with the file write pending, so that a
-resync rewrites it, unless no data mirror would then be in sync.
-If its data component already has a dummy slot, a resync could not
-regenerate the parity, so its lost object also gets a dummy slot
-while the remaining parity can still rebuild the data, and the
-parity stays in use.  Since a parity object may hold parity of any
-raid set, lost parity objects count against every raid set of the
-data component.
+A repair that gives a component a new empty OST object, for a dangling
+reference with "lfsck --create-ostobj" or for an object shared with
+another file, would leave an EC component without its parity or data.
+A data component of an EC pair whose parity is in sync gets a dummy
+slot instead, as the orphan handling leaves for a lost object, so that
+EC reads rebuild that stripe from parity, as clients with
+https://review.whamcloud.com/71263 ("LU-20911 lov: rebuild EC stripes
+with no object from parity") do, and the object of the other file is
+no longer referenced.  It does so even when its raid set has lost more
+stripes than the parity can rebuild, so that a read of them fails
+rather than returns zeroes, or wrong data rebuilt from parity that an
+empty object no longer matches, and the parity stays in use for the
+other raid sets.  If the parity has a newer EC version than LFSCK
+knows, the stripe gets the empty object, and the parity is marked
+stale.  A parity component still gets the new object, but is marked
+stale first, with the file write pending, so that a resync rewrites
+it, unless no data mirror would then be in sync.  If its data
+component has a dummy slot, a resync could not regenerate the parity,
+so its lost object also gets a dummy slot, and the parity stays in
+use.
 
 When an OST with lfsck_verify_pfid enabled was asked to verify the
 parent FID of an object that it was already verifying, it would leak
@@ -64,13 +65,15 @@ unmount.  Take the reference only when the object is queued.
 
 Add sanity-lfsck test_55 to read and resync an EC file whose data and
 parity objects name a parent that does not exist, with
-lfsck_verify_pfid enabled, test_56 to repair an EC file whose data
-and parity objects are all lost, test_58 to repair a 2+2 file that
-lost one data and one parity object, and test_59 to repair an EC data
-object shared with another file.
+lfsck_verify_pfid enabled, test_56 to repair an EC file whose parity
+objects are lost, test_58a to repair a 2+2 file that lost one data and
+one parity object, test_58b to repair a 2+1 file that lost both data
+objects, and test_59 to repair an EC data object shared with another
+file.
 
 Test-Parameters: trivial testlist=sanity-lfsck
 Fixes: 730a204e7366 ("LU-3951 lfsck: OST-object inconsistency self detect/repair")
+Fixes: da8c97237968 ("LU-12187 lod: set parity component pattern")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: ClaudeCode:claude-opus-5-5 ltvm
 Change-Id: I35f88d4f3c724061c17af2ae70f614f0003ebbe5
@@ -290,3 +293,77 @@ Some concerns, see inline comments. When an EC raid set loses more stripes than 
 
 --- Message (patrick bot, 2026-11-24 05:07:47.000000000) ---
 Hashtag removed: pw_shepherd
+
+--- Message (Andreas Dilger, 2026-11-25 11:53:39.000000000) ---
+Uploaded patch set 4.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-25 11:54:08.000000000) ---
+Patch Set 3:
+
+(3 comments)
+
+PS4: test_58 failed in CI because OBD_FAIL_LFSCK_DANGLING applies to every OST of the OSS: OST1 refilled its precreate pool during the window, so f0 lost its OST1 data object too, and three lost objects of a 2+2 raid set correctly made the parity stale.  test_58 is now test_58a, and refills the pools of the OSTs whose objects must survive before setting the fail_loc (passed 40 repeats on a 4-MDT VM).  The ofd_add_inconsistency_item() reference leak that Patrickbot flagged on PS2 was fixed in PS3.
+
+The repair rule also changed, see the replies below: a lost data stripe of an EC pair now always gets a dummy slot, even when its raid set lost more stripes than the parity can rebuild, so a read of it fails rather than returns zeroes or wrong data, and the parity stays in use for the other raid sets.  A lost parity object gets a dummy slot while the data has one.  test_56 now loses only the parity objects, and new test_58b covers a 2+1 file that lost both data objects (fails without the change).
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 12:01:32.000000000) ---
+Patch Set 4:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 12:08:54.000000000) ---
+Patch Set 4:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-25 13:06:33.000000000) ---
+Patch Set 4: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137772/ : SUCCESS
+
+--- Message (Maloo, 2026-11-25 13:07:58.000000000) ---
+Patch Set 4:
+
+#### The following sessions will be run for Build 137772 (patch #4):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137772&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137772#redirect

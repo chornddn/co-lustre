@@ -1,0 +1,95 @@
+Key:        LU-21321
+Summary:    Unlink after partial cross-MDT rename leaves a dangling local ldiskfs entry on the source MDT
+Link:       https://jira.whamcloud.com/browse/LU-21321
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Vadakkumuri Valappil Abooback
+Created:    Tue, 24 Nov 2026 22:43:51 +0000
+Updated:    Tue, 24 Nov 2026 22:47:55 +0000
+
+--- Environment ---
+Two-MDT Lustre lab with ldiskfs targets. MDT0 held the source directory and file object. MDT1 held the destination directory. Backend evidence collected with debugfs 1.47.3-wc2.
+
+--- Description ---
+Summary
+In a two-MDT ldiskfs lab, a rename attempted while the source MDT was read-only left both names visible with the same FID and a reported link count of 1. After the source MDT returned to read-write, unlinking the destination name succeeded. The original source name remained in the local ldiskfs directory and returned ENOENT on the Lustre client.
+
+Rename evidence
+
+	Start with source.txt under an MDT0 directory and an absent destination name under an MDT1 directory. MDT0 owns the file FID [0x20000cf21:0x2:0x0].
+
+	With MDT0 read-only and MDT1 writable, attempt the rename with mv -T. The client reported that the two paths were the same file. Subsequent lfs path2fid returned [0x20000cf21:0x2:0x0] for both paths, and client stat returned the same inode number, size 27, and links=1 for both.
+
+	On MDT0, debugfs showed the source entry in parent inode 294 pointing to regular inode 307, generation 3781440640. Its LMA carried the file FID and its only linkEA record was parent [0x20000cf21:0x1:0x0], name source.txt. On MDT1 the destination entry pointed to agent inode 266 with the same FID and LMA incompat=2.
+
+	Both names persisted after MDT0 returned to read-write and completed recovery. MDT1 remained online throughout.
+
+Unlink evidence
+On the client, rm of the MDT1 destination source.txt succeeded. Listing the original MDT0 parent then showed:
+
+ls: cannot access '/mnt/lustre/rename-20261124T204834Z-mdt0/source.txt': No such file or directory
+-????????? ? ? ? ? ? source.txt
+
+The post-unlink raw directory listing on MDT0 still showed this record:
+
+307  100644 (17)  0  0  0  24-Nov-2026 20:48 fid:[0x20000cf21:0x2:0x0] source.txt
+
+This confirms the stale local directory entry and its on-disk inode reference. With a single recorded link before unlink, the expected failure mechanism is that unlink retires the file object and can free inode 307 while the source directory entry still references it, leaving an ldiskfs directory entry pointing to a free inode. A post-unlink inode bitmap check is still pending. The raw directory listing alone does not establish whether inode 307 was freed.
+
+Expected behavior
+A cross-MDT rename should leave one reachable name on success, or preserve the original reachable name if the operation cannot complete. Recovery should reconcile any partially applied rename so a subsequent unlink cannot leave another directory entry pointing to the retired object.
+
+Related issues
+
+	LU-21320 observed a dangling remote directory entry after rmdir returned EROFS with the parent MDT read-only. This report covers a regular file and a surviving local source entry after endpoint unlink.
+
+	LU-20421 describes a partial distributed rename followed by unlink of the old source name, leaving the destination dangling. In this test the destination was unlinked and the source became dangling.
+
+--- Comment (JIRAUSER19323, Tue, 24 Nov 2026 22:44:38 +0000) ---
+Post-unlink inode bitmap check on MDT0 confirms the ldiskfs inconsistency described above:
+
+# debugfs -R 'testi ' /dev/vdb
+Inode 307 is not in use
+
+The original source.txt entry in MDT0 parent inode 294 still records inode 307 and FID [0x20000cf21:0x2:0x0]. With the allocation bitmap marking inode 307 free, the surviving entry is a local ldiskfs directory reference to a freed inode.
+
+--- Comment (JIRAUSER19323, Tue, 24 Nov 2026 22:46:38 +0000) ---
+Command output showing the two names and the link undercount
+
+After the rename attempt and before unlink, both paths resolved to the same Lustre object:
+
+$ lfs path2fid "$src" "$dst"
+/mnt/lustre/rename-20261124T204834Z-mdt0/source.txt: [0x20000cf21:0x2:0x0]
+/mnt/lustre/rename-20261124T204834Z-mdt1/source.txt: [0x20000cf21:0x2:0x0]
+$ stat -c '%n inode=%i links=%h size=%s' -- "$src" "$dst"
+/mnt/lustre/rename-20261124T204834Z-mdt0/source.txt inode=144116077687734274 links=1 size=27
+/mnt/lustre/rename-20261124T204834Z-mdt1/source.txt inode=144116077687734274 links=1 size=27
+
+Backend excerpts before unlink corroborate the two names:
+
+MDT0 source directory, parent inode 294 (debugfs ls -l -D):
+  307  100644 (17)  0  0  0  24-Nov-2026 20:48 fid:[0x20000cf21:0x2:0x0] source.txt
+MDT0 debugfs stat of inode 307:
+  Links: 1   Blockcount: 0
+  lma: fid=[0x20000cf21:0x2:0x0] compat=0 incompat=0
+  linkea: idx=0 parent=[0x20000cf21:0x1:0x0] name='source.txt'
+
+MDT1 destination directory, parent inode 29265 (debugfs ls -l -D):
+  266  100000 (17)  0  0  0  1-Jan-1970 00:00 fid:[0x20000cf21:0x2:0x0] source.txt
+MDT1 debugfs stat of agent inode 266:
+  lma: fid=[0x20000cf21:0x2:0x0] compat=0 incompat=2
+
+MDT0 inode 307 owned the file. MDT1 inode 266 was an agent for that object. Two reachable namespace names referenced the same FID, while the owning inode recorded one link and its linkEA listed only the MDT0 source name. The count was one too low for the observed two-name state.
+
+After MDT0 returned to read-write, rm of the MDT1 destination name completed without error. The client then listed the original MDT0 source as -????????? with ENOENT. The raw MDT0 source directory still contained the same entry pointing to inode 307, and debugfs testi reported “Inode 307 is not in use.” This confirms that the successful unlink freed the owning inode while the original local dirent survived. The observed before-and-after state is consistent with unlink consuming the only recorded link. The intermediate on-disk link count of zero was not sampled directly.
+
+--- Comment (JIRAUSER19323, Tue, 24 Nov 2026 22:47:55 +0000) ---
+Exact client command and output from the rename attempt with MDT0 read-only and MDT1 writable:
+
+# mv -T -- \
+    /mnt/lustre/rename-20261124T204834Z-mdt0/source.txt \
+    /mnt/lustre/rename-20261124T204834Z-mdt1/source.txt
+mv: '/mnt/lustre/rename-20261124T204834Z-mdt0/source.txt' and '/mnt/lustre/rename-20261124T204834Z-mdt1/source.txt' are the same file

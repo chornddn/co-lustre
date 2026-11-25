@@ -1,0 +1,260 @@
+Change:     71420
+Subject:    LU-21325 osd-zfs: keep the xattr dnode in osd_add_projid()
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71420
+Change-Id:  I1e3db646addc156f33d1a16bb0321e1760960116
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Max Wang
+Created:    2026-11-25 04:53:32.000000000
+Updated:    2026-11-25 16:24:18.000000000
+Patch Set:  1
+Insertions: +148
+Deletions:  -17
+Comments:   5 (3 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Brian Behlendorf, Timothy Day
+
+--- Commit Message ---
+LU-21325 osd-zfs: keep the xattr dnode in osd_add_projid()
+
+osd_add_projid() gives an object made before the pool had
+project_quota a slot for the project ID. It rebuilds the SA with
+sa_replace_all_by_template(), which drops every attribute that is
+not in the template, and the template lacks SA_ZPL_XATTR. The first
+time such an object gets a project ID, with "lfs project -p" or by
+a rename into a project directory, the pointer to its xattr dnode
+is dropped.
+
+The xattr dnode holds the xattrs, and a layout, that do not fit in
+the SA. The MDT keeps using its cached copy of the object, so
+nothing shows until it loads the object from disk again, at a
+restart or when the cache is trimmed. After that those xattrs are
+gone, and a file whose layout spilled reads as empty.
+
+List SA_ZPL_XATTR in the template when the object has an xattr
+dnode. It goes after RDEV, so UID, GID and PROJID keep the offsets
+that zfs_space_delta_cb() reads. __osd_sa_attr_init() builds its
+template the same way and gets the same entry. The assertion on the
+template size moves after the last attribute is added. Objects that
+already lost the pointer are not repaired.
+
+The test for this also found that osd_add_projid() sleeps, and
+osd_attr_set() calls it with oo_attr_lock held for write.
+sa_lookup() and sa_replace_all_by_template() take SA mutexes, and
+zio_buf_alloc() and nvlist_pack() allocate with KM_SLEEP. On a kernel
+that counts preemption, such as RHEL 9, an allocation that has to
+grow its slab cache schedules inside the lock:
+
+  BUG: scheduling while atomic: mdt00_000/1212285/0x00000002
+   schedule_timeout+0x87/0x160
+   spl_cache_grow+0x1bb/0x2b0 [spl]
+   spl_kmem_cache_alloc+0x148/0x160 [spl]
+   osd_add_projid+0x616/0x8b0 [osd_zfs]
+   osd_attr_set+0xce4/0x1070 [osd_zfs]
+
+The same thread then fails an assertion in lnet_ni_send() and the
+MDS panics.
+
+The rest of osd_attr_set() only updates the cached attributes under
+the lock and calls osd_object_sa_bulk_update() after it. Do the same
+for the project ID: call osd_add_projid() before taking the lock,
+still under oo_guard, and read the cached attributes in it under a
+read lock. The project ID is then set with the other attributes
+under the lock, which stores the value osd_add_projid() wrote a
+second time.
+
+conf-sanity 141 makes the MDT pool without project_quota, makes
+files whose xattrs and layout spill out of the SA, enables the
+feature, gives the files a project ID, restarts the servers and
+compares data, layout, xattrs and project ID. On RHEL 9 the MDS
+panics without the lock change, and the files lose xattrs and
+layouts without the template change.
+
+Fixes: ec79791a7cda ("LU-13189 osd-zfs: add project id for old objects without ZFS_PROJID")
+Test-Parameters: fstype=zfs testlist=conf-sanity env=ONLY=141
+Signed-off-by: Max Wang <wamax@amazon.com>
+Change-Id: I1e3db646addc156f33d1a16bb0321e1760960116
+
+--- Review History ---
+
+--- Message (Max Wang, 2026-11-25 04:53:32.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 04:57:49.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 04:58:15.000000000) ---
+Patch Set 1:
+
+(2 comments)
+
+2 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-25 05:20:45.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137719/ : SUCCESS
+
+--- Message (Maloo, 2026-11-25 05:21:09.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 137719 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137719&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137719#redirect
+
+--- Message (Maloo, 2026-11-25 07:49:32.000000000) ---
+Patch Set 1:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Onyx Autotest 2 from onyx-145vm3: https://testing.whamcloud.com/test_sessions/da36715c-7576-460a-89cf-67a5c4fd5720 ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-ldiskfs-ubuntu %%
+https://testing.whamcloud.com/test_sessions/da36715c-7576-460a-89cf-67a5c4fd5720
+https://testing.whamcloud.com/test_sessions/aecb65b3-f8d3-4b13-bde6-f81eb1b1b8e7
+
+--- Message (Maloo, 2026-11-25 11:09:39.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-2 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm101: https://testing.whamcloud.com/test_sessions/d8c51fc0-664e-4232-9da0-86171b853c3b ran 11 tests.  1 tests failed: sanity-lnet.
+
+--- Message (Maloo, 2026-11-25 14:32:47.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm108: https://testing.whamcloud.com/test_sessions/aab92e53-1503-4176-87e3-5dd0c1764fb4 ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-25 15:00:23.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm251: https://testing.whamcloud.com/test_sessions/9f73107c-ef22-4a98-9d1b-9d36a20fa9cf ran 11 tests.  1 tests failed: racer.
+
+--- Message (Maloo, 2026-11-25 16:16:37.000000000) ---
+Patch Set 1: Verified+1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm194: https://testing.whamcloud.com/test_sessions/45166839-bf90-47a4-b030-4a57d8469982 ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-25 16:23:31.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+The template fix looks right, but moving osd_add_projid() out of oo_attr_lock seems to open a lost-update race on OST objects. See inline comments.
+
+--- Message (patrick bot, 2026-11-25 16:24:18.000000000) ---
+Hashtag added: pw_shepherd

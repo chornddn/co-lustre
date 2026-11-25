@@ -1,5 +1,5 @@
 Change:     69768
-Subject:    LU-11962 flr: fix the handling of foreign mirrors
+Subject:    LU-14319 flr: fix the handling of foreign mirrors
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/69768
 Change-Id:  Idb5f277a3117a352a99cecdaefd6ee7ee89b5397
 Project:    fs/lustre-release
@@ -7,54 +7,86 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-10-17 22:56:35.000000000
-Updated:    2026-11-23 07:14:54.000000000
-Patch Set:  8
-Insertions: +153
-Deletions:  -11
-Comments:   41 (0 unresolved)
-Hashtags:   pccro, 218_review_priority, pw_shepherd, pt_ecro
+Updated:    2026-11-25 16:08:47.000000000
+Patch Set:  10
+Insertions: +358
+Deletions:  -31
+Comments:   47 (0 unresolved)
+Hashtags:   218_review_priority, pt_ecro, pccro, pw_shepherd, pw_halt
 
 --- Labels ---
-  Code-Review: Artem Blagodarenko: +1
-  Verified: Maloo: +1; jenkins: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
-  REVIEWER: James Simmons, Bruno Faccini, Artem Blagodarenko, Qian Yingjin, Marc Vef
+  REVIEWER: James Simmons, Bruno Faccini, Artem Blagodarenko, Qian Yingjin, Marc Vef, Keguang Xu
 
 --- Commit Message ---
-LU-11962 flr: fix the handling of foreign mirrors
+LU-14319 flr: fix the handling of foreign mirrors
 
 Several places mishandle a mirror made of a foreign HSM component, as
-PCC-RO adds:
+PCC-RO adds, which has no data in Lustre:
 - "lfs getstripe" prints all of its lhm_* fields whatever is asked,
   so "lfs getstripe -N" prints them after the mirror count, it is the
   last initialized component that "-c", "-S" or "-i" show, and
   lhm_flags repeats its named flags in hex;
+- lov_foreign_hsm_to_le() wrote the archive ID and version of the
+  buffer to itself, leaving stale values in them on disk;
 - lod_primary_pick() may pick it as the primary mirror for a write
   when the OSTs of the data mirror are unavailable;
-- mdd_split_ea(), and data_mirror_remains() and
-  last_non_stale_mirror() of lfs, count it as data, so "lfs mirror
+- mdd_split_ea(), and data_mirror_remains(), last_non_stale_mirror()
+  and file_stays_redundant() of lfs, count it as data, so "lfs mirror
   split" can remove the only data mirror, or the only in-sync one;
 - a designated read of it, e.g. "lfs mirror read -N", which any user
   with read access can do, hits the LASSERT in
-  lov_io_layout_at_mirror(), and "lfs mirror verify" reads from it.
+  lov_io_layout_at_mirror(), "lfs mirror verify" reads from it, and
+  "lfs mirror resync" tries to copy data into it when it is stale;
+- a client setting a layout taken from such a file, e.g. a copytool
+  restoring the striping of an archived file, "lfs setstripe --copy"
+  or "lfs migrate", gets -EINVAL, as lod_qos_parse_config() parses
+  the foreign component as a plain one, and "lfs mirror extend -N"
+  uses it as the template of the new mirror and fails the same way;
+- the MDT does not see a released file with a foreign mirror as
+  released, and returns neither its size nor its block count.
 
-Print an HSM component only for the verbose and layout pattern output
-and never as the last initialized one, never pick an HSM mirror in
-lod_primary_pick(), and do not count foreign mirrors as data when
-splitting or verifying, or as a redundant copy.
-Refuse designated I/O to a foreign mirror in lov_io_mirror_init().
+Print the lhm_* fields of an HSM component only for the default, -v
+and -L output, not when a single field such as -N or -c is asked for,
+and never use it as the last initialized one, never pick an HSM mirror
+in lod_primary_pick(), and do not count foreign mirrors as data when
+splitting or verifying, or as a redundant copy.  Refuse designated I/O
+to a foreign mirror in lov_io_mirror_init().  Fix
+lov_foreign_hsm_to_le().  Drop foreign mirrors covering [0, EOF) from
+the layout of a new file set by a client, in the lov_foreign_md form
+or as the plain component with LOV_PATTERN_FOREIGN that
+llapi_layout_to_lum() makes of them.  Skip them in
+llapi_layout_get_last_init_comp(), in the stale components that "lfs
+mirror resync" copies and reports as resynced, as the source of a
+resync in llapi_mirror_find() and lfs_mirror_force_resync(), and in
+the mirrors "lfs mirror verify" reports and compares, and do not clear
+the stale flag of an HSM or PCC mirror at RESYNC_DONE.  Skip foreign
+components in mdt_hsm_is_released(), as mdt_hsm_set_released() does.
+Also swab all the components of a layout after a foreign one in
+lustre_swab_lov_comp_md_v1().
 
-Add sanity-pcc test_51 to check the HSM flags, "lfs getstripe -N" and
-"-c", the split of data mirrors, and the read and verify of a file
-attached to PCC-RO.
+So "lfs mirror resync" of a file whose only stale mirror is a foreign
+one returns without a change, leaving the file WRITE_PENDING until
+that mirror is updated, and "lfs migrate" of a file with a foreign
+mirror drops the mirror instead of failing.
 
-Test-Parameters: testlist=sanity-pcc,sanity-flr
-Fixes: 472e0f27d411 ("LU-19545 ec: tight binding parity mirror to data mirror")
+Add sanity-pcc test_21bb to check the archive ID on disk, mirror
+verify, setstripe --copy and mirror extend of a PCC-RO file, and
+verify after a write, and test_21bc to check the HSM flags, "lfs
+getstripe -N" and "-c", the split of data mirrors, and the read and
+verify of a PCC-RO file.
+
+Test-Parameters: testlist=sanity-pcc,sanity-flr,sanity-hsm
+Test-Parameters: testlist=sanity-pcc,sanity-flr serverversion=2.17
+Test-Parameters: testlist=sanity-pcc,sanity-flr clientversion=2.17
 Fixes: ce98bfe5f726 ("LU-10499 pcc: add readonly mode for PCC")
 Fixes: aebb405e32e4 ("LU-10499 pcc: use foreign layout for PCCRO on server side")
 Fixes: 2e591389646c ("LU-19548 lfs: update mirror split for EC support")
+Fixes: 61a002cd8631 ("LU-13602 flr: skip unknown FLR component types")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: ClaudeCode:claude-opus-5-5 ltvm llm_code_and_review_tools
 Change-Id: Idb5f277a3117a352a99cecdaefd6ee7ee89b5397
@@ -513,3 +545,66 @@ Patch Set 8:
 Patch Set 8:
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-11-25 07:58:12.000000000) ---
+Uploaded patch set 9: Patch Set 8 was rebased.
+
+Copied Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR **changekind:TRIVIAL_REBASE** OR **changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE** OR is:MIN")
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-25 07:58:36.000000000) ---
+Patch Set 9:
+
+(5 comments)
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 08:01:32.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 08:11:23.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-25 08:32:38.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137728/ : SUCCESS
+
+--- Message (Andreas Dilger, 2026-11-25 09:10:29.000000000) ---
+Uploaded patch set 10.
+
+Outdated Votes:
+* Code-Review+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (wc-checkpatch, 2026-11-25 09:15:44.000000000) ---
+Patch Set 10:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 09:16:49.000000000) ---
+Patch Set 10:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-25 10:31:42.000000000) ---
+Patch Set 10: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137744/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-25 14:38:46.000000000) ---
+Patch Set 10:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-25 14:40:06.000000000) ---
+Hashtag added: pw_halt

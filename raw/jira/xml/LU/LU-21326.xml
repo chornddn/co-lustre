@@ -1,0 +1,134 @@
+<rss version="0.92"><channel><item>
+            <title>[LU-21326] gss: SSK mount hangs when a context init reply is sent across LNet networks</title>
+                <link>https://jira.whamcloud.com/browse/LU-21326</link>
+                <project id="10000" key="LU">Lustre</project>
+                    <description>&lt;p&gt;With SSK, a mount can hang when the client and server share more than one&lt;br/&gt;
+LNet network. The client's context init request (`SEC_CTX_INIT`, o801)&lt;br/&gt;
+arrives on one network, but the server sends the reply to the client's&lt;br/&gt;
+primary NID on another. LNet has no route between them and drops the&lt;br/&gt;
+reply:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+LNetError: lnet_handle_find_routed_path()) Unable to send message from &amp;lt;server&amp;gt;@tcp1 to &amp;lt;client&amp;gt;@tcp - Route table may be misconfigured
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The client logs `o801 ... Request sent has timed out for slow reply`, the&lt;br/&gt;
+import stays `CONNECTING`, and the mount waits. Without any rule, LNet&lt;br/&gt;
+spreads requests over the shared networks, so the hang is intermittent: a&lt;br/&gt;
+different set of imports fails at each mount. The same happens between&lt;br/&gt;
+servers that share networks (MDT-MDT, MDT-OST).&lt;/p&gt;
+
+&lt;p&gt;Affects 2.15.52 and later; seen on 2.17.62.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;To reproduce&lt;/b&gt;, with one client and one server (MGS/MDS/OSS) on two&lt;br/&gt;
+LNet networks that are not routed to each other:&lt;/p&gt;
+
+&lt;p&gt;1. On both nodes, put LNet on two networks, `tcp` first so that it holds&lt;br/&gt;
+the primary NID. Discovery is on by default.&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lnetctl lnet configure
+lnetctl net add --net tcp --&lt;span class="code-keyword"&gt;if&lt;/span&gt; eth0
+lnetctl net add --net tcp1 --&lt;span class="code-keyword"&gt;if&lt;/span&gt; eth1
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;2. Set up SSK. On the server, make one key and copy it to the client:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lgss_sk -t mgs,server,client -f testfs -n &lt;span class="code-keyword"&gt;default&lt;/span&gt; \
+-g &amp;lt;server&amp;gt;@tcp -d /dev/urandom -w /etc/lustre/testfs.key
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;Start `lsvcgssd` with SK enabled (`-s`) on the server, mount the&lt;br/&gt;
+targets with `-o skpath=/etc/lustre/testfs.key`, and set the flavor on&lt;br/&gt;
+the MGS:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lctl conf_param testfs.srpc.flavor.&lt;span class="code-keyword"&gt;default&lt;/span&gt;=skn
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;3. On the client, send everything to the server over `tcp1`, which is not&lt;br/&gt;
+the network of the client's primary NID:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+lnetctl udsp add --dst tcp1 --priority 0
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;4. Mount the client:&lt;/p&gt;
+&lt;div class="code panel" style="border-width: 1px;"&gt;&lt;div class="codeContent panelContent"&gt;
+&lt;pre class="code-java"&gt;
+mount -t lustre -o skpath=/etc/lustre/testfs.key &amp;lt;server&amp;gt;@tcp:/testfs /mnt/testfs
+&lt;/pre&gt;
+&lt;/div&gt;&lt;/div&gt;
+&lt;p&gt;The mount hangs, and the server logs the error above for each reply.&lt;br/&gt;
+Removing the rule (`lnetctl udsp del --all`) lets it finish. With the rule&lt;br/&gt;
+on `tcp` instead (`--dst tcp`), the mount works.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Cause.&lt;/b&gt; `gss_svc_upcall_handle_init()` looks up the sender's primary&lt;br/&gt;
+NID to key the context, which SK needs. Since 1c250cbfa127 ("&lt;a href="https://jira.whamcloud.com/browse/LU-10391" title="LNET: Support IPv6" class="issue-link" data-issue-key="LU-10391"&gt;&lt;del&gt;LU-10391&lt;/del&gt;&lt;/a&gt;&lt;br/&gt;
+ptlrpc: change rq_source to struct lnet_nid") it does that lookup on&lt;br/&gt;
+`req-&amp;gt;rq_source` itself, and `LNetPrimaryNID()` rewrites its argument in&lt;br/&gt;
+place. `ptlrpc_send_reply()` then sends the reply from the NI the request&lt;br/&gt;
+arrived on to that rewritten NID. Before that commit the lookup used a&lt;br/&gt;
+copy.&lt;/p&gt;
+
+&lt;p&gt;&lt;b&gt;Fix.&lt;/b&gt; Do the lookup on a copy again, so the reply goes back to the NID&lt;br/&gt;
+the request came from. With it, the steps above mount, as do repeated mounts with no rule. &lt;/p&gt;</description>
+                <environment />
+        <key id="100880">LU-21326</key>
+            <summary>gss: SSK mount hangs when a context init reply is sent across LNet networks</summary>
+                <type id="1" iconUrl="https://jira.whamcloud.com/secure/viewavatar?size=xsmall&amp;avatarId=11303&amp;avatarType=issuetype">Bug</type>
+                                            <priority id="10104" iconUrl="https://jira.whamcloud.com/images/icons/priorities/medium.svg">Medium</priority>
+                        <status id="1" iconUrl="https://jira.whamcloud.com/images/icons/statuses/open.png" description="The issue is open and ready for the assignee to start work on it.">Open</status>
+                    <statusCategory id="2" key="new" colorName="default" />
+                                    <resolution id="-1">Unresolved</resolution>
+                                        <assignee username="mrasobarnett">Matt Rásó-Barnett</assignee>
+                                    <reporter username="mrasobarnett">Matt Rásó-Barnett</reporter>
+                        <labels>
+                    </labels>
+                <created>Wed, 25 Nov 2026 12:37:06 +0000</created>
+                <updated>Wed, 25 Nov 2026 12:44:58 +0000</updated>
+                                                                                <due />
+                            <votes>0</votes>
+                                    <watches>2</watches>
+                                                                            <comments>
+                            <comment id="506890" author="gerrit" created="Wed, 25 Nov 2026 12:44:58 +0000">&lt;p&gt;"Matt Raso-Barnett &amp;lt;matt@thelustrecollective.com&amp;gt;" uploaded a new patch: &lt;a href="https://review.whamcloud.com/c/fs/lustre-release/+/71432" class="external-link" target="_blank" rel="nofollow noopener"&gt;https://review.whamcloud.com/c/fs/lustre-release/+/71432&lt;/a&gt;&lt;br/&gt;
+Subject: &lt;a href="https://jira.whamcloud.com/browse/LU-21326" title="gss: SSK mount hangs when a context init reply is sent across LNet networks" class="issue-link" data-issue-key="LU-21326"&gt;LU-21326&lt;/a&gt; gss: send context init reply to the request's source&lt;br/&gt;
+Project: fs/lustre-release&lt;br/&gt;
+Branch: master&lt;br/&gt;
+Current Patch Set: 1&lt;br/&gt;
+Commit: 3d7a5b3dcf312249fec06e955b87ee0ff808949a&lt;/p&gt;</comment>
+                    </comments>
+                    <attachments>
+                    </attachments>
+                <subtasks>
+                    </subtasks>
+                <customfields>
+                                                                                                                                                                                            <customfield id="customfield_10890" key="com.atlassian.jira.plugins.jira-development-integration-plugin:devsummary">
+                        <customfieldname>Development</customfieldname>
+                        <customfieldvalues>
+                            
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        <customfield id="customfield_10390" key="com.pyxis.greenhopper.jira:gh-lexo-rank">
+                        <customfieldname>Rank</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>1|i073zb:</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                <customfield id="customfield_10090" key="com.pyxis.greenhopper.jira:gh-global-rank">
+                        <customfieldname>Rank (Obsolete)</customfieldname>
+                        <customfieldvalues>
+                            <customfieldvalue>9223372036854775807</customfieldvalue>
+                        </customfieldvalues>
+                    </customfield>
+                                                                                            <customfield id="customfield_10060" key="com.atlassian.jira.plugin.system.customfieldtypes:select">
+                        <customfieldname>Severity</customfieldname>
+                        <customfieldvalues>
+                                <customfieldvalue key="10022">3</customfieldvalue>
+
+                        </customfieldvalues>
+                    </customfield>
+                                                                                                                                                                                                                                                                                                                                                        </customfields>
+    </item></channel></rss>

@@ -1,0 +1,256 @@
+Change:     71424
+Subject:    LU-13833 llite: hook client object cache to sb shrinker
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71424
+Change-Id:  I8d4850e0197ae3d4d3403647602beb49a602440a
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Zhenyu Xu
+Created:    2026-11-25 07:34:17.000000000
+Updated:    2026-11-25 16:31:13.000000000
+Patch Set:  1
+Insertions: +251
+Deletions:  -0
+Comments:   6 (1 unresolved)
+
+--- Labels ---
+  Code-Review: Andreas Dilger: +1
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  REVIEWER: Andreas Dilger, James Simmons
+
+--- Commit Message ---
+LU-13833 llite: hook client object cache to sb shrinker
+
+The VFS per-superblock shrinker accounts for the dentry and inode
+caches through sb->s_dentry_lru and sb->s_inode_lru, but it knows
+nothing about the lu_object cache hanging off every cached inode: one
+mdc/lov object per inode plus one lovsub and OSC object per stripe.
+Those come from lu_kmem_init() without SLAB_RECLAIM_ACCOUNT, so they
+are reported as unreclaimable slab, and since an object referenced by
+a cached inode never reaches the lu_site LRU, the global lu_site
+shrinker cannot see it either until that inode is evicted.
+
+On a client caching tens of millions of inodes and their stripes this
+leaves a large, apparently unreclaimable population that only
+drop_caches, or enough pressure to drive inode eviction, ever frees -
+what LU-14408 and LU-13833 describe.
+
+Hook llite into super_operations::nr_cached_objects() and
+->free_cached_objects().  The kernel has had these since v3.0 and adds
+the filesystem count to the dentry and inode LRU counts in
+super_cache_count() (checked against v4.18 and v6.17), so
+super_cache_scan() proportions its budget over the three populations
+and hands ->free_cached_objects() the share that belongs to the
+lu_object cache.
+
+Report only objects on the site LRU, i.e. those that can be freed
+without evicting an inode, so that the number stays honest; objects
+still held by an inode show up here once prune_icache_sb() has evicted
+it in the same scan.  free_cached_objects() caps itself at 1024
+objects per call and takes the site lock and the purge mutex with
+trylock, so it can never queue behind a long purge (drop_caches) nor
+use lu_shrink_env concurrently with the global lu_site shrinker.
+
+The LDLM lock cache is left alone: cancelling locks needs the ldlm
+pool state machine and its own thread, and lru_size/lru_max_age
+already bound it on the client.  Per-node and per-memcg accuracy of
+the count is left to LU-18175.
+
+Add sanity test_921, which populates the client object cache with a
+small metadata workload and then checks that reclaim drains it: the
+lu_site must grow while the inodes are cached, its lru_purged counter
+must advance by at least one object per inode after drop_caches, the
+hash must shrink, and osc_object_kmem must return to its baseline.
+
+Signed-off-by: Bobi Jam <bobijam@whamcloud.com>
+Assisted-by: AugmentAgent:DeepSeek-V4.1-Flash
+Change-Id: I8d4850e0197ae3d4d3403647602beb49a602440a
+
+--- Review History ---
+
+--- Message (Zhenyu Xu, 2026-11-25 07:34:17.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 07:38:01.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 07:39:45.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+4 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-25 08:17:36.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137726/ : SUCCESS
+
+--- Message (Maloo, 2026-11-25 08:18:12.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 137726 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137726&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137726#redirect
+
+--- Message (Maloo, 2026-11-25 09:38:29.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm43: https://testing.whamcloud.com/test_sessions/ec1b2e30-5caf-4731-9b42-22d8d806830d ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-25 09:39:02.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-157vm186: https://testing.whamcloud.com/test_sessions/362dca54-1ef5-4184-8ec9-24ce8961d4f9 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-25 10:18:10.000000000) ---
+Patch Set 1:
+
+Failed optional test review-ldiskfs-ubuntu on RHEL 8.10 / x86_64, Ubuntu 26.04 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm262: https://testing.whamcloud.com/test_sessions/afa79148-453c-4f66-a834-2f9e67014eea ran 1 tests.  1 tests failed: node-provisioning.
+%% NODE-PROVISIONING FAILED MULTIPLE TIMES FOR review-ldiskfs-ubuntu %%
+https://testing.whamcloud.com/test_sessions/afa79148-453c-4f66-a834-2f9e67014eea
+https://testing.whamcloud.com/test_sessions/22618733-1e2b-4459-a0e5-6e1d75aba064
+
+--- Message (Maloo, 2026-11-25 11:30:06.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-4 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm95: https://testing.whamcloud.com/test_sessions/b52b0e4f-976b-49fd-ba1b-07dc35949513 ran 5 tests.  1 tests failed: sanity-pcc.
+
+--- Message (Maloo, 2026-11-25 11:46:03.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm6: https://testing.whamcloud.com/test_sessions/1a481a93-0be7-445d-a4ef-c8907989f3b2 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-25 12:58:29.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-2 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm78: https://testing.whamcloud.com/test_sessions/1bbb5a8e-3e3d-4fb7-bc17-c4fbc6eda458 ran 11 tests.  1 tests failed: sanityn.
+
+--- Message (Maloo, 2026-11-25 13:00:08.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm208: https://testing.whamcloud.com/test_sessions/66aa49ff-3f1b-4cfe-b8a9-4f2d1910eb82 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Andreas Dilger, 2026-11-25 13:04:04.000000000) ---
+Patch Set 1: Code-Review+1
+
+(2 comments)
+
+--- Message (Maloo, 2026-11-25 13:55:02.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-154vm15: https://testing.whamcloud.com/test_sessions/023c979d-96ca-427f-b6f5-dfa7313304f4 ran 6 tests.  2 tests failed: sanity-sec, sanity.
+
+--- Message (Maloo, 2026-11-25 16:31:13.000000000) ---
+Patch Set 1:
+
+Failed optional test review-dne-part-9 on RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm184: https://testing.whamcloud.com/test_sessions/35e4e032-68d2-475d-952a-1eb92b77bf67 ran 11 tests.  1 tests failed: racer.
