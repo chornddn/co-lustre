@@ -1,0 +1,37 @@
+Key:        LU-21335
+Summary:    ldiskfs: stale OI generations survive scrub and block namespace LFSCK repair
+Link:       https://jira.whamcloud.com/browse/LU-21335
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Praveen Solanki
+Created:    Wed, 25 Nov 2026 17:33:56 +0000
+Updated:    Wed, 25 Nov 2026 17:33:56 +0000
+
+--- Environment ---
+Lustre 2.15.5 downstream build, ldiskfs, two-MDT test filesystem. Mainline status unverified.
+
+--- Description ---
+Observed behavior
+
+Four directory entries on one MDT retained their original FIDs after the referenced ldiskfs inode numbers were reused. Filtered tracing during namespace LFSCK showed that each OI recheck returned rc=0 and the original inode number and generation. Read-only inode inspection found a different current generation at each of those inode numbers.
+
+The phase-1 assistant reported "namespace LFSCK assistant fail to handle the entry ... rc = -115" (EINPROGRESS) for all four FIDs. The scan completed with failed_phase1=4 and zero dangling repairs with create_mdtobj enabled. A standalone OI scrub completed with zero mapping updates. The following namespace repair reported the same four failures. A namespace dry run also showed the same failures. The backend remained read-write during these scans.
+
+Suspected cause
+
+In osd_iget_check(), a generation mismatch with an unchanged OI recheck can return -EREMCHG. In osd_fid_lookup(), this queues the FID and the stale inode/generation for scrub and can return -EINPROGRESS. The priority path in osd_scrub_check_update() can then compare that queued tuple with the identical on-disk OI tuple and take the osd_id_eq() success path. In that path, equality only shows that the index record has not changed. It gives no evidence that the inode still belongs to the FID. The lookups and generation mismatches were traced. The scrub no-op branch is a source-based hypothesis.
+
+Proposed fix
+
+Validate priority OI items against the live inode generation and Lustre identity before treating an equal index tuple as healthy. If the mapping is definitively stale, invalidate it only if the same FID-to-inode/generation record is still present under the index write lock and transaction. Preserve a mapping another thread has already corrected, honor dry-run mode, and allow scrub to recover an original object that exists elsewhere. If the namespace assistant observed a transient lookup failure, retry the affected dirent after OI reconciliation with a bounded retry. Enter dangling-object repair only after a fresh lookup definitively reports absence and the dirent still names the same FID.
+
+Regression coverage
+
+Use a test fixture with a stale OI generation and a valid mapping for the inode's current owner. Check that the stale FID reaches a conclusive lookup outcome, the current owner's mapping is preserved, and a concurrent valid remap is never deleted. Cover dry run, an original object found elsewhere during scrub, and the absent-object case with create_mdtobj enabled.
+
+Related issues
+
+LU-8218 covers stale OI handling in the non-restore case. LU-14119 adds cleanup after an LMA identity mismatch. LU-15643 addresses repeated scrub of irreparable FIDs. LU-20505 addresses an object-table iterator race while OI mappings are being built.

@@ -1,0 +1,68 @@
+Key:        LU-21339
+Summary:    socklnd: a failed connect on one local NI closes the conns of the other local NIs
+Link:       https://jira.whamcloud.com/browse/LU-21339
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   WC Triage
+Reporter:   Chris Horn
+Created:    Wed, 25 Nov 2026 19:33:28 +0000
+Updated:    Wed, 25 Nov 2026 19:33:46 +0000
+
+--- Description ---
+Problem
+A node has two or more local NIs on one tcp net. When a connect on one NI fails, socklnd also closes the conns of the healthy NIs to the same peer NID. The healthy NIs then reconnect. During a long failure of one NI, this close occurs again and again.
+
+Environment
+
+	master, 2.17.62.
+
+	A client with 2 local NIs, tcp(eth0,mv0). A server with 1 NID.
+
+Reproduction
+
+	Configure the client with 2 local NIs on one tcp net.
+
+	Start I/O from the client to an OST.
+
+	Drop all traffic on one client NI for 180 s.
+
+	Count the conns that the healthy NI makes to the server (New conn lines in the debug log with +net).
+
+Analysis
+ksocknal_peer_failed() calls lnet_notify() when the ksock peer of the failed NI has no conns. lnet_notify() marks the peer NI down and calls ksocknal_notify_gw_down() with the peer NID only. That callback closes the conns of every local NI to that NID. Each message that LNet receives from the peer marks the peer NI up again. So each later failed connect on the bad NI closes the healthy conns again.
+
+LU-17855 (2a0127d5fba5) added the down mark on each new report and the up mark on each received message. Together these give the repeated close.
+
+Results on VMs, one dd stream, one NI dropped for 180 s:
+
+Build
+Healthy NI reconnects in the drop
+Down reports per drop
+
+unpatched
+63-73 (7 drops)
+7-9
+
+patched
+0 (9 drops)
+7-9
+
+The lnet module parameter auto_down=0 stops the close. It also stops the down reports, which routers use.
+
+Proposed fix
+Remove the close from ksocknal_notify_gw_down(). The ksock peer that reports has no conns, so each other conn fails on its own error or timeout. The down report still reaches LNet. Add sanity-lnet test_551. It needs 2 interfaces.
+
+--- Comment (gerrit, Wed, 25 Nov 2026 19:33:46 +0000) ---
+"Chris Horn " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71493
+
+Subject: LU-21339 socklnd: keep conns of other NIs on peer down
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 4b482aa01691c48bc6e6a332f22cbf173e40677f

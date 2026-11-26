@@ -1,0 +1,304 @@
+Change:     71499
+Subject:    LU-19895 clio: enable large folios for buffered I/O
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71499
+Change-Id:  I0658bb0088fc75c02ca435a97807709a903ebbe5
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Andreas Dilger
+Created:    2026-11-26 03:06:32.000000000
+Updated:    2026-11-26 16:05:41.000000000
+Patch Set:  1
+Insertions: +3018
+Deletions:  -1200
+Comments:   45 (0 unresolved)
+
+--- Labels ---
+  Code-Review: (no votes)
+  Verified: jenkins: +1
+
+--- Reviewers ---
+  CC: Shaun Tancheff
+
+--- Commit Message ---
+LU-19895 clio: enable large folios for buffered I/O
+
+Enable large folios for buffered I/O (writes, readahead, read
+faults and mmap) on Linux 6.12 and later, so the client builds
+fewer, larger RPCs for cached data. Track folios and base-page
+counts through the client cache and RPCs. Direct I/O still uses
+one PAGE_SIZE chunk per cl_page.
+
+The llite.*.large_folios tunable, on by default, enables
+allocation. llite.*.folio_order_max limits newly instantiated
+inodes to at most 1 MiB, or 20 - PAGE_SHIFT. Expose
+llite.*.folio_order_min and the client dirty_pages count.
+
+Huge page mmap faults read ahead in folios up to the maximum
+order whatever the layout, so their DLM lock covers the
+largest folio that can hold the faulting page. A folio that
+crosses a stripe or component, does not fit one RPC, or is on
+a file that may not use large folios is dropped and read again
+in base pages, as is one a read finds partly outside the DLM
+locks it checked; readahead skips such a folio. An append,
+which is not split per stripe, sizes its folios to the stripe
+chunk they start in. An mmap write to a cached folio that no
+longer fits one RPC drops it and refaults. Files whose layout
+has a parity component keep base pages until EC recovery
+handles folios, and EC recovery drops a large folio a fault
+left there. New folios are also base pages while
+enable_mlock_pages is set, since the kernel mlocks a large folio
+only at reclaim and the OSC LRU would evict it. Large folios
+already cached when it is set are not converted.
+
+Preserve partial folios when punching holes: zero them once
+the server has punched, and drop them if the punch failed.
+Keep a tail punch's leading valid range in cp_off/cp_len
+instead of the punched range itself. Protect mmap writes against
+filesystem freeze and lock and commit the whole folio.
+Readahead advances by folio size and counts base pages,
+including for random reads. It creates folios as large as
+its DLM lock, stripe, RPC, window and reserved pages allow,
+and base pages for strided reads, so cold reads use large
+folios too. Restore encrypted offsets when RPC preparation
+fails.
+
+Grow RPC asynchronous metadata to hold the folio descriptors.
+Make sanity/277 use 4 KiB writes and a failure-injection delay
+that fires once, so its cache accounting check observes the
+intended state.
+Add sanity/849 for the tunables and buffered and mmap I/O,
+and sanity/859 for a partial write into readahead.
+
+Reset the queued count if direct I/O or buffered page queuing
+fails, and complete the direct I/O pages not yet queued with the
+error.
+Skip an empty RPC's folio-less placeholder when undoing
+encryption bounce pages on a failed request pack, since it
+has no folio to check.
+
+Dirty a cached folio whole when it is first queued, since a
+later write or mmap store into a queued folio does not queue
+it again. The last folio of an extent is trimmed to the file
+size, and a truncate inside a dirty folio keeps its range. A
+buffered write whose lock or RPC size does not cover the
+whole folio is written synchronously, and a short copy into
+a folio that is not uptodate is retried, so the folio never
+holds unread bytes. A partial write to a clean large folio
+drops it and writes base pages, so clean data is not sent
+again, as does one to a folio that is not uptodate and
+reaches outside the write's lock. A write that starts inside
+a page begins with a base page, so only that page is read
+first. Readahead for an open that has written uses base
+pages, so a program that reads back the file it writes and
+fills its holes a few bytes at a time, as linkers and
+assemblers do, does not lose the readahead of those holes.
+The cost is that the rest of a dropped folio is read again
+when next used, and an mmap store writes back its whole
+folio; a dirty range kept per folio would avoid both.
+
+While PCC mmap hands the mapping to the PCC backing file, the
+mapping takes that file's folio order range.
+
+DoM open drops an unread large folio from the cache before
+filling it from the inline data.
+
+Decrypt each folio of an RPC extent and report a hole only
+when the whole extent is one.
+
+Dump each page of a folio on a checksum mismatch, and unmap
+the page with the pointer that was mapped, not one advanced
+by a short kernel_write().
+
+Expand an extent to the chunk holding a folio's last page and
+check that against the server's maximum extent size, so a large
+folio near that maximum does not start a needless new extent.
+A new folio waits for an extent that covers only part of it.
+
+A cached folio that spans grant chunks must start on one in
+its stripe object, and grant is reserved for each chunk a
+queued range spans, so grant still bounds what is cached.
+
+The OSC LRU still counts one slot per folio. The follow-on
+change "LU-19895 osc: account cached folios in base pages"
+counts base pages instead.
+
+Make recovery-small/108 ping the OST to discover an eviction
+that lands after dd finished, which faster buffered writes make
+the common case.
+
+Test-Parameters: optional clientdistro=el10.0
+Test-Parameters: clientdistro=el10.1
+Test-Parameters: clientdistro=el10.1 serverversion=2.17 testlist=sanity
+HPE-bug-id: LUS-13263
+Fixes: 87d17d0a16ab ("LU-13814 osc: add osc_dio_submit")
+Fixes: 93ef6e7863b4 ("LU-10239 osc: limit chunk number of write submit")
+Signed-off-by: Shaun Tancheff <shaun@tancheff.com>
+Assisted-by: Codex:gpt-6.1-sol
+Assisted-by: ClaudeCode:claude-sonnet-5
+Assisted-by: ClaudeCode:claude-opus-5-5
+Assisted-by: ClaudeCode:claude-sonnet-5-5
+Signed-off-by: Patrick Farrell <patrick@thelustrecollective.com>
+Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
+Change-Id: I0658bb0088fc75c02ca435a97807709a903ebbe5
+
+--- Review History ---
+
+--- Message (Andreas Dilger, 2026-11-26 03:06:32.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-26 03:10:40.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-26 03:18:50.000000000) ---
+Patch Set 1:
+
+(45 comments)
+
+46 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-26 05:31:33.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137867/ : SUCCESS
+
+--- Message (Maloo, 2026-11-26 05:32:50.000000000) ---
+Patch Set 1:
+
+#### The following sessions will be run for Build 137867 (patch #1):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el10.1-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.7-x86_64/el10.0-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137867&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137867#redirect
+
+--- Message (Maloo, 2026-11-26 16:05:41.000000000) ---
+Patch Set 1:
+
+Failed enforced test review-dne-part-4 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm39: https://testing.whamcloud.com/test_sessions/768187c9-9ee5-4630-9f6c-ae0224169a11 ran 5 tests.  1 tests failed: sanity-pcc.

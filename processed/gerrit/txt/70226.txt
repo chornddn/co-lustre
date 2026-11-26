@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Alexey Lyashkov
 Created:    2026-10-30 08:51:08.000000000
-Updated:    2026-11-25 07:07:39.000000000
-Patch Set:  6
-Insertions: +305
-Deletions:  -89
-Comments:   48 (33 unresolved)
+Updated:    2026-11-26 15:56:40.000000000
+Patch Set:  7
+Insertions: +296
+Deletions:  -93
+Comments:   54 (30 unresolved)
 
 --- Labels ---
-  Code-Review: wc-checkpatch: -1; Andrew Perepechko: -1
-  Verified: Maloo: +1; jenkins: +1
+  Code-Review: Artem Blagodarenko: +1; Andrew Perepechko: +1
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Andreas Dilger, Nikitas Angelinas, Gerrit AI review for Lustre
@@ -27,32 +27,40 @@ LU-21073 llite: report the size and times the objects report
 stat(), lseek(SEEK_END/SEEK_DATA/SEEK_HOLE), O_APPEND writes and
 fallocate glimpse the file, then read i_size and the timestamps back
 out of the inode.  Between the merge and that read i_size can be
-rewritten by writers that do not take ll_inode_size_lock(), such as
-ll_update_inode() for an MDS reply, truncate or another merge, so the
-size used is not the one the merge produced.  ll_merge_attr() writes
-the timestamps in two steps, MDS values first and then the merge with
-the OST ones, so a racing reader can see the intermediate values.
-LU-17753 closed that for stat() alone by holding the size lock across
-the copy.
+rewritten by writers that do not take ll_inode_size_lock(): a read in
+vvp_prep_size() case (A) sets i_size to the KMS, which on a PFL or
+mirrored file is the end of the locked component, and so do
+ll_update_inode() for an MDS reply and truncate.  ll_merge_attr()
+also writes the timestamps in two steps, so a racing reader can see
+the intermediate values.  LU-17753 closed that for stat() alone by
+holding the size lock across the copy.
 
 Take one snapshot and report from it.  ll_merge_attr() fills a caller
 cl_attr under the size lock with the merged size, blocks and times,
-and cl_glimpse_lock()/ll_glimpse_size0() return 1 when they filled it.
-Paths that do not glimpse (size from the MDS, PCC, AT_STATX_DONT_SYNC,
-restore, directories) fill it from the inode with ll_attr_from_inode()
-under the same lock.  ll_getattr_dentry(), ll_file_seek(), the lseek,
-append and fallocate IO paths, and vvp_prep_size() use the snapshot
-instead of i_size.  lseek seeds it from the inode in case the merge is
-skipped.
+and cl_glimpse_lock()/ll_glimpse_attr() return 1 when they filled it.
+Paths that do not glimpse (AT_STATX_DONT_SYNC, restore, directories)
+fill it from the inode under the same lock; PCC fills it from the PCC
+copy.  ll_getattr_dentry(), ll_file_seek(), the lseek, append and
+fallocate IO paths and vvp_prep_size() use the snapshot, not i_size.
+
+The strict-SOM shortcut of ll_getattr_dentry() reported i_size, which
+the read could have lowered.  ll_update_inode() now saves the strict
+MDS size and blocks in lli_som_size/lli_som_blocks, ordered against
+lli_attr_valid by a barrier, and the shortcut reports them.
+
+The LU-417 fix-up (blocks 0 while the data is only in dirty pages)
+moves to cl_glimpse_lock() and checks the snapshot, so it no longer
+runs on every merge.  Remove the unused cl_glimpse_size().
 
 cl_attr carries seconds only, so stat() now reports tv_nsec 0 on every
-path, as the glimpse path already did.  i_size keeps its meaning for
-the IO path.
+path, as the glimpse path already did.
 
-Test-Parameters: trivial testlist=sanityn env=ONLY=16
+Add sanityn test_16n: a read on the second mount must not shrink the
+size stat reports for a PFL and a mirrored file.
+
+Fixes: 3f7853b31ef6 ("LU-10934 llite: integrate statx() API with Lustre")
 Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
 HPE-bug-id: LUS-13567
-Assisted-by: Copilot:claude-opus-5.5
 Change-Id: If1df9f44db3cc38af888e19715766d15740b94d7
 
 --- Review History ---
@@ -438,3 +446,57 @@ Patch Set 6: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Alexey Lyashkov, 2026-11-26 13:59:06.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-26 14:01:49.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-26 14:14:58.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-26 14:22:24.000000000) ---
+Patch Set 6:
+
+(4 comments)
+
+--- Message (Andrew Perepechko, 2026-11-26 14:22:27.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+Re-reviewed patch set 7 against patch set 6. It is rebased onto current master (v2_17_62-62), which now has 69694, and drops the OBD_MD_FLSIZE guard from ll_merge_attr_nolock(). The LU-417 fix-up is back in cl_glimpse_lock() only, tests the snapshot and sets i_blocks only while it is still 0. ll_attr_from_inode() is static, smp_wmb()/smp_rmb() order the saved strict SOM size against lli_attr_valid, ll_glimpse_size0() is renamed ll_glimpse_attr(), and the commit message is rewritten. sanityn.sh is unchanged.
+
+I found no defect in the new code. Every caller of cl_glimpse_lock() and __cl_glimpse_size() handles the new return value 1: vvp_prep_size() returns 0 after a successful glimpse, and ll_glimpse_size() still returns 0. On this base ll_merge_attr() writes cat_size into i_size unconditionally, and the grow-only merges of 69694 use the scratch buffer. So append, fallocate and lseek act on the size the inode adopted, which answers Andreas's file.c:1840 point for this tree.
+
+The AI review defects from patch set 1 are fixed in the code: a pcc_inode_getattr() error falls back to Lustre again (cached && rc < 0), the pcc_inode_enabled() pre-check is gone, and PCC-RO reports the clear-text size. Andreas's glimpse.c points are covered too: the LU-417 check uses the snapshot, and AGL neither merges nor takes the size lock. None of these threads has an answer yet. Could you reply and resolve them, with the commit message threads that patch set 7 covers?
+
+Series: 70224 patch set 9 folds its test_16n into test_16i, so the duplicate subtest from my patch set 6 review is gone. A trial cherry-pick of this patch set onto 70224 patch set 9 conflicts only in the fill_attr block of ll_getattr_dentry() (its OBD_FAIL_LLITE_STAT_SIZE_RACE hook) and leaves sanityn.sh with one test_16l and one test_16n. 70225 patch set 8 still sits on the old 70224 and conflicts in file.c, glimpse.c and llite_internal.h.
+
+A note for 64086 (patch set 51), which also changes vvp_io_lseek_start(): it skips the merge while an EC data stripe is unavailable. With this patch, attr and ls_size would then stay 0, so whichever change lands second has to fill them from the inode in that branch, as Andreas noted on patch set 1. The cherry-pick conflicts there, so it will not merge silently.
+
+Tests: by my reading the mirrored pass of test_16n fails without this patch, because the strict SOM shortcut reported the i_size the read had lowered to the KMS. The PFL pass is coverage only, as its comment says. The change is client-only and tested on the local client, so no version check is needed, and no other open change adds a test_16n. checkpatch is clean locally. Patch set 7 has no build or Maloo results yet.
+
+--- Message (Andrew Perepechko, 2026-11-26 14:22:36.000000000) ---
+Patch Set 7: Code-Review+1
+
+--- Message (jenkins, 2026-11-26 15:24:53.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137941/ : SUCCESS
+
+--- Message (Artem Blagodarenko, 2026-11-26 15:56:40.000000000) ---
+Patch Set 7: Code-Review+1
+
+(1 comment)

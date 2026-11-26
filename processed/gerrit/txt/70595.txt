@@ -1,5 +1,5 @@
 Change:     70595
-Subject:    LU-19823 lod: lower EC parity and fill parity to fit OSTs
+Subject:    LU-19823 lod: keep EC parity count and fill parity OSTs
 Link:       https://review.whamcloud.com/c/fs/lustre-release/+/70595
 Change-Id:  I067031d79874d1ff50adc406dd802cd52c3ebbe5
 Project:    fs/lustre-release
@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Andreas Dilger
 Created:    2026-11-08 01:18:03.000000000
-Updated:    2026-11-25 00:27:47.000000000
-Patch Set:  2
-Insertions: +428
-Deletions:  -166
-Comments:   14 (4 unresolved)
-Hashtags:   pw_shepherd, pt_ecro
+Updated:    2026-11-26 13:09:25.000000000
+Patch Set:  3
+Insertions: +402
+Deletions:  -140
+Comments:   20 (1 unresolved)
+Hashtags:   pt_ecro, pw_shepherd
 
 --- Labels ---
-  Code-Review: (no votes)
+  Code-Review: Ronnie Sahlberg: +1
   Verified: Maloo: +1; jenkins: +1
 
 --- Reviewers ---
@@ -23,23 +23,21 @@ Hashtags:   pw_shepherd, pt_ecro
   REVIEWER: Ronnie Sahlberg, Keguang Xu
 
 --- Commit Message ---
-LU-19823 lod: lower EC parity and fill parity to fit OSTs
+LU-19823 lod: keep EC parity count and fill parity OSTs
 
-A layout whose raid sets get smaller to fit the OSTs or failure
-domains may need more parity stripes than it has data stripes, e.g.
-"-c 4 --ec 4+4" on 7 OSTs as 3+4.  Dropping up to 1/4 of the data
-stripes does not help there, so the create would fail with ENOSPC
-although the same file without EC is created.  Instead, when fitting
-to the OSTs or failure domains, lower M by one at a time and fit K
-again each time, since a smaller M can allow larger raid sets again,
-so M is only as much smaller as needed and the example is 4+3.  When
-shrinking at allocation K is fixed, so M becomes the most parity
-stripes those raid sets can have.  The QoS single raid set shrink also
-keeps at least as many data stripes as parity, by lowering M to half
-of the usable OSTs.  M is not lowered for a component whose extent
-holds too few stripes for its parity, e.g. "-E 1M" with 1MiB stripes.
-Say in lfs-setstripe.1 that a lowered M protects against fewer OST
-failures.
+A layout whose raid sets do not fit the OSTs or failure domains with
+raid sets of at least 3/4 of K fails with ENOSPC, although the same
+file without EC is created, e.g. "-c 4 --ec 4+4" on 6 OSTs, where even
+3+4 needs 7, or "-c 16 --ec 8+2" on 7 OSTs.  Now that M may be larger
+than K, keep M and put the data stripes into raid sets of as many data
+stripes as fit with it, two 2+4 and {4, 3}+2 raid sets in these
+examples, so the file survives the loss of as many OSTs or failure
+domains as requested, down to raid sets of one data stripe if there is
+only one more domain than M.  As for other fits, an odd count with K=2
+leaves out a data stripe, and the parity stripes are limited to
+LOV_MAX_STRIPE_COUNT. Only fail with ENOSPC if there are no more OSTs
+or domains than M. Describe this in lfs-setstripe.1,
+obdfilter.failure_domain.4 and failure-domain.txt.
 
 The allocators try each OST for the parity of one raid set only, the
 one being placed when they get to it, and with -c never an OST with
@@ -50,32 +48,39 @@ tried at all, so a create could fail with ENOSPC for some RR start
 positions or QoS choices although the domains fit every raid set, e.g.
 "-c 5 --ec 2+2" on 8 OSTs in 5 domains as 1,2,3,4,5,1,2,3 with data on
 OST5,6,7,0,1: raid set 0 takes OST3 and OST4 for its parity, and raid
-set 1 needs two of domains 3, 4 and 5, but only OST2 is left.  Have
-lod_ec_add_parities() try every OST of the pool for each raid set,
-first those no component of the file uses and mirror avoidance
-allows, then those used by other components or mirrors, such as the
-data of other raid sets, then those with the parity of other raid
-sets, each only if it has precreated objects and is not degraded.
-Last, only from RR, which does not hold the QoS lock, also try OSTs
-that are reconnecting, degraded or short of precreated objects,
-waiting for objects to be precreated; QoS falls back to RR if the
-parity is still short.  Keep bitmaps of the OSTs with data and parity,
-so a wide layout needs no scan of its stripes for each OST.
-An OST whose object can not be declared is tried at most once more,
-on that last pass.  If the parity component is complete and reuses an
-OST, mark it overstriped.  A raid set still never uses an OST or a
-domain of its own stripes, nor a domain of an overlapping component
-of another mirror, so as long as the OSTs or domains that other
-mirrors leave free fit the largest raid set the parity fits.  Say in
-failure-domain.txt and ec.txt that parity may share an OST or domain
-with the parity of another raid set.
+set 1 needs two of domains 3, 4 and 5, but only OST2 and the data
+OST7, both in domain 3, are left.  Have lod_ec_add_parities() try
+every OST of the pool for each raid set, first those no component of
+the file uses and mirror avoidance allows, then those used by other
+components or mirrors, such as the data of other raid sets, then those
+with the parity of other raid sets, each only if it has precreated
+objects and is not degraded.  Last, only from RR, which does not hold
+the QoS lock, also try OSTs that are reconnecting, degraded or short
+of precreated objects, waiting for objects to be precreated; QoS falls
+back to RR if the parity is still short.  Keep bitmaps of the OSTs
+with data and parity, so a wide layout needs no scan of its stripes
+for each OST.  An OST whose object can not be declared is tried at
+most once more, on that last pass.  If the parity component is
+complete and has two of its stripes on one OST, mark it overstriped,
+but have QoS never put two parity stripes of one raid set on the same
+OST when it places an overstriped parity.  A raid set still never uses
+an OST or a domain of its own stripes, nor a domain of an overlapping
+component of another mirror, so as long as the failure domains (or
+OSTs, without domains) that other mirrors leave free fit the largest
+raid set the parity fits.  Say in failure-domain.txt and ec.txt that
+parity may share an OST or domain with the parity of another raid set.
 
 Add sanity-ec test_31i for "-c 5 --ec 2+2" with 4 and 5 failure
 domains, with both allocators, created on MDT0000 since the MDTs
-refresh the OST failure domains independently, and have test_27i
-check that "-c 4 --ec 4+4" on 7 OSTs is created as 4+3 and resyncs.
+refresh the OST failure domains independently, and have test_27h check
+that "-c K --ec K+P" on K+1 OSTs is created with smaller raid sets,
+that "-c 2 --ec 2+P" with one more OST than P gives two 1+P raid sets
+whose parity is overstriped, and that it fails with no more OSTs than
+P.  Have test_27k and test_35a expect smaller raid sets for 6+2 on 6
+OSTs and 4 domains.
 
 Test-Parameters: trivial testlist=sanity-ec
+Fixes: c53abca9f9ee ("LU-19852 lod: raidset aware stripe allocator")
 Signed-off-by: Andreas Dilger <adilger@thelustrecollective.com>
 Assisted-by: ClaudeCode:claude-opus-5.5 ltvm llm_code_and_review_tools
 Change-Id: I067031d79874d1ff50adc406dd802cd52c3ebbe5
@@ -191,3 +196,50 @@ Patch Set 2:
 Patch Set 2:
 
 (1 comment)
+
+--- Message (Andreas Dilger, 2026-11-26 00:15:13.000000000) ---
+Uploaded patch set 3.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Andreas Dilger, 2026-11-26 00:15:59.000000000) ---
+Patch Set 1:
+
+(1 comment)
+
+--- Message (Andreas Dilger, 2026-11-26 00:16:00.000000000) ---
+Patch Set 2:
+
+(3 comments)
+
+--- Message (Ronnie Sahlberg, 2026-11-26 00:17:59.000000000) ---
+Patch Set 3: Code-Review+1
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-26 00:19:35.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 code warning(s).
+If you believe the warnings are incorrect, please leave a comment with your explanations as a reply to the warning.
+
+--- Message (wc-checkpatch, 2026-11-26 01:13:40.000000000) ---
+Patch Set 3:
+
+(1 comment)
+
+1 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (jenkins, 2026-11-26 03:02:09.000000000) ---
+Patch Set 3: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137850/ : SUCCESS
+
+--- Message (Gerrit AI review for Lustre, 2026-11-26 13:09:25.000000000) ---
+Patch Set 3:
+
+Looks good to me.

@@ -1,0 +1,79 @@
+Key:        LU-21334
+Summary:    mount.lustre default md_stripe_cache_size=16384 uses too much memory
+Link:       https://jira.whamcloud.com/browse/LU-21334
+Type:       Bug
+Priority:   Medium
+Status:     Open
+Resolution: Unresolved
+Assignee:   Minh Diep - TLC
+Reporter:   Minh Diep - TLC
+Created:    Wed, 25 Nov 2026 17:28:20 +0000
+Updated:    Wed, 25 Nov 2026 17:28:52 +0000
+
+--- Description ---
+mount.lustre sets mo_md_stripe_cache_size to 16384 by default
+
+(set_defaults() in lustre/utils/mount_lustre.c).  At each OST mount,
+
+tune_md_stripe_cache_size() in libmount_utils_ldiskfs.c writes this value
+
+to /sys/block/mdN/md/stripe_cache_size when the current value is lower.
+
+It never lowers it.  So every md device under an OST gets 16384 stripe
+
+heads unless the operator sets the mount option.
+
+Each stripe head holds one page per member device, plus about 1.8 KiB:
+
+cost = stripe_cache_size * (members * PAGE_SIZE + head)
+
+	4-member array: about 285 MiB
+
+	10-member array: about 670 MiB
+
+This is per array, and the md shrinker does not go below the value that
+
+was set.  On a 2 GiB server with 4 arrays the stripe caches used 1.14 GiB,
+
+then other allocations failed ("page allocation failure: order:4" from
+
+mount.lustre, netlink ENOBUFS).
+
+The man page also says the unit is KiB; it is a count of stripe heads.
+
+It says MDT devices are tuned, but tune_block_dev() returns early for
+
+anything that is not an OST.
+
+Proposed fix: default to 0, so mount.lustre leaves the device's own value
+
+alone.  -o md_stripe_cache_size= works as before.  Document the
+
+sizing rule for md RAID5/6 over HDDs, where a small cache costs write
+
+throughput (a 10-member RAID6 with 8 writers of 4 MiB lost 52% at 256
+
+compared with 16384).
+
+Reproducer:
+
+	Create an md RAID5/6 device with 4 members.
+
+	cat /sys/block/mdN/md/stripe_cache_size (for example 256).
+
+	mkfs.lustre --ost ... /dev/mdN; mount -t lustre /dev/mdN /mnt/ost
+
+	cat /sys/block/mdN/md/stripe_cache_size again: it is now 16384.
+
+--- Comment (gerrit, Wed, 25 Nov 2026 17:28:52 +0000) ---
+"Minh " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71478
+
+Subject: LU-21334 utils: leave md stripe_cache_size alone by default
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 6e8e8449a57d384e516631ef18619d06aac46ee2

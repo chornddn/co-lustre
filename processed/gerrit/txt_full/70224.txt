@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Alexey Lyashkov
 Created:    2026-10-30 08:48:55.000000000
-Updated:    2026-11-25 07:07:39.000000000
-Patch Set:  8
-Insertions: +306
-Deletions:  -17
-Comments:   50 (23 unresolved)
+Updated:    2026-11-26 16:13:05.000000000
+Patch Set:  9
+Insertions: +391
+Deletions:  -27
+Comments:   60 (30 unresolved)
 Hashtags:   218_review_blocker, 218_review_priority
 
 --- Labels ---
-  Code-Review: Vitaly Fertman: -1; wc-checkpatch: -1; Andrew Perepechko: +1; patrick bot: -1
+  Code-Review: patrick bot: -1
   Verified: Maloo: -1; jenkins: +1
 
 --- Reviewers ---
@@ -25,34 +25,18 @@ Hashtags:   218_review_blocker, 218_review_priority
 --- Commit Message ---
 LU-21075 llite: do not shrink i_size down to KMS
 
-vvp_prep_size() wrote KMS into i_size unconditionally. KMS is a lower
-bound only: osc_lock_lvb_update() clamps it to the end of the granted
-DLM extent, and sub-objects with no valid KMS contribute nothing to
-the merged value. On a PFL file whose size lives in a component the
-client holds no lock on, that publishes the end of the component being
-read as the file size, and a concurrent stat() reports it.
+A read could shrink i_size to KMS, causing stat to report a
+short file.  KMS is only a lower bound: on a PFL file it can
+end before the component containing the file's actual end.
 
-Extend i_size up to KMS instead, and never lower it here. cat_size is
-no upper bound for it either: a remote truncate lowers the KMS of the
-objects whose locks it cancels only, and an object nobody enqueues
-again keeps reporting the size the file had before, so the merged
-size still describes the old file.
+Extend i_size to KMS only when it is smaller.  Bound fast
+cached reads by KMS and glimpse when reading beyond it, so a
+stale i_size cannot expose zeroes after a remote truncate.
 
-Bound what the page cache may serve by KMS instead. lli_kms records
-how far the locks this client holds reach: vvp_prep_size() publishes
-it, vvp_attr_update() zeroes it when a lock is cancelled, and
-ll_read_from_cache() stops there, so the generic read loop - which
-runs to i_size with no further control from llite - cannot return
-zeroes between a new EOF and a stale i_size. While i_size is above
-KMS with no lock behind it, vvp_prep_size() takes one glimpse, which
-makes the attributes, and lli_kms, current again - sanityn test_16i
-and test_16n.
-
-Fixes: 240cad9a0a ("LU-19344 llite: set read size correctly")
-
-Change-Id: I888cd25f4a80b6933010e402c54596de3ef03ec8
+Fixes: 240cad9a0a82 ("LU-19344 llite: set read size correctly")
 Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
 HPE-bug-id: LUS-13572
+Change-Id: I888cd25f4a80b6933010e402c54596de3ef03ec8
 
 --- Review History ---
 
@@ -1415,3 +1399,214 @@ Patch Set 8: Code-Review-1
 
 This change cannot be cherry-picked to master.
 Please rebase the change locally and upload the rebased commit for review.
+
+--- Message (Alexey Lyashkov, 2026-11-25 19:19:58.000000000) ---
+Uploaded patch set 9.
+
+Outdated Votes:
+* Code-Review+1, Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 19:25:32.000000000) ---
+Patch Set 9:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 19:35:31.000000000) ---
+Patch Set 9:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-25 20:01:06.000000000) ---
+Patch Set 5:
+
+(1 comment)
+
+--- Message (Andrew Perepechko, 2026-11-25 20:01:09.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+Re-reviewed patch set 9 (c0d037ccf6, now on top of 71492 patch set 1). The KMS bookkeeping is much better: lli_kms is now changed only from CAT_KMS updates that lovsub_attr_update() propagates to the top object, under the top cl_object attribute lock and with WRITE_ONCE(), so the lost-cancel race from file.c:1827 on patch set 8 is gone. The stale-glimpse clause in vvp_prep_size() is dropped, and lov_attr_get_dom() now reports the MDC KMS, which answers the DoM fast-read question of the AI review.
+
+Still open: the early return in vvp_io_read_start() is unchanged, so sanity test_27J will fail again on el8 clients (Andreas and Vitaly at vvp_io.c:941 on patch set 8, Patrick bot). It needs to be dropped or split out, or test_27J adjusted. Andreas's minor about the glimpse branch returning before CFS_RACE() and the AI review questions on test_271ba and on the ll_read_from_cache() comment are not answered either. One question on an error path and two test notes inline.
+
+The commit message no longer describes most of the patch, see the inline note. Test-Parameters for the striped and FLR cases of sanityn test_16i are still missing. This patch set now depends on 71492. As far as I can see it does not need 71492 for correctness, but test_127h checks the write-side KMS publication that 71492 reworks, so the two should be tested together.
+
+No version checks are needed: the changed code and the new tests are client-only and run on the local client. No CI results on patch set 9 yet.
+
+--- Message (jenkins, 2026-11-26 01:16:47.000000000) ---
+Patch Set 9: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137834/ : SUCCESS
+
+--- Message (Maloo, 2026-11-26 01:18:23.000000000) ---
+Patch Set 9:
+
+#### The following sessions will be run for Build 137834 (patch #9):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137834&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137834#redirect
+
+--- Message (Maloo, 2026-11-26 09:05:14.000000000) ---
+Patch Set 9:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm105: https://testing.whamcloud.com/test_sessions/149e3ca1-5c94-4ae6-82f3-2495648117d8 ran 5 tests.  1 tests failed: sanity.
+
+--- Message (patrick bot, 2026-11-26 09:14:06.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-26 09:26:10.000000000) ---
+Patch Set 9: Code-Review-1
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-26 09:36:25.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Maloo, 2026-11-26 09:44:46.000000000) ---
+Patch Set 9:
+
+Failed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm250: https://testing.whamcloud.com/test_sessions/95c71084-f457-4e62-9183-33df1ca798d1 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-26 10:34:39.000000000) ---
+Patch Set 9:
+
+Failed enforced test review-dne-zfs-part-7 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm88: https://testing.whamcloud.com/test_sessions/74d6fd24-e222-4735-995c-9c032576fee3 ran 11 tests.  1 tests failed: sanity-quota.
+
+--- Message (Maloo, 2026-11-26 16:01:56.000000000) ---
+Patch Set 9: Verified-1
+
+Passed enforced test review-dne-part-3 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-152vm185: https://testing.whamcloud.com/test_sessions/3fd18af8-9507-4851-95ad-1756ea8e10ac ran 3 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-26 16:13:05.000000000) ---
+Patch Set 9:
+
+(4 comments)
+
+AI code review results below, please doublecheck
+
+Some concerns. The vvp_io_read_start() hunk still breaks sanity test_27J on older kernels and needs a refresh; the other inline items are minor and can ride along.

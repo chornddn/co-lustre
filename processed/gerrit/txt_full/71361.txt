@@ -7,11 +7,11 @@ Branch:     master
 Status:     NEW
 Owner:      Chris Horn
 Created:    2026-11-24 03:48:23.000000000
-Updated:    2026-11-25 04:30:40.000000000
-Patch Set:  1
-Insertions: +966
-Deletions:  -393
-Comments:   10 (4 unresolved)
+Updated:    2026-11-26 09:55:02.000000000
+Patch Set:  2
+Insertions: +1069
+Deletions:  -430
+Comments:   20 (1 unresolved)
 Hashtags:   pw_shepherd
 
 --- Labels ---
@@ -20,7 +20,7 @@ Hashtags:   pw_shepherd
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
-  REVIEWER: Andreas Dilger, wangdi
+  REVIEWER: Qian Yingjin, Etienne AUJAMES
 
 --- Commit Message ---
 LU-20090 nrs: add a two-stage class lookup for TBF
@@ -36,19 +36,52 @@ the bucket adds the rule ID, so the bucket keeps its rule for life.
 A hit costs one lookup and no walk of the rule list. The rule dump
 adds the rule ID, and the CPT line adds the lookup counters:
 
-    CPT 0: key=nid, miss 2, walk 2, checked 4, lru_free 0, rcache 2,
-      class 2
+    CPT 0: key=nid, miss 2, walk 2, checked 4, lru_free 0, rerate 0,
+      rcache 2, class 2
     default * 10000, id 1, ref 0
 
 The counter lru_free counts the rule cache entries that the LRU shrink
 frees. A miss count that grows with lru_free shows a cache thrash. A
-miss count that grows alone shows new keys.
+miss count that grows alone shows new keys or rule changes. A rule
+start moves the head sequence, and a rule stop ends the entries of its
+rule. The next request of each key then counts as a miss. Each miss
+runs one walk here. A later patch can refuse a walk, so the two
+counts can then differ.
 
-A rule stop or a rule add no longer moves a bucket to a new rule.
-The queued requests of the old bucket drain at the rate of its rule.
-The next request of the key goes to a bucket of the new rule.
+A rule add no longer moves a bucket to a new rule. The queued requests
+of the old bucket drain at the rate of its rule. The next request of
+the key goes to a bucket of the new rule.
 
-The key now clears each ID field that the policy type does not use.
+A rate command now reaches every bucket of its rule at once. Each rule
+keeps a list of its buckets. A rate change sets the new rate on each
+bucket of the rule under scp_req_lock and tr_rule_lock. A rule stop
+gives the buckets of the rule the rate of the default rule. A stop
+thus clears a queue that a low rate caused, with no new request. A
+new bucket copies the rate of its rule under tr_rule_lock, so a
+command cannot miss it. A bucket with a new rate can send its first
+queued request at once. The throttle timer moves to that time.
+The counter rerate counts the buckets with queued requests that a
+rate command reached. The rule generation is gone, so the request
+path takes no scp_req_lock to classify a request.
+
+A rule stop also copies the realtime flag of the default rule. After
+a rule stop, a later change of the default rule does not reach the
+buckets of the stopped rule.
+
+Since 3408489c96ba, the key holds the UID, the GID and the project ID.
+When ptlrpc_body lacks an ID that the policy type needs, the fallback
+in nrs_tbf_id_cli_set() fills all three IDs. Also, ptlrpc_body gives
+the UID and the GID together. A uid policy thus put one UID in a
+bucket for each GID. The fallback also split it by project ID. Each
+bucket had the full rate. The key now clears each ID field that the
+policy type does not use.
+
+A request with no export, such as a first connect, gets the nodemap
+ID LUSTRE_NODEMAP_MAX_ID. Before, nodemap_get_from_exp() read a NULL
+export. With GFP_ATOMIC, a lookup that meets a freeing object now
+returns -EBUSY, and does not call schedule(). The high priority move
+classifies a request under exp_rpc_lock. The request then uses the
+fallback policy.
 The command structures lose the TBF prefix for a second policy.
 
 The rule stop path removed a rule from the list under nrs_lock only.
@@ -61,16 +94,18 @@ The policy start parses its argument with the command parser, so a
 later patch can add start keys. A bad key value now returns the
 error of its parse, not -EINVAL. An empty policy start argument now
 starts the generic type, as no argument does. Before, it failed with
--EINVAL.
+-EINVAL. A trailing space in the argument is now valid.
 
 Fix three test defects. The 77k cleanup left TBF rules for the next
 test, so 77k now registers it with stack_trap. 77kb restored the
 jobid_var from the wrong variable. 77kj did not wait for the servers
-to get the nodemap.
+to get the nodemap. Also, tbf_verify() no longer sets an EXIT trap,
+which dropped the stack_trap handlers of the 77k tests.
 
 Fixes: 33e35c0bf214 ("LU-3558 ptlrpc: Add the NRS TBF policy")
 Fixes: 3408489c96ba ("LU-20090 nrs: use fixed size key for NRS TBF class bucket")
 Test-Parameters: trivial testlist=sanityn env=ONLY=77
+Test-Parameters: trivial testlist=conf-sanity env=ONLY="117 123ai 123aj"
 Signed-off-by: Chris Horn <chorn@ddn.com>
 Assisted-by: ClaudeCode:claude-opus-5-5
 Change-Id: I2c64d9117ba09829b7c187b89489e22781bbe308
@@ -150,3 +185,82 @@ Mostly good; the two-stage lookup and its refcount/RCU handling look correct to 
 Patch Set 1:
 
 (1 comment)
+
+--- Message (Chris Horn, 2026-11-25 17:38:58.000000000) ---
+Uploaded patch set 2.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Chris Horn, 2026-11-25 17:44:43.000000000) ---
+Patch Set 2:
+
+(4 comments)
+
+--- Message (wc-checkpatch, 2026-11-25 17:45:33.000000000) ---
+Patch Set 2:
+
+(5 comments)
+
+5 style warning(s).
+For more details please see https://wiki.lustre.org/Lustre_Coding_Style_Guidelines
+
+--- Message (Chris Horn, 2026-11-25 17:46:28.000000000) ---
+Removed reviewer <GERRIT_ACCOUNT_803>.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 18:03:01.000000000) ---
+Patch Set 2:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-26 00:27:15.000000000) ---
+Patch Set 2: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137827/ : SUCCESS
+
+--- Message (Maloo, 2026-11-26 00:28:04.000000000) ---
+Patch Set 2:
+
+#### The following sessions will be run for Build 137827 (patch #2):
+
+#### Enforced:
+
+- review-ldiskfs-dne on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-dne-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137827&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137827#redirect
+
+--- Message (Maloo, 2026-11-26 09:38:39.000000000) ---
+Patch Set 2: Verified+1
+
+Passed enforced test review-ldiskfs-dne on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm55: https://testing.whamcloud.com/test_sessions/2f45bc67-8a7e-4688-b6bc-878fc5cb3ba9 ran 5 tests.
+
+--- Message (Gerrit AI review for Lustre, 2026-11-26 09:55:02.000000000) ---
+Patch Set 2:
+
+(1 comment)
+
+AI code review results below, please doublecheck
+
+Looks good. The two-stage lookup, the refcount and RCU handling, and the new rate locking hold up under tracing. One commit-message item is inline: two more Fixes: tags. Add them on the next refresh; it doesn't need a re-spin on its own.

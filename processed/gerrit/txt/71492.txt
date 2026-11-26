@@ -1,0 +1,97 @@
+Change:     71492
+Subject:    LU-21075 osc: update write attributes once per batch
+Link:       https://review.whamcloud.com/c/fs/lustre-release/+/71492
+Change-Id:  I7be96df2f09bda9341756a0cd2150b4c5aecb73d
+Project:    fs/lustre-release
+Branch:     master
+Status:     NEW
+Owner:      Alexey Lyashkov
+Created:    2026-11-25 19:19:58.000000000
+Updated:    2026-11-26 16:18:07.000000000
+Patch Set:  1
+Insertions: +43
+Deletions:  -16
+Comments:   7 (7 unresolved)
+Hashtags:   pw_shepherd
+
+--- Labels ---
+  Code-Review: Andrew Perepechko: +1
+  Verified: Maloo: +1; jenkins: +1
+
+--- Reviewers ---
+  CC: Gerrit AI review for Lustre
+  REVIEWER: Andrew Perepechko
+
+--- Commit Message ---
+LU-21075 osc: update write attributes once per batch
+
+osc_io_commit_async() updated timestamps, size and KMS for each
+page, taking the shared object attribute lock even when the update
+left all values unchanged.
+
+Update attributes from the last accepted page of each ordered batch
+before its callback dirties or unlocks the pages.  Use the same
+flush path before waiting for grants or finding a new extent, and
+preserve partial-page ends and successfully accepted short queues.
+Skip attribute updates when timestamps, size and KMS are unchanged.
+
+Change-Id: I7be96df2f09bda9341756a0cd2150b4c5aecb73d
+Signed-off-by: Alexey Lyashkov <alexey.lyashkov@hpe.com>
+
+--- Review History ---
+
+--- Message (Alexey Lyashkov, 2026-11-25 19:19:58.000000000) ---
+Uploaded patch set 1.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 19:25:27.000000000) ---
+Patch Set 1:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 19:35:42.000000000) ---
+Patch Set 1:
+
+Looks good to me.
+
+--- Message (Andrew Perepechko, 2026-11-25 20:00:59.000000000) ---
+Patch Set 1:
+
+(4 comments)
+
+Reviewed patch set 1. The batching keeps the ordering that matters: osc_page_touch_at() for the last accepted page of a batch still runs before the commit callback marks the folios uptodate, dirties and unlocks them, and every flush point (full batch, before osc_enter_cache()/osc_extent_find() in osc_queue_async_io(), end of osc_io_commit_async()) goes through osc_io_commit_batch(). I found no defect.
+
+What I checked: writeback cannot overtake the deferred update, since cl_page_make_ready() and osc_extent_truncate() both block on the folio lock that the callback drops; the DLM lock of the IO is held for the whole commit, so a cancel cannot shift KMS under the deferred update or be followed by a raise; early exits (-EBUSY, -EDQUOT, -EIO, grant wait or extent wait failures) apply attributes only to pages already accepted, and batch_to is set only after acceptance.
+
+Partial last page: batch_to is the caller's to only when the last page itself is in the batch, matching the bytes vvp_io_write_commit() accounts for a short queue. Skipping a no-op update is equivalent: osc_attr_update() would write the same values, and lovsub_attr_update() only drops the lov attribute cache, whose sole inputs (loi_lvb, loi_kms) change only through cl_object_attr_update(). DIO (cl_page_touch) and mkwrite (osc_io_fault_start) get only that skip.
+
+Relation to 70224: patch set 9 of 70224 is now based on this change, so 70224 (a 2.18 review blocker) cannot land before it. Its lovsub to vvp KMS propagation makes each attribute update dearer, which this change amortizes, but its correctness does not seem to need it. If that is right, would it make sense to decouple the two so 70224 is not held by a performance change?
+
+Tests and CI: no new test, which is acceptable for a change meant to be behaviour-neutral, but the commit message should say so and give performance numbers; see the inline comment. checkpatch is clean, and the client modules build without warnings against a 6.8 kernel. No Maloo results yet.
+
+--- Message (Andrew Perepechko, 2026-11-25 20:01:02.000000000) ---
+Patch Set 1: Code-Review+1
+
+--- Message (jenkins, 2026-11-26 01:14:57.000000000) ---
+Patch Set 1: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137835/ : SUCCESS
+
+--- Message (patrick bot, 2026-11-26 09:19:33.000000000) ---
+Hashtag added: pw_shepherd
+
+--- Message (patrick bot, 2026-11-26 16:12:35.000000000) ---
+Hashtag removed: pw_shepherd
+
+--- Message (Gerrit AI review for Lustre, 2026-11-26 16:15:19.000000000) ---
+Patch Set 1:
+
+(3 comments)
+
+AI code review results below, please doublecheck
+
+No code defects found: osc_page_touch_at() still runs for the last accepted page of each batch before the commit callback unlocks the folios, and skipping no-op updates leaves the lov attribute cache consistent. The only comments are on the commit message, so this is fine to land if nothing else forces a refresh.
+
+--- Message (patrick bot, 2026-11-26 16:18:07.000000000) ---
+Hashtag added: pw_shepherd

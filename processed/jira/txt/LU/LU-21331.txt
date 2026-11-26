@@ -1,0 +1,88 @@
+Key:        LU-21331
+Summary:    ptlrpc: forward clock step makes targets evict all exports
+Link:       https://jira.whamcloud.com/browse/LU-21331
+Type:       Bug
+Priority:   Medium
+Status:     In Progress
+Resolution: Unresolved
+Assignee:   Minh Diep - TLC
+Reporter:   Minh Diep - TLC
+Created:    Wed, 25 Nov 2026 16:46:34 +0000
+Updated:    Wed, 25 Nov 2026 16:50:54 +0000
+Links:      Related: is related to  LU-21139
+
+--- Description ---
+When the clock on a server steps forward, every target on that server
+
+evicts every export it has not heard from since the step. The clock can
+
+step when a VM resumes from suspend, when chrony corrects a bad RTC, or
+
+after "date -s". The console shows:
+
+lustre-MDT0000: haven't heard from client ... in 318 seconds. I think it's dead, and I am evicting it.
+
+Both clients and the MDT OSP exports on an OST are evicted, within about
+
+one second of each other.
+
+Cause
+
+The ping evictor keeps export times on the wall clock.
+
+exp_deadline, exp_last_request_time and obd_eviction_timer
+
+are set from ktime_get_real_seconds() in __class_new_export(),
+
+rev_import_init() and ptlrpc_update_export_timer().
+
+ping_evictor_main() compares them with the same clock. A step of S
+
+seconds makes every export look S seconds idle at the same time. When S
+
+is larger than the deadline margin (about 100s with default timeouts),
+
+all of these exports are evicted together.
+
+Fix
+
+Use ktime_get_seconds() for these values. They are only compared
+
+with each other or printed as a difference, so they do not need wall
+
+clock time. rq_deadline/rq_arrival_time (adaptive timeouts,
+
+early replies) and scp_last_request also use wall clock time, but
+
+they do not cause evictions and are not changed.
+
+Reproducer
+
+Mount a filesystem with an OSS on its own node and write from a client
+
+to OST0000. On the OSS, stop chronyd/ntpd and step the clock forward
+
+300 seconds:
+
+date -s "+300 seconds"
+
+Within a few seconds the MDT OSP exports and the client are evicted from
+
+the OST. The new test replay-single test_225 does this and checks that
+
+no target logs "haven't heard from client" and no client is evicted.
+
+It fails on unpatched master.
+
+--- Comment (gerrit, Wed, 25 Nov 2026 16:50:45 +0000) ---
+"Minh " uploaded a new patch: https://review.whamcloud.com/c/fs/lustre-release/+/71454
+
+Subject: LU-21331 ptlrpc: time export deadlines on the monotonic clock
+
+Project: fs/lustre-release
+
+Branch: master
+
+Current Patch Set: 1
+
+Commit: 2162fec661247368e75969f5aef334342a92c742

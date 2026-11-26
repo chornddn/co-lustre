@@ -7,15 +7,15 @@ Branch:     master
 Status:     NEW
 Owner:      Artem Blagodarenko
 Created:    2026-11-11 23:19:33.000000000
-Updated:    2026-11-23 20:28:30.000000000
-Patch Set:  5
-Insertions: +410
-Deletions:  -49
-Comments:   62 (9 unresolved)
+Updated:    2026-11-26 16:28:39.000000000
+Patch Set:  7
+Insertions: +689
+Deletions:  -60
+Comments:   74 (2 unresolved)
 
 --- Labels ---
-  Code-Review: Andreas Dilger: -1
-  Verified: Maloo: -1; jenkins: +1
+  Code-Review: (no votes)
+  Verified: jenkins: +1
 
 --- Reviewers ---
   CC: Gerrit AI review for Lustre, patrick bot
@@ -32,40 +32,50 @@ lfs fid2path cannot map it, and a tool that reads an OST to find the
 files on it has to walk the namespace for them.
 
 When LOD creates the objects of a layout, pass the parent FID and the
-stripe index to OSP in the allocation hint.  OSP queues a setattr
-record for each new object in its sync llog, in the same transaction,
-and the sync thread sends it to the OST as an OST_SETATTR with
-OBD_MD_FLFID, as it sends ownership changes.  The record is
+stripe index to OSP in the allocation hint, and OSP keeps it with the
+object.  It goes to the OST with the first ownership or layout version
+change of the object, at no extra cost.  At the last close of the
+file, mdd_close_pfid() sends it to the objects that still lack it,
+skipping those that the lazy size shows hold data, which the write
+gave their parent FID.  So a file whose data covers all its objects
+costs no RPC, and an empty file one per object.  The MDT pays one
+local transaction at the last close of each new file.  It is an
+OST_SETATTR with OBD_MD_FLFID from the sync llog, in
 llog_setattr64_rec_v2, whose padding now holds the parent FID.  It is
-optional: if the llog cannot take it, the object gets its parent FID
-from its first write, as before.
+best effort: if the MDT restarts while the file is open, objects that
+are never written keep no parent FID, as before.  Nor is it sent
+when its llog record cannot be declared, as when the sync llog
+already holds max_sync_changes records, so it never adds to that
+queue past the limit.
 
-The OST stores a parent FID from an MDT setattr only if the object
-has none, deciding it again under the object lock, and replies to a
-setattr left with nothing to do without a transaction.  OSP takes
-such a reply as committed and cancels the record, as it does for an
-object that no longer exists.  A new connect flag,
-OBD_CONNECT2_CREATE_PFID, keeps OSP from sending the record to an OST
-that would replace the parent FID instead.  OSP checks it again when
-it sends a record, since the OST may have reconnected without it.
+The OST stores a parent FID from an MDT setattr only if the object has
+none, deciding it again under the object lock, and replies to a
+setattr left with nothing to do without a transaction.  A filter_fid
+that holds only the layout version of a mirrored or EC file has none.
+OSP takes such a reply as committed and cancels the record, as it does
+for an object that no longer exists.  A client fallocate now also
+stores the layout of an object that has only its parent FID, as a
+write or punch does.  An older OST replaces the parent FID instead,
+which changes it only if the layout was swapped while the record was
+queued.
 
-The record is sent once the create commits, so a layout swap (lfs
-migrate, lfs mirror extend) often runs first.  The swap used to skip
-objects with no parent FID, and the late record then gave them the
-volatile file.  It now gives them their new parent, and the OST drops
-the late record.  The swap sets it with out_xattr_set(), which leaves
-the parent FID that OFD keeps in memory as it was, so OST fid2path
-now reads it again.
+A layout swap (lfs migrate, lfs mirror extend) skipped objects with no
+parent FID, so the volatile file would later be sent as their parent.
+It now gives them their new parent, and OSP drops the one it kept. The
+swap sets it with out_xattr_set(), which leaves the parent FID that
+OFD keeps in memory as it was, so OST fid2path now reads it again.
 
 osp.*.create_pfid (default 1) turns this off.
 
 Add sanity test 27za, with the migrate and mirror extend of empty
-files.  Keep sanity-lfsck 18c creating objects with no
-parent FID, and 17 leaving the objects its fault injection orphans
-without one, which 18a would otherwise count as orphans to repair.
+files, and the setattr RPCs that written objects and an ownership
+change save.  Keep sanity-lfsck 18c creating objects with no parent
+FID, and 17 leaving the objects its fault injection orphans without
+one, which 18a would otherwise count as orphans to repair.
 
 Test-Parameters: testlist=sanity env=ONLY=27za,ONLY_REPEAT=10
 Test-Parameters: testlist=sanity-lfsck
+Test-Parameters: testlist=sanity-flr
 Signed-off-by: Artem Blagodarenko <ablagodarenko@thelustrecollective.com>
 Assisted-by: Claude:claude-opus-5-5
 Change-Id: Icca3ac3b185e368ac55bfa1241d16a2888741263
@@ -853,3 +863,418 @@ Looks good; one optional comment nit inline for whenever the patch is next refre
 Patch Set 5: Code-Review-1
 
 (8 comments)
+
+--- Message (Artem Blagodarenko, 2026-11-25 21:18:35.000000000) ---
+Uploaded patch set 6.
+
+Outdated Votes:
+* Code-Review-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE OR changekind:TRIVIAL_REBASE OR changekind:TRIVIAL_REBASE_WITH_MESSAGE_UPDATE OR is:MIN")
+* Verified+1, Verified-1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Artem Blagodarenko, 2026-11-25 21:19:13.000000000) ---
+Patch Set 5:
+
+(9 comments)
+
+PS6 addresses the review: the parent FID is sent at last close or with an MDT setattr instead of at create, and the connect flag is gone. Replies inline.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-25 21:21:18.000000000) ---
+Patch Set 6:
+
+Code-wise looks good to me.
+
+--- Message (wc-checkpatch, 2026-11-25 21:23:20.000000000) ---
+Patch Set 6:
+
+Looks good to me.
+
+--- Message (jenkins, 2026-11-26 01:54:17.000000000) ---
+Patch Set 6: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137842/ : SUCCESS
+
+--- Message (Maloo, 2026-11-26 01:55:52.000000000) ---
+Patch Set 6:
+
+#### The following sessions will be run for Build 137842 (patch #6):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137842&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137842#redirect
+
+--- Message (Maloo, 2026-11-26 08:11:22.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm140: https://testing.whamcloud.com/test_sessions/58b8ed2e-2a09-428b-a018-bc83c875ebbb ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-26 08:30:05.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-zfs-subtest-change on RHEL 9.7 / x86_64 uploaded by Onyx Autotest 2 from onyx-143vm1: https://testing.whamcloud.com/test_sessions/b8b73815-d411-4790-9043-904b95b24565 ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-26 11:05:19.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-ldiskfs-arm on RHEL 8.10 / x86_64, Rocky 9.8 / aarch64 uploaded by Onyx Autotest 2 from onyx-180vm22: https://testing.whamcloud.com/test_sessions/cc057dd1-e6cc-4377-892a-9c7dd58a02ad ran 8 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 11:37:51.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 9.8 / x86_64 uploaded by Onyx Autotest 2 from onyx-158vm95: https://testing.whamcloud.com/test_sessions/8124403c-8af5-4ceb-9e50-1d41f13c8eda ran 7 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 11:41:43.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-selinux-ssk-part-1 on RHEL 8.10 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm43: https://testing.whamcloud.com/test_sessions/6b8d7912-eb5c-4417-9f4c-c1c1a4115b8e ran 3 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 11:55:58.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm270: https://testing.whamcloud.com/test_sessions/a7c4d303-be36-4176-a779-12c8dee3adff ran 7 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 12:03:41.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-zfs-part-1 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-154vm155: https://testing.whamcloud.com/test_sessions/711ebe88-39f1-46d4-a614-43b5c1f36cec ran 3 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-26 12:17:05.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-ldiskfs on RHEL 8.10 / x86_64, RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-159vm68: https://testing.whamcloud.com/test_sessions/407e81f0-70c2-43cc-b8e9-7756301e32b0 ran 7 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 12:18:15.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-zfs-part-5 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-153vm62: https://testing.whamcloud.com/test_sessions/7bfa875a-80d0-4ad3-af92-72a6cf27b12e ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-26 12:21:00.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-part-1 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-156vm18: https://testing.whamcloud.com/test_sessions/09a6b9bb-c575-4bc9-a143-f57a2dacd1e2 ran 3 tests.  1 tests failed: sanity.
+%% THIS TEST SESSION CRASHED %%
+
+--- Message (Maloo, 2026-11-26 12:27:45.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-part-5 on RHEL 10.2 / x86_64 uploaded by Onyx Autotest 2 from onyx-155vm66: https://testing.whamcloud.com/test_sessions/9bca275e-4492-4663-8c68-86d18a4d3c33 ran 6 tests.  1 tests failed: replay-dual.
+
+--- Message (Maloo, 2026-11-26 12:54:27.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-ipv6 on RHEL 9.8 / x86_64 uploaded by Trevis Autotest 2 from trevis-156vm110: https://testing.whamcloud.com/test_sessions/7f9400c7-3492-4442-b0ce-7fc69553565b ran 4 tests.  1 tests failed: sanity.
+
+--- Message (Maloo, 2026-11-26 13:20:31.000000000) ---
+Patch Set 6:
+
+Failed enforced test review-dne-zfs-part-2 on RHEL 10.2 / x86_64 uploaded by Trevis Autotest 2 from trevis-155vm162: https://testing.whamcloud.com/test_sessions/32882ae6-f773-42a4-80ba-fc845de59dd4 ran 11 tests.  1 tests failed: sanityn.
+
+--- Message (patrick bot, 2026-11-26 13:56:07.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (patrick bot, 2026-11-26 14:04:17.000000000) ---
+Patch Set 6:
+
+(1 comment)
+
+--- Message (Autotest, 2026-11-26 14:04:52.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-part-5 session on el10.2-x86_64/ldiskfs servers and clients for build 137842 patch 6. Requested by Patrickbot because of LU-21242.
+
+--- Message (Autotest, 2026-11-26 14:05:54.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-5 session on el9.8-x86_64/zfs servers and clients for build 137842 patch 6. Requested by Patrickbot because of LU-21242.
+
+--- Message (Autotest, 2026-11-26 14:06:51.000000000) ---
+Patch Set 6:
+
+Onyx Autotest 2 retesting enforced review-dne-zfs-part-2 session on el10.2-x86_64/zfs servers and clients for build 137842 patch 6. Requested by Patrickbot because of LU-18673.
+
+--- Message (Artem Blagodarenko, 2026-11-26 14:45:43.000000000) ---
+Uploaded patch set 7.
+
+Outdated Votes:
+* Verified+1 (copy condition: "changekind:NO_CHANGE OR changekind:NO_CODE_CHANGE")
+
+--- Message (Artem Blagodarenko, 2026-11-26 14:46:00.000000000) ---
+Patch Set 7:
+
+(1 comment)
+
+--- Message (wc-checkpatch, 2026-11-26 14:46:15.000000000) ---
+Patch Set 7:
+
+Looks good to me.
+
+--- Message (Misc Code Checks Robot (Gatekeeper helper), 2026-11-26 14:48:19.000000000) ---
+Patch Set 7:
+
+Code-wise looks good to me.
+
+--- Message (jenkins, 2026-11-26 16:27:26.000000000) ---
+Patch Set 7: Verified+1
+
+Build Successful 
+
+https://build.whamcloud.com/job/lustre-reviews/137947/ : SUCCESS
+
+--- Message (Maloo, 2026-11-26 16:28:16.000000000) ---
+Patch Set 7:
+
+#### The following sessions will be run for Build 137947 (patch #7):
+
+#### Enforced:
+
+- review-ldiskfs on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-zfs on el8.10-x86_64/el8.10-x86_64/zfs/zfs
+
+- review-dne-part-2 on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-ldiskfs-arm on el8.10-x86_64/rocky9.8-aarch64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el8.10-x86_64/el8.10-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs on el8.10-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- review-dne-subtest-change on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-subtest-change on el9.7-x86_64/el9.7-x86_64/zfs/zfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+- custom on el9.7-x86_64/el9.7-x86_64/ldiskfs/ldiskfs
+
+#### Optional:
+
+- review-dne-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-3 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-5 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-7 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-2 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-4 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-zfs-part-6 on el9.8-x86_64/el9.8-x86_64/zfs/zfs
+
+- review-dne-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-4 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-zfs-part-1 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-3 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-5 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-zfs-part-7 on el10.2-x86_64/el10.2-x86_64/zfs/zfs
+
+- review-dne-ipv6 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-part-9 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el9.8-x86_64/el9.8-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-1 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-dne-selinux-ssk-part-2 on el10.2-x86_64/el10.2-x86_64/ldiskfs/ldiskfs
+
+- review-ldiskfs-ubuntu on el8.10-x86_64/ubuntu2604-x86_64/ldiskfs/ldiskfs
+
+---
+
+Maloo Test Queue: https://testing.whamcloud.com/test_queue?jobs=lustre-reviews&builds=137947&commit=Apply+Filter
+
+Maloo Results: https://testing.whamcloud.com/test_sessions/related?jobs=lustre-reviews&builds=137947#redirect
+
+--- Message (Autotest, 2026-11-26 16:28:39.000000000) ---
+Patch Set 6:
+
+Trevis Autotest 2 is abandoning the following sessions because: later build 137947 found
+- Enforced review-dne-part-3 on el10.2-x86_64/ldiskfs servers and clients
